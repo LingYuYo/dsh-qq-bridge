@@ -1,0 +1,37 @@
+{
+  "dsh": {
+    "baseUrl": "http://127.0.0.1:2852",
+    "sessionCwd": "C:\\path\\to\\your\\QQChat-workspace",
+    "workspaceTitle": "QQ 聊天",
+    "agentPreset": "qq-chat",
+    "provider": "trae",
+    "model": "deepseek-v4.1-flash",
+    "reasoningEffort": "high"
+  },
+  "onebot": {
+    "wsUrl": "ws://127.0.0.1:3001",
+    "accessToken": "CHANGE_ME_随机令牌"
+  },
+  "allow": {
+    "private": [],
+    "groups": [],
+    "deny": { "private": [], "groups": [] },
+    "allowAllWhenEmpty": false
+  },
+  "replyTimeoutMs": 180000,
+  "sendDelayMs": 400,
+  "chunkSize": 1000,
+  "bubbleMaxChars": 30,
+  "mergeMaxChars": 15,
+  "sendIntervalMs": 500,
+  "typingDelay": {
+    "enabled": true
+  },
+  "trimEndPunctuation": {
+    "enabled": true,
+    "keep": ["？", "！"]
+  },
+  "groupAtReply": true,
+  "groupAtPosition": "last",
+  "stateFile": "./state/sessions.json"
+}
