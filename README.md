@@ -103,3 +103,24 @@ node qq-bridge/test-offline.mjs
 
 MIT，见 [LICENSE](LICENSE)。
 与腾讯、NapCat、DeepSeek 官方均无隶属关系；用你自己的账号做事，后果自负。
+
+## 开发流程（本仓库是唯一写入点）
+
+改代码只在这个仓库里改，线上运行的那两份是从这里同步过去的副本：
+
+```powershell
+# 1. 在仓库里改，跑测试
+node qq-bridge/test-offline.mjs        # 要 0 失败
+
+# 2. 提交
+git add -A; git commit -m "..."; git push
+
+# 3. 同步到线上（默认预演，只打印差异不动文件）
+..\sync-to-live.ps1
+..\sync-to-live.ps1 -Apply             # 真同步：先跑测试，绿了才写，写前自动备份
+```
+
+同步脚本在**工作区根**（不在本仓库里），因为它要同时知道仓库和线上两边的位置。
+它会：跳过 `qq-bridge/config.json` 与 `state/`、把 `cordis.patch.yml` 里的占位符
+回填成线上的真实值、覆盖前备份到 `<线上>/.sync-backup/<时间戳>/`。
+
