@@ -10,6 +10,17 @@ QQ ──► NapCat (OneBot v11 正向 WS) ──► qq-bridge ──► DSH Web
                                         └── agent 回复 ─────┘
 ```
 
+## 版本演进
+
+当前版本：**v0.1.1-beta.1**
+
+本次新增：
+
+- **外部插件兼容层**：只读扫描 QQ Agent 格式（`plugin.json` / `skill.json`），支持动态配置表单，默认全部关闭。
+- **沙箱执行基础链路（P1）**：`ctx.subprocess` 独立进程 + `--permission` + `module.registerHooks` 拦截 `node:fs` / `node:child_process` / 越界引用，支持对自包含模块执行 `setup()` 冒烟测试。
+- **人设系统重构**：概览卡片 + 独立编辑弹窗，支持机器人名字、参与度、管理员附加规则、系统提示词覆盖，桥接层拼接逻辑同步更新。
+- **UI 布局收尾**：左下角一键启动卡片、记忆整理面板、外部插件卡片描述裁剪与过滤。
+
 ## 仓库结构
 
 ```
@@ -19,6 +30,10 @@ plugins/dsh-qq-guard/     DSH 插件（Host + 浏览器半身）
   ├─ cordis.patch.yml     bundle patch：插入 qq-chat preset + 顶层 settings 行
   ├─ napcat.mjs           NapCat 进程管理（启动 / 停止 / 三层在线判定）
   ├─ bridge-runner.mjs    桥接进程管理（autoStart / 单实例 / 崩溃重启上限）
+  ├─ sandbox/             外部插件沙箱执行链路
+  │   ├─ protocol.mjs     Host ↔ 子进程的 NDJSON 协议（零依赖、两侧共用）
+  │   ├─ manager.mjs      Host 侧：拉起子进程 / 超时 / 熔断 / 对外只暴露 testLoad
+  │   └─ child.mjs        子进程入口：--permission + registerHooks 拦危险内置模块
   └─ test-*.mjs           离线回归（假 ctx / 假 subprocess，不真起进程）
 
 qq-bridge/                独立桥接进程（零 npm 依赖）
@@ -40,8 +55,9 @@ qq-bridge/                独立桥接进程（零 npm 依赖）
    - `tools.restrict`：把危险工具从该作用域的工具清单里隐藏；
    - `tools.guard`：执行期白名单兜底，任何不在白名单内的调用一律拒绝。
    - **必须装在 preset 子行**：顶层 `tools.guard` 是全局的，会把浏览器里的正常会话一起锁死。这个坑在代码注释里写了来龙去脉。
-2. **设置页**（`role: settings`，装在 profile 顶层）：分片节奏、气泡长度、群聊 @ 位置、标点处理、白名单、NapCat / 桥接进程管理。
-3. **HTTP 路由**：`/dsh-qq-guard/config`（桥接轮询热更新）、`/dsh-qq-guard/status`（状态上报）、`/dsh-qq-guard/napcat`、`/dsh-qq-guard/bridge`。
+2. **设置页**（`role: settings`，装在 profile 顶层）：分片节奏、气泡长度、群聊 @ 位置、标点处理、白名单、人设、外部插件、NapCat / 桥接进程管理。
+3. **HTTP 路由**：`/dsh-qq-guard/config`（桥接轮询热更新）、`/dsh-qq-guard/status`（状态上报）、`/dsh-qq-guard/napcat`、`/dsh-qq-guard/bridge`、`/dsh-qq-guard/external-plugins/test`（沙箱冒烟测试）。
+4. **沙箱**：外部插件一律在独立子进程里加载执行，绝不 import 进 DSH 主进程。
 
 ### `qq-bridge`
 
@@ -87,7 +103,7 @@ node qq-bridge/start.mjs             # 正式启动
 node qq-bridge/test-offline.mjs
 ```
 
-覆盖回复审计、消息解析（array / 字符串 / 混合段）、长文本分片、分气泡、群聊 @、热配置同步、白名单热读、人设写入、DSH 端口自动跟随、在线探测四态、单实例锁，并串跑插件侧四组回归（门禁作用域 / 设置页数据通路 / NapCat 进程管理 / autoStart）。
+覆盖回复审计、消息解析（array / 字符串 / 混合段）、长文本分片、分气泡、群聊 @、热配置同步、白名单热读、人设写入、DSH 端口自动跟随、在线探测四态、单实例锁，并串跑插件侧回归（门禁作用域 / 设置页数据通路 / NapCat 进程管理 / autoStart / 沙箱协议与子进程 / 外部插件扫描与卡片）。
 
 不连 QQ、不启 NapCat、不碰 DSH 会话。插件侧用例需要 `@deepseek-ai/schemastery`，用 `QQG_SCHEMASTERY` 指向它的 `lib/index.mjs`（不设就自动探测 `node_modules`）。
 
@@ -98,6 +114,17 @@ node qq-bridge/test-offline.mjs
 - 未实现 `/reset` 等斜杠命令。
 - 人设改动只对**新建** QQ 会话生效，已有会话保留原人设与上下文。
 - NapCat 安装目录**必须显式配置**（`napcat.dir`），仓库不含任何机器相关默认值。
+- **外部插件目前只对「自包含」模块开放测试执行**，受控模块需 P2 阶段提供 shim 才能加载。
+- **沙箱不提供网络能力**：子进程没有 `net` / `http` / `fetch` 的放行，外部插件不能联网。
+
+## 参考项目与致谢
+
+- [**K0nd1us/QQ-agent**](https://github.com/K0nd1us/QQ-agent) —— 「立志做使用起来最简单、功能最全面的 LLM 机器人」，MIT。
+  一个跑在自己电脑上的 QQ 群聊机器人，Electron 桌面壳 + 事件驱动 / 无状态会话架构，控制台零编程门槛。
+  本项目的**外部插件清单格式（`plugin.json` / `skill.json`）**与「测试运行」交互参考了它的设计。
+- [Derpyu520/qq-bridge](https://github.com/Derpyu520/qq-bridge) —— QQ Agent 的上游原型，OneBot 桥接的最初形态。
+
+感谢这些项目把踩过的坑摊在明面上。
 
 ## 许可
 
@@ -123,4 +150,3 @@ git add -A; git commit -m "..."; git push
 同步脚本在**工作区根**（不在本仓库里），因为它要同时知道仓库和线上两边的位置。
 它会：跳过 `qq-bridge/config.json` 与 `state/`、把 `cordis.patch.yml` 里的占位符
 回填成线上的真实值、覆盖前备份到 `<线上>/.sync-backup/<时间戳>/`。
-
