@@ -53,15 +53,6 @@ window.__ModuleLoader__.load({
   white-space: pre-wrap; overflow-wrap: anywhere; }
 .qqg-hint { font-size: 11.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary);
   background: var(--dsw-alias-bg-layer-2); border-radius: 6px; padding: 7px 10px; }
-.qqg-page { box-sizing: border-box; width: 100%; min-width: 0; height: 100%; min-height: 0;
-  background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary);
-  display: flex; flex-direction: column; overflow: hidden; }
-.qqg-pagehead { flex: 0 0 auto; padding: 28px clamp(24px, 4vw, 48px) 0; }
-.qqg-pagetitle { margin: 0 0 6px; font-size: 20px; font-weight: 500; line-height: 28px; }
-.qqg-pagedesc { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
-.qqg-pagebody { flex: 1 1 auto; min-height: 0; overflow-y: auto;
-  padding: 20px clamp(24px, 4vw, 48px) 48px; }
-.qqg-pagebody .qqg-card { max-width: 760px; }
 
 /* ── 左导航 + 右内容（主面板）────────────────────────────── */
 .qqg-layout { display: flex; align-items: stretch; width: 100%; min-width: 0; height: 100%; min-height: 0;
@@ -69,7 +60,10 @@ window.__ModuleLoader__.load({
   background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary); }
 .qqg-nav { flex: 0 0 168px; width: 168px; display: flex; flex-direction: column; gap: 2px;
   padding-right: 12px; border-right: 1px solid var(--dsw-alias-border-l1);
-  overflow-y: auto; min-height: 0; }
+  min-height: 0; }
+/* 菜单列表单独滚动，底部引导按钮固定在下方（不被列表滚动带走）。 */
+.qqg-nav-list { flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 2px; }
 .qqg-nav-item { box-sizing: border-box; width: 100%; text-align: left; font: inherit; font-size: 13px;
   color: var(--dsw-alias-label-secondary); background: transparent; border: 0; border-radius: 6px;
   padding: 7px 10px; cursor: pointer; transition: background .12s ease, color .12s ease; white-space: nowrap;
@@ -93,10 +87,8 @@ window.__ModuleLoader__.load({
 .qqg-group-head { display: flex; align-items: center; justify-content: space-between;
   gap: 12px; flex-wrap: wrap; }
 .qqg-actions { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.qqg-btn-danger { color: var(--dsw-alias-state-error-primary);
-  border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 45%, transparent); }
-.qqg-btn-danger:hover:enabled { border-color: var(--dsw-alias-state-error-primary);
-  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent); }
+/* ⚠️ .qqg-btn-danger 必须写在 .qqg-btn **之后**：两者特异性相同（都是单个类），
+   靠源码顺序决胜负；放前面会被 .qqg-btn 的 color 覆盖，删除按钮就不红了。 */
 /* 桥接日志折叠区 */
 .qqg-logbox { margin-top: 4px; font-size: 11.5px; color: var(--dsw-alias-label-secondary); }
 .qqg-logbox summary { cursor: pointer; user-select: none; padding: 2px 0; }
@@ -133,6 +125,12 @@ window.__ModuleLoader__.load({
 .qqg-btn-primary { background: var(--dsw-alias-button-primary-fill); color: var(--dsw-alias-label-primary-foreground);
   border-color: transparent; }
 .qqg-btn-primary:hover:enabled { border-color: transparent; filter: brightness(1.06); }
+/* 危险按钮：必须排在 .qqg-btn / .qqg-btn-primary 之后，否则同特异性下被覆盖。 */
+.qqg-btn-danger { color: var(--dsw-alias-state-error-primary);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 45%, transparent); }
+.qqg-btn-danger:hover:enabled { color: var(--dsw-alias-state-error-primary);
+  border-color: var(--dsw-alias-state-error-primary);
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent); }
 .qqg-input-grow { flex: 1 1 auto; width: auto; min-width: 0; }
 
 /* ── 多行文本框（人设）────────────────────────────────────── */
@@ -160,6 +158,537 @@ window.__ModuleLoader__.load({
 .qqg-list-add { display: flex; align-items: center; gap: 8px; }
 `
 
+    /* ═══════════════════════════════════════════════════════════
+       Phase 2 · 五 Tab 控制台骨架（Mock 优先）
+       本段只加「壳」：卡片、网格、图表、表格、导航。
+       真实数据链路（remote.settings / HTTP 兜底 / 热更新 / 启停路由）
+       一个字节都没动，全部沿用下面的既有实现。
+       ═══════════════════════════════════════════════════════════ */
+    const CSS2 = `
+/* 主题色：DSH 主题里没有 --dsw-alias-accent，真正带色相的是 state-business-primary
+   （浅色 = deepseek-500 #4176e6 / 深色 = deepseek-400 #7aaaff），
+   所以按 state-business → button-info-fill → brand-primary 的顺序取。 */
+.qqg-layout {
+  --qqg-accent: var(--dsw-alias-state-business-primary, var(--dsw-alias-button-info-fill, var(--dsw-alias-brand-primary, #4176e6)));
+  /* 卡片：不用 bg-layer-3（浅色下 #f9fafb 与页面底色几乎同色，卡片会「消失」）。
+     改成「label-primary 往 bg-base 里叠一点」：浅色=极浅灰、深色=比底色亮一档，
+     一套公式同时满足两套主题，不需要给深色单独写覆盖。 */
+  --qqg-card-bg: color-mix(in srgb, var(--dsw-alias-label-primary) 4%, var(--dsw-alias-bg-base));
+  --qqg-card-bd: color-mix(in srgb, var(--dsw-alias-label-primary) 10%, transparent);
+  /* 卡片内部的「凹陷块」用半透明叠色，深浅两套主题都自动成立。 */
+  --qqg-inset-bg: color-mix(in srgb, var(--dsw-alias-label-primary) 6%, transparent);
+}
+.qqg-layout .qqg-nav { flex: 0 0 186px; width: 186px; gap: 3px; }
+.qqg-nav-brand { display: flex; align-items: center; gap: 8px; padding: 2px 10px 11px;
+  margin-bottom: 3px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
+.qqg-nav-brand-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+  background: var(--qqg-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--qqg-accent) 20%, transparent); }
+.qqg-nav-brand-text { font-size: 12.5px; font-weight: 600; letter-spacing: .02em; white-space: nowrap; }
+.qqg-nav-item { display: flex; align-items: center; gap: 9px; }
+.qqg-nav-icon { flex: 0 0 auto; display: inline-flex; opacity: .82; }
+.qqg-nav-item-on .qqg-nav-icon { color: var(--qqg-accent); opacity: 1; }
+.qqg-nav-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.qqg-nav-badge { flex: 0 0 auto; min-width: 16px; height: 16px; padding: 0 5px; border-radius: 999px;
+  background: var(--dsw-alias-state-error-primary); color: #fff; font-size: 10px; line-height: 16px;
+  text-align: center; font-variant-numeric: tabular-nums; }
+/* 底部「使用引导」：margin-top:auto 沉底，浅色分割线与菜单隔开。
+   尺寸/圆角/悬浮效果刻意与 .qqg-nav-item 对齐，只是图标带一点主题色。 */
+.qqg-nav-foot { flex: 0 0 auto; margin-top: auto; padding-top: 12px; padding-bottom: 4px;
+  border-top: 1px solid var(--dsw-alias-border-l1); }
+.qqg-nav-guide { box-sizing: border-box; width: 100%; display: flex; align-items: center; gap: 9px;
+  text-align: left; font: inherit; font-size: 13px; color: var(--dsw-alias-label-secondary);
+  background: transparent; border: 0; border-radius: 6px; padding: 7px 10px; cursor: pointer;
+  transition: background .12s ease, color .12s ease; white-space: nowrap; }
+.qqg-nav-guide:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.qqg-nav-guide-icon { flex: 0 0 auto; display: inline-flex; color: var(--qqg-accent); }
+.qqg-nav-guide-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.qqg-nav-guide-done { flex: 0 0 auto; font-size: 10.5px; color: var(--dsw-alias-label-secondary);
+  font-variant-numeric: tabular-nums; }
+
+/* ── 卡片 ─────────────────────────────────────────────────── */
+/* 卡片底色/描边沿用 DSH 自己的设置卡 token：
+   浅色主题下 bg-layer-2 与页面底色同为 #fff，只靠 border-l1(4% 黑) 几乎看不出卡片，
+   所以描边取 settings-card-stroke（= border-l4），和官方设置卡视觉一致。 */
+.qqg-stack { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.qqg-panel { box-sizing: border-box; display: flex; flex-direction: column; gap: 12px;
+  padding: 16px 18px; border-radius: 14px;
+  background: var(--qqg-card-bg);
+  border: 1px solid var(--qqg-card-bd);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--dsw-alias-label-primary) 4%, transparent); }
+.qqg-panel-accent { border-color: color-mix(in srgb, var(--qqg-accent) 34%, var(--dsw-alias-border-l1));
+  background: linear-gradient(158deg, color-mix(in srgb, var(--qqg-accent) 13%, var(--dsw-alias-bg-layer-2)) 0%,
+    var(--dsw-alias-bg-layer-2) 64%); }
+.qqg-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.qqg-panel-title { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 600; letter-spacing: .01em; }
+.qqg-panel-title::before { content: ''; width: 3px; height: 13px; border-radius: 2px; flex: 0 0 auto;
+  background: var(--qqg-accent); }
+.qqg-panel-desc { margin-top: 3px; font-size: 11.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
+.qqg-anchor { scroll-margin-top: 12px; }
+.qqg-pill { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; padding: 1px 8px;
+  border-radius: 999px; border: 1px solid var(--dsw-alias-border-l2); background: var(--qqg-inset-bg);
+  color: var(--dsw-alias-label-secondary); white-space: nowrap; }
+.qqg-pill-accent { color: var(--qqg-accent); border-color: color-mix(in srgb, var(--qqg-accent) 40%, transparent);
+  background: color-mix(in srgb, var(--qqg-accent) 10%, transparent); }
+
+/* ── 统计卡 ───────────────────────────────────────────────── */
+.qqg-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 12px; }
+.qqg-stat { position: relative; overflow: hidden; display: flex; flex-direction: column; gap: 5px;
+  padding: 13px 14px; border-radius: 12px; background: var(--qqg-inset-bg);
+  border: 1px solid var(--qqg-card-bd); }
+.qqg-stat::after { content: ''; position: absolute; right: -34px; bottom: -58px; width: 118px; height: 118px;
+  border-radius: 50%; pointer-events: none;
+  background: radial-gradient(circle, color-mix(in srgb, var(--qqg-accent) 22%, transparent), transparent 70%); }
+.qqg-stat-label { font-size: 11px; color: var(--dsw-alias-label-secondary); }
+.qqg-stat-value { font-size: 22px; font-weight: 600; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.qqg-stat-unit { font-size: 11px; font-weight: 400; color: var(--dsw-alias-label-secondary); margin-left: 3px; }
+.qqg-stat-foot { font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
+.qqg-up { color: var(--dsw-alias-state-success-primary); }
+.qqg-down { color: var(--dsw-alias-state-error-primary); }
+
+/* ── AI 排障助手 ──────────────────────────────────────────── */
+.qqg-ai { display: flex; flex-direction: column; gap: 9px; }
+.qqg-ai-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.qqg-ai-chip { font: inherit; font-size: 11.5px; padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--dsw-alias-border-l2); background: var(--qqg-inset-bg);
+  color: var(--dsw-alias-label-secondary); cursor: pointer; transition: color .12s ease, border-color .12s ease; }
+.qqg-ai-chip:hover { color: var(--dsw-alias-label-primary);
+  border-color: color-mix(in srgb, var(--qqg-accent) 50%, var(--dsw-alias-border-l2)); }
+.qqg-ai-row { display: flex; align-items: flex-end; gap: 8px; }
+.qqg-ai-input { flex: 1 1 auto; width: 100%; min-width: 0; box-sizing: border-box; resize: vertical; font: inherit;
+  font-size: 12.5px; line-height: 1.6; color: var(--dsw-alias-label-primary);
+  background: var(--qqg-inset-bg); border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px; padding: 9px 11px; }
+.qqg-ai-row .qqg-ai-input { width: auto; }
+.qqg-ai-input:focus { outline: none;
+  border-color: color-mix(in srgb, var(--qqg-accent) 60%, var(--dsw-alias-border-l2)); }
+
+/* ── 会话管理（左右分栏）───────────────────────────────────── */
+.qqg-split { display: grid; grid-template-columns: minmax(232px, 302px) minmax(0, 1fr); gap: 14px; align-items: start; }
+@media (max-width: 900px) { .qqg-split { grid-template-columns: minmax(0, 1fr); } }
+.qqg-session-list { display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: 14px;
+  max-height: 660px; overflow: auto; background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1); }
+.qqg-session { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 10px;
+  cursor: pointer; border: 1px solid transparent; transition: background .12s ease, border-color .12s ease; }
+.qqg-session:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.qqg-session-on { background: color-mix(in srgb, var(--qqg-accent) 14%, var(--dsw-alias-bg-layer-2));
+  border-color: color-mix(in srgb, var(--qqg-accent) 40%, transparent); }
+.qqg-avatar { flex: 0 0 auto; width: 32px; height: 32px; border-radius: 10px; display: flex;
+  align-items: center; justify-content: center; font-size: 13px; font-weight: 600; color: #fff;
+  background: linear-gradient(135deg, var(--qqg-accent), color-mix(in srgb, var(--qqg-accent) 40%, #7a5cff)); }
+.qqg-avatar-lg { width: 44px; height: 44px; border-radius: 12px; font-size: 17px; }
+.qqg-session-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.qqg-session-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.qqg-session-name { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qqg-session-time { margin-left: auto; flex: 0 0 auto; font-size: 10.5px;
+  color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); }
+.qqg-session-preview { font-size: 11.5px; color: var(--dsw-alias-label-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qqg-unread { flex: 0 0 auto; min-width: 16px; height: 16px; padding: 0 5px; border-radius: 999px;
+  background: var(--dsw-alias-state-error-primary); color: #fff; font-size: 10px; line-height: 16px;
+  text-align: center; font-variant-numeric: tabular-nums; }
+.qqg-session-detail { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.qqg-detail-head { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.qqg-detail-meta { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.qqg-detail-name { font-size: 15px; font-weight: 600; }
+.qqg-detail-sub { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-size: 11.5px; color: var(--dsw-alias-label-secondary); }
+.qqg-msg { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 10px;
+  font-size: 12px; line-height: 1.55; background: var(--qqg-inset-bg); }
+.qqg-msg-me { background: color-mix(in srgb, var(--qqg-accent) 14%, var(--qqg-inset-bg)); }
+.qqg-msg-meta { font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
+
+/* ── 技能 / 插件卡片网格 ──────────────────────────────────── */
+.qqg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 12px; }
+.qqg-tile { display: flex; flex-direction: column; gap: 9px; padding: 14px; border-radius: 14px;
+  background: var(--qqg-card-bg);
+  border: 1px solid var(--qqg-card-bd);
+  transition: border-color .15s ease, transform .15s ease; }
+.qqg-tile:hover { transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--qqg-accent) 42%, var(--dsw-alias-border-l1)); }
+.qqg-tile-top { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.qqg-tile-icon { flex: 0 0 auto; width: 32px; height: 32px; border-radius: 9px; display: flex;
+  align-items: center; justify-content: center; color: var(--qqg-accent);
+  background: color-mix(in srgb, var(--qqg-accent) 14%, var(--qqg-inset-bg));
+  border: 1px solid color-mix(in srgb, var(--qqg-accent) 26%, transparent); }
+.qqg-tile-name { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qqg-tile-sub { font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
+.qqg-tile-desc { flex: 1 1 auto; font-size: 11.5px; line-height: 1.55; color: var(--dsw-alias-label-secondary); }
+.qqg-tile-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
+/* ── 使用引导（导航底部按钮 + 弹窗内的三步清单）────────────── */
+.qqg-onboard { display: flex; flex-direction: column; gap: 9px; }
+.qqg-onboard-row { display: flex; align-items: center; gap: 10px; padding: 9px 11px; border-radius: 10px;
+  background: var(--qqg-inset-bg); border: 1px solid var(--dsw-alias-border-l1); }
+.qqg-onboard-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.qqg-onboard-name { font-size: 12.5px; font-weight: 600; }
+.qqg-onboard-desc { font-size: 11px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
+.qqg-progress { display: flex; align-items: center; gap: 8px; font-size: 11px;
+  color: var(--dsw-alias-label-secondary); }
+.qqg-progress-track { flex: 1 1 auto; height: 5px; border-radius: 999px; overflow: hidden;
+  background: var(--qqg-inset-bg); }
+.qqg-progress-fill { height: 100%; border-radius: 999px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--qqg-accent) 70%, transparent), var(--qqg-accent)); }
+
+/* ── 图表（纯 CSS）────────────────────────────────────────── */
+.qqg-chart { display: flex; align-items: flex-end; gap: 10px; height: 188px; padding: 12px 2px 0; }
+.qqg-chart-col { flex: 1 1 0; min-width: 0; height: 100%; display: flex; flex-direction: column;
+  align-items: center; justify-content: flex-end; gap: 6px; }
+.qqg-chart-bar { width: 100%; max-width: 42px; min-height: 6px; border-radius: 8px 8px 3px 3px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--qqg-accent) 88%, #fff 12%) 0%,
+    color-mix(in srgb, var(--qqg-accent) 32%, transparent) 100%);
+  transition: filter .15s ease; }
+.qqg-chart-col:hover .qqg-chart-bar { filter: brightness(1.16); }
+.qqg-chart-val { font-size: 10.5px; color: var(--dsw-alias-label-secondary); font-variant-numeric: tabular-nums; }
+.qqg-chart-day { font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
+.qqg-area-wrap { display: flex; flex-direction: column; gap: 8px; }
+.qqg-area { position: relative; height: 168px; margin: 4px 2px 0; }
+.qqg-area-stroke, .qqg-area-fill { position: absolute; inset: 0; }
+.qqg-area-stroke { background: var(--qqg-accent); }
+.qqg-area-fill { background: linear-gradient(180deg,
+  color-mix(in srgb, var(--qqg-accent) 42%, transparent) 0%,
+  color-mix(in srgb, var(--qqg-accent) 3%, transparent) 100%); }
+.qqg-area-dot { position: absolute; width: 6px; height: 6px; margin: -3px 0 0 -3px; border-radius: 50%;
+  background: var(--qqg-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--qqg-accent) 22%, transparent); }
+.qqg-area-labels { display: flex; justify-content: space-between; padding: 0 2px; font-size: 10.5px;
+  color: var(--dsw-alias-label-secondary); }
+.qqg-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 11px; color: var(--dsw-alias-label-secondary); }
+.qqg-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.qqg-legend-swatch { width: 9px; height: 9px; border-radius: 3px; background: var(--qqg-accent); }
+
+/* ── 统计表格 ─────────────────────────────────────────────── */
+.qqg-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; align-items: start; }
+.qqg-table-wrap { overflow: auto; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l1); }
+.qqg-table { width: 100%; border-collapse: collapse; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.qqg-table th { position: sticky; top: 0; z-index: 1; padding: 8px 12px; text-align: left;
+  font-weight: 600; white-space: nowrap; color: var(--dsw-alias-label-secondary);
+  background: var(--qqg-inset-bg); border-bottom: 1px solid var(--dsw-alias-border-l1); }
+.qqg-table td { padding: 8px 12px; border-bottom: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-primary); }
+.qqg-table tr:last-child td { border-bottom: 0; }
+.qqg-table tbody tr:hover td { background: var(--dsw-alias-interactive-bg-hover); }
+.qqg-table .qqg-num { text-align: right; }
+.qqg-table .qqg-muted { color: var(--dsw-alias-label-secondary); }
+.qqg-share { display: flex; align-items: center; gap: 8px; min-width: 96px; }
+.qqg-share-track { flex: 1 1 auto; height: 5px; border-radius: 999px; overflow: hidden;
+  background: var(--qqg-inset-bg); }
+.qqg-share-fill { height: 100%; border-radius: 999px; background: var(--qqg-accent); opacity: .8; }
+
+/* ── 页面头部 ─────────────────────────────────────────────── */
+.qqg-pagehead-tags { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; padding-top: 4px; }
+.qqg-tabhead { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px;
+  flex-wrap: wrap; padding-bottom: 2px; }
+.qqg-tabhead-title { margin: 0; font-size: 18px; font-weight: 600; line-height: 1.3; }
+.qqg-tabhead-desc { margin: 4px 0 0; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
+
+/* ── 全局设置：把既有 .qqg-group 统一成灰色卡片 ─────────────── */
+.qqg-anchor { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.qqg-anchor .qqg-group, .qqg-stack > .qqg-group { gap: 10px; padding: 16px 18px; border-radius: 14px;
+  background: var(--qqg-card-bg);
+  border: 1px solid var(--qqg-card-bd);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--dsw-alias-label-primary) 4%, transparent); }
+.qqg-anchor .qqg-group-title, .qqg-stack > .qqg-group .qqg-group-title { display: flex; align-items: center;
+  gap: 8px; font-size: 13.5px; font-weight: 600; color: var(--dsw-alias-label-primary); letter-spacing: .01em; }
+.qqg-anchor .qqg-group-title::before, .qqg-stack > .qqg-group .qqg-group-title::before { content: '';
+  width: 3px; height: 13px; border-radius: 2px; flex: 0 0 auto; background: var(--qqg-accent); }
+.qqg-anchor .qqg-row, .qqg-stack > .qqg-group .qqg-row { padding: 9px 0; }
+.qqg-anchor .qqg-hint, .qqg-stack > .qqg-group .qqg-hint { background: var(--qqg-inset-bg); }
+.qqg-hint-bottom { margin-top: 4px; }
+
+/* ── 通用模态框（遮罩 + Esc / 点遮罩关闭）──────────────────── */
+/* 遮罩用 bg-mask-3（浅色 #0000007a / 深色更沉）：mask-1 在浅色下只有 24%，
+   弹窗压不住背后的卡片，看起来像「浮在半空」。 */
+.qqg-mask { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center;
+  justify-content: center; padding: 24px;
+  background: var(--dsw-alias-bg-mask-3, rgba(0, 0, 0, .48)); }
+.qqg-modal { box-sizing: border-box; display: flex; flex-direction: column;
+  width: min(720px, 100%); max-height: min(86vh, 920px); border-radius: 16px; overflow: hidden;
+  background: var(--dsw-alias-bg-base); border: 1px solid var(--qqg-card-bd);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, .34); }
+.qqg-modal-sm { width: min(420px, 100%); }
+.qqg-modal-head { flex: 0 0 auto; display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 12px; padding: 16px 18px 13px; border-bottom: 1px solid var(--qqg-card-bd); }
+.qqg-modal-title { font-size: 14.5px; font-weight: 600; line-height: 1.35; }
+.qqg-modal-desc { margin-top: 4px; font-size: 11.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
+.qqg-modal-x { flex: 0 0 auto; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 7px;
+  background: transparent; color: var(--dsw-alias-label-secondary); font: inherit; font-size: 17px;
+  line-height: 1; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
+.qqg-modal-x:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.qqg-modal-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 16px 18px; }
+.qqg-modal-foot { flex: 0 0 auto; display: flex; align-items: center; justify-content: flex-end;
+  gap: 8px; padding: 12px 18px 15px; border-top: 1px solid var(--qqg-card-bd); }
+/* 弹窗里的分组不做卡片，改成「扁平分段 + 分隔线」，避免卡片套卡片。 */
+.qqg-modal-body .qqg-group { gap: 9px; padding: 0; background: transparent; border: 0; box-shadow: none; }
+.qqg-modal-body .qqg-group + .qqg-group { margin-top: 15px; padding-top: 15px;
+  border-top: 1px solid var(--qqg-card-bd); }
+.qqg-modal-body .qqg-group-title { display: flex; align-items: center; gap: 8px; font-size: 12.5px;
+  font-weight: 600; color: var(--dsw-alias-label-primary); }
+.qqg-modal-body .qqg-group-title::before { content: ''; width: 3px; height: 12px; border-radius: 2px;
+  flex: 0 0 auto; background: var(--qqg-accent); }
+.qqg-modal-body .qqg-row { padding: 8px 0; }
+.qqg-modal-body .qqg-hint { background: var(--qqg-inset-bg); }
+.qqg-modal-body .qqg-textarea-actions { margin-top: 2px; }
+
+/* ── 人设弹窗：紧凑左对齐表单 ─────────────────────────────── */
+/* 每个字段竖排三段：标签 → 说明 → 控件，标签和说明共用同一条左基线。
+   单行字段固定 200px 宽，第一排并排；多行字段占满整行。
+   .qqg-prow 默认 align-items:stretch，配合 .qqg-pf-desc 的 flex:1，
+   让同一排里说明长两行的字段也能把控件压到底部对齐。 */
+.qqg-pform { display: flex; flex-direction: column; gap: 14px; }
+.qqg-prow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 12px; }
+.qqg-pf { display: flex; flex-direction: column; min-width: 0; }
+.qqg-pf-sm { flex: 0 0 200px; width: 200px; }
+.qqg-pf-wide { flex: 1 1 100%; width: 100%; }
+.qqg-pf-label { font-size: 12.5px; line-height: 1.4; color: var(--dsw-alias-label-primary); }
+.qqg-pf-desc { flex: 1 1 auto; margin: 2px 0 5px; font-size: 11px; line-height: 1.45;
+  color: var(--dsw-alias-label-secondary); }
+.qqg-pf-ctl { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.qqg-pf-sm .qqg-input { box-sizing: border-box; width: 100%; }
+.qqg-pf-wide .qqg-textarea { min-height: 120px; }
+.qqg-pf-foot { font-size: 10.5px; line-height: 1.4;
+  color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); font-variant-numeric: tabular-nums; }
+@media (max-width: 560px) { .qqg-pf-sm { flex: 1 1 100%; width: 100%; } }
+
+/* ── 大按钮（运行节奏卡片里那两颗）────────────────────────── */
+.qqg-actions-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(224px, 1fr)); gap: 12px; }
+.qqg-bigbtn { box-sizing: border-box; width: 100%; display: flex; align-items: center; gap: 12px;
+  padding: 14px 16px; border-radius: 12px; text-align: left; cursor: pointer; font: inherit;
+  color: var(--dsw-alias-label-primary); background: var(--qqg-inset-bg);
+  border: 1px solid var(--qqg-card-bd); transition: border-color .14s ease, background .14s ease; }
+.qqg-bigbtn:hover { border-color: color-mix(in srgb, var(--qqg-accent) 50%, var(--qqg-card-bd));
+  background: color-mix(in srgb, var(--qqg-accent) 8%, transparent); }
+.qqg-bigbtn-icon { flex: 0 0 auto; width: 34px; height: 34px; border-radius: 10px; display: flex;
+  align-items: center; justify-content: center; color: var(--qqg-accent);
+  background: color-mix(in srgb, var(--qqg-accent) 14%, transparent); }
+.qqg-bigbtn-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.qqg-bigbtn-name { font-size: 13px; font-weight: 600; }
+.qqg-bigbtn-desc { font-size: 11px; line-height: 1.45; color: var(--dsw-alias-label-secondary); }
+.qqg-bigbtn-arrow { flex: 0 0 auto; color: var(--dsw-alias-label-secondary); }
+
+/* ── 卡片工具区（齿轮 / 垃圾桶 / 拖拽手柄 / 上下移）────────── */
+.qqg-tile-top { align-items: center; }
+.qqg-tile-title { flex: 1 1 auto; min-width: 0; }
+.qqg-tile-tools { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 1px; }
+.qqg-icon-btn { box-sizing: border-box; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 6px;
+  background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; }
+.qqg-icon-btn:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.qqg-icon-btn-danger:hover { color: var(--dsw-alias-state-error-primary);
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent); }
+.qqg-icon-btn:disabled { opacity: .35; cursor: default; }
+.qqg-icon-btn:disabled:hover { background: transparent; color: var(--dsw-alias-label-secondary); }
+.qqg-drag { flex: 0 0 auto; display: inline-flex; color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary));
+  cursor: grab; }
+.qqg-drag:active { cursor: grabbing; }
+.qqg-tile[draggable="true"] { cursor: grab; }
+.qqg-tile-dragging { opacity: .4; }
+.qqg-tile-over { border-color: var(--qqg-accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--qqg-accent) 26%, transparent); }
+.qqg-tile-foot .qqg-tile-arrows { display: inline-flex; gap: 1px; }
+
+/* ── 表单控件补充（弹窗内）────────────────────────────────── */
+.qqg-field { display: flex; flex-direction: column; gap: 6px; }
+.qqg-field + .qqg-field { margin-top: 12px; }
+.qqg-field-label { font-size: 12px; color: var(--dsw-alias-label-primary); }
+.qqg-field-hint { font-size: 11px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
+/* 独占一行的字段块（NapCat 安装目录）：标签在上，输入框 + 按钮在下。
+   输入框必须 flex:1 + min-width:0，否则长绝对路径会把卡片撑破。 */
+.qqg-field-block { display: flex; flex-direction: column; gap: 6px; padding: 9px 0;
+  border-top: 1px solid var(--dsw-alias-border-l1); }
+.qqg-field-block:first-of-type { border-top: 0; }
+.qqg-dir-row { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; }
+.qqg-dir-row .qqg-dir-input { flex: 1 1 auto; width: auto; min-width: 0; max-width: 100%; }
+.qqg-btn-browse { flex: 0 0 auto; }
+.qqg-slider { width: 100%; accent-color: var(--qqg-accent); cursor: pointer; }
+.qqg-slider-ticks { display: flex; justify-content: space-between; gap: 4px; margin-top: 2px;
+  font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
+.qqg-slider-ticks span { flex: 1 1 0; text-align: center; }
+.qqg-slider-ticks span.on { color: var(--qqg-accent); font-weight: 600; }
+
+/* ── 设置弹窗：左表单 / 右说明 ────────────────────────────── */
+.qqg-setgrid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 760px) { .qqg-setgrid { grid-template-columns: minmax(0, 1fr); } }
+.qqg-setdesc { display: flex; flex-direction: column; gap: 10px; padding: 14px; border-radius: 12px;
+  background: var(--qqg-inset-bg); border: 1px solid var(--qqg-card-bd); }
+.qqg-setdesc-title { font-size: 12.5px; font-weight: 600; }
+.qqg-setdesc-text { font-size: 11.5px; line-height: 1.6; color: var(--dsw-alias-label-secondary); }
+.qqg-setdesc-list { margin: 0; padding-left: 16px; font-size: 11.5px; line-height: 1.7;
+  color: var(--dsw-alias-label-secondary); }
+.qqg-kv { display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  font-size: 11.5px; color: var(--dsw-alias-label-secondary); }
+.qqg-kv b { font-weight: 600; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
+
+/* ── 人设概览卡 + 人设设置弹窗 ─────────────────────────────── */
+.qqg-persona-card { display: flex; flex-direction: column; gap: 8px; padding: 13px 14px;
+  border-radius: 12px; background: var(--qqg-inset-bg); border: 1px solid var(--qqg-card-bd); }
+.qqg-persona-role { display: flex; flex-direction: column; gap: 4px;
+  padding-top: 8px; border-top: 1px solid var(--dsw-alias-border-l1); }
+.qqg-persona-preview { font-size: 11.5px; line-height: 1.6; color: var(--dsw-alias-label-secondary);
+  white-space: pre-line; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; }
+.qqg-persona-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
+.qqg-persona-select { flex: 1 1 220px; min-width: 0; }
+/* toolbar 放进 .qqg-pform 后由父级 gap 控制间距，这里只留分割线内边距。 */
+.qqg-pform .qqg-persona-toolbar { margin-bottom: 0; }
+
+/* ── 添加弹窗：文件选择占位 ───────────────────────────────── */
+.qqg-dropzone { display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px; padding: 22px 16px; border-radius: 12px; text-align: center; cursor: pointer;
+  border: 1px dashed var(--qqg-card-bd); background: var(--qqg-inset-bg);
+  font-size: 11.5px; color: var(--dsw-alias-label-secondary); }
+.qqg-dropzone:hover { border-color: color-mix(in srgb, var(--qqg-accent) 55%, var(--qqg-card-bd));
+  color: var(--dsw-alias-label-primary); }
+`
+
+    /* ══════════ Mock 数据（本阶段只喂 UI，不接任何真实逻辑）══════════ */
+    const MOCK_TODAY = { calls: 1284, tokens: 386420, cost: 4.82 }
+    const MOCK_TREND = { calls: 12.4, tokens: 8.1, cost: -3.2 }
+
+    const MOCK_SESSIONS = [
+      {
+        id: 's1', name: '翎羽', qq: '10001', kind: '私聊', initial: '翎', unread: 3,
+        time: '14:32', preview: '分片规则改好了吗？', online: true, tag: '白名单',
+        persona: '你是一只傲娇猫娘，说话带「哼」，但正经问题会认真答。',
+        allow: true,
+        messages: [
+          { from: 'them', text: '在吗，桥接是不是又断了', time: '14:20' },
+          { from: 'me', text: '没断，NapCat 在线，刚重连过 WS。', time: '14:21' },
+          { from: 'them', text: '行，那分片规则改好了吗？', time: '14:32' },
+        ],
+      },
+      {
+        id: 's2', name: '摸鱼群', qq: '20002', kind: '群聊', initial: '摸', unread: 12,
+        time: '14:18', preview: '[图片] 今天这破网又炸了', online: true, tag: '白名单',
+        persona: '', allow: true,
+        messages: [
+          { from: 'them', text: '今天这破网又炸了', time: '14:16' },
+          { from: 'them', text: '[图片]', time: '14:18' },
+        ],
+      },
+      {
+        id: 's3', name: '硬件折腾群', qq: '20003', kind: '群聊', initial: '硬', unread: 0,
+        time: '13:52', preview: '固态换完温度掉了 8 度', online: true, tag: '白名单',
+        persona: '', allow: true,
+        messages: [{ from: 'them', text: '固态换完温度掉了 8 度', time: '13:52' }],
+      },
+      {
+        id: 's4', name: '路人甲', qq: '30004', kind: '私聊', initial: '路', unread: 0,
+        time: '12:07', preview: '你好，请问你是机器人吗', online: false, tag: '未放行',
+        persona: '', allow: false,
+        messages: [{ from: 'them', text: '你好，请问你是机器人吗', time: '12:07' }],
+      },
+      {
+        id: 's5', name: '电子系毕设群', qq: '20005', kind: '群聊', initial: '电', unread: 0,
+        time: '昨天', preview: '答辩时间定了，下周三上午', online: false, tag: '白名单',
+        persona: '', allow: true,
+        messages: [{ from: 'them', text: '答辩时间定了，下周三上午', time: '昨天' }],
+      },
+      {
+        id: 's6', name: '广告号', qq: '40006', kind: '私聊', initial: '广', unread: 0,
+        time: '昨天', preview: '【已拦截】推广内容', online: false, tag: '已拦截',
+        persona: '', allow: false,
+        messages: [{ from: 'them', text: '【已拦截】推广内容', time: '昨天' }],
+      },
+    ]
+
+    /* 技能 / 插件列表：本机 QQ 桥接业务的硬编码数据（不再是 DSH 平台自带的假清单）。
+       ver / 作者 / 说明都按真实业务编的，第二阶段接真实装载时按 id 对表即可。 */
+    const MOCK_USAGE_DAYS = [
+      { day: '10-15', calls: 642, tokens: 182340, cost: 2.28, ok: 98.4 },
+      { day: '10-16', calls: 715, tokens: 204880, cost: 2.56, ok: 99.1 },
+      { day: '10-17', calls: 588, tokens: 161200, cost: 2.01, ok: 97.8 },
+      { day: '10-18', calls: 903, tokens: 268400, cost: 3.35, ok: 99.4 },
+      { day: '10-19', calls: 1102, tokens: 331760, cost: 4.14, ok: 98.9 },
+      { day: '10-20', calls: 1216, tokens: 362100, cost: 4.52, ok: 99.2 },
+      { day: '10-21', calls: 1284, tokens: 386420, cost: 4.82, ok: 99.0 },
+    ]
+
+    const MOCK_USAGE_MODELS = [
+      { name: 'deepseek-v4.1-flash', calls: 3120, tokens: 962400, cost: 11.24, share: 48 },
+      { name: 'doubao-seed-1.6', calls: 1420, tokens: 402100, cost: 6.02, share: 22 },
+      { name: 'deepseek-v4.1', calls: 860, tokens: 318800, cost: 5.66, share: 13 },
+      { name: 'qwen3-235b-a22b', calls: 540, tokens: 141200, cost: 2.14, share: 8 },
+      { name: '其他', calls: 401, tokens: 96600, cost: 1.32, share: 9 },
+    ]
+
+    const MOCK_USAGE_PLUGINS = [
+      { name: 'QQ 桥接', calls: 2840, tokens: 812400, cost: 9.82, share: 44 },
+      { name: '记忆提取', calls: 1620, tokens: 468200, cost: 6.11, share: 25 },
+      { name: '网页搜索', calls: 980, tokens: 302600, cost: 4.28, share: 15 },
+      { name: '会话清理', calls: 620, tokens: 182400, cost: 2.02, share: 10 },
+      { name: '其他', calls: 282, tokens: 96500, cost: 1.15, share: 6 },
+    ]
+
+    /** 未接线的按钮统一绑它（本阶段只搭壳）。 */
+    const noop = () => {}
+
+    /** 内联 SVG 图标表（stroke 风格，跟随 currentColor）。 */
+    const GLYPHS = {
+      status: ['M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17z', 'M12 7.5V12l3.2 2'],
+      sessions: ['M4 5.5h16v9.5H9.5L5 18.5V15H4z'],
+      skills: ['M4 4h7v7H4z', 'M13 4h7v7h-7z', 'M4 13h7v7H4z', 'M13 13h7v7h-7z'],
+      settings: ['M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z', 'M12 2.5v2.2', 'M12 19.3v2.2',
+        'M2.5 12h2.2', 'M19.3 12h2.2', 'M5 5l1.6 1.6', 'M17.4 17.4L19 19', 'M19 5l-1.6 1.6', 'M6.6 17.4L5 19'],
+      usage: ['M4 19V11', 'M9.3 19V6', 'M14.6 19v-5', 'M19.9 19V9'],
+      memory: ['M12 3.2a6 6 0 0 1 6 6v3.4a6 6 0 0 1-12 0V9.2a6 6 0 0 1 6-6z',
+        'M9 9.5h.01', 'M15 9.5h.01', 'M9.6 14.2a3 3 0 0 0 4.8 0'],
+      search: ['M11 4.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z', 'M16 16l4 4'],
+      file: ['M6 3.5h7l5 5V20.5H6z', 'M13 3.5v5h5'],
+      clock: ['M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17z', 'M12 7.5V12l3.2 2'],
+      code: ['M9 8l-4 4 4 4', 'M15 8l4 4-4 4'],
+      image: ['M4 5h16v14H4z', 'M4 15.5l4.5-4.5 3.5 3.5 3-3L20 16', 'M8.5 9.2h.01'],
+      shield: ['M12 3l7 3v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6z'],
+      bridge: ['M3.5 6.5a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H8l-3 2.4V12.5H5.5a2 2 0 0 1-2-2z',
+        'M15 11.5h3.5a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H16l-2.4 2v-2.4H15a2 2 0 0 1-2-2v-2'],
+      spark: ['M12 3l1.9 5.6L19.5 10l-5.6 1.9L12 17.5l-1.9-5.6L4.5 10l5.6-1.4z'],
+      // ── Phase 3 新增 ──
+      gear: ['M12 9.2a2.8 2.8 0 1 0 0 5.6 2.8 2.8 0 0 0 0-5.6z',
+        'M19.1 14.3a1.6 1.6 0 0 0 .32 1.77l.06.06a1.9 1.9 0 1 1-2.7 2.7l-.05-.06a1.6 1.6 0 0 0-1.78-.32 1.6 1.6 0 0 0-.97 1.47V20a1.9 1.9 0 1 1-3.8 0v-.1a1.6 1.6 0 0 0-1.05-1.47 1.6 1.6 0 0 0-1.77.32l-.06.06a1.9 1.9 0 1 1-2.7-2.7l.06-.05a1.6 1.6 0 0 0 .32-1.78 1.6 1.6 0 0 0-1.47-.97H4a1.9 1.9 0 1 1 0-3.8h.1a1.6 1.6 0 0 0 1.47-1.05 1.6 1.6 0 0 0-.32-1.77l-.06-.06a1.9 1.9 0 1 1 2.7-2.7l.05.06a1.6 1.6 0 0 0 1.78.32H9.8a1.6 1.6 0 0 0 .97-1.47V4a1.9 1.9 0 1 1 3.8 0v.1a1.6 1.6 0 0 0 .97 1.47 1.6 1.6 0 0 0 1.78-.32l.05-.06a1.9 1.9 0 1 1 2.7 2.7l-.06.05a1.6 1.6 0 0 0-.32 1.78v.05a1.6 1.6 0 0 0 1.47.97H20a1.9 1.9 0 1 1 0 3.8h-.1a1.6 1.6 0 0 0-1.47.97z'],
+      trash: ['M4 6.5h16', 'M9.5 6.5V4.6h5v1.9', 'M6.2 6.5l.9 13a1.6 1.6 0 0 0 1.6 1.5h6.6a1.6 1.6 0 0 0 1.6-1.5l.9-13',
+        'M10.2 10.4v6.4', 'M13.8 10.4v6.4'],
+      plus: ['M12 5v14', 'M5 12h14'],
+      arrowUp: ['M12 19V5', 'M6 11l6-6 6 6'],
+      arrowDown: ['M12 5v14', 'M18 13l-6 6-6-6'],
+      chevron: ['M9 5.5l6.5 6.5L9 18.5'],
+      send: ['M20.5 3.5L11 13', 'M20.5 3.5l-6.2 17-3.3-7.5-7.5-3.3z'],
+      activity: ['M3.5 12h3.2l2.6-6.5 4.4 13 2.6-6.5h4.2'],
+      bulb: ['M9.2 18h5.6', 'M10 21h4',
+        'M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2v.1h5v-.1c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z'],
+      check: ['M5 12.5l4.5 4.5L19 7.5'],
+      // 六边形点阵拖拽手柄：两列共 6 个实心小圆点。
+      dots: ['M9.5 6.5h.01', 'M14.5 6.5h.01', 'M9.5 12h.01', 'M14.5 12h.01', 'M9.5 17.5h.01', 'M14.5 17.5h.01'],
+    }
+
+    function Glyph({ name, size = 16 }) {
+      const paths = GLYPHS[name] ?? GLYPHS.spark
+      return h('svg', {
+        viewBox: '0 0 24 24', width: size, height: size, fill: 'none', stroke: 'currentColor',
+        strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round',
+        'aria-hidden': true, style: { display: 'block' },
+      }, paths.map((d, i) => h('path', { key: i, d })))
+    }
+
+    /** 卡片描述：去换行 + 最多 30 字 + 省略号（按 Unicode 码点算，中文/emoji 都不会截半个）。 */
+    function clipCardText(text, max = 30) {
+      const flat = String(text ?? '').replace(/\s+/g, ' ').trim()
+      const chars = [...flat]
+      return {
+        text: chars.length > max ? chars.slice(0, max).join('') + '…' : flat,
+        full: flat,
+        clipped: chars.length > max,
+      }
+    }
+
+    /** 六边形点阵拖拽手柄（两列实心点，fill 而非 stroke）。 */
+    function DotsHandle({ size = 15 }) {
+      const pts = [[9.6, 6.2], [14.4, 6.2], [9.6, 12], [14.4, 12], [9.6, 17.8], [14.4, 17.8]]
+      return h('svg', {
+        viewBox: '0 0 24 24', width: size, height: size, fill: 'currentColor', stroke: 'none',
+        'aria-hidden': true, style: { display: 'block' },
+      }, pts.map(([cx, cy], i) => h('circle', { key: i, cx, cy, r: 1.5 })))
+    }
+
     /** 默认值：与 Host 侧 Config 的 .default() 必须一致。 */
     const DEFAULTS = {
       bubbleMaxChars: 30,
@@ -173,6 +702,10 @@ window.__ModuleLoader__.load({
       'flypitDelayTiers.medium': 450,
       'flypitDelayTiers.long': 800,
       'trimEndPunctuation.enabled': true,
+      // 与 Host 侧 Config 的 bridge.autoStart 默认值保持一致（默认关，fail-closed）。
+      'bridge.autoStart': false,
+      // 人设参与度默认「普通群友」（与 Host 侧重拼系统提示词时的默认值一致）。
+      personaParticipation: 'normal',
     }
 
     /** 按点分路径取值（'typingDelay.enabled' → value.typingDelay.enabled）。 */
@@ -368,16 +901,9 @@ window.__ModuleLoader__.load({
       h('path', { d: 'M15 11.5h3.5a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H16l-2.6 2v-2.6H15a2 2 0 0 1-2-2v-1.4' }))
     }
 
-    /** 主面板：一页标题 + 设置表单。 */
+    /** 主面板：直接渲染五 Tab 控制台（页头由各 Tab 自己的 TabHead 负责）。 */
     function BridgePanel(props) {
-      // main 槽位也不给 form；用 props 里注入的 remoteForm（见 apply 里的 inject）。
-      return h('div', { className: 'qqg-page' },
-        h('div', { className: 'qqg-pagehead' },
-          h('h1', { className: 'qqg-pagetitle' }, 'QQ 桥接'),
-          h('p', { className: 'qqg-pagedesc' }, 'QQ 消息与 DSH 会话之间的桥接参数。改完即时生效，无需重启桥接。')),
-        h('div', { className: 'qqg-pagebody' },
-          h(SettingsPanel, props)),
-      )
+      return h(SettingsPanel, props)
     }
 
     function Row({ label, desc, children }) {
@@ -423,15 +949,23 @@ window.__ModuleLoader__.load({
       })
     }
 
-    /** 内置面板的左侧导航分类。 */
+    /** 内置面板的左侧导航分类（Phase 2：五个主 Tab）。 */
     const SECTIONS = [
-      { id: 'status', label: '运行状态' },
-      { id: 'napcat', label: 'NapCat 管理' },
-      { id: 'onebot', label: 'OneBot 连接' },
-      { id: 'allow', label: '白名单管理' },
-      { id: 'persona', label: '人设配置' },
-      { id: 'split', label: '分片与节奏' },
+      { id: 'status', label: '运行状态', icon: 'status' },
+      { id: 'sessions', label: '会话管理', icon: 'sessions', badge: MOCK_SESSIONS.filter((s) => s.unread > 0).length },
+      { id: 'skills', label: '技能与插件', icon: 'skills' },
+      { id: 'settings', label: '全局设置', icon: 'settings' },
+      { id: 'usage', label: '数据与用量', icon: 'usage' },
     ]
+
+    /** 使用引导弹窗里「去配置」按钮的目标锚点。 */
+    const ANCHORS = {
+      'set-napcat': 'qqg-anchor-napcat',
+      'set-allow': 'qqg-anchor-allow',
+      'set-onebot': 'qqg-anchor-onebot',
+      'set-split': 'qqg-anchor-split',
+      'set-persona': 'qqg-anchor-persona',
+    }
 
     /** 一条「标签 + 说明 + 控件」行。 */
     function Field(props) { return h(Row, props) }
@@ -599,7 +1133,7 @@ window.__ModuleLoader__.load({
 
       return h('div', { className: 'qqg-group' },
         h('div', { className: 'qqg-group-head' },
-          h('div', { className: 'qqg-group-title' }, '运行状态'),
+          h('div', { className: 'qqg-group-title' }, '实时状态'),
           // 三个控制按钮：右上角
           h('div', { className: 'qqg-actions' },
             h('button', {
@@ -677,6 +1211,13 @@ window.__ModuleLoader__.load({
               className: 'qqg-btn',
               onClick: () => setTokenShown((v) => !v),
             }, tokenShown ? '隐藏' : '显示'))),
+        h(SwitchField, {
+          label: 'DSH 启动时自动拉起桥接进程',
+          hint: '修改插件配置会导致热重载，开启此项可防止桥接掉线。',
+          value: get('bridge.autoStart') === true,
+          disabled: !writable,
+          onChange: (v) => write('bridge.autoStart', v),
+        }),
         h('div', { className: 'qqg-hint' },
           '改动会在桥接重启后生效（WS 连接在启动时建立，不做热重连）。'))
     }
@@ -714,33 +1255,220 @@ window.__ModuleLoader__.load({
           '白名单每次收到消息都从最新配置现读，保存后下一条消息立即生效，无需重启桥接。'))
     }
 
+    /** 参与度三档：id 与桥接 composePersonaPrompt 的 key 一一对应。 */
+    const PERSONA_PARTICIPATION = [
+      { id: 'quiet', label: '安静型' },
+      { id: 'normal', label: '普通群友' },
+      { id: 'active', label: '活跃型' },
+    ]
+    const personaParticipationLabel = (id) =>
+      (PERSONA_PARTICIPATION.find((item) => item.id === id) ?? PERSONA_PARTICIPATION[1]).label
+
+    /**
+     * 人设设置弹窗（P1.5 重构）。
+     *
+     * 所有字段先在本地 draft 里改，点「保存」才一次性 mutate 写回配置；
+     * 顶部下拉 = 默认人设 + 自定义人设列表，支持新增 / 删除当前自定义人设。
+     * 桥接层会根据这些字段重拼最终系统提示词（名字替换 + 附加规则追加）。
+     */
+    function PersonaModal({ get, writable, form, onClose }) {
+      const readPresets = () => {
+        const raw = get('personaPresets')
+        return Array.isArray(raw)
+          ? raw
+            .filter((item) => item && typeof item === 'object')
+            .map((item) => ({ id: String(item.id ?? ''), name: String(item.name ?? ''), text: String(item.text ?? '') }))
+          : []
+      }
+      const [draft, setDraft] = React.useState(() => ({
+        selected: String(get('personaPresetId') ?? ''),
+        botName: String(get('personaBotName') ?? ''),
+        groupName: String(get('personaGroupName') ?? ''),
+        participation: String(get('personaParticipation') ?? 'normal'),
+        text: String(get('personaText') ?? ''),
+        extraRules: String(get('personaExtraRules') ?? ''),
+        systemPrompt: String(get('personaSystemPrompt') ?? ''),
+        presets: readPresets(),
+      }))
+      const set = (key, value) => setDraft((prev) => ({ ...prev, [key]: value }))
+      const selectedPreset = draft.presets.find((item) => item.id === draft.selected) ?? null
+
+      const selectPreset = (id) => {
+        if (id === '') {
+          setDraft((prev) => ({ ...prev, selected: '', text: '' }))
+          return
+        }
+        const preset = draft.presets.find((item) => item.id === id)
+        if (!preset) return
+        setDraft((prev) => ({ ...prev, selected: id, text: preset.text }))
+      }
+      const addPreset = () => {
+        const id = `persona-${Date.now()}`
+        const preset = { id, name: `人设 ${draft.presets.length + 1}`, text: '' }
+        setDraft((prev) => ({ ...prev, presets: [...prev.presets, preset], selected: id, text: '' }))
+      }
+      const removePreset = () => {
+        if (draft.selected === '') return
+        setDraft((prev) => ({
+          ...prev,
+          presets: prev.presets.filter((item) => item.id !== prev.selected),
+          selected: '',
+          text: '',
+        }))
+      }
+      const save = () => {
+        if (!form || !writable) return
+        // 选中的自定义人设跟着角色设定文本一起更新。
+        const presets = draft.presets.map((item) => (item.id === draft.selected
+          ? { ...item, text: draft.text }
+          : item))
+        form.mutate([
+          { op: 'set', path: ['personaBotName'], value: draft.botName.trim() },
+          { op: 'set', path: ['personaGroupName'], value: draft.groupName.trim() },
+          { op: 'set', path: ['personaParticipation'], value: draft.participation },
+          { op: 'set', path: ['personaText'], value: draft.text },
+          { op: 'set', path: ['personaExtraRules'], value: draft.extraRules },
+          { op: 'set', path: ['personaSystemPrompt'], value: draft.systemPrompt },
+          { op: 'set', path: ['personaPresetId'], value: draft.selected },
+          { op: 'set', path: ['personaPresets'], value: presets },
+        ])
+        onClose()
+      }
+
+      /** 字数提示：按 Unicode 码点算，中文 / emoji 都按 1 个字计。 */
+      const charCount = (text) => [...String(text ?? '')].length
+
+      /** 人设弹窗专用字段块：标签 / 说明 / 控件竖排，三者共用同一条左基线。 */
+      const pField = (label, desc, control, wide) => h('div', {
+        className: 'qqg-pf' + (wide ? ' qqg-pf-wide' : ' qqg-pf-sm'),
+      },
+      h('div', { className: 'qqg-pf-label' }, label),
+      desc ? h('div', { className: 'qqg-pf-desc' }, desc) : null,
+      h('div', { className: 'qqg-pf-ctl' }, control))
+
+      /** 多行文本框 + 框下字数占位提示。 */
+      const textarea = (key, ariaLabel, rows, placeholder) => h(React.Fragment, null,
+        h('textarea', {
+          className: 'qqg-textarea',
+          rows,
+          value: draft[key],
+          disabled: !writable,
+          placeholder,
+          'aria-label': ariaLabel,
+          onChange: (e) => set(key, e.target.value),
+        }),
+        h('div', { className: 'qqg-pf-foot' },
+          charCount(draft[key]) > 0 ? `已填 ${charCount(draft[key])} 字` : '未填写'))
+
+      return h(Modal, {
+        open: true,
+        title: '人设设置',
+        desc: '名字、参与度和附加规则会和角色设定一起拼成最终系统提示词；留空即用内置。',
+        onClose,
+        footer: [
+          h('button', { key: 'c', type: 'button', className: 'qqg-btn', onClick: onClose }, '取消'),
+          h('button', {
+            key: 's', type: 'button', className: 'qqg-btn qqg-btn-primary',
+            disabled: !writable,
+            onClick: save,
+          }, '保存'),
+        ],
+      },
+      writable ? null : h('div', { className: 'qqg-status qqg-status-err', style: { marginBottom: 10 } },
+        '当前配置不可写，下面的内容只能看不能改。'),
+
+      h('div', { className: 'qqg-pform' },
+
+        // 顶部：人设选择 + 新增 / 删除
+        h('div', { className: 'qqg-persona-toolbar' },
+          h('select', {
+            className: 'qqg-input qqg-persona-select',
+            value: draft.selected,
+            disabled: !writable,
+            'aria-label': '选择人设',
+            onChange: (e) => selectPreset(e.target.value),
+          },
+          h('option', { value: '' }, '默认人设（内置）'),
+          draft.presets.map((preset) => h('option', { key: preset.id, value: preset.id }, preset.name || preset.id))),
+          h('button', {
+            type: 'button', className: 'qqg-btn', disabled: !writable,
+            onClick: addPreset,
+          }, '+ 添加人设'),
+          h('button', {
+            type: 'button', className: 'qqg-btn', disabled: !writable || draft.selected === '',
+            title: draft.selected === '' ? '当前是默认人设，没有可删除的自定义人设' : '删除当前选中的自定义人设',
+            onClick: removePreset,
+          }, '删除当前自定义人设')),
+
+        // 第一排：名字 / 展示名 / 参与度（固定 200px，并排紧凑，不占满整行）
+        h('div', { className: 'qqg-prow' },
+          pField('机器人名字', '会替换默认人设里的名字，并追加身份说明。',
+            h('input', {
+              className: 'qqg-input', value: draft.botName, disabled: !writable,
+              placeholder: '例如：林小鱼', 'aria-label': '机器人名字',
+              onChange: (e) => set('botName', e.target.value),
+            })),
+          pField('群内展示名', '群聊里对别人显示的昵称。',
+            h('input', {
+              className: 'qqg-input', value: draft.groupName, disabled: !writable,
+              placeholder: '例如：小鱼', 'aria-label': '群内展示名',
+              onChange: (e) => set('groupName', e.target.value),
+            })),
+          pField('参与度', '决定 bot 在群里主动接话的频率。',
+            h('select', {
+              className: 'qqg-input', value: draft.participation, disabled: !writable,
+              'aria-label': '参与度',
+              onChange: (e) => set('participation', e.target.value),
+            }, PERSONA_PARTICIPATION.map((item) => h('option', { key: item.id, value: item.id }, item.label))))),
+
+        // 第二~四排：多行文本，整行宽 + 120px 起，框下带字数占位提示
+        pField('角色设定', '核心人设正文。留空 = 使用 qq-chat preset 的默认人设。',
+          textarea('text', '角色设定', 6, '例如：你是一只傲娇猫娘，说话带「哼」「才不是呢」……'), true),
+        pField('管理员附加规则', '可选，追加到系统提示词末尾。',
+          textarea('extraRules', '管理员附加规则', 4, '例如：晚上 11 点后说话轻一点。'), true),
+        pField('系统提示词覆盖', '留空=使用内置。填了就完全替换上面拼出来的内容。',
+          textarea('systemPrompt', '系统提示词覆盖', 4, '整段系统提示词；填写后名字 / 参与度 / 附加规则都不再追加。'), true),
+
+        // 底部提示：紧贴表单下方
+        h('div', { className: 'qqg-hint' },
+          '改动要点保存才会生效。'
+          + (selectedPreset ? `当前选择的自定义人设：${selectedPreset.name || selectedPreset.id}。` : '当前使用默认人设。'))))
+    }
+
+    /**
+     * 人设概览卡片（只读）：名字 / 展示名 / 参与度 / 角色设定前两行。
+     * 编辑入口统一收进弹窗，避免一大块文本框直接铺在设置页上。
+     */
     function PersonaSection({ get, write, writable, form }) {
-      const text = get('personaText') ?? ''
-      const presetDefault = get('personaPresetDefault') ?? ''
+      const [open, setOpen] = React.useState(false)
+      const botName = String(get('personaBotName') ?? '').trim()
+      const groupName = String(get('personaGroupName') ?? '').trim()
+      const participation = String(get('personaParticipation') ?? 'normal')
+      const text = String(get('personaText') ?? '')
+      const preview = text.replace(/\r/g, '').split('\n').filter((line) => line.trim() !== '').slice(0, 2).join('\n')
+
       return h('div', { className: 'qqg-group' },
         h('div', { className: 'qqg-group-title' }, '人设配置'),
-        h('div', { className: 'qqg-subgroup' },
-          h(Field, {
-            label: '自定义人设',
-            desc: '非空时覆盖 qq-chat preset 的默认人设；留空则使用默认。保存后对新会话生效。',
-          }, h('span', { className: 'qqg-mono' }, `${[...text].length} 字`)),
-          h(TextArea, {
-            value: text, disabled: !writable, rows: 14,
-            placeholder: '例如：你是一只傲娇猫娘，说话带「哼」「才不是呢」……',
-            ariaLabel: '自定义人设',
-            onCommit: (v) => write('personaText', v),
-          }),
-          h('div', { className: 'qqg-textarea-actions' },
-            h('button', {
-              type: 'button',
-              className: 'qqg-btn',
-              disabled: !writable || presetDefault === '',
-              title: presetDefault === '' ? '尚未取到 preset 默认人设' : '恢复为 preset 自带人设',
-              onClick: () => write('personaText', ''),
-            }, '恢复默认人设')),
-        ),
-        h('div', { className: 'qqg-hint' },
-          '留空 = 使用 preset 内置人设。「恢复默认」只是把人设清空后回落到 preset，不会删除 preset 本身。'))
+        h('div', { className: 'qqg-persona-card' },
+          h('div', { className: 'qqg-kv' }, h('span', null, '机器人名字'), h('b', null, botName || '未设置（用默认）')),
+          h('div', { className: 'qqg-kv' }, h('span', null, '群内展示名'), h('b', null, groupName || '未设置')),
+          h('div', { className: 'qqg-kv' }, h('span', null, '参与度'), h('b', null, personaParticipationLabel(participation))),
+          h('div', { className: 'qqg-persona-role' },
+            h('div', { className: 'qqg-label-desc' }, '角色设定'),
+            h('div', { className: 'qqg-persona-preview' },
+              preview !== '' ? preview : '未自定义，使用 qq-chat preset 的内置人设。'))),
+        h('div', { className: 'qqg-actions' },
+          h('button', {
+            type: 'button', className: 'qqg-btn qqg-btn-primary',
+            onClick: () => setOpen(true),
+          }, '⚙️ 编辑人设')),
+        open
+          ? h(PersonaModal, {
+            key: `persona-${botName}-${participation}-${[...text].length}`,
+            get, write, writable, form,
+            onClose: () => setOpen(false),
+          })
+          : null)
     }
 
     function SplitSection({ get, write, writable }) {
@@ -809,15 +1537,13 @@ window.__ModuleLoader__.load({
             }))))
     }
 
-    /** NapCat 管理区（批次 4B）：启停 + 三层状态。 */
-    function NapcatSection({ get, write, writable }) {
+    /** NapCat 进程状态轮询（运行状态页用）：每 3 秒一次；启停后 refresh() 立刻再拉。 */
+    function useNapcatProcess(enabled = true) {
       const [snap, setSnap] = React.useState(null)
-      const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState(null)
       const [tick, setTick] = React.useState(0)
-
-      // 每 3 秒拉一次状态（也用 tick 在启停后立刻刷新）
       React.useEffect(() => {
+        if (!enabled) return undefined
         let stopped = false
         let timer = null
         const load = async () => {
@@ -826,26 +1552,42 @@ window.__ModuleLoader__.load({
               headers: { accept: 'application/json' },
               credentials: 'include',
             })
+            if (stopped) return
             if (res.ok) { setSnap(await res.json()); setError(null) }
             else setError(`状态查询失败：HTTP ${res.status}`)
-          } catch (e) { setError(e?.message ?? String(e)) }
+          } catch (e) { if (!stopped) setError(e?.message ?? String(e)) }
           if (!stopped) timer = setTimeout(load, 3000)
         }
         void load()
         return () => { stopped = true; if (timer) clearTimeout(timer) }
-      }, [tick])
+      }, [enabled, tick])
+      return { snap, error, refresh: () => setTick((v) => v + 1) }
+    }
+
+    /**
+     * NapCat 进程控制面板（「运行状态」页，紧接「实时状态」）。
+     *
+     * 启停操作从「全局设置」搬到这里：路由仍是 `/dsh-qq-guard/napcat?action=...`，
+     * 与「实时状态」里的桥接启停并排；状态每 3 秒轮询一次，点完启停立刻 refresh，
+     * 所以按钮状态和端口监听情况会跟着实时变。
+     */
+    function NapcatProcessSection({ get, writable }) {
+      const { snap, error, refresh } = useNapcatProcess(true)
+      const [busy, setBusy] = React.useState(false)
+      const [actError, setActError] = React.useState(null)
+      const napcatDir = String(get('napcat.dir') ?? '').trim()
 
       const act = async (action) => {
-        setBusy(true); setError(null)
+        setBusy(true); setActError(null)
         try {
           const res = await fetch(`/dsh-qq-guard/napcat?action=${action}`, {
             method: 'POST', credentials: 'include',
             headers: { accept: 'application/json' },
           })
           const body = await res.json().catch(() => ({}))
-          if (!res.ok || !body.ok) setError(body.detail ?? body.reason ?? `HTTP ${res.status}`)
-        } catch (e) { setError(e?.message ?? String(e)) }
-        finally { setBusy(false); setTick((v) => v + 1) }
+          if (!res.ok || !body.ok) setActError(body.detail ?? body.reason ?? `HTTP ${res.status}`)
+        } catch (e) { setActError(e?.message ?? String(e)) }
+        finally { setBusy(false); refresh() }
       }
 
       const stateText = {
@@ -859,51 +1601,160 @@ window.__ModuleLoader__.load({
       const state = snap?.state
       const dotCls = state === 'online' ? 'qqg-dot-ok'
         : (state === 'stopped' ? 'qqg-dot-idle' : state ? 'qqg-dot-warn' : 'qqg-dot-idle')
-      // 状态用彩色小标签呈现，比裸文字更直观，也避免「已停止」旁边空一大块
       const tagCls = state === 'online' ? 'qqg-tag qqg-tag-ok'
         : (state === 'stopped' ? 'qqg-tag' : state ? 'qqg-tag qqg-tag-warn' : 'qqg-tag')
 
-      const canStart = writable && !busy && (state === 'stopped' || state === undefined)
+      // 安装目录为空时直接禁用启动：Host 端 resolveNapcatExe 会抛「未配置安装目录」，
+      // 与其让用户点了看报错，不如在这里就 fail-closed，并把原因写进按钮 title。
+      const canStart = writable && !busy && napcatDir !== '' && (state === 'stopped' || state === undefined)
       const canStop = writable && !busy && snap?.managed === true
+      const startTitle = napcatDir === ''
+        ? '先到「全局设置 → NapCat 进程」填写安装目录'
+        : (state === 'stopped' || state === undefined ? '启动 NapCat 进程' : 'NapCat 已在运行')
 
       return h('div', { className: 'qqg-group' },
-        h('div', { className: 'qqg-group-title' }, 'NapCat 进程'),
+        h('div', { className: 'qqg-group-head' },
+          h('div', { className: 'qqg-group-title' }, 'NapCat 进程'),
+          h('div', { className: 'qqg-actions' },
+            h('button', {
+              type: 'button', className: 'qqg-btn qqg-btn-primary',
+              disabled: !canStart,
+              title: startTitle,
+              onClick: () => act('start'),
+            }, busy ? '处理中…' : '启动 NapCat'),
+            h('button', {
+              type: 'button', className: 'qqg-btn',
+              disabled: !canStop,
+              title: snap?.managed === true ? '停止由本插件启动的 NapCat' : '当前进程不是本插件启动的，不能停',
+              onClick: () => act('stop'),
+            }, '停止'))),
+
         h(Field, { label: '当前状态', desc: '三层判定：进程存活 + WS 端口监听 + get_status 在线，三者同时成立才算在线。' },
           h('div', { className: 'qqg-inline' },
             h('span', { className: tagCls },
               h('span', { className: 'qqg-dot ' + dotCls }),
               h('span', null, snap ? (stateText[state] ?? state) : '查询中…')))),
-        h(Field, { label: '线程 / 端口', desc: 'WS 端口是否处于 LISTENING。' },
+
+        h(Field, { label: '端口监听', desc: 'WS 端口是否处于 LISTENING。' },
           h('div', { className: 'qqg-inline' },
             h('span', { className: 'qqg-mono' },
               snap
                 ? `端口 ${snap.wsPort} ${snap.portListening ? '监听中' : '未监听'} · 进程 ${snap.processAlive ? '存活' : '不在'}`
                 : '—'))),
+
         h(Field, { label: '登录账号', desc: '需要配置 OneBot HTTP API 才能自动识别。' },
           h('div', { className: 'qqg-inline' },
             h('span', { className: 'qqg-mono' },
               snap
                 ? (snap.selfId ? `${snap.selfId}${snap.nickname ? `（${snap.nickname}）` : ''}` : (snap.probeAvailable ? '未登录' : '未配置 HTTP API，无法确认'))
                 : '—'))),
-        h(Field, { label: '操作', desc: '启动前会先探测端口，已在跑就直接复用，不会双开。' },
-          h('div', { className: 'qqg-inline' },
+
+        napcatDir === ''
+          ? h('div', { className: 'qqg-status qqg-status-err' },
+            '未配置安装目录，NapCat 无法启动。请到「全局设置 → NapCat 进程」填写安装目录。')
+          : null,
+        actError ? h('div', { className: 'qqg-status qqg-status-err' }, actError) : null,
+        error ? h('div', { className: 'qqg-status qqg-status-err' }, error) : null,
+        snap?.lastError ? h('div', { className: 'qqg-detail' }, `上次错误：${snap.lastError}`) : null,
+
+        h('div', { className: 'qqg-hint' },
+          '启动前会先探测端口，已在跑就直接复用，不会双开。停止顺序：先 TERM，5 秒宽限后强制结束进程树。'))
+    }
+
+    /**
+     * NapCat 配置区（「全局设置」页）：**只保留输入框**。
+     *
+     * 启停按钮与进程状态已经移到「运行状态」页的 NapCat 控制面板，
+     * 这里避免两处各放一套按钮、各自轮询造成状态不同步。
+     */
+    function NapcatSection({ get, write, writable, pickDirectory }) {
+      // 「浏览」按钮：picking 期间禁用，避免连点叠出两个原生对话框（Host 也会 409）。
+      const [picking, setPicking] = React.useState(false)
+      const [pickError, setPickError] = React.useState(null)
+      const napcatDir = String(get('napcat.dir') ?? '')
+
+      /**
+       * 点「浏览」→ 弹系统「选择文件夹」窗口 → 拿绝对路径直接写进配置。
+       * 前端**不碰**文件系统：浏览器的 <input type="file"> 按安全策略拿不到绝对路径。
+       * 两条通路（优先级从高到低）：
+       *   ① `uiWorkspace.pickDirectory()`（客户端服务，走同一个原生对话框，改完 F5 就可用）
+       *   ② `POST /dsh-qq-guard/pick-dir`（我们自己的 Host 路由，需重启 DSH 才注册）
+       * 取消不是错误，静默返回。
+       */
+      const browseDir = async () => {
+        if (picking) return
+        setPicking(true); setPickError(null)
+        try {
+          if (typeof pickDirectory === 'function') {
+            const result = await pickDirectory()
+            if (result?.ok) {
+              if (result.path) write('napcat.dir', String(result.path))
+              return
+            }
+            if (result?.reason !== 'no-ui-workspace') {
+              setPickError(result?.detail ?? result?.reason ?? '调起选择器失败')
+              return
+            }
+            // uiWorkspace 没装载 → 落到下面的 Host 路由兜底。
+          }
+          const res = await fetch('/dsh-qq-guard/pick-dir', {
+            method: 'POST', credentials: 'include',
+            headers: { accept: 'application/json' },
+          })
+          const body = await res.json().catch(() => ({}))
+          if (!res.ok || !body.ok) {
+            // 404：Host 侧路由还没注册（改了 index.js 但没重载插件）。
+            // 501：profile 没挂 directory-picker，或当前是 browse 后端没有原生窗口。
+            // 两种情况都退化成「手输路径」，把原因说清楚，别只甩个 HTTP 状态码。
+            const hint = res.status === 404
+              ? 'Host 端还没有 /dsh-qq-guard/pick-dir 路由。插件代码刚更新的话，需要重启 DSH（或在应用内把插件关开一次）才会注册。'
+              : res.status === 501
+                ? '当前 DSH 没有可用的原生目录选择器，请直接在输入框里填绝对路径。'
+                : res.status === 409
+                  ? '已经有一个选择窗口开着，先处理它再点。'
+                  : null
+            setPickError(hint ?? body.detail ?? body.reason ?? `HTTP ${res.status}`)
+            return
+          }
+          if (body.cancelled === true || body.path === null || body.path === undefined) return
+          write('napcat.dir', String(body.path))
+        } catch (e) {
+          setPickError(e?.message ?? String(e))
+        } finally {
+          setPicking(false)
+        }
+      }
+
+      return h('div', { className: 'qqg-group' },
+        h('div', { className: 'qqg-group-title' }, 'NapCat 进程'),
+        // 安装目录：输入框独占一行并 flex:1 自适应（塞进 148px 的 qqg-control 会溢出），
+        // 右侧跟「浏览」按钮调系统原生文件夹选择器。
+        h('div', { className: 'qqg-field-block' },
+          h('div', { className: 'qqg-label-main' }, '安装目录'),
+          h('div', { className: 'qqg-label-desc' },
+            '含 NapCatWinBootMain.exe 的目录。点「浏览」直接选文件夹，不用手打路径。'),
+          h('div', { className: 'qqg-dir-row' },
+            h('input', {
+              className: 'qqg-input qqg-dir-input',
+              value: napcatDir,
+              placeholder: 'C:\\Program Files\\NapCat',
+              disabled: !writable,
+              'aria-label': 'NapCat 安装目录',
+              onChange: (e) => write('napcat.dir', e.target.value),
+            }),
             h('button', {
-              type: 'button', className: 'qqg-btn qqg-btn-primary',
-              disabled: !canStart, onClick: () => act('start'),
-            }, busy ? '处理中…' : '启动 NapCat'),
-            h('button', {
-              type: 'button', className: 'qqg-btn',
-              disabled: !canStop, onClick: () => act('stop'),
-            }, '停止'))),
-        h(Field, { label: '安装目录', desc: '含 NapCatWinBootMain.exe 的目录；留空用内置默认值。' },
-          h('input', {
-            className: 'qqg-input qqg-input-grow',
-            value: get('napcat.dir') ?? '',
-            placeholder: 'D:\\...\\NapCat.52230.Shell',
-            disabled: !writable,
-            'aria-label': 'NapCat 安装目录',
-            onChange: (e) => write('napcat.dir', e.target.value),
-          })),
+              type: 'button',
+              className: 'qqg-btn qqg-btn-browse',
+              disabled: !writable || picking,
+              title: '打开系统的「选择文件夹」窗口',
+              'aria-label': '浏览选择 NapCat 安装目录',
+              onClick: browseDir,
+            }, picking ? '选择中…' : '浏览')),
+          pickError ? h('div', { className: 'qqg-status qqg-status-err' }, pickError) : null,
+          napcatDir.trim() === ''
+            ? h('div', { className: 'qqg-status qqg-status-err' },
+              '未配置安装目录，NapCat 无法启动。点「浏览」选择一个文件夹。')
+            : null),
         h(Field, { label: '快速登录 QQ 号', desc: '填了就带账号启动（等同 napcat.quick.bat）；留空需手动登录。' },
           h('input', {
             className: 'qqg-input qqg-input-grow',
@@ -913,10 +1764,1524 @@ window.__ModuleLoader__.load({
             'aria-label': '快速登录 QQ 号',
             onChange: (e) => write('napcat.quickLoginQQ', e.target.value),
           })),
-        error ? h('div', { className: 'qqg-status qqg-status-err' }, error) : null,
-        snap?.lastError ? h('div', { className: 'qqg-detail' }, `上次错误：${snap.lastError}`) : null,
         h('div', { className: 'qqg-hint' },
-          '停止顺序：先 TERM，5 秒宽限后强制结束进程树。DSH 退出时会自动停掉由本插件启动的 NapCat，不留孤儿进程。'))
+          '启动/停止操作请前往「运行状态」页。'))
+    }
+
+    /* ══════════ 通用壳组件 ══════════ */
+    function Panel({ title, desc, right, accent, children }) {
+      return h('section', { className: 'qqg-panel' + (accent ? ' qqg-panel-accent' : '') },
+        (title || right)
+          ? h('div', { className: 'qqg-panel-head' },
+            h('div', null,
+              title ? h('div', { className: 'qqg-panel-title' }, title) : null,
+              desc ? h('div', { className: 'qqg-panel-desc' }, desc) : null),
+            right ?? null)
+          : null,
+        children)
+    }
+
+    function StatCard({ label, value, unit, foot, footCls }) {
+      return h('div', { className: 'qqg-stat' },
+        h('div', { className: 'qqg-stat-label' }, label),
+        h('div', { className: 'qqg-stat-value' }, value,
+          unit ? h('span', { className: 'qqg-stat-unit' }, unit) : null),
+        foot ? h('div', { className: 'qqg-stat-foot ' + (footCls ?? '') }, foot) : null)
+    }
+
+    function TabHead({ title, desc, tags }) {
+      return h('div', { className: 'qqg-tabhead' },
+        h('div', null,
+          h('h2', { className: 'qqg-tabhead-title' }, title),
+          desc ? h('p', { className: 'qqg-tabhead-desc' }, desc) : null),
+        tags ? h('div', { className: 'qqg-pagehead-tags' }, tags) : null)
+    }
+
+    function fmtNum(n) { return n.toLocaleString('zh-CN') }
+
+    /* ══════════ 通用模态框 ══════════ */
+    /**
+     * 统一弹窗：遮罩 + 卡片 + 标题栏 + 底部按钮区。
+     * 关闭方式三种：右上角 ×、点遮罩、按 Esc。
+     * `size='sm'` 用于确认框（窄版）。
+     * `footer` 传 null 表示不渲染按钮区。
+     */
+    function Modal({ open, title, desc, size, onClose, footer, children }) {
+      // Esc 关闭。挂 window 而不是元素，否则焦点不在弹窗里就收不到按键。
+      React.useEffect(() => {
+        if (!open) return undefined
+        const onKey = (e) => { if (e.key === 'Escape') onClose() }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+      }, [open, onClose])
+      if (!open) return null
+      return h('div', {
+        className: 'qqg-mask',
+        role: 'presentation',
+        // 只在点遮罩本体时关闭；点弹窗内部会冒泡上来，用 target 判断拦住。
+        onClick: (e) => { if (e.target === e.currentTarget) onClose() },
+      },
+      h('div', {
+        className: 'qqg-modal' + (size === 'sm' ? ' qqg-modal-sm' : ''),
+        role: 'dialog', 'aria-modal': 'true', 'aria-label': title,
+      },
+      h('div', { className: 'qqg-modal-head' },
+        h('div', null,
+          h('div', { className: 'qqg-modal-title' }, title),
+          desc ? h('div', { className: 'qqg-modal-desc' }, desc) : null),
+        h('button', {
+          type: 'button', className: 'qqg-modal-x', 'aria-label': '关闭',
+          onClick: onClose,
+        }, '×')),
+      h('div', { className: 'qqg-modal-body' }, children),
+      footer === null ? null : h('div', { className: 'qqg-modal-foot' }, footer)))
+    }
+
+    /** 确认框：复用 Modal，按钮固定「取消 / 确认」。 */
+    function ConfirmModal({ open, title, desc, confirmText, danger, onCancel, onConfirm }) {
+      return h(Modal, {
+        open, title, desc, size: 'sm', onClose: onCancel,
+        footer: [
+          h('button', { key: 'c', type: 'button', className: 'qqg-btn', onClick: onCancel }, '取消'),
+          h('button', {
+            key: 'o', type: 'button',
+            className: 'qqg-btn ' + (danger ? 'qqg-btn-danger' : 'qqg-btn-primary'),
+            onClick: onConfirm,
+          }, confirmText ?? '确认'),
+        ],
+      })
+    }
+
+    /** 单行输入框表单字段。 */
+    function TextField({ label, hint, value, placeholder, onChange }) {
+      return h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, label),
+        h('input', {
+          className: 'qqg-input', style: { width: '100%' }, value,
+          placeholder, 'aria-label': label,
+          onChange: (e) => onChange(e.target.value),
+        }),
+        hint ? h('span', { className: 'qqg-field-hint' }, hint) : null)
+    }
+
+    /** 下拉选择字段。 */
+    function SelectField({ label, hint, value, options, onChange }) {
+      return h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, label),
+        h('select', {
+          className: 'qqg-input', style: { width: '100%' }, value,
+          'aria-label': label,
+          onChange: (e) => onChange(e.target.value),
+        }, options.map((o) => h('option', { key: o, value: o }, o))),
+        hint ? h('span', { className: 'qqg-field-hint' }, hint) : null)
+    }
+
+    /** 数字字段。 */
+    function NumField({ label, hint, value, min, max, step, onChange }) {
+      return h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, label),
+        h('input', {
+          type: 'number', className: 'qqg-input', style: { width: '100%' },
+          value, min, max, step, 'aria-label': label,
+          onChange: (e) => {
+            const n = Number(e.target.value)
+            onChange(Number.isFinite(n) ? n : value)
+          },
+        }),
+        hint ? h('span', { className: 'qqg-field-hint' }, hint) : null)
+    }
+
+    /** 开关字段（一行文字 + 右侧 Switch）。 */
+    function SwitchField({ label, hint, value, onChange, disabled }) {
+      return h('div', { className: 'qqg-row' },
+        h('div', { className: 'qqg-label' },
+          h('div', { className: 'qqg-label-main' }, label),
+          hint ? h('div', { className: 'qqg-label-desc' }, hint) : null),
+        h('div', { className: 'qqg-control' },
+          h(Switch, { checked: value === true, ariaLabel: label, onChange, disabled })))
+    }
+
+    /** 按 settings 描述数组渲染一组字段（技能 / 插件设置弹窗共用）。 */
+    function SettingsFields({ fields, values, onChange }) {
+      return h(React.Fragment, null, fields.map((f) => {
+        const v = values[f.key] ?? f.value
+        const set = (next) => onChange(f.key, next)
+        if (f.type === 'switch') return h(SwitchField, { key: f.key, label: f.label, hint: f.hint, value: v, onChange: set })
+        if (f.type === 'select') return h(SelectField, { key: f.key, label: f.label, hint: f.hint, value: v, options: f.options, onChange: set })
+        if (f.type === 'number') {
+          return h(NumField, {
+            key: f.key, label: f.label, hint: f.hint, value: v,
+            min: f.min, max: f.max, step: f.step, onChange: set,
+          })
+        }
+        return h(TextField, { key: f.key, label: f.label, hint: f.hint, value: v, onChange: set })
+      }))
+    }
+
+
+    /** 今日用量概览（Mock）。 */
+    function TodayUsage() {
+      return h(Panel, {
+        title: '今日用量概览',
+        desc: 'Mock 数据，接入统计后端后替换。',
+        right: h('span', { className: 'qqg-pill qqg-pill-accent' }, '今日'),
+      },
+      h('div', { className: 'qqg-stats' },
+        h(StatCard, { label: '调用次数', value: fmtNum(MOCK_TODAY.calls), unit: '次',
+          foot: `较昨日 +${MOCK_TREND.calls}%`, footCls: 'qqg-up' }),
+        h(StatCard, { label: 'Token 消耗', value: fmtNum(MOCK_TODAY.tokens), unit: 'tokens',
+          foot: `较昨日 +${MOCK_TREND.tokens}%`, footCls: 'qqg-up' }),
+        h(StatCard, { label: '预估成本', value: '¥' + MOCK_TODAY.cost.toFixed(2),
+          foot: `较昨日 ${MOCK_TREND.cost}%`, footCls: 'qqg-down' }),
+        h(StatCard, { label: '成功回复', value: '99.0', unit: '%',
+          foot: '失败 12 次 · 拦截 37 次' })))
+    }
+
+    /** AI 排障助手（只有壳）。 */
+    function AiAssistant() {
+      const [text, setText] = React.useState('')
+      return h(Panel, {
+        title: 'AI 排障助手',
+        desc: '接入日志后可按需诊断；当前仅界面骨架，未连接模型。',
+        right: h('span', { className: 'qqg-pill' }, '未接入'),
+      },
+      h('div', { className: 'qqg-ai' },
+        h('div', { className: 'qqg-ai-chips' },
+          ['为什么桥接连不上？', 'NapCat 没登录怎么办？', '帮我看看最近报错', '分片太碎了怎么调']
+            .map((q) => h('button', {
+              key: q, type: 'button', className: 'qqg-ai-chip',
+              onClick: () => setText(q),
+            }, q))),
+        h('div', { className: 'qqg-ai-row' },
+          h('textarea', {
+            className: 'qqg-ai-input', rows: 2,
+            placeholder: '描述现象，例如「群消息收到了但没回复」…',
+            value: text,
+            'aria-label': 'AI 排障助手输入框',
+            onChange: (e) => setText(e.target.value),
+          }),
+          h('button', {
+            type: 'button', className: 'qqg-btn qqg-btn-primary',
+            disabled: !text.trim(), onClick: noop,
+          }, '分析'))))
+    }
+
+    /* ══════════ Tab 2 · 会话管理（Mock）══════════ */
+    function SessionsTab() {
+      const [list, setList] = React.useState(MOCK_SESSIONS)
+      const [selected, setSelected] = React.useState(MOCK_SESSIONS[0].id)
+      const [allowOverride, setAllowOverride] = React.useState({})
+      const [personaDraft, setPersonaDraft] = React.useState({})
+      const [confirmDel, setConfirmDel] = React.useState(false)
+      const cur = list.find((s) => s.id === selected) ?? list[0]
+      // 删到空列表时不能继续渲染详情，给个空态。
+      if (!cur) {
+        return h('div', { className: 'qqg-stack' },
+          h(TabHead, { title: '会话管理', desc: '本页为 Mock 数据，未接真实会话服务。' }),
+          h(Panel, { title: '会话列表为空', desc: 'Mock 阶段删除只影响本次页面状态，刷新即恢复。' },
+            h('div', { className: 'qqg-actions' },
+              h('button', {
+                type: 'button', className: 'qqg-btn qqg-btn-primary',
+                onClick: () => { setList(MOCK_SESSIONS); setSelected(MOCK_SESSIONS[0].id) },
+              }, '恢复 Mock 数据'))))
+      }
+      const allow = allowOverride[cur.id] ?? cur.allow
+      const persona = personaDraft[cur.id] ?? cur.persona
+      const doDelete = () => {
+        const rest = list.filter((s) => s.id !== cur.id)
+        setList(rest)
+        if (rest.length > 0) setSelected(rest[0].id)
+        setConfirmDel(false)
+      }
+
+      return h('div', { className: 'qqg-stack' },
+        h(TabHead, {
+          title: '会话管理',
+          desc: '按会话覆盖人设与白名单；本页为 Mock 数据，未接真实会话服务。',
+          tags: h(React.Fragment, null,
+            h('span', { className: 'qqg-pill' }, `${list.length} 个会话`),
+            h('span', { className: 'qqg-pill qqg-pill-accent' }, 'Mock')),
+        }),
+        h('div', { className: 'qqg-split' },
+          h('div', { className: 'qqg-session-list', 'aria-label': '会话列表' },
+            list.map((s) => h('div', {
+              key: s.id,
+              className: 'qqg-session' + (s.id === selected ? ' qqg-session-on' : ''),
+              role: 'button', tabIndex: 0,
+              onClick: () => setSelected(s.id),
+              onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') setSelected(s.id) },
+            },
+            h('div', { className: 'qqg-avatar' }, s.initial),
+            h('div', { className: 'qqg-session-main' },
+              h('div', { className: 'qqg-session-top' },
+                h('span', { className: 'qqg-session-name' }, s.name),
+                h('span', { className: 'qqg-session-time' }, s.time)),
+              h('div', { className: 'qqg-session-preview' }, s.preview)),
+            s.unread > 0 ? h('span', { className: 'qqg-unread' }, s.unread > 99 ? '99+' : s.unread) : null))),
+
+          h('div', { className: 'qqg-session-detail' },
+            h(Panel, null,
+              h('div', { className: 'qqg-detail-head' },
+                h('div', { className: 'qqg-avatar qqg-avatar-lg' }, cur.initial),
+                h('div', { className: 'qqg-detail-meta' },
+                  h('div', { className: 'qqg-detail-name' }, cur.name),
+                  h('div', { className: 'qqg-detail-sub' },
+                    h('span', { className: 'qqg-mono' }, cur.qq),
+                    h('span', { className: 'qqg-pill' }, cur.kind),
+                    h('span', { className: 'qqg-pill ' + (cur.online ? 'qqg-pill-accent' : '') },
+                      cur.online ? '在线' : '离线'),
+                    h('span', { className: 'qqg-pill' }, cur.tag))),
+                h('div', { className: 'qqg-actions' },
+                  h('button', { type: 'button', className: 'qqg-btn', onClick: noop }, '打开会话'),
+                  h('button', { type: 'button', className: 'qqg-btn', onClick: noop }, '清空上下文'),
+                  h('button', {
+                    type: 'button', className: 'qqg-btn qqg-btn-danger',
+                    onClick: () => setConfirmDel(true),
+                  }, '删除会话')))),
+            h(Panel, {
+              title: '单人设覆盖',
+              desc: '留空则沿用全局人设；保存后对该会话生效。',
+              right: h('span', { className: 'qqg-pill' }, `${[...persona].length} 字`),
+            },
+            h('textarea', {
+              className: 'qqg-ai-input', rows: 5,
+              placeholder: '为该会话单独指定人设…',
+              value: persona,
+              'aria-label': '单人设覆盖',
+              onChange: (e) => setPersonaDraft((m) => ({ ...m, [cur.id]: e.target.value })),
+            }),
+            h('div', { className: 'qqg-textarea-actions' },
+              h('button', { type: 'button', className: 'qqg-btn qqg-btn-primary', onClick: noop }, '保存人设'),
+              h('button', {
+                type: 'button', className: 'qqg-btn',
+                onClick: () => setPersonaDraft((m) => ({ ...m, [cur.id]: '' })),
+              }, '恢复全局'))),
+
+            h(Panel, { title: '单独白名单', desc: '关闭后该会话不再进白名单，消息直接丢弃。' },
+              h('div', { className: 'qqg-row' },
+                h('div', { className: 'qqg-label' },
+                  h('div', { className: 'qqg-label-main' }, '允许该会话'),
+                  h('div', { className: 'qqg-label-desc' }, '仅对本会话生效，不影响全局白名单。')),
+                h('div', { className: 'qqg-control' },
+                  h(Switch, {
+                    checked: allow, ariaLabel: '单独白名单开关',
+                    onChange: (v) => setAllowOverride((m) => ({ ...m, [cur.id]: v })),
+                  })))),
+
+            h(Panel, {
+              title: '记忆提取',
+              desc: '从该会话抽取长期事实写入记忆空间。',
+            },
+            h('div', { className: 'qqg-actions' },
+              h('button', { type: 'button', className: 'qqg-btn qqg-btn-primary', onClick: noop }, '提取记忆'),
+              h('button', { type: 'button', className: 'qqg-btn', onClick: noop }, '查看已提取'))),
+
+            h(Panel, { title: '最近消息', desc: 'Mock 展示。' },
+              h('div', { className: 'qqg-list' },
+                cur.messages.map((m, i) => h('div', {
+                  key: i, className: 'qqg-msg' + (m.from === 'me' ? ' qqg-msg-me' : ''),
+                },
+                h('div', { className: 'qqg-msg-meta' },
+                  (m.from === 'me' ? 'bot' : cur.name) + ' · ' + m.time),
+                h('div', null, m.text)))))
+          )
+        ),
+
+        h(ConfirmModal, {
+          open: confirmDel,
+          title: `删除会话「${cur.name}」？`,
+          desc: '会移除该会话的人设覆盖、白名单设置与本地缓存。Mock 阶段只在本次页面状态里删除，刷新即恢复。',
+          confirmText: '删除会话',
+          danger: true,
+          onCancel: () => setConfirmDel(false),
+          onConfirm: doDelete,
+        })
+      )
+    }
+
+    /* ══════════ Tab 3 · 技能与插件（Mock）══════════ */
+    /**
+     * 一张卡片：图标 + 名字 + 版本 + 描述 + 开关，右侧工具区（齿轮 / 垃圾桶 / 拖拽手柄）。
+     * 原生 HTML5 拖拽：卡片本身 draggable，手柄只是视觉提示（按住卡片任意位置都能拖）。
+     * 上下箭头是拖拽的降级方案，键盘用户也能排序。
+     */
+    function MockTile({ item, index, total, onToggle, onSettings, onDelete, onMove,
+      dragging, dragOver, onDragStart, onDragEnd, onDragOver, onDrop }) {
+      const cls = ['qqg-tile']
+      if (dragging) cls.push('qqg-tile-dragging')
+      if (dragOver) cls.push('qqg-tile-over')
+      return h('div', {
+        className: cls.join(' '),
+        draggable: true,
+        onDragStart,
+        onDragEnd,
+        onDragOver,
+        onDrop,
+      },
+      h('div', { className: 'qqg-tile-top' },
+        h('span', { className: 'qqg-drag', title: '拖拽排序', 'aria-hidden': true },
+          h(DotsHandle, { size: 15 })),
+        h('div', { className: 'qqg-tile-icon' }, h(Glyph, { name: item.icon, size: 17 })),
+        h('div', { className: 'qqg-tile-title' },
+          h('div', { className: 'qqg-tile-name' }, item.name),
+          h('div', { className: 'qqg-tile-sub' }, `${item.tag} · v${item.ver}`)),
+        h('div', { className: 'qqg-tile-tools' },
+          h('button', {
+            type: 'button', className: 'qqg-icon-btn',
+            title: '设置', 'aria-label': `${item.name} 设置`,
+            onClick: (e) => { e.stopPropagation(); onSettings(item) },
+          }, h(Glyph, { name: 'gear', size: 14 })),
+          h('button', {
+            type: 'button', className: 'qqg-icon-btn qqg-icon-btn-danger',
+            title: '删除', 'aria-label': `删除 ${item.name}`,
+            onClick: (e) => { e.stopPropagation(); onDelete(item) },
+          }, h(Glyph, { name: 'trash', size: 14 })))),
+      h('div', { className: 'qqg-tile-desc' }, item.desc),
+      h('div', { className: 'qqg-tile-foot' },
+        h('span', { className: 'qqg-status' }, item.enabled ? '已启用' : '已停用'),
+        h('div', { className: 'qqg-tile-arrows' },
+          h('button', {
+            type: 'button', className: 'qqg-icon-btn', title: '上移',
+            'aria-label': `${item.name} 上移`,
+            disabled: index === 0,
+            onClick: (e) => { e.stopPropagation(); onMove(index, -1) },
+          }, h(Glyph, { name: 'arrowUp', size: 13 })),
+          h('button', {
+            type: 'button', className: 'qqg-icon-btn', title: '下移',
+            'aria-label': `${item.name} 下移`,
+            disabled: index === total - 1,
+            onClick: (e) => { e.stopPropagation(); onMove(index, 1) },
+          }, h(Glyph, { name: 'arrowDown', size: 13 }))),
+        h(Switch, {
+          checked: item.enabled, ariaLabel: `${item.name} 开关`,
+          onChange: () => onToggle(item.id),
+        })))
+    }
+
+    /** 技能 / 插件设置弹窗：左表单，右说明。 */
+    function TileSettingsModal({ target, onClose }) {
+      const item = target?.item
+      const [values, setValues] = React.useState({})
+      // 每次换目标重新灌一遍初值，避免上一个卡片的设置串到下一个。
+      React.useEffect(() => { setValues({}) }, [target?.item?.id])
+      if (!item) return null
+      const fields = item.settings ?? []
+      return h(Modal, {
+        open: true,
+        title: `${item.name} · 设置`,
+        desc: `v${item.ver} · ${item.tag} · 最后更新 ${item.updated}`,
+        onClose,
+        footer: [
+          h('button', { key: 'r', type: 'button', className: 'qqg-btn', onClick: () => setValues({}) }, '恢复默认'),
+          h('button', { key: 'c', type: 'button', className: 'qqg-btn', onClick: onClose }, '取消'),
+          h('button', {
+            key: 's', type: 'button', className: 'qqg-btn qqg-btn-primary',
+            onClick: () => { onClose() },
+          }, '保存'),
+        ],
+      },
+      h('div', { className: 'qqg-setgrid' },
+        h('div', null,
+          fields.length
+            ? h(SettingsFields, { fields, values, onChange: (k, v) => setValues((m) => ({ ...m, [k]: v })) })
+            : h('div', { className: 'qqg-hint' }, '该条目暂无可配置项。')),
+        h('div', { className: 'qqg-setdesc' },
+          h('div', { className: 'qqg-setdesc-title' }, '说明'),
+          h('div', { className: 'qqg-setdesc-text' }, item.desc),
+          h('div', { className: 'qqg-kv' }, h('span', null, '作者'), h('b', null, item.author)),
+          h('div', { className: 'qqg-kv' }, h('span', null, '版本'), h('b', null, 'v' + item.ver)),
+          h('div', { className: 'qqg-kv' }, h('span', null, '分类'), h('b', null, item.tag)),
+          (item.notes ?? []).length
+            ? h('ul', { className: 'qqg-setdesc-list' },
+              item.notes.map((n, i) => h('li', { key: i }, n)))
+            : null,
+          h('div', { className: 'qqg-field-hint' }, 'Mock 阶段：保存只关弹窗，不写任何配置。'))))
+    }
+
+    /** 添加技能 / 添加插件弹窗（输入框 + 本地文件选择占位）。 */
+    function AddModal({ kind, onClose, onAdd }) {
+      const label = kind === 'skill' ? '技能' : '插件'
+      const [name, setName] = React.useState('')
+      const [desc, setDesc] = React.useState('')
+      const [file, setFile] = React.useState('')
+      if (!kind) return null
+      const submit = () => {
+        const n = name.trim()
+        if (!n) return
+        onAdd({ name: n, desc: desc.trim() || `手动添加的${label}。`, file })
+      }
+      return h(Modal, {
+        open: true,
+        title: `添加${label}`,
+        desc: `Mock 阶段只往列表里插一条本地数据，不读真实文件、不装任何东西。`,
+        size: 'sm',
+        onClose,
+        footer: [
+          h('button', { key: 'c', type: 'button', className: 'qqg-btn', onClick: onClose }, '取消'),
+          h('button', {
+            key: 'a', type: 'button', className: 'qqg-btn qqg-btn-primary',
+            disabled: !name.trim(), onClick: submit,
+          }, `添加${label}`),
+        ],
+      },
+      h(TextField, {
+        label: `${label}名称`, value: name, onChange: setName,
+        placeholder: kind === 'skill' ? '例如：表情包生成' : '例如：消息去重',
+      }),
+      h('div', { style: { height: 12 } }),
+      h(TextField, {
+        label: '简介（可选）', value: desc, onChange: setDesc,
+        placeholder: '一句话说明它做什么',
+      }),
+      h('div', { style: { height: 14 } }),
+      h('div', { className: 'qqg-dropzone', role: 'button', tabIndex: 0,
+        onClick: () => setFile(file ? '' : `${label}-bundle.zip`),
+        onKeyDown: (e) => { if (e.key === 'Enter') setFile(file ? '' : `${label}-bundle.zip`) },
+      },
+      h(Glyph, { name: 'plus', size: 18 }),
+      h('span', null, file ? `已选择：${file}（点击清除）` : '点击选择本地文件（.zip / .js，Mock）')))
+    }
+
+    /**
+     * 外部插件「测试运行」结果弹窗（P1）。
+     *
+     * 成功：展示入口导出、hooks/providers、插件实际调用过的 api、耗时与沙箱 pid。
+     * 失败：展示稳定错误码 + message + Host 收集的 stderr 尾部（含被 registerHooks
+     * 拦下的 node:fs 这类信息）。
+     */
+    function SandboxResultModal({ state, onClose }) {
+      const open = state !== null && state !== undefined && state.phase === 'done'
+      const ok = state?.ok === true
+      const result = state?.result ?? {}
+      const info = result.exports ?? {}
+      const list = (value) => (Array.isArray(value) && value.length > 0 ? value.join('、') : '（无）')
+      const has = (value) => (value === true ? '有' : '无')
+      const err = state?.error ?? {}
+      const rows = ok
+        ? [
+          ['模块', result.moduleId ?? state?.name ?? ''],
+          ['入口导出', `setup ${has(info.setup)} · register ${has(info.register)} · activate ${has(info.activate)}`],
+          ['hooks', list(info.hooks)],
+          ['providers', list(info.providers)],
+          ['插件用到的 api', list(result.apiCalls)],
+          ['耗时', `${result.durationMs ?? '?'} ms`],
+          ['沙箱', result.sandbox
+            ? `pid ${result.sandbox.pid ?? '?'} · Node ${result.sandbox.node ?? '?'}`
+            : '—'],
+        ]
+        : []
+
+      return h(Modal, {
+        open,
+        title: ok ? '加载成功' : '加载失败',
+        desc: state ? state.name : '',
+        onClose,
+        footer: [h('button', {
+          key: 'ok', type: 'button', className: 'qqg-btn qqg-btn-primary', onClick: onClose,
+        }, '知道了')],
+      },
+      ok
+        ? h('div', { className: 'qqg-stack' },
+          h('div', { className: 'qqg-status' }, '插件已在独立沙箱子进程中 import 成功，并执行完 setup(api)。'),
+          rows.map(([key, value]) => h('div', { key, className: 'qqg-kv' },
+            h('span', null, key), h('b', null, String(value)))))
+        : h('div', { className: 'qqg-stack' },
+          h('div', { className: 'qqg-status qqg-status-err' },
+            `${err.code ?? 'E_UNKNOWN'}：${err.message ?? '加载失败'}`),
+          err.detail ? h('pre', { className: 'qqg-log' }, String(err.detail)) : null,
+          Array.isArray(err.stderrTail) && err.stderrTail.length > 0
+            ? h('pre', { className: 'qqg-log' }, err.stderrTail.join('\n'))
+            : null))
+    }
+
+    /**
+     * 把外部插件的 configSchema + 清单默认值 + 本地已保存值合成一份表单初值。
+     * 只处理 boolean / number / string / enum；Host 扫描时已经把其他类型丢掉了。
+     */
+    function buildExternalDraft(module, saved) {
+      const schema = module?.configSchema ?? {}
+      const defaults = module?.settingsDefaults ?? {}
+      const current = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {}
+      const draft = {}
+      for (const [key, field] of Object.entries(schema)) {
+        let value = current[key]
+        if (value === undefined) value = defaults[key]
+        if (value === undefined) value = field.default
+        if (field.type === 'boolean') draft[key] = value === true
+        else if (field.type === 'number') draft[key] = Number.isFinite(Number(value)) ? Number(value) : 0
+        else if (field.type === 'string') draft[key] = String(value ?? '')
+        else if (field.type === 'enum') {
+          const values = Array.isArray(field.values) ? field.values : []
+          draft[key] = values.includes(String(value)) ? String(value) : (values[0] ?? '')
+        }
+      }
+      return draft
+    }
+
+    /**
+     * 外部插件设置弹窗（P1.5）：按 configSchema 动态渲染表单。
+     *
+     * 配置只写进**本插件自己的** profile 配置（`externalPlugins.settings[模块 id]`），
+     * 不碰对方目录里的 config.json；沙箱执行时如何消费这些值留到 P2。
+     */
+    function ExtSettingsModal({ module, saved, writable, onSave, onClose }) {
+      const schema = module?.configSchema ?? {}
+      const [draft, setDraft] = React.useState(() => buildExternalDraft(module, saved))
+      const setField = (key, value) => setDraft((prev) => ({ ...prev, [key]: value }))
+
+      const control = (key, field) => {
+        const value = draft[key]
+        const label = field.label || key
+        const disabled = !writable
+        if (field.type === 'boolean') {
+          return h(Switch, {
+            checked: value === true, disabled, ariaLabel: label,
+            onChange: (next) => setField(key, next),
+          })
+        }
+        if (field.type === 'number') {
+          return h('input', {
+            type: 'number', className: 'qqg-input qqg-input-num',
+            value: value === undefined ? '' : String(value),
+            min: field.min, max: field.max, step: field.step,
+            disabled, 'aria-label': label,
+            onChange: (e) => setField(key, e.target.value === '' ? '' : Number(e.target.value)),
+          })
+        }
+        if (field.type === 'enum') {
+          const values = Array.isArray(field.values) ? field.values : []
+          return h('select', {
+            className: 'qqg-input', value: value ?? '', disabled, 'aria-label': label,
+            onChange: (e) => setField(key, e.target.value),
+          }, values.map((option) => h('option', { key: option, value: option }, option)))
+        }
+        if (field.multiline === true) {
+          return h('textarea', {
+            className: 'qqg-textarea', rows: 3,
+            value: String(value ?? ''), disabled, 'aria-label': label,
+            onChange: (e) => setField(key, e.target.value),
+          })
+        }
+        return h('input', {
+          className: 'qqg-input qqg-input-grow',
+          type: field.secret === true ? 'password' : 'text',
+          value: String(value ?? ''), disabled, 'aria-label': label,
+          onChange: (e) => setField(key, e.target.value),
+        })
+      }
+
+      const fields = Object.entries(schema)
+      const kinds = new Set(fields.map(([, field]) => field.type))
+      const skipped = (module?.unknownFieldCount ?? 0)
+
+      return h(Modal, {
+        open: true,
+        title: `外部插件配置 · ${module?.name || module?.id || ''}`,
+        desc: '来自对方的 configSchema，保存到本插件的本地配置；不会写入对方目录。',
+        onClose,
+        footer: [
+          h('button', { key: 'c', type: 'button', className: 'qqg-btn', onClick: onClose }, '取消'),
+          h('button', {
+            key: 's', type: 'button', className: 'qqg-btn qqg-btn-primary',
+            disabled: !writable || fields.length === 0,
+            onClick: () => onSave(draft),
+          }, '保存'),
+        ],
+      },
+      writable ? null : h('div', { className: 'qqg-status qqg-status-err', style: { marginBottom: 10 } },
+        '当前配置不可写，下面的值只能看不能改。'),
+      fields.length === 0
+        ? h('div', { className: 'qqg-hint' }, '这个插件没有可渲染的配置项。')
+        : h('div', { className: 'qqg-stack' }, fields.map(([key, field]) => h(Field, {
+          key,
+          label: field.label || key,
+          desc: field.description || '',
+        }, control(key, field)))),
+      h('div', { className: 'qqg-hint', style: { marginTop: 10 } },
+        `支持的类型：boolean / number / string / enum（共 ${kinds.size} 种）`
+        + (skipped > 0 ? `；清单另有 ${skipped} 个非标字段已忽略。` : '。')))
+    }
+
+    function SkillsTab({ get, write, writable, pickDirectory }) {
+      // 清单本身来自配置：数组顺序 = 展示顺序，enabled = 开关。
+      // 不再有前端假列表，所有改动都写回 config（写盘由 config-editor 负责）。
+      const skills = Array.isArray(get('skills')) ? get('skills') : []
+      const plugins = Array.isArray(get('plugins')) ? get('plugins') : []
+      const extEnabled = Array.isArray(get('externalPlugins.enabled')) ? get('externalPlugins.enabled') : []
+      const extDirs = Array.isArray(get('externalPlugins.dirs')) ? get('externalPlugins.dirs') : []
+
+      const [settingsTarget, setSettingsTarget] = React.useState(null)
+      const [deleteTarget, setDeleteTarget] = React.useState(null)
+      const [addKind, setAddKind] = React.useState(null)
+      const [drag, setDrag] = React.useState({ from: null, over: null })
+      const [dirDraft, setDirDraft] = React.useState('')
+      const [scan, setScan] = React.useState(null)
+      const [scanError, setScanError] = React.useState(null)
+      const [scanBusy, setScanBusy] = React.useState(false)
+      // P1：外部插件「测试运行」状态。running 时卡片按钮显示加载中，done 后弹结果。
+      const [sandboxRun, setSandboxRun] = React.useState(null)
+      // P1.5：外部插件过滤（all / self / controlled）与 configSchema 弹窗目标。
+      const [extFilter, setExtFilter] = React.useState('all')
+      const [extSettingsTarget, setExtSettingsTarget] = React.useState(null)
+
+      const listOf = (kind) => (kind === 'skill' ? skills : plugins)
+      const pathOf = (kind) => (kind === 'skill' ? 'skills' : 'plugins')
+      const saveList = (kind, next) => {
+        if (!writable) return
+        write(pathOf(kind), next)
+      }
+
+      const flip = (kind) => (id) => saveList(kind, listOf(kind).map((x) =>
+        (x.id === id ? { ...x, enabled: !x.enabled } : x)))
+
+      const moveTo = (kind, from, to) => {
+        const list = listOf(kind)
+        if (from === to || from < 0 || to < 0 || from >= list.length || to >= list.length) return
+        const next = list.slice()
+        const [it] = next.splice(from, 1)
+        next.splice(to, 0, it)
+        saveList(kind, next)
+      }
+
+      const remove = (kind) => (id) => saveList(kind, listOf(kind).filter((x) => x.id !== id))
+
+      const add = (kind) => (draft) => {
+        const isSkill = kind === 'skill'
+        saveList(kind, [...listOf(kind), {
+          id: `custom-${Date.now()}`,
+          icon: isSkill ? 'spark' : 'bridge',
+          name: draft.name,
+          desc: draft.desc,
+          ver: '0.1.0',
+          tag: '自定义',
+          enabled: false,
+        }])
+        setAddKind(null)
+      }
+
+      const countOn = (list) => list.filter((x) => x.enabled).length
+
+      /* ── 外部插件：只读扫描 Host 的目录，不改目标、不装包 ── */
+      const runScan = async () => {
+        setScanBusy(true); setScanError(null)
+        try {
+          const res = await fetch('/dsh-qq-guard/external-plugins', {
+            headers: { accept: 'application/json' }, credentials: 'include',
+          })
+          const body = await res.json().catch(() => ({}))
+          if (!res.ok || !body.ok) { setScanError(body.detail ?? body.reason ?? `HTTP ${res.status}`); return }
+          setScan(body)
+        } catch (e) {
+          setScanError(e?.message ?? String(e))
+        } finally {
+          setScanBusy(false)
+        }
+      }
+      React.useEffect(() => { void runScan() }, [JSON.stringify(extDirs)])
+
+      const toggleExternal = (key, name) => {
+        if (!writable) return
+        // 兼容历史配置：早期只记包名，现在优先记 id（id 与目录名可能不一致）。
+        const matches = (x) => x === key || (name !== undefined && x === name)
+        const on = extEnabled.some(matches)
+        const next = on ? extEnabled.filter((x) => !matches(x)) : [...extEnabled, key]
+        write('externalPlugins.enabled', next)
+      }
+
+      const addDir = (dir) => {
+        const d = String(dir ?? '').trim()
+        if (!writable || !d) return
+        if (extDirs.includes(d)) return
+        write('externalPlugins.dirs', [...extDirs, d])
+        setDirDraft('')
+      }
+
+      /**
+       * P1：把外部插件交给 Host 的独立沙箱子进程加载。
+       *
+       * 只传 id + dir（Host 会重新扫描校验，不信任前端路径）；
+       * 结果弹窗展示导出的 setup/hooks 和插件碰过的 api，失败展示错误码。
+       */
+      const runSandbox = async (it) => {
+        if (sandboxRun?.phase === 'running') return
+        setSandboxRun({ id: it.id, name: it.name || it.id, phase: 'running' })
+        try {
+          const res = await fetch('/dsh-qq-guard/external-plugins/test', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { accept: 'application/json', 'content-type': 'application/json' },
+            body: JSON.stringify({ id: it.id, dir: it.dir }),
+          })
+          const body = await res.json().catch(() => ({}))
+          if (res.ok && body?.ok === true) {
+            setSandboxRun({ id: it.id, name: it.name || it.id, phase: 'done', ok: true, result: body.result ?? {} })
+          } else {
+            setSandboxRun({
+              id: it.id,
+              name: it.name || it.id,
+              phase: 'done',
+              ok: false,
+              error: body?.error ?? { code: `HTTP_${res.status}`, message: '沙箱请求失败' },
+            })
+          }
+        } catch (error) {
+          setSandboxRun({
+            id: it.id,
+            name: it.name || it.id,
+            phase: 'done',
+            ok: false,
+            error: { code: 'E_NETWORK', message: error?.message ?? String(error) },
+          })
+        }
+      }
+
+      const renderGrid = (kind, list) => h('div', { className: 'qqg-grid' },
+        list.length === 0
+          ? h('div', { className: 'qqg-hint' }, '清单为空。可以点右上角添加，或在配置文件里编辑。')
+          : list.map((it, i) => h(MockTile, {
+            key: it.id, item: it, index: i, total: list.length,
+            onToggle: flip(kind),
+            onSettings: (item) => setSettingsTarget({ kind, item }),
+            onDelete: (item) => setDeleteTarget({ kind, item }),
+            onMove: (index, delta) => moveTo(kind, index, index + delta),
+            dragging: drag.from === `${kind}:${it.id}`,
+            dragOver: drag.over === `${kind}:${it.id}` && drag.from !== `${kind}:${it.id}`,
+            onDragStart: (e) => {
+              setDrag({ from: `${kind}:${it.id}`, over: null })
+              // 必须 setData，否则 Firefox 不认为这是有效拖拽。
+              try { e.dataTransfer.setData('text/plain', it.id) } catch { /* 忽略 */ }
+              if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
+            },
+            onDragEnd: () => setDrag({ from: null, over: null }),
+            onDragOver: (e) => {
+              if (!drag.from || !drag.from.startsWith(kind + ':')) return
+              e.preventDefault()  // 不 preventDefault 就不会触发 drop
+              if (drag.over !== `${kind}:${it.id}`) setDrag((d) => ({ ...d, over: `${kind}:${it.id}` }))
+            },
+            onDrop: (e) => {
+              e.preventDefault()
+              const fromKey = drag.from ?? ''
+              if (!fromKey.startsWith(kind + ':')) { setDrag({ from: null, over: null }); return }
+              const fromId = fromKey.slice(kind.length + 1)
+              moveTo(kind, list.findIndex((x) => x.id === fromId), i)
+              setDrag({ from: null, over: null })
+            },
+          })))
+
+      const extEntries = scan?.entries ?? []
+      /** 外部模块来源格式 → 卡片文案（三种形态：DSH 包 / QQ 技能 / QQ 插件）。 */
+      const FORMAT_LABEL = {
+        'package.json': 'DSH 包',
+        'skill.json': '技能清单',
+        'plugin.json': '插件清单',
+      }
+      const KIND_LABEL = { package: 'DSH 插件包', skill: '技能', plugin: '插件' }
+      /** 兼容等级 → 标签样式：受控黄、无效红、DSH 原生绿、自包含中性。 */
+      const compatClass = (tier) => tier === 'controlled' ? 'qqg-tag qqg-tag-warn'
+        : tier === 'invalid' ? 'qqg-tag qqg-tag-err'
+          : tier === 'native' ? 'qqg-tag qqg-tag-ok' : 'qqg-tag'
+      /** 卡片副标题：版本 + 目录语义 + DSH 入口。 */
+      const extSub = (it) => {
+        const parts = [KIND_LABEL[it.kind] ?? '模块', `v${it.version || '0.0.0'}`]
+        if (it.kind === 'package') {
+          const entry = `${it.hasClient ? 'UI' : ''}${it.hasBundle ? (it.hasClient ? '+Host' : 'Host') : ''}`
+          if (entry) parts.push(entry)
+        }
+        return parts.join(' · ')
+      }
+      /** 卡片元数据行：来源格式 / 分类 / 作者 / 被忽略的非标字段数。 */
+      const extMeta = (it) => {
+        const parts = [FORMAT_LABEL[it.format] ?? it.format]
+        if (it.category) parts.push(`分类 ${it.category}`)
+        if (it.author) parts.push(`作者 ${it.author}`)
+        if (Number(it.unknownFieldCount) > 0) parts.push(`已忽略 ${it.unknownFieldCount} 个非标字段`)
+        return parts.join(' · ')
+      }
+      const compatTitle = (it) => {
+        const reasons = Array.isArray(it.compat?.reasons) ? it.compat.reasons : []
+        return reasons.length > 0 ? reasons.join('；') : '静态扫描未发现宿主依赖'
+      }
+      /** 开关状态以配置里的「意图」为准，不靠扫描快照（否则点完不刷新看不到变化）。 */
+      const extOn = (it) => extEnabled.includes(it.id) || extEnabled.includes(it.name)
+      const extCount = (tier) => extEntries.filter((it) => it.compat?.tier === tier).length
+      /** 过滤下拉：全部 / 自包含 / 受控（坏清单只在「全部」里出现）。 */
+      const extFiltered = extEntries.filter((it) => {
+        if (extFilter === 'self') return it.compat?.tier === 'self-contained'
+        if (extFilter === 'controlled') return it.compat?.tier === 'controlled'
+        return true
+      })
+      const extSettingsSaved = get('externalPlugins.settings')
+      const savedSettingsOf = (it) => {
+        const all = extSettingsSaved && typeof extSettingsSaved === 'object' ? extSettingsSaved : {}
+        const saved = all[it.id]
+        return saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {}
+      }
+
+      return h('div', { className: 'qqg-stack' },
+        h('div', { className: 'qqg-tabhead' },
+          h('div', null,
+            h('h2', { className: 'qqg-tabhead-title' }, '技能与插件'),
+            h('p', { className: 'qqg-tabhead-desc' },
+              '清单、顺序、开关全部来自真实配置，改完立即写回；外部插件只读扫描、默认全关。')),
+          h('div', { className: 'qqg-actions' },
+            h('button', {
+              type: 'button', className: 'qqg-btn',
+              onClick: () => setAddKind('plugin'),
+            }, '+ 添加插件'),
+            h('button', {
+              type: 'button', className: 'qqg-btn qqg-btn-primary',
+              onClick: () => setAddKind('skill'),
+            }, '+ 添加技能'))),
+
+        h(Panel, {
+          title: '技能（Skill）',
+          desc: '会话内可调用的能力，按需启用。顺序即展示顺序。',
+          right: h('span', { className: 'qqg-pill' }, `${countOn(skills)} / ${skills.length} 已启用`),
+        }, renderGrid('skill', skills)),
+
+        h(Panel, {
+          title: '插件（Plugin）',
+          desc: '消息处理管线上的中间件，改动对桥接即时生效。',
+          right: h('span', { className: 'qqg-pill' }, `${countOn(plugins)} / ${plugins.length} 已启用`),
+        }, renderGrid('plugin', plugins)),
+
+        // ── 外部插件挂载 ──
+        h(Panel, {
+          title: '外部插件',
+          desc: '只读扫描目录里的有效模块：带 `dsh` 字段的 package.json、QQ Agent 的 plugin.json / skill.json（BOM 容错）。默认全部关闭；P0 只展示卡片，不加载、不执行任何外部代码。',
+          right: h('div', { className: 'qqg-actions' },
+            h('select', {
+              className: 'qqg-input', value: extFilter, disabled: extEntries.length === 0,
+              'aria-label': '外部插件过滤',
+              onChange: (e) => setExtFilter(e.target.value),
+            },
+            h('option', { value: 'all' }, `全部 ${extEntries.length}`),
+            h('option', { value: 'self' }, `自包含 ${extCount('self-contained')}`),
+            h('option', { value: 'controlled' }, `受控 ${extCount('controlled')}`)),
+            h('span', { className: 'qqg-pill' },
+              scanBusy ? '扫描中…' : `可跑 ${scan?.runnable ?? 0} / ${scan?.scanned ?? 0}`),
+            (scan?.controlled ?? 0) > 0
+              ? h('span', { className: 'qqg-pill' }, `受控 ${scan.controlled}`)
+              : null,
+            h('button', { type: 'button', className: 'qqg-btn', onClick: runScan }, '重新扫描')),
+        },
+        h('div', { className: 'qqg-dir-row', style: { marginBottom: 10 } },
+          h('input', {
+            className: 'qqg-input qqg-dir-input',
+            value: dirDraft,
+            placeholder: scan?.dirs?.[0] ?? '外部插件目录（profile 的 node_modules，或 QQ Agent 的 app 根）',
+            disabled: !writable,
+            'aria-label': '外部插件目录',
+            onChange: (e) => setDirDraft(e.target.value),
+          }),
+          h('button', {
+            type: 'button', className: 'qqg-btn qqg-btn-browse',
+            disabled: !writable,
+            title: '选择目录',
+            onClick: async () => {
+              if (typeof pickDirectory !== 'function') return
+              const r = await pickDirectory()
+              if (r?.ok && r.path) addDir(r.path)
+            },
+          }, '浏览'),
+          h('button', {
+            type: 'button', className: 'qqg-btn qqg-btn-primary',
+            disabled: !writable || !dirDraft.trim(),
+            onClick: () => addDir(dirDraft),
+          }, '添加目录')),
+        extDirs.length > 0
+          ? h('div', { className: 'qqg-chips', style: { marginBottom: 10 } },
+            extDirs.map((d) => h('span', { key: d, className: 'qqg-chip' },
+              h('span', { className: 'qqg-chip-text' }, d),
+              h('button', {
+                type: 'button', className: 'qqg-chip-x', disabled: !writable,
+                'aria-label': `移除目录 ${d}`,
+                onClick: () => write('externalPlugins.dirs', extDirs.filter((x) => x !== d)),
+              }, '×'))))
+          : null,
+        scanError ? h('div', { className: 'qqg-status qqg-status-err', style: { marginBottom: 8 } }, scanError) : null,
+        extEntries.length === 0
+          ? h('div', { className: 'qqg-hint' },
+            scan ? '该目录下没有找到 package.json（含 dsh 字段）/ plugin.json / skill.json。' : '正在扫描…')
+          : extFiltered.length === 0
+            ? h('div', { className: 'qqg-hint' }, '当前筛选下没有插件，切回「全部」看看。')
+            : h('div', { className: 'qqg-grid' },
+              extFiltered.map((it) => {
+                const desc = clipCardText(it.description || '（无描述）')
+                const schemaCount = Object.keys(it.configSchema ?? {}).length
+                return h('div', { key: it.dir ?? it.id ?? it.name, className: 'qqg-tile' },
+                  h('div', { className: 'qqg-tile-top' },
+                    h('span', { className: 'qqg-drag' }, h(DotsHandle, { size: 14 })),
+                    h('div', { className: 'qqg-tile-icon' }, h(Glyph, { name: 'bridge', size: 16 })),
+                    h('div', { className: 'qqg-tile-title' },
+                      h('div', { className: 'qqg-tile-name' }, it.name || it.id),
+                      h('div', { className: 'qqg-tile-sub' }, extSub(it))),
+                    // 配置齿轮（有 configSchema 才有） + 兼容性标签。
+                    h('div', { className: 'qqg-tile-tools' },
+                      schemaCount > 0
+                        ? h('button', {
+                          type: 'button', className: 'qqg-icon-btn',
+                          title: `配置（${schemaCount} 项，来自 configSchema）`,
+                          'aria-label': `${it.name || it.id} 设置`,
+                          onClick: () => setExtSettingsTarget(it),
+                        }, h(Glyph, { name: 'settings', size: 14 }))
+                        : null,
+                      h('span', {
+                        className: compatClass(it.compat?.tier),
+                        title: compatTitle(it),
+                      }, it.compat?.label ?? '未判定'))),
+                  h('div', {
+                    className: 'qqg-tile-desc',
+                    title: desc.clipped ? desc.full : undefined,
+                  }, desc.text),
+                  h('div', { className: 'qqg-tile-sub', style: { marginTop: 4 } }, extMeta(it)),
+                  it.error
+                    ? h('div', { className: 'qqg-status qqg-status-err', style: { marginTop: 4, fontSize: 10.5 } }, it.error)
+                    : null,
+                  Array.isArray(it.warnings) && it.warnings.length > 0
+                    ? h('div', {
+                      className: 'qqg-hint', style: { marginTop: 4, fontSize: 10.5 },
+                      title: it.warnings.join('；'),
+                    }, `⚠ ${it.warnings.slice(0, 2).join('；')}${it.warnings.length > 2 ? ' …' : ''}`)
+                    : null,
+                  h('div', { className: 'qqg-tile-foot' },
+                    h('div', { className: 'qqg-actions' },
+                      h('button', {
+                        type: 'button', className: 'qqg-btn',
+                        disabled: !it.hasEntry
+                          || it.compat?.tier !== 'self-contained'
+                          || sandboxRun?.phase === 'running',
+                        title: !it.hasEntry
+                          ? '该模块没有入口文件，无法加载'
+                          : it.compat?.tier !== 'self-contained'
+                            ? `「${it.compat?.label ?? '未判定'}」模块 P1 不加载；等沙箱 shim（P2）`
+                            : '在独立子进程里加载并执行 setup(api)',
+                        onClick: () => runSandbox(it),
+                      }, sandboxRun?.phase === 'running' && sandboxRun.id === it.id ? '加载中…' : '测试运行'),
+                      h('span', { className: 'qqg-status' },
+                        extOn(it) ? '已启用（仅记录意图）' : '已关闭')),
+                    h(Switch, {
+                      checked: extOn(it),
+                      disabled: !writable,
+                      ariaLabel: `${it.name || it.id} 开关`,
+                      onChange: () => toggleExternal(it.id || it.name, it.name),
+                    })))
+              }))),
+
+        // P1：沙箱加载结果弹窗
+        h(SandboxResultModal, {
+          state: sandboxRun,
+          onClose: () => setSandboxRun(null),
+        }),
+
+        // P1.5：configSchema 动态表单弹窗（按模块挂 key，切换模块时重建初值）
+        extSettingsTarget
+          ? h(ExtSettingsModal, {
+            key: extSettingsTarget.dir ?? extSettingsTarget.id,
+            module: extSettingsTarget,
+            saved: savedSettingsOf(extSettingsTarget),
+            writable,
+            onClose: () => setExtSettingsTarget(null),
+            onSave: (draft) => {
+              const all = extSettingsSaved && typeof extSettingsSaved === 'object' && !Array.isArray(extSettingsSaved)
+                ? extSettingsSaved
+                : {}
+              write('externalPlugins.settings', { ...all, [extSettingsTarget.id]: draft })
+              setExtSettingsTarget(null)
+            },
+          })
+          : null,
+
+        h(TileSettingsModal, {
+          target: settingsTarget,
+          onClose: () => setSettingsTarget(null),
+        }),
+
+        h(ConfirmModal, {
+          open: deleteTarget !== null,
+          title: deleteTarget ? `删除「${deleteTarget.item.name}」？` : '',
+          desc: deleteTarget
+            ? `${deleteTarget.kind === 'skill' ? '技能' : '插件'}会从配置里移除，写盘后立即生效。`
+            : '',
+          confirmText: '删除',
+          danger: true,
+          onCancel: () => setDeleteTarget(null),
+          onConfirm: () => {
+            if (deleteTarget) remove(deleteTarget.kind)(deleteTarget.item.id)
+            setDeleteTarget(null)
+          },
+        }),
+
+        h(AddModal, {
+          kind: addKind,
+          onClose: () => setAddKind(null),
+          onAdd: (draft) => add(addKind)(draft),
+        }))
+    }
+
+    /* ══════════ 使用引导（左侧导航底部按钮 + 弹窗）══════════ */
+    /**
+     * 三步检查清单的**唯一口径**：导航底部「x/3」和弹窗进度条都读这一份。
+     *
+     * 之前按钮只算了 NapCat / 白名单两项，弹窗却算三项 —— 于是三项全绿时
+     * 按钮显示 2/3、弹窗显示 100%（3/3）。现在状态派生集中在这里，
+     * 两边只差渲染方式，不再可能出现不同步。
+     *
+     * @param {(path:string)=>any} get 配置读取
+     * @param {object|null} proc useBridgeProc 的实时进程状态（null = 还没查回来）
+     */
+    function guideSteps(get, proc) {
+      const napcatDir = String(get('napcat.dir') ?? '').trim()
+      const priv = get('allow.private') ?? []
+      const groups = get('allow.groups') ?? []
+      const bridgeKnown = proc !== null && proc !== undefined
+      const bridgeAlive = proc?.alive === true
+      return {
+        bridgeKnown,
+        bridgeAlive,
+        items: [
+          {
+            id: 'napcat',
+            name: 'NapCat 进程',
+            ok: napcatDir !== '',
+            desc: napcatDir !== '' ? `已配置安装目录：${napcatDir}` : '未填写安装目录，NapCat 无法启动',
+          },
+          {
+            id: 'allow',
+            name: '白名单',
+            ok: priv.length > 0 || groups.length > 0,
+            desc: (priv.length > 0 || groups.length > 0)
+              ? `已放行 ${priv.length} 个私聊 / ${groups.length} 个群`
+              : '白名单为空，默认谁都不回（fail-closed）',
+          },
+          {
+            id: 'bridge',
+            name: '桥接进程',
+            ok: bridgeKnown ? bridgeAlive : null,
+            desc: !bridgeKnown
+              ? '正在查询桥接进程状态…'
+              : bridgeAlive
+                ? `运行中${proc?.uptimeMs ? `，已运行 ${Math.round(proc.uptimeMs / 1000)}s` : ''}`
+                : '未运行，需要启动后才会收发消息',
+          },
+        ],
+      }
+    }
+
+    /** 由 guideSteps 派生完成数 / 百分比；弹窗与按钮共用。 */
+    function guideProgress(state) {
+      const done = state.items.filter((x) => x.ok === true).length
+      const total = state.items.length
+      return { done, total, pct: Math.round((done / total) * 100) }
+    }
+
+    /**
+     * 三步检查清单弹窗。
+     *
+     * 状态全部现读：
+     *   ① NapCat  —— napcat.dir 是否已配置
+     *   ② 白名单  —— allow.private / allow.groups 是否有条目
+     *   ③ 桥接    —— useBridgeProc 的真实进程状态（alive），不是配置里的 autoStart
+     *
+     * 前两步「去配置」= 关弹窗 + 切到全局设置 + 滚到对应卡片；
+     * 第三步「去启动」= 直接 POST /dsh-qq-guard/bridge?action=start（与运行状态页同一个路由）。
+     *
+     * proc 由 SettingsPanel 统一轮询后传进来：按钮上的计数也要用它，
+     * 弹窗自己再轮询一份就会出现两个状态源。
+     */
+    function OnboardingModal({ open, get, goto, proc, refreshProc, onClose }) {
+      const state = guideSteps(get, proc)
+      const { done, total, pct } = guideProgress(state)
+      const [busy, setBusy] = React.useState(false)
+      const [err, setErr] = React.useState(null)
+
+      const actions = {
+        napcat: { action: '去配置', onAction: () => { onClose(); goto('set-napcat') } },
+        allow: { action: '去配置', onAction: () => { onClose(); goto('set-allow') } },
+        bridge: {
+          action: state.bridgeAlive ? null : '去启动',
+          onAction: async () => {
+            setBusy(true); setErr(null)
+            try {
+              const res = await fetch('/dsh-qq-guard/bridge?action=start', {
+                method: 'POST', credentials: 'include',
+                headers: { accept: 'application/json' },
+              })
+              const body = await res.json().catch(() => ({}))
+              if (!res.ok || !body.ok) setErr(body.detail ?? body.reason ?? `HTTP ${res.status}`)
+            } catch (e) {
+              setErr(e?.message ?? String(e))
+            } finally {
+              setBusy(false)
+              if (typeof refreshProc === 'function') refreshProc()
+            }
+          },
+        },
+      }
+      const items = state.items.map((it) => ({ ...it, ...(actions[it.id] ?? { action: null, onAction: null }) }))
+
+      const dotOf = (ok) => (ok === true ? 'qqg-dot-ok' : ok === false ? 'qqg-dot-warn' : 'qqg-dot-idle')
+
+      return h(Modal, {
+        open, title: '使用引导',
+        desc: '三步把 QQ 桥接跑通。状态实时读取当前配置与进程，改完即时刷新。',
+        onClose,
+        footer: [h('button', { key: 'c', type: 'button', className: 'qqg-btn qqg-btn-primary', onClick: onClose }, '知道了')],
+      },
+      h('div', { className: 'qqg-progress' },
+        h('span', null, '完成度'),
+        h('div', { className: 'qqg-progress-track' },
+          h('div', { className: 'qqg-progress-fill', style: { width: pct + '%' } })),
+        h('span', null, `${pct}%（${done} / ${total}）`)),
+      h('div', { className: 'qqg-onboard', style: { marginTop: 12 } },
+        items.map((it) => h('div', { key: it.id, className: 'qqg-onboard-row' },
+          h('span', { className: 'qqg-dot ' + dotOf(it.ok) }),
+          h('div', { className: 'qqg-onboard-main' },
+            h('div', { className: 'qqg-onboard-name' }, it.name),
+            h('div', { className: 'qqg-onboard-desc' }, it.desc)),
+          it.action
+            ? h('button', {
+              type: 'button',
+              className: 'qqg-btn' + (it.id === 'bridge' ? ' qqg-btn-primary' : ''),
+              disabled: busy && it.id === 'bridge',
+              onClick: it.onAction,
+            }, busy && it.id === 'bridge' ? '启动中…' : it.action)
+            : h('span', { className: 'qqg-pill qqg-pill-accent' },
+              h(Glyph, { name: 'check', size: 11 }), '已就绪')))),
+      err ? h('div', { className: 'qqg-status qqg-status-err', style: { marginTop: 10 } }, err) : null,
+      h('div', { className: 'qqg-hint', style: { marginTop: 12 } },
+        '顺序建议：先填 NapCat 安装目录 → 启动 NapCat 并登录 → 配好白名单 → 启动桥接。'))
+    }
+
+    /** 信息发送配置弹窗：分片参数 + 打字延时参数（全部走真实配置读写）。 */
+    function SendConfigModal({ open, get, write, writable, form, onClose }) {
+      return h(Modal, {
+        open,
+        title: '信息发送配置',
+        desc: '决定回复怎么切片、每条之间等多久。改完桥接 2 秒内热更新，无需重启。',
+        onClose,
+        footer: [h('button', { key: 'd', type: 'button', className: 'qqg-btn qqg-btn-primary', onClick: onClose }, '完成')],
+      },
+      writable ? null : h('div', { className: 'qqg-status qqg-status-err', style: { marginBottom: 12 } },
+        '当前配置不可写，下面的数值只能看不能改。'),
+      h(SplitSection, { get, write, writable, form }))
+    }
+
+    /** 响应档位：0 仅艾特 / 1 +关键词 / 2 +随机 / 3 全响应。 */
+    const ACTIVITY_LEVELS = [
+      { id: 0, label: '仅艾特', desc: '只有被 @ 或私聊才回，群里最安静。' },
+      { id: 1, label: '+关键词', desc: '被 @ 或命中关键词才回。' },
+      { id: 2, label: '+随机', desc: '在关键词基础上，按概率随机接话。' },
+      { id: 3, label: '全响应', desc: '每条消息都可能回，最吵。' },
+    ]
+
+    /**
+     * 活跃设置弹窗（Phase 4：真实读写）。
+     *
+     * 全部字段都绑到真实配置 `rhythm.*`，改完写盘 → 桥接 2 秒内轮询到新值。
+     * 弹窗里不再保留本地 state 兜底，`get()` 读什么就显示什么。
+     */
+    function ActiveSettingsModal({ open, get, write, writable, onClose }) {
+      const level = Number(get('rhythm.activityLevel') ?? 1)
+      const cur = ACTIVITY_LEVELS[level] ?? ACTIVITY_LEVELS[1]
+      const debounceMs = Number(get('rhythm.debounceWindowMs') ?? 800)
+      const batchMs = Number(get('rhythm.batchIntervalMs') ?? 2500)
+      const muteOn = get('rhythm.mute.enabled') !== false
+      const muteWords = Array.isArray(get('rhythm.mute.words')) ? get('rhythm.mute.words').join('，') : ''
+      const muteSec = Number(get('rhythm.mute.seconds') ?? 60)
+      const perMin = Number(get('rhythm.rateLimit.perMin') ?? 12)
+      const burst = Number(get('rhythm.rateLimit.burst') ?? 3)
+      const silent = get('rhythm.rateLimit.silent') !== false
+
+      const set = (key, value) => { if (writable) write(key, value) }
+      const setWords = (text) => set('rhythm.mute.words',
+        String(text).split(/[，,]/).map((x) => x.trim()).filter(Boolean))
+
+      return h(Modal, {
+        open,
+        title: '活跃设置',
+        desc: '控制 bot 什么时候接话、接得多快。保存即写盘，桥接 2 秒内热更新。',
+        onClose,
+        footer: [
+          h('button', {
+            key: 'r', type: 'button', className: 'qqg-btn', disabled: !writable,
+            onClick: () => {
+              set('rhythm.activityLevel', 1)
+              set('rhythm.debounceWindowMs', 800)
+              set('rhythm.batchIntervalMs', 2500)
+              set('rhythm.rateLimit.perMin', 12)
+              set('rhythm.rateLimit.burst', 3)
+              set('rhythm.rateLimit.silent', true)
+              set('rhythm.mute.enabled', true)
+              set('rhythm.mute.words', ['闭嘴', '安静', '别刷屏'])
+              set('rhythm.mute.seconds', 60)
+            },
+          }, '恢复默认'),
+          h('button', { key: 's', type: 'button', className: 'qqg-btn qqg-btn-primary', onClick: onClose }, '完成'),
+        ],
+      },
+      writable ? null : h('div', { className: 'qqg-status qqg-status-err', style: { marginBottom: 12 } },
+        '当前配置不可写，下面的值只能看不能改。'),
+      h('div', { className: 'qqg-setgrid' },
+        // 左：响应档位 + 指令禁言
+        h('div', null,
+          h('div', { className: 'qqg-group-title' }, '响应档位'),
+          h('div', { className: 'qqg-field', style: { marginTop: 10 } },
+            h('input', {
+              type: 'range', className: 'qqg-slider',
+              min: 0, max: ACTIVITY_LEVELS.length - 1, step: 1,
+              value: level,
+              disabled: !writable,
+              'aria-label': '响应档位',
+              onChange: (e) => set('rhythm.activityLevel', Number(e.target.value)),
+            }),
+            h('div', { className: 'qqg-slider-ticks' },
+              ACTIVITY_LEVELS.map((l) => h('span', {
+                key: l.id, className: level === l.id ? 'on' : '',
+              }, l.label))),
+            h('div', { className: 'qqg-field-hint', style: { marginTop: 8 } },
+              `${cur.label} —— ${cur.desc}`)),
+          h('div', { style: { height: 16 } }),
+          h(SwitchField, {
+            label: '指令禁言', value: muteOn, onChange: (v) => set('rhythm.mute.enabled', v),
+            hint: '命中禁言指令词时，该会话静默一段时间不再回复。',
+          }),
+          muteOn ? h(React.Fragment, null,
+            h(TextField, {
+              label: '禁言指令词', value: muteWords, onChange: setWords,
+              hint: '逗号分隔，任一命中即触发。',
+            }),
+            h('div', { style: { height: 12 } }),
+            h(NumField, {
+              label: '禁言时长（秒）', value: muteSec, min: 5, max: 3600,
+              onChange: (v) => set('rhythm.mute.seconds', v),
+            })) : null),
+
+        // 右：节奏参数 + 说明
+        h('div', null,
+          h('div', { className: 'qqg-group-title' }, '合并与节奏'),
+          h('div', { style: { marginTop: 10 } },
+            h(NumField, {
+              label: '防抖合并窗口（毫秒）', value: debounceMs, min: 0, max: 10000, step: 50,
+              onChange: (v) => set('rhythm.debounceWindowMs', v),
+              hint: '同一会话连续发多条时，等这么久再一起处理。',
+            }),
+            h('div', { style: { height: 12 } }),
+            h(NumField, {
+              label: '批次间隔（毫秒）', value: batchMs, min: 0, max: 30000, step: 100,
+              onChange: (v) => set('rhythm.batchIntervalMs', v),
+              hint: '一轮回复分成多个气泡时，相邻气泡的间隔。',
+            }),
+            h('div', { style: { height: 12 } }),
+            h(NumField, {
+              label: '每分钟回复上限', value: perMin, min: 1, max: 120,
+              onChange: (v) => set('rhythm.rateLimit.perMin', v),
+              hint: '按会话独立计数，超出后丢弃。',
+            }),
+            h('div', { style: { height: 12 } }),
+            h(NumField, {
+              label: '允许突发条数', value: burst, min: 0, max: 30,
+              onChange: (v) => set('rhythm.rateLimit.burst', v),
+            }),
+            h('div', { style: { height: 8 } }),
+            h(SwitchField, {
+              label: '超限静默', value: silent,
+              onChange: (v) => set('rhythm.rateLimit.silent', v),
+              hint: '打开则不回「太频繁」这类提示，避免暴露机器人。',
+            })),
+          h('div', { className: 'qqg-setdesc', style: { marginTop: 14 } },
+            h('div', { className: 'qqg-setdesc-title' }, '当前取值'),
+            h('div', { className: 'qqg-kv' }, h('span', null, '响应档位'), h('b', null, cur.label)),
+            h('div', { className: 'qqg-kv' }, h('span', null, '合并窗口'), h('b', null, debounceMs + ' ms')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '批次间隔'), h('b', null, batchMs + ' ms')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '频率上限'), h('b', null, perMin + '/分（突发 ' + burst + '）')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '指令禁言'),
+              h('b', null, muteOn ? muteSec + 's' : '关')),
+            h('ul', { className: 'qqg-setdesc-list' },
+              h('li', null, '红线：模型原生换行绝不合并，这里只合并同一个人的连续短消息。'),
+              h('li', null, '这些字段桥接每 2 秒轮询一次，保存后通常 2 秒内生效。'))))))
+    }
+
+    function SettingsTab({ get, write, writable, form, pickDirectory }) {
+      const common = { get, write, writable, form, pickDirectory }
+      const [sendOpen, setSendOpen] = React.useState(false)
+      const [activeOpen, setActiveOpen] = React.useState(false)
+      return h('div', { className: 'qqg-stack' },
+        h(TabHead, {
+          title: '全局设置',
+          desc: '改动由 config-editor 写入 profile 配置，桥接每 2 秒轮询，通常 2 秒内生效。',
+        }),
+
+        h('div', { id: 'qqg-anchor-split', className: 'qqg-anchor' },
+          h(Panel, {
+            title: '运行节奏',
+            desc: '发送切片与响应时机。点开分别配置。',
+            right: h('span', { className: 'qqg-pill' }, '2 组参数'),
+          },
+          h('div', { className: 'qqg-actions-2' },
+            h('button', {
+              type: 'button', className: 'qqg-bigbtn',
+              onClick: () => setSendOpen(true),
+            },
+            h('span', { className: 'qqg-bigbtn-icon' }, h(Glyph, { name: 'send', size: 17 })),
+            h('span', { className: 'qqg-bigbtn-main' },
+              h('span', { className: 'qqg-bigbtn-name' }, '信息发送配置'),
+              h('span', { className: 'qqg-bigbtn-desc' },
+                `单行阈值 ${get('bubbleMaxChars')} · 合并上限 ${get('mergeMaxChars')} · 打字延时分级`)),
+            h('span', { className: 'qqg-bigbtn-arrow' }, h(Glyph, { name: 'chevron', size: 15 }))),
+            h('button', {
+              type: 'button', className: 'qqg-bigbtn',
+              onClick: () => setActiveOpen(true),
+            },
+            h('span', { className: 'qqg-bigbtn-icon' }, h(Glyph, { name: 'activity', size: 17 })),
+            h('span', { className: 'qqg-bigbtn-main' },
+              h('span', { className: 'qqg-bigbtn-name' }, '活跃设置'),
+              h('span', { className: 'qqg-bigbtn-desc' }, '响应档位 · 防抖合并 · 批次间隔 · 指令禁言')),
+            h('span', { className: 'qqg-bigbtn-arrow' }, h(Glyph, { name: 'chevron', size: 15 })))))),
+
+        h('div', { id: 'qqg-anchor-persona', className: 'qqg-anchor' }, h(PersonaSection, common)),
+        h('div', { id: 'qqg-anchor-allow', className: 'qqg-anchor' }, h(AllowSection, common)),
+        h('div', { id: 'qqg-anchor-onebot', className: 'qqg-anchor' }, h(OneBotSection, common)),
+        h('div', { id: 'qqg-anchor-napcat', className: 'qqg-anchor' }, h(NapcatSection, common)),
+
+        h(SendConfigModal, {
+          open: sendOpen, get, write, writable, form,
+          onClose: () => setSendOpen(false),
+        }),
+        h(ActiveSettingsModal, {
+          open: activeOpen,
+          get, write, writable,
+          onClose: () => setActiveOpen(false),
+        }))
+    }
+
+    /* ══════════ Tab 5 · 数据与用量（Mock）══════════ */
+    /** 纯 CSS 柱状图：每根柱子 = 一个 div，高度按数据换算成 px（避免百分比高度在 flex 里失真）。 */
+    function BarChart({ rows, valueKey }) {
+      const max = Math.max(...rows.map((r) => r[valueKey]))
+      const MAX_BAR_PX = 132
+      return h('div', { className: 'qqg-chart' },
+        rows.map((r) => {
+          const px = Math.max(6, Math.round((r[valueKey] / max) * MAX_BAR_PX))
+          return h('div', { key: r.day, className: 'qqg-chart-col', title: `${r.day} · ${fmtNum(r[valueKey])}` },
+            h('div', { className: 'qqg-chart-val' }, fmtNum(r[valueKey])),
+            h('div', { className: 'qqg-chart-bar', style: { height: px + 'px' } }),
+            h('div', { className: 'qqg-chart-day' }, r.day.slice(3)))
+        }))
+    }
+
+    /**
+     * 纯 CSS 折线/面积图：
+     *   面积 = 一个 div + clip-path polygon（折线点 + 底边闭合）；
+     *   折线 = 沿同一组折线点、向下偏移 1.2% 形成的**细带** polygon，
+     *          这样不依赖层叠遮挡，放大缩小都不会露出整块实色。
+     * 不引任何图表库。
+     */
+    function AreaChart({ rows, valueKey }) {
+      const max = Math.max(...rows.map((r) => r[valueKey]))
+      const min = Math.min(...rows.map((r) => r[valueKey]))
+      const span = max - min || 1
+      const pts = rows.map((r, i) => {
+        const x = (i / Math.max(rows.length - 1, 1)) * 100
+        const y = 92 - ((r[valueKey] - min) / span) * 76
+        return [x, y]
+      })
+      const areaPoly = ['0% 100%', ...pts.map(([x, y]) => `${x.toFixed(2)}% ${y.toFixed(2)}%`), '100% 100%'].join(', ')
+      const linePoly = [
+        ...pts.map(([x, y]) => `${x.toFixed(2)}% ${y.toFixed(2)}%`),
+        ...pts.slice().reverse().map(([x, y]) => `${x.toFixed(2)}% ${(y + 1.4).toFixed(2)}%`),
+      ].join(', ')
+      return h('div', { className: 'qqg-area-wrap' },
+        h('div', { className: 'qqg-area' },
+          h('div', { className: 'qqg-area-fill', style: { clipPath: `polygon(${areaPoly})` } }),
+          h('div', { className: 'qqg-area-stroke', style: { clipPath: `polygon(${linePoly})` } }),
+          pts.map(([x, y], i) => h('span', {
+            key: i, className: 'qqg-area-dot',
+            style: { left: x + '%', top: y + '%' },
+            title: `${rows[i].day} · ${fmtNum(rows[i][valueKey])}`,
+          }))),
+        h('div', { className: 'qqg-area-labels' },
+          rows.map((r) => h('span', { key: r.day }, r.day.slice(3)))))
+    }
+
+    function UsageTable({ cols, rows }) {
+      return h('div', { className: 'qqg-table-wrap' },
+        h('table', { className: 'qqg-table' },
+          h('thead', null, h('tr', null,
+            cols.map((c) => h('th', { key: c.key, className: c.num ? 'qqg-num' : '' }, c.label)))),
+          h('tbody', null, rows.map((r, i) => h('tr', { key: i },
+            cols.map((c) => h('td', { key: c.key, className: c.num ? 'qqg-num' : '' },
+              c.render ? c.render(r) : r[c.key])))))))
+    }
+
+    const shareCell = (r) => h('div', { className: 'qqg-share' },
+      h('div', { className: 'qqg-share-track' },
+        h('div', { className: 'qqg-share-fill', style: { width: Math.min(r.share, 100) + '%' } })),
+      h('span', { className: 'qqg-muted' }, r.share + '%'))
+
+    function UsageTab() {
+      const [dim, setDim] = React.useState('calls')
+      const dimLabel = { calls: '调用次数', tokens: 'Token', cost: '成本' }
+      return h('div', { className: 'qqg-stack' },
+        h(TabHead, {
+          title: '数据与用量',
+          desc: '图表与表格均为 Mock 数据，用于确认版式；接统计接口后替换数据源即可。',
+          tags: h(React.Fragment, null,
+            h('span', { className: 'qqg-pill qqg-pill-accent' }, 'Mock'),
+            h('span', { className: 'qqg-pill' }, '近 7 天')),
+        }),
+        h(Panel, {
+          title: '用量趋势',
+          desc: '近 7 天每日用量。柱状图与面积图均为纯 CSS 绘制。',
+          right: h('div', { className: 'qqg-actions' },
+            ['calls', 'tokens', 'cost'].map((k) => h('button', {
+              key: k, type: 'button',
+              className: 'qqg-btn' + (dim === k ? ' qqg-btn-primary' : ''),
+              onClick: () => setDim(k),
+            }, dimLabel[k]))),
+        },
+        h(BarChart, { rows: MOCK_USAGE_DAYS, valueKey: dim }),
+        h('div', { className: 'qqg-legend' },
+          h('span', { className: 'qqg-legend-item' },
+            h('span', { className: 'qqg-legend-swatch' }), dimLabel[dim])),
+        h('div', { style: { borderTop: '1px solid var(--dsw-alias-border-l1)', paddingTop: 14 } },
+          h('div', { className: 'qqg-panel-desc' }, 'Token 消耗走势（面积图）'),
+          h(AreaChart, { rows: MOCK_USAGE_DAYS, valueKey: 'tokens' }))),
+
+        h('div', { className: 'qqg-cols' },
+          h(Panel, { title: '按天统计', desc: '占位表格，字段与后端约定后再接。' },
+            h(UsageTable, {
+              cols: [
+                { key: 'day', label: '日期' },
+                { key: 'calls', label: '调用', num: true, render: (r) => fmtNum(r.calls) },
+                { key: 'tokens', label: 'Token', num: true, render: (r) => fmtNum(r.tokens) },
+                { key: 'cost', label: '成本', num: true, render: (r) => '¥' + r.cost.toFixed(2) },
+                { key: 'ok', label: '成功率', num: true, render: (r) => r.ok.toFixed(1) + '%' },
+              ],
+              rows: MOCK_USAGE_DAYS,
+            })),
+          h(Panel, { title: '按模型统计', desc: '占位表格。' },
+            h(UsageTable, {
+              cols: [
+                { key: 'name', label: '模型' },
+                { key: 'calls', label: '调用', num: true, render: (r) => fmtNum(r.calls) },
+                { key: 'tokens', label: 'Token', num: true, render: (r) => fmtNum(r.tokens) },
+                { key: 'cost', label: '成本', num: true, render: (r) => '¥' + r.cost.toFixed(2) },
+                { key: 'share', label: '占比', render: shareCell },
+              ],
+              rows: MOCK_USAGE_MODELS,
+            }))),
+        h(Panel, { title: '按插件统计', desc: '占位表格。' },
+          h(UsageTable, {
+            cols: [
+              { key: 'name', label: '插件 / 技能' },
+              { key: 'calls', label: '调用', num: true, render: (r) => fmtNum(r.calls) },
+              { key: 'tokens', label: 'Token', num: true, render: (r) => fmtNum(r.tokens) },
+              { key: 'cost', label: '成本', num: true, render: (r) => '¥' + r.cost.toFixed(2) },
+              { key: 'share', label: '占比', render: shareCell },
+            ],
+            rows: MOCK_USAGE_PLUGINS,
+          })))
     }
 
     function SettingsPanel(props) {
@@ -928,6 +3293,10 @@ window.__ModuleLoader__.load({
       const value = snap?.value ?? {}
       const writable = snap?.writable === true
       const [active, setActive] = React.useState('status')
+      const [guideOpen, setGuideOpen] = React.useState(false)
+      // 引导按钮上的计数要包含桥接进程的真实状态，所以把轮询提到面板这一层：
+      // 弹窗与底部按钮共用同一份 proc，避免两个状态源各算各的。
+      const [guideProc, refreshGuideProc] = useBridgeProc(true)
 
       const get = (path) => {
         const v = getPath(value, path)
@@ -955,24 +3324,71 @@ window.__ModuleLoader__.load({
       }
 
       const common = { get, write, writable, form }
+      // 引导里的「去配置」：切到全局设置 Tab 并滚到对应卡片。
+      const goto = (target) => {
+        setActive('settings')
+        const id = ANCHORS[target]
+        if (!id) return
+        // 等 React 把目标 Tab 挂到 DOM 之后再滚，否则拿不到节点。
+        window.setTimeout(() => {
+          const el = document.getElementById(id)
+          if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        }, 60)
+      }
+
+      // 引导按钮上的「x/3」：与弹窗共用 guideSteps/guideProgress，口径完全一致。
+      const guide = guideProgress(guideSteps(get, guideProc))
+
       let body
-      if (active === 'status') body = h(StatusSection, common)
-      else if (active === 'napcat') body = h(NapcatSection, common)
-      else if (active === 'onebot') body = h(OneBotSection, common)
-      else if (active === 'allow') body = h(AllowSection, common)
-      else if (active === 'persona') body = h(PersonaSection, common)
-      else body = h(SplitSection, common)
+      if (active === 'sessions') body = h(SessionsTab)
+      else if (active === 'skills') body = h(SkillsTab, { ...common, pickDirectory: props?.pickDirectory })
+      else if (active === 'usage') body = h(UsageTab)
+      else if (active === 'settings') body = h(SettingsTab, { ...common, pickDirectory: props?.pickDirectory })
+      else {
+        // 运行状态：既有状态/启停/日志 + 今日用量 + AI 排障助手。
+        body = h('div', { className: 'qqg-stack' },
+          h(TabHead, {
+            title: '运行状态',
+            desc: '桥接与 NapCat 的实时状态；启停按钮直接打到 Host 路由。',
+            tags: h(React.Fragment, null,
+              h('span', { className: 'qqg-pill' }, '每 3 秒刷新'),
+              h('span', { className: 'qqg-pill qqg-pill-accent' }, '实时')),
+          }),
+          h(TodayUsage),
+          h(StatusSection, common),
+          // NapCat 的状态与启停也放在这一页：和桥接启停挨着，不用再切 Tab。
+          h(NapcatProcessSection, common),
+          h(AiAssistant))
+      }
 
       return h('div', { className: 'qqg-layout' },
         h('style', null, CSS),
-        h('nav', { className: 'qqg-nav', 'aria-label': 'QQ 桥接设置分类' },
-          SECTIONS.map((s) => h('button', {
-            key: s.id,
-            type: 'button',
-            className: 'qqg-nav-item' + (active === s.id ? ' qqg-nav-item-on' : ''),
-            'aria-current': active === s.id ? 'page' : undefined,
-            onClick: () => setActive(s.id),
-          }, s.label))),
+        h('style', null, CSS2),
+        h('nav', { className: 'qqg-nav', 'aria-label': 'QQ 桥接控制台导航' },
+          h('div', { className: 'qqg-nav-brand' },
+            h('span', { className: 'qqg-nav-brand-dot' }),
+            h('span', { className: 'qqg-nav-brand-text' }, 'QQ 桥接')),
+          // 菜单列表独立滚动；底部引导按钮用 margin-top:auto 沉底，不跟着滚。
+          h('div', { className: 'qqg-nav-list' },
+            SECTIONS.map((s) => h('button', {
+              key: s.id,
+              type: 'button',
+              className: 'qqg-nav-item' + (active === s.id ? ' qqg-nav-item-on' : ''),
+              'aria-current': active === s.id ? 'page' : undefined,
+              onClick: () => setActive(s.id),
+            },
+            h('span', { className: 'qqg-nav-icon' }, h(Glyph, { name: s.icon, size: 15 })),
+            h('span', { className: 'qqg-nav-text' }, s.label),
+            s.badge ? h('span', { className: 'qqg-nav-badge' }, s.badge) : null))),
+          h('div', { className: 'qqg-nav-foot' },
+            h('button', {
+              type: 'button', className: 'qqg-nav-guide',
+              title: '三步把 QQ 桥接跑通',
+              onClick: () => setGuideOpen(true),
+            },
+            h('span', { className: 'qqg-nav-guide-icon' }, h(Glyph, { name: 'bulb', size: 15 })),
+            h('span', { className: 'qqg-nav-guide-text' }, '使用引导'),
+            h('span', { className: 'qqg-nav-guide-done' }, `${guide.done}/${guide.total}`)))),
         h('div', { className: 'qqg-content' },
           body,
           h('div', { className: 'qqg-hint qqg-hint-bottom' },
@@ -984,7 +3400,13 @@ window.__ModuleLoader__.load({
             snap?.source === 'http'
               ? '只读模式：正在用 HTTP 兜底读取，改动无法保存（remote.settings 不可用）。'
               : '当前配置不可写（可能被更高优先级的配置层覆盖）。'),
-        ))
+        ),
+        // 引导弹窗挂在最外层：从任何 Tab 点左下角按钮都能开。
+        h(OnboardingModal, {
+          open: guideOpen, get, goto,
+          proc: guideProc, refreshProc: refreshGuideProc,
+          onClose: () => setGuideOpen(false),
+        }))
     }
 
     return {
@@ -993,6 +3415,34 @@ window.__ModuleLoader__.load({
       // 自己声明的也是 ["remote", "remote.settings"]）。
       inject: ['slots', 'remote', 'remote.settings'],
       apply(ctx) {
+        /**
+         * 调起系统原生「选择文件夹」对话框（不经过我们自己的 Host 路由）。
+         *
+         * 走客户端已装载的 `uiWorkspace.pickDirectory()`（由 profile 的
+         * `directory-picker` 行提供，native 后端 —— 我们用 client Slots 的
+         * `sidebar.workspaces.directoryFlow` 确认过它的 occupant 是 active 的）。
+         * 好处：**不需要 Host 端任何新代码**，改完 F5 就能用；
+         * 而 `/dsh-qq-guard/pick-dir` 那条自定义路由要重启 DSH 才会注册，只作兜底。
+         *
+         * uiWorkspace 是可选服务（`ctx.get` 拿，不做硬 inject），
+         * 所以这里延迟解析，避免插件装载顺序影响。
+         */
+        const pickDirectoryNative = async () => {
+          let ws
+          try {
+            ws = ctx.get?.('uiWorkspace') ?? ctx.uiWorkspace
+          } catch { ws = undefined }
+          if (!ws || typeof ws.pickDirectory !== 'function') {
+            return { ok: false, reason: 'no-ui-workspace' }
+          }
+          try {
+            const path = await ws.pickDirectory()
+            return { ok: true, path: path ?? null }
+          } catch (error) {
+            return { ok: false, reason: 'pick-failed', detail: error?.message ?? String(error) }
+          }
+        }
+
         ctx.effect(() => {
           const style = document.createElement('style')
           style.dataset.plugin = '@local/dsh-qq-guard'
@@ -1018,7 +3468,7 @@ window.__ModuleLoader__.load({
             id: 'qq-bridge',
             order: 6,
             label: () => 'QQ 桥接',
-            inject: () => ({ remoteForm }),
+            inject: () => ({ remoteForm, pickDirectory: pickDirectoryNative }),
           }, SettingsPanel)),
           'qq-guard: settings section',
         )
@@ -1034,7 +3484,7 @@ window.__ModuleLoader__.load({
           () => ctx.slots.inject('main', () => ctx.slots.register({
             name: 'main',
             key: MAIN_KEY,
-            inject: () => ({ remoteForm }),
+            inject: () => ({ remoteForm, pickDirectory: pickDirectoryNative }),
           }, BridgePanel)),
           'qq-guard: main panel',
         )
@@ -1059,7 +3509,7 @@ window.__ModuleLoader__.load({
             () => inner.slots.inject('plugins.bundle.config', () => inner.slots.register({
               name: 'plugins.bundle.config',
               key: '@local/dsh-qq-guard',
-              inject: () => ({ form }),
+              inject: () => ({ form, pickDirectory: pickDirectoryNative }),
             }, SettingsPanel)),
             'qq-guard: plugins page card',
           )

@@ -80,7 +80,53 @@ export const inject = ['tools', 'webServer', 'subprocess']
 // Config 用的 Schemastery：官方包，随 DSH 一起解析（本插件不声明依赖）。
 import Schema from '@deepseek-ai/schemastery'
 import { NapcatManager, DEFAULT_WS_PORT } from './napcat.mjs'
-import { BridgeRunner } from './bridge-runner.mjs'
+import { BridgeRunner, DEFAULT_BRIDGE_DIR } from './bridge-runner.mjs'
+import { SandboxManager } from './sandbox/manager.mjs'
+import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, realpathSync } from 'node:fs'
+import { builtinModules } from 'node:module'
+import os from 'node:os'
+import path from 'node:path'
+
+/**
+ * 技能 / 插件清单的默认值（Phase 4）。
+ *
+ * 为什么把清单放进 Config 而不是留成前端常量：
+ *   用户要求「拖拽排序的结果、开关的切换状态必须真实写回配置」。
+ *   那这条数组本身就是配置本体 —— 顺序 = 数组顺序，开关 = `enabled`。
+ *   前端只渲染配置里的东西，不再自己维护一份假列表。
+ *
+ * ⚠️ 改这里的默认值时注意：已经保存过配置的用户不会被覆盖
+ * （Config 的 default 只在该字段从未落盘时生效）。
+ */
+const DEFAULT_SKILLS = [
+  { id: 'sk-voice', name: '发语音', icon: 'send', tag: '内置', ver: '1.0.2', enabled: true,
+    desc: '把回复文本合成语音，以 QQ 语音条发出；超过 60 秒自动转文字。' },
+  { id: 'sk-vision', name: '图片理解', icon: 'image', tag: '内置', ver: '1.3.2', enabled: true,
+    desc: '识别聊天里发的截图与照片，提取文字、报错信息和界面元素。' },
+  { id: 'sk-search', name: '网页搜索', icon: 'search', tag: '内置', ver: '1.0.4', enabled: true,
+    desc: '联网检索并把结果压缩成两三句话，用于回答时效性问题。' },
+  { id: 'sk-memory', name: '记忆提取', icon: 'memory', tag: '内置', ver: '1.2.0', enabled: true,
+    desc: '从会话里抽取长期事实（偏好、身份、约定），写进记忆空间供后续召回。' },
+  { id: 'sk-remind', name: '定时提醒', icon: 'clock', tag: '内置', ver: '1.1.0', enabled: false,
+    desc: '按 cron 或「每天早上八点」这类自然语言创建提醒，到点私聊推送。' },
+  { id: 'sk-weather', name: '天气查询', icon: 'spark', tag: '实验', ver: '0.9.3', enabled: false,
+    desc: '按城市查实时天气与未来三天预报，群聊里需要显式提问才触发。' },
+]
+
+const DEFAULT_PLUGINS = [
+  { id: 'pl-debounce', name: '防抖合并', icon: 'activity', tag: '本地', ver: '1.4.0', enabled: true,
+    desc: '群聊里连续多条短消息先攒一窗口再一次性回复，避免逐条刷屏。' },
+  { id: 'pl-ratelimit', name: '频率控制', icon: 'shield', tag: '本地', ver: '1.1.0', enabled: true,
+    desc: '按会话限流，超出阈值直接静默丢弃，防止被刷屏或触发风控。' },
+  { id: 'pl-compact', name: '上下文压缩', icon: 'memory', tag: '内置', ver: '1.4.3', enabled: true,
+    desc: '长会话自动摘要早期内容，控制 token 开销，同时保住关键约定。' },
+  { id: 'pl-guard', name: '工具门禁', icon: 'shield', tag: '本地', ver: '1.1.0', enabled: true,
+    desc: 'deny-by-default 的工具白名单，把本地执行能力彻底挡在 QQ 会话之外。' },
+  { id: 'pl-persona', name: '人设注入', icon: 'spark', tag: '本地', ver: '1.2.1', enabled: true,
+    desc: '把全局人设或会话级覆盖注入系统提示词，complete 模式下不掺入任何框架自述。' },
+  { id: 'pl-archive', name: '日志归档', icon: 'file', tag: '实验', ver: '0.8.2', enabled: false,
+    desc: '把桥接日志与收到的截图按日期归档到工作区，方便事后复盘。' },
+]
 
 /**
  * 需要从 schema 隐藏 + 执行期拒绝的工具名。
@@ -220,6 +266,31 @@ const Config = Schema.object({
   personaPresetDefault: Schema.string()
     .description('当前 preset 的默认人设（只读快照，供 UI 的「恢复默认」按钮参考）。')
     .default('').volatile(),
+  // P1.5：人设拆成结构化字段，桥接层（bridge.mjs composePersonaPrompt）拼最终系统提示词。
+  personaBotName: Schema.string()
+    .description('机器人名字。非空时替换默认人设里的 DeepSeek，并追加身份说明。')
+    .default('').volatile(),
+  personaGroupName: Schema.string()
+    .description('群内展示名。非空时追加到身份说明里。')
+    .default('').volatile(),
+  personaParticipation: Schema.string()
+    .description('参与度：quiet=安静型 / normal=普通群友 / active=活跃型。')
+    .default('normal').volatile(),
+  personaExtraRules: Schema.string()
+    .description('管理员附加规则。非空时追加到最终系统提示词末尾。')
+    .default('').volatile(),
+  personaSystemPrompt: Schema.string()
+    .description('完整系统提示词覆盖。非空时完全替换内置人设（名字/参与度/附加规则都不再追加）。')
+    .default('').volatile(),
+  personaPresets: Schema.array(Schema.object({
+    id: Schema.string().required(),
+    name: Schema.string().default(''),
+    text: Schema.string().default(''),
+  })).description('自定义人设列表（UI 下拉选择用）。')
+    .default([]).volatile(),
+  personaPresetId: Schema.string()
+    .description('当前选中的自定义人设 id；空串 = 使用默认人设。')
+    .default('').volatile(),
 
   // ── 白名单（批次 4A-UI）──────────────────────────────────────
   // 桥接每处理一条消息都从热配置现读，改完下一条即生效。
@@ -270,6 +341,85 @@ const Config = Schema.object({
       .description('DSH 启动时自动拉起桥接（让状态灯常亮）。已有桥接实例在跑时会自动跳过，不会双开。')
       .default(false).volatile(),
   }).description('桥接进程管理').default({}),
+  // ── 技能与插件清单（Phase 4：真实读写）──────────────────────
+  //
+  // 数组顺序 = 界面排序（拖拽/上下移直接写回这个顺序）；
+  // `enabled` = 开关状态。前端不再维护自己的假列表。
+  skills: Schema.array(Schema.object({
+    id: Schema.string().description('稳定标识，改它等于换一条。').required(),
+    name: Schema.string().required(),
+    icon: Schema.string().default('spark'),
+    tag: Schema.string().default('内置'),
+    ver: Schema.string().default('1.0.0'),
+    desc: Schema.string().default(''),
+    enabled: Schema.boolean().default(false),
+  })).description('技能清单（顺序即展示顺序）').default(DEFAULT_SKILLS).volatile(),
+
+  plugins: Schema.array(Schema.object({
+    id: Schema.string().required(),
+    name: Schema.string().required(),
+    icon: Schema.string().default('spark'),
+    tag: Schema.string().default('本地'),
+    ver: Schema.string().default('1.0.0'),
+    desc: Schema.string().default(''),
+    enabled: Schema.boolean().default(false),
+  })).description('插件清单（顺序即展示顺序）').default(DEFAULT_PLUGINS).volatile(),
+
+  // ── 外部插件挂载（只读扫描，默认全关）───────────────────────
+  //
+  // 扫描目录里的有效模块：package.json（含 `dsh` 字段）、plugin.json、skill.json
+  // （QQ Agent 格式，BOM 容错）。不改目标目录、不装东西、不执行外部代码。
+  // `enabled` 记录被打开的外部插件（按名称/id），默认空 = 全关。
+  externalPlugins: Schema.object({
+    dirs: Schema.array(Schema.string())
+      .description('外部插件目录（为空时自动定位当前 profile 的 node_modules）。')
+      .default([]).volatile(),
+    enabled: Schema.array(Schema.string())
+      .description('被启用的外部插件名称/id。默认空 = 全部关闭。')
+      .default([]).volatile(),
+    // P1.5：外部插件配置项的本地副本（按模块 id 存 configSchema 里的值）。
+    // 只写进本插件自己的 profile 配置，**不碰对方的 config.json**。
+    settings: Schema.dict(Schema.any())
+      .description('外部插件的本地配置（按模块 id 分组，来自各自的 configSchema）。')
+      .default({}).volatile(),
+  }).description('外部插件挂载').default({}),
+
+  // ── DSH 会话（Phase 4）──────────────────────────────────────
+  //
+  // 桥接的 pickHotConfig 只放行这个子键（`dsh.baseUrl` / `sessionCwd` 这类
+  // 连接参数绝不通过热配置下发），所以开关放在 `dsh.archiveStaleSessions` 上。
+  dsh: Schema.object({
+    archiveStaleSessions: Schema.boolean()
+      .description('桥接发现映射会话失效并重建时，自动归档那条旧会话（防止 DSH 侧会话堆积）。')
+      .default(true).volatile(),
+  }).description('DSH 会话').default({}),
+
+  // ── 运行节奏（Phase 4：活跃设置弹窗的真实字段）──────────────
+  //
+  // 桥接每 2 秒轮询 /config 拿这些值，改完下一条消息即按新值处理。
+  rhythm: Schema.object({
+    activityLevel: Schema.number()
+      .description('响应档位：0=仅艾特/私聊，1=+关键词，2=+随机，3=全响应。')
+      .default(1).min(0).max(3).volatile(),
+    debounceWindowMs: Schema.number()
+      .description('防抖合并窗口(ms)：同一会话连续消息在此窗口内合并成一次处理。')
+      .default(800).min(0).max(10000).volatile(),
+    batchIntervalMs: Schema.number()
+      .description('批次间隔(ms)：一轮回复拆成多个气泡时相邻气泡的最小间隔。')
+      .default(2500).min(0).max(30000).volatile(),
+    rateLimit: Schema.object({
+      perMin: Schema.number().description('每会话每分钟回复上限').default(12).min(1).max(120).volatile(),
+      burst: Schema.number().description('允许的突发条数').default(3).min(0).max(30).volatile(),
+      silent: Schema.boolean().description('超限是否静默（不提示）').default(true).volatile(),
+    }).description('频率控制').default({}),
+    mute: Schema.object({
+      enabled: Schema.boolean().description('指令禁言总开关').default(true).volatile(),
+      words: Schema.array(Schema.string())
+        .description('禁言指令词，任一命中即静音该会话。')
+        .default(['闭嘴', '安静', '别刷屏']).volatile(),
+      seconds: Schema.number().description('禁言时长(秒)').default(60).min(5).max(3600).volatile(),
+    }).description('指令禁言').default({}),
+  }).description('运行节奏').default({}),
 }).description('QQ 桥接运行时参数：改完即时生效（桥接轮询本插件的 /dsh-qq-guard/config）。')
 
 /** 路由路径：桥接据此拉配置。 */
@@ -280,6 +430,569 @@ const STATUS_ROUTE_PATH = '/dsh-qq-guard/status'
 const NAPCAT_ROUTE_PATH = '/dsh-qq-guard/napcat'
 /** 路由路径：桥接进程启停与状态（批次 4B 补充）。 */
 const BRIDGE_ROUTE_PATH = '/dsh-qq-guard/bridge'
+/** 路由路径：调起系统原生「选择文件夹」对话框（NapCat 安装目录的「浏览」按钮）。 */
+const PICK_DIR_ROUTE_PATH = '/dsh-qq-guard/pick-dir'
+/** 路由路径：只读扫描外部插件目录（Phase 4）。 */
+const EXTERNAL_ROUTE_PATH = '/dsh-qq-guard/external-plugins'
+/** 路由路径：在独立沙箱子进程里加载一个外部插件（P1，只读测试）。 */
+const EXTERNAL_TEST_ROUTE_PATH = '/dsh-qq-guard/external-plugins/test'
+/** 路由路径：清理 QQ 工作区里失效的会话（Phase 4）。 */
+const CLEANUP_ROUTE_PATH = '/dsh-qq-guard/cleanup-sessions'
+
+/**
+ * 定位「当前 profile 的 node_modules」——外部插件扫描的默认目录。
+ *
+ * 为什么不用 import.meta.url 推：本包是 profile 里的 link 开发插件，
+ * import.meta.url 指向源码目录（default-workspace/plugins/...），不是 profile。
+ * 所以反过来找：哪个 profile 的 node_modules 里装了 `@local/dsh-qq-guard`，
+ * 那个就是当前 profile。
+ *
+ * @returns {string[]} 候选目录（通常 1 个）
+ */
+export function findDefaultPluginDirs() {
+  const root = path.join(os.homedir(), '.dsh', 'profiles')
+  const out = []
+  let names
+  try { names = readdirSync(root, { withFileTypes: true }) } catch { return out }
+  for (const d of names) {
+    if (!d.isDirectory()) continue
+    const nm = path.join(root, d.name, 'node_modules')
+    if (!existsSync(nm)) continue
+    if (existsSync(path.join(nm, '@local', 'dsh-qq-guard'))) out.push(nm)
+  }
+  return out
+}
+
+/* ── 外部插件扫描（P0：只读展示，不加载任何外部代码）─────────────────
+ *
+ * 兼容两种生态：
+ *   ① DSH 原生插件包：`package.json` 里有 `dsh` 字段（bundle / client 入口）；
+ *   ② QQ Agent 模块：目录下有 `plugin.json` 或 `skill.json`（`skill.json` 优先，
+ *      两者在对方装载器里等价，只是目录语义不同）。清单允许 UTF-8 BOM。
+ *
+ * 元数据按规范白名单解析，非标字段（settingsUi / intercept / commands / tools …）
+ * 一律丢弃，只留一个计数；卡片上要显示的是稳定的那几个字段，不跟对方的补丁走。
+ *
+ * 兼容性判定只做**静态扫描**：命中 Node 原生模块、宿主内部引用（相对路径越出
+ * 模块目录，如 `../../src/*`）或裸 npm 包 → 标「只读/受控」。P0 不执行任何代码，
+ * 所以「受控」只是标签，不是执行许可。扫描失败一律 fail-closed 归到受控。
+ */
+
+/** QQ Agent 清单文件名：`skill.json` 优先，其次 `plugin.json`。 */
+const QQ_MANIFEST_FILES = ['skill.json', 'plugin.json']
+
+/** QQ Agent 清单里保留的标准字段；其余（非标扩展）一律丢弃。 */
+const QQ_MANIFEST_FIELDS = new Set([
+  'id', 'name', 'version', 'apiVersion', 'enabledByDefault',
+  'category', 'description', 'author',
+  'requires', 'capabilities', 'permissions',
+  'configSchema', 'settings', 'prompt', 'deprecated', 'entry',
+])
+
+/** QQ Agent 规范分类枚举；非法值回退 `utility`（与对方的 normalizeManifest 一致）。 */
+const QQ_CATEGORIES = new Set(['model', 'message', 'knowledge', 'media', 'utility', 'fun', 'query'])
+
+/** 静态扫描边界：超限即按受控处理（fail-closed，和对方准入闸同款策略）。 */
+const EXTERNAL_MAX_FILES = 500
+const EXTERNAL_MAX_DEPTH = 12
+
+/** 扫描时跳过的目录：依赖、版本库、产物目录都不是插件本体。 */
+const EXTERNAL_SKIP_DIRS = new Set(['node_modules', '.git', '.github', 'coverage'])
+
+/** 从源码里提取模块说明符：from 'x' / import 'x' / import('x') / require('x')。 */
+const IMPORT_SPEC_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*)['"]([^'"\n]+)['"]/g
+/** 运行期动态 import（模板串）：静态扫描看不到目标，按受控处理。 */
+const DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*`[^`]*\$\{/
+/** Node 22+ 绕过 import/require 的取内置模块方式。 */
+const GET_BUILTIN_MODULE_RE = /\bprocess\s*\.\s*getBuiltinModule\b/
+
+/** 读 JSON，容忍 UTF-8 BOM（对方清单允许带 BOM，直接 JSON.parse 会炸）。 */
+function readJsonWithBom(file) {
+  const text = readFileSync(file, 'utf8')
+  return JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
+}
+
+/** 判断一个相对说明符是否越出模块目录（宿主内部引用）。 */
+function escapesModuleDir(baseDir, spec) {
+  const resolved = path.resolve(baseDir, spec)
+  const rel = path.relative(baseDir, resolved)
+  return rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)
+}
+
+/**
+ * 静态扫描模块依赖，产出兼容性判定所需的最小证据。
+ *
+ * 只读 `.js/.mjs/.cjs`，不 import、不执行；符号链接一律不跟（防环）。
+ *
+ * @param {string} dir 模块目录
+ * @returns {{nodeBuiltins:string[], hostSrc:boolean, bare:string[], dynamic:boolean, files:number, truncated:boolean}}
+ */
+export function scanModuleDeps(dir) {
+  const base = path.resolve(dir)
+  const builtins = new Set(builtinModules)
+  const nodeBuiltins = new Set()
+  const bare = new Set()
+  let hostSrc = false
+  let dynamic = false
+  let files = 0
+  let truncated = false
+
+  const walk = (current, depth) => {
+    if (truncated) return
+    if (depth > EXTERNAL_MAX_DEPTH) { truncated = true; return }
+    let entries
+    try { entries = readdirSync(current, { withFileTypes: true }) } catch { return }
+    for (const item of entries) {
+      if (truncated) return
+      if (item.name.startsWith('.') || EXTERNAL_SKIP_DIRS.has(item.name)) continue
+      if (item.isSymbolicLink()) continue
+      const full = path.join(current, item.name)
+      if (item.isDirectory()) { walk(full, depth + 1); continue }
+      if (!/\.(?:js|mjs|cjs)$/i.test(item.name)) continue
+      if (files >= EXTERNAL_MAX_FILES) { truncated = true; return }
+      files += 1
+      let text
+      try { text = readFileSync(full, 'utf8') } catch { continue }
+      if (DYNAMIC_IMPORT_RE.test(text) || GET_BUILTIN_MODULE_RE.test(text)) dynamic = true
+      for (const match of text.matchAll(IMPORT_SPEC_RE)) {
+        const spec = match[1].trim()
+        if (!spec) continue
+        const name = spec.startsWith('node:') ? spec.slice(5) : spec
+        if (spec.startsWith('node:') || builtins.has(name)) { nodeBuiltins.add(spec); continue }
+        if (spec.startsWith('.')) {
+          if (escapesModuleDir(base, spec)) hostSrc = true
+          continue
+        }
+        if (path.isAbsolute(spec)) { hostSrc = true; continue }
+        bare.add(spec)
+      }
+    }
+  }
+
+  walk(base, 0)
+  return {
+    nodeBuiltins: [...nodeBuiltins].sort(),
+    hostSrc,
+    bare: [...bare].sort(),
+    dynamic,
+    files,
+    truncated,
+  }
+}
+
+/**
+ * 兼容性分级（P0 只用于打标签）。
+ *
+ * @returns {{tier:string, label:string, reasons:string[]}}
+ */
+function classifyExternalCompat({ deps, manifestError = '' }) {
+  if (manifestError) return { tier: 'invalid', label: '清单无效', reasons: [manifestError] }
+  const reasons = []
+  if (deps.nodeBuiltins.length > 0) {
+    reasons.push(`依赖 Node 原生模块：${deps.nodeBuiltins.slice(0, 5).join('、')}`)
+  }
+  if (deps.hostSrc) reasons.push('引用了宿主内部模块（相对路径越出插件目录）')
+  if (deps.bare.length > 0) {
+    reasons.push(`依赖外部 npm 包：${deps.bare.slice(0, 4).join('、')}`)
+  }
+  if (deps.dynamic) reasons.push('存在运行期动态 import（静态扫描看不到目标）')
+  if (deps.truncated) reasons.push('代码文件数超过扫描上限，按受控处理（fail-closed）')
+  if (reasons.length > 0) return { tier: 'controlled', label: '只读/受控', reasons }
+  return { tier: 'self-contained', label: '自包含', reasons: [] }
+}
+
+/** 入参统一成数组：字符串 → 单元素，null/undefined → 空，数组逐项 String 去重。 */
+function asStringArray(value) {
+  if (Array.isArray(value)) {
+    const out = []
+    for (const item of value) {
+      const text = String(item ?? '').trim()
+      if (text && !out.includes(text)) out.push(text)
+    }
+    return out
+  }
+  if (value === null || value === undefined) return []
+  const single = String(value).trim()
+  return single ? [single] : []
+}
+
+/**
+ * configSchema 的展示上限：清单来自外部目录，不能让它把设置页撑爆。
+ */
+const MAX_CONFIG_SCHEMA_FIELDS = 100
+const MAX_CONFIG_TEXT = 200
+const MAX_CONFIG_ENUM_VALUES = 50
+
+/** 截断展示文本（清单里的 label/description 可能很长或带换行）。 */
+function clipConfigText(value, max = MAX_CONFIG_TEXT) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  return text.length > max ? text.slice(0, max) + '…' : text
+}
+
+/**
+ * 归一化 QQ Agent 的 configSchema。
+ *
+ * P1.5 只渲染 4 种类型：boolean / number / string / enum；`action` 是对方控制台的
+ * 界面入口、`internal` 只是说明，两者都丢弃（不认识的类型不猜语义）。
+ *
+ * @param {unknown} raw 清单里的 configSchema
+ * @returns {Record<string, object>}
+ */
+export function normalizeConfigSchema(raw) {
+  const out = {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out
+  let count = 0
+  for (const [key, def] of Object.entries(raw)) {
+    if (count >= MAX_CONFIG_SCHEMA_FIELDS) break
+    if (!def || typeof def !== 'object' || Array.isArray(def)) continue
+    const type = typeof def.type === 'string' ? def.type : ''
+    if (!['boolean', 'number', 'string', 'enum'].includes(type)) continue
+
+    const field = { type }
+    if (typeof def.label === 'string') field.label = clipConfigText(def.label)
+    if (typeof def.description === 'string') field.description = clipConfigText(def.description)
+
+    if (type === 'boolean') {
+      field.default = def.default === true
+    } else if (type === 'number') {
+      field.default = Number.isFinite(Number(def.default)) ? Number(def.default) : 0
+      for (const name of ['min', 'max', 'step']) {
+        if (Number.isFinite(Number(def[name]))) field[name] = Number(def[name])
+      }
+    } else if (type === 'string') {
+      field.default = typeof def.default === 'string' ? def.default : ''
+      if (def.secret === true) field.secret = true
+      if (def.multiline === true) field.multiline = true
+    } else {
+      let values = []
+      if (Array.isArray(def.values)) {
+        values = def.values.map((value) => String(value)).filter(Boolean)
+      } else if (Array.isArray(def.options)) {
+        values = def.options
+          .filter((option) => option && typeof option === 'object' && option.value !== undefined)
+          .map((option) => String(option.value))
+      }
+      field.values = values.slice(0, MAX_CONFIG_ENUM_VALUES)
+      const fallback = field.values.includes(String(def.default))
+        ? String(def.default)
+        : (field.values[0] ?? '')
+      field.default = fallback
+    }
+    out[key] = field
+    count += 1
+  }
+  return out
+}
+
+/**
+ * 从清单的 settings 里挑出 configSchema 声明过的默认值。
+ *
+ * 只收原始类型（字符串/数字/布尔），不把外部清单的任意对象塞进配置。
+ *
+ * @param {unknown} raw 清单里的 settings
+ * @param {Record<string, object>} schema 归一化后的 configSchema
+ * @returns {Record<string, string|number|boolean>}
+ */
+function pickSettingsDefaults(raw, schema) {
+  const out = {}
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const [key, value] of Object.entries(raw)) {
+      if (!(key in schema)) continue
+      if (['string', 'number', 'boolean'].includes(typeof value)) out[key] = value
+    }
+  }
+  for (const [key, field] of Object.entries(schema)) {
+    if (!(key in out) && field.default !== undefined) out[key] = field.default
+  }
+  return out
+}
+
+/**
+ * 按 QQ Agent 规范归一化清单：补默认值、校验 id、丢弃非标字段。
+ *
+ * @param {object|null} raw 已解析的清单（解析失败传 null）
+ * @param {{dirName:string, moduleDir:string, manifestFile:string, manifestError?:string}} options
+ */
+export function normalizeQqManifest(raw, { dirName, moduleDir, manifestFile, manifestError = '' }) {
+  const problems = []
+  const manifest = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : null
+  if (!manifest) {
+    const reason = manifestError || `清单内容不是对象（${manifestFile}）`
+    return {
+      entry: {
+        id: dirName,
+        name: dirName,
+        version: '0.0.0',
+        description: '',
+        author: '',
+        category: 'utility',
+        apiVersion: 1,
+        kind: manifestFile === 'skill.json' ? 'skill' : 'plugin',
+        format: manifestFile,
+        source: manifestFile,
+        requires: [],
+        capabilities: [],
+        permissions: [],
+        enabledByDefault: false,
+        unknownFieldCount: 0,
+        entry: '',
+        hasEntry: false,
+        configSchema: {},
+        settingsDefaults: {},
+      },
+      problems: [reason],
+    }
+  }
+
+  const str = (value) => (typeof value === 'string' ? value.trim() : '')
+  const rawId = str(manifest.id)
+  if (!rawId) problems.push('清单缺少 id，已回退成目录名')
+  else if (!/^[a-z0-9][a-z0-9._-]*$/i.test(rawId)) problems.push(`清单 id「${rawId}」不符合规范`)
+  const id = rawId || dirName
+
+  const categoryRaw = str(manifest.category)
+  const category = QQ_CATEGORIES.has(categoryRaw) ? categoryRaw : 'utility'
+  if (categoryRaw && !QQ_CATEGORIES.has(categoryRaw)) {
+    problems.push(`分类「${categoryRaw}」非规范值，已回退 utility`)
+  }
+
+  const version = str(manifest.version) || '0.0.0'
+  const apiVersion = Number.isFinite(Number(manifest.apiVersion)) && Number(manifest.apiVersion) > 0
+    ? Number(manifest.apiVersion)
+    : 1
+
+  const entryRel = str(manifest.entry) || 'index.js'
+  let hasEntry = false
+  if (escapesModuleDir(moduleDir, entryRel)) {
+    problems.push(`入口「${entryRel}」越出模块目录，已忽略`)
+  } else {
+    try { hasEntry = existsSync(path.resolve(moduleDir, entryRel)) } catch { hasEntry = false }
+    if (!hasEntry) problems.push(`入口文件不存在：${entryRel}`)
+  }
+
+  const unknownFieldCount = Object.keys(manifest)
+    .filter((key) => !QQ_MANIFEST_FIELDS.has(key)).length
+  const configSchema = normalizeConfigSchema(manifest.configSchema)
+  const settingsDefaults = pickSettingsDefaults(manifest.settings, configSchema)
+
+  return {
+    entry: {
+      id,
+      name: str(manifest.name) || id,
+      version,
+      description: str(manifest.description),
+      author: str(manifest.author),
+      category,
+      apiVersion,
+      kind: manifestFile === 'skill.json' ? 'skill' : 'plugin',
+      format: manifestFile,
+      source: manifestFile,
+      requires: asStringArray(manifest.requires),
+      capabilities: asStringArray(manifest.capabilities),
+      permissions: asStringArray(manifest.permissions),
+      enabledByDefault: manifest.enabledByDefault !== false,
+      unknownFieldCount,
+      entry: entryRel,
+      hasEntry,
+      configSchema,
+      settingsDefaults,
+    },
+    problems,
+  }
+}
+
+/**
+ * 读取单个模块目录的卡片数据；不是插件目录时返回 null。
+ *
+ * 三种有效形态：
+ *   · package.json 且带 `dsh` 字段 → DSH 原生包；
+ *   · skill.json                 → QQ Agent 技能；
+ *   · plugin.json                → QQ Agent 插件。
+ *
+ * 清单坏了不丢弃：仍然出一张卡片，带 `compat.tier='invalid'` 和原因。
+ */
+function readExternalModule(moduleDir, rootDir) {
+  const dirName = path.basename(moduleDir)
+  const relDir = path.relative(rootDir, moduleDir).split(path.sep).join('/') || '.'
+
+  let pkg = null
+  let pkgError = ''
+  const pkgPath = path.join(moduleDir, 'package.json')
+  if (existsSync(pkgPath)) {
+    try { pkg = readJsonWithBom(pkgPath) } catch (error) { pkgError = `解析 package.json 失败：${error?.message ?? error}` }
+  }
+
+  const isDshPackage = pkg !== null && typeof pkg === 'object' && !Array.isArray(pkg)
+    && pkg.dsh !== undefined && pkg.dsh !== null
+  if (isDshPackage) {
+    // @local/* 是本仓库 link 出来的开发插件（含本插件自己），不算外部插件。
+    if (typeof pkg.name === 'string' && pkg.name.startsWith('@local/')) return null
+    return {
+      id: String(pkg.name ?? dirName),
+      name: String(pkg.name ?? dirName),
+      version: String(pkg.version ?? '0.0.0'),
+      description: String(pkg.description ?? ''),
+      author: typeof pkg.author === 'string' ? pkg.author : '',
+      category: '',
+      apiVersion: 0,
+      kind: 'package',
+      format: 'package.json',
+      source: 'package.json',
+      dir: path.resolve(moduleDir),
+      relDir,
+      dirName,
+      hasClient: Boolean(pkg.dsh?.client),
+      hasBundle: Boolean(pkg.dsh?.bundle),
+      requires: [],
+      capabilities: [],
+      permissions: [],
+      enabledByDefault: false,
+      unknownFieldCount: 0,
+      entry: '',
+      hasEntry: false,
+      configSchema: {},
+      settingsDefaults: {},
+      deps: { nodeBuiltins: [], hostSrc: false, bare: [], dynamic: false, files: 0, truncated: false },
+      compat: { tier: 'native', label: 'DSH 原生', reasons: [] },
+      warnings: [],
+      error: pkgError,
+    }
+  }
+
+  // 找 QQ Agent 清单：skill.json 优先，其次 plugin.json。
+  let manifestFile = ''
+  let manifest = null
+  let manifestError = ''
+  for (const file of QQ_MANIFEST_FILES) {
+    const full = path.join(moduleDir, file)
+    if (!existsSync(full)) continue
+    manifestFile = file
+    try { manifest = readJsonWithBom(full) } catch (error) {
+      manifestError = `解析 ${file} 失败：${error?.message ?? error}`
+    }
+    break
+  }
+  if (!manifestFile) return null
+
+  const normalized = normalizeQqManifest(manifest, {
+    dirName, moduleDir, manifestFile, manifestError,
+  })
+  const deps = manifestError
+    ? { nodeBuiltins: [], hostSrc: false, bare: [], dynamic: false, files: 0, truncated: false }
+    : scanModuleDeps(moduleDir)
+  const compat = classifyExternalCompat({ deps, manifestError })
+  const warnings = [...normalized.problems]
+  if (pkgError) warnings.push(pkgError)
+  if (normalized.entry.id !== dirName) {
+    warnings.push(`清单 id「${normalized.entry.id}」与目录名「${dirName}」不一致`)
+  }
+
+  return {
+    ...normalized.entry,
+    dir: path.resolve(moduleDir),
+    relDir,
+    dirName,
+    hasClient: false,
+    hasBundle: false,
+    deps,
+    compat,
+    warnings,
+    error: manifestError,
+  }
+}
+
+/**
+ * 只读扫描一个目录，找出所有有效插件模块。
+ *
+ * 支持三种摆放：
+ *   · 目录本身就是模块根（用户直接选了某个插件目录）；
+ *   · 目录下平铺模块（node_modules / plugins / skills 这一层）；
+ *   · QQ Agent 应用根：`<root>/plugins/*` 与 `<root>/skills/*`。
+ *
+ * 不写任何文件、不 import 外部代码；符号链接一律跳过（本仓库 link 出去的
+ * 开发插件不算「外部安装」）。
+ *
+ * @param {string} dir 目录（node_modules、QQ Agent 的 app 根，或单个插件目录）
+ * @returns {Array<object>} 卡片数据
+ */
+export function scanPluginDir(dir) {
+  const out = []
+  const seen = new Set()
+
+  const consider = (moduleDir) => {
+    let real
+    try { real = path.resolve(moduleDir) } catch { return }
+    const key = process.platform === 'win32' ? real.toLowerCase() : real
+    if (seen.has(key)) return
+    seen.add(key)
+    let entry
+    try { entry = readExternalModule(moduleDir, dir) } catch { entry = null }
+    if (entry) out.push(entry)
+  }
+
+  const scanContainer = (container) => {
+    let entries
+    try { entries = readdirSync(container, { withFileTypes: true }) } catch { return }
+    for (const item of entries) {
+      if (item.name.startsWith('.') || EXTERNAL_SKIP_DIRS.has(item.name)) continue
+      const full = path.join(container, item.name)
+      if (item.name.startsWith('@')) {
+        let subs
+        try { subs = readdirSync(full, { withFileTypes: true }) } catch { continue }
+        for (const sub of subs) {
+          if (sub.name.startsWith('.')) continue
+          consider(path.join(full, sub.name))
+        }
+        continue
+      }
+      // 跳过符号链接 / junction：那些是本仓库 `link:` 出去的开发插件
+      // （dsh-bili-whale、dsh-ofm-eac-tunnel 之类），不算「外部安装的插件」。
+      if (item.isSymbolicLink()) continue
+      consider(full)
+    }
+  }
+
+  // ① 目录自己就是模块根。
+  consider(dir)
+  // ② 平铺在目录下的模块。
+  scanContainer(dir)
+  // ③ QQ Agent 应用根：固定两个一级目录（与对方的装载器一致）。
+  for (const sub of ['plugins', 'skills']) {
+    const container = path.join(dir, sub)
+    let stat
+    try { stat = statSync(container) } catch { continue }
+    if (!stat.isDirectory()) continue
+    scanContainer(container)
+  }
+  return out
+}
+
+/**
+ * 取 DSH 的目录选择能力（`ctx.directoryPicker`）。
+ *
+ * 为什么用它而不是自己 spawn 一个 Node 弹窗脚本：
+ *   profile 的 `directory-picker` 行挂的是 `dsh-host-directory-picker-auto`，
+ *   在 Windows 桌面会解析成 native 后端 —— 它已经实现好了
+ *   「独立子进程 + Win32 IFileOpenDialog + 取消/失败语义」，自己再写一份纯属重复踩坑。
+ *   契约见 @deepseek-ai/dsh-host-directory-picker：`capability()` 返回
+ *   `{ kind: 'native', pick(signal) }` 或 `{ kind: 'browse', ... }`；
+ *   `pick()` 解析为绝对路径，取消时解析为 null。
+ *
+ * @param {object} ctx 插件上下文
+ * @returns {object|undefined} 选择器服务；未挂载时为 undefined
+ */
+function readDirectoryPicker(ctx) {
+  try {
+    if (ctx?.directoryPicker !== undefined && ctx.directoryPicker !== null) return ctx.directoryPicker
+  } catch { /* 服务未挂载时属性访问可能抛错，退回 ctx.get */ }
+  try {
+    if (typeof ctx?.get === 'function') {
+      const viaGet = ctx.get('directoryPicker')
+      if (viaGet !== undefined && viaGet !== null) return viaGet
+    }
+  } catch { /* 同上 */ }
+  return undefined
+}
 
 /**
  * 桥接上报的 QQ 账号状态四态（批次 5）。
@@ -312,6 +1025,40 @@ function sendJson(res, status, payload) {
     'cache-control': 'no-store',
   })
   res.end(body)
+}
+
+/**
+ * 读一个 JSON 请求体（有大小上限）。
+ *
+ * 为什么要自己写：这个插件没有装 body parser，而 P1 的沙箱测试路由需要
+ * `{ id, dir }`。超过上限直接 413，避免有人拿超大 body 拖死 Host。
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {{maxBytes?:number}} [options]
+ * @returns {Promise<object>}
+ */
+function readJsonBody(req, { maxBytes = 8 * 1024 } = {}) {
+  return new Promise((resolve, reject) => {
+    let size = 0
+    const chunks = []
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > maxBytes) {
+        reject(Object.assign(new Error(`请求体超过 ${maxBytes} 字节`), { statusCode: 413 }))
+        req.destroy?.()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8').trim()
+      if (!text) { resolve({}); return }
+      try { resolve(JSON.parse(text)) } catch {
+        reject(Object.assign(new Error('请求体不是合法 JSON'), { statusCode: 400 }))
+      }
+    })
+    req.on('error', (error) => reject(error))
+  })
 }
 
 /**
@@ -517,6 +1264,398 @@ function applySettings(ctx, config) {
       },
     }),
     'qq-guard: bridge runtime config route',
+  )
+
+  // ── 原生目录选择器（NapCat 安装目录的「浏览」按钮）──────────────
+  //
+  // 前端拿不到 `<input type="file">` 选中的绝对路径（安全限制），所以手输路径
+  // 是唯一的路 —— 体验极差。这里在 Host 侧调 DSH 官方的 directoryPicker seam，
+  // 由它弹系统原生的「选择文件夹」窗口，把绝对路径回给前端。
+  //
+  // 状态码约定（前端据此决定要不要降级成手输）：
+  //   200        { ok:true, path } 或 { ok:true, cancelled:true, path:null }
+  //   409        已经有一个选择窗口开着（原生对话框是模态的，不能叠）
+  //   501        profile 没挂 directory-picker，或挂的是 browse 后端（没有原生窗口）
+  //   500        选择器自己报错
+  let picking = false
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: PICK_DIR_ROUTE_PATH,
+      handler: async (req, res) => {
+        const fetchSite = req.headers['sec-fetch-site']
+        if (typeof fetchSite === 'string' && fetchSite !== 'same-origin') {
+          sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
+          return
+        }
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, reason: 'method not allowed' })
+          return
+        }
+        const picker = readDirectoryPicker(ctx)
+        if (picker === undefined) {
+          sendJson(res, 501, {
+            ok: false, reason: 'picker-not-mounted',
+            detail: 'DSH 没有挂载 directoryPicker 服务（profile 里缺 directory-picker 行）',
+          })
+          return
+        }
+        let capability
+        try {
+          capability = picker.capability()
+        } catch (error) {
+          sendJson(res, 500, { ok: false, reason: 'capability-failed', detail: error?.message ?? String(error) })
+          return
+        }
+        if (capability?.kind !== 'native' || typeof capability.pick !== 'function') {
+          sendJson(res, 501, {
+            ok: false, reason: 'picker-not-native',
+            detail: `当前 directoryPicker 是 ${capability?.kind ?? '未知'} 后端，调不起系统对话框；请手输路径`,
+          })
+          return
+        }
+        if (picking) {
+          sendJson(res, 409, { ok: false, reason: 'busy', detail: '已经有一个目录选择窗口开着，请先处理它' })
+          return
+        }
+        picking = true
+        try {
+          const picked = await capability.pick()
+          if (picked === null || picked === undefined) {
+            sendJson(res, 200, { ok: true, cancelled: true, path: null })
+            return
+          }
+          sendJson(res, 200, { ok: true, path: String(picked) })
+        } catch (error) {
+          sendJson(res, 500, { ok: false, reason: 'pick-failed', detail: error?.message ?? String(error) })
+        } finally {
+          picking = false
+        }
+      },
+    }),
+    'qq-guard: native directory picker route',
+  )
+
+  // ── 外部插件扫描（Phase 4 / P0）───────────────────────────────
+  //
+  // 只读扫描，不 import 外部代码、不写目标目录、不装包：
+  //   · package.json 里带 `dsh` 字段的 DSH 原生包；
+  //   · QQ Agent 的 plugin.json / skill.json（BOM 容错）。
+  // `@local/*` 是本仓库的 link 开发插件（含本插件自己），不算「外部」，跳过。
+  // 所有条目默认 enabled:false —— 配置里显式打开才回显为 true，但 P0 不执行。
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: EXTERNAL_ROUTE_PATH,
+      handler: (req, res) => {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          sendJson(res, 405, { ok: false, reason: 'method not allowed' })
+          return
+        }
+        const fetchSite = req.headers['sec-fetch-site']
+        if (typeof fetchSite === 'string' && fetchSite !== 'same-origin' && fetchSite !== 'none') {
+          sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
+          return
+        }
+        const cfg = plainConfig(config) ?? {}
+        const configured = Array.isArray(cfg.externalPlugins?.dirs) ? cfg.externalPlugins.dirs : []
+        const dirs = configured.length > 0 ? configured : findDefaultPluginDirs()
+        const enabled = new Set(Array.isArray(cfg.externalPlugins?.enabled) ? cfg.externalPlugins.enabled : [])
+        const entries = []
+        const seen = new Set()
+        for (const dir of dirs) {
+          for (const entry of scanPluginDir(dir)) {
+            // 同一目录只出现一次（app 根 + plugins/ 两种入口可能扫到同一个模块）。
+            const key = process.platform === 'win32' ? entry.dir.toLowerCase() : entry.dir
+            if (seen.has(key)) continue
+            seen.add(key)
+            entries.push({ ...entry, enabled: enabled.has(entry.name) || enabled.has(entry.id) })
+          }
+        }
+        entries.sort((a, b) => a.name.localeCompare(b.name))
+        const controlled = entries.filter((e) => e.compat?.tier === 'controlled').length
+        const invalid = entries.filter((e) => e.compat?.tier === 'invalid').length
+        sendJson(res, 200, {
+          ok: true,
+          dirs,
+          scanned: entries.length,
+          // 「能跑的」= 有 bundle patch 或 client 入口，缺这两个的包挂上去也没东西可跑。
+          runnable: entries.filter((e) => e.hasClient || e.hasBundle).length,
+          // P0 只读展示：受控 / 清单无效的条目只在卡片上出现，不会被加载。
+          controlled,
+          invalid,
+          entries,
+        })
+      },
+    }),
+    'qq-guard: external plugin scan route',
+  )
+
+  // ── 外部插件沙箱加载测试（P1）─────────────────────────────────
+  //
+  // 只干一件事：把扫描到的「自包含」模块交给独立子进程，执行它的 setup/register，
+  // 把结果（导出了什么、碰了哪些 api）回给 UI。外部代码永远不进 DSH 主进程。
+  //
+  // 安全约束：
+  //   · 客户端只能传 { id, dir }，Host **重新扫描**配置里的根目录来定位模块，
+  //     绝不按客户端给的路径直接 import；
+  //   · 只放行 compat.tier === 'self-contained' 的模块（受控模块等 P2 的 shim）；
+  //   · 入口必须存在、realpath 必须仍在模块目录内（防符号链接逃逸）；
+  //   · 子进程由 SandboxManager 统一加 --permission / registerHooks 拦截。
+  const readExternalRoots = () => {
+    const cfg = plainConfig(config) ?? {}
+    const configured = Array.isArray(cfg.externalPlugins?.dirs) ? cfg.externalPlugins.dirs : []
+    return configured.length > 0 ? configured : findDefaultPluginDirs()
+  }
+
+  /** 按 id/dir 在配置的根目录里找模块（重新扫描，不信任客户端路径）。 */
+  const findExternalModule = (query) => {
+    const wantedDir = typeof query.dir === 'string' && query.dir
+      ? path.resolve(query.dir)
+      : ''
+    const wantedId = typeof query.id === 'string' ? query.id : ''
+    const seen = new Set()
+    for (const root of readExternalRoots()) {
+      for (const entry of scanPluginDir(root)) {
+        const key = process.platform === 'win32' ? entry.dir.toLowerCase() : entry.dir
+        if (seen.has(key)) continue
+        seen.add(key)
+        if (wantedDir) {
+          const entryDir = process.platform === 'win32' ? entry.dir.toLowerCase() : entry.dir
+          if (entryDir === (process.platform === 'win32' ? wantedDir.toLowerCase() : wantedDir)) return entry
+          continue
+        }
+        if (wantedId && (entry.id === wantedId || entry.name === wantedId)) return entry
+      }
+    }
+    return null
+  }
+
+  /** 沙箱错误码 → HTTP 状态码。 */
+  const sandboxStatus = (code) => {
+    if (code === 'E_TIMEOUT') return 504
+    if (code === 'E_BUSY' || code === 'E_CIRCUIT_OPEN') return 429
+    if (code === 'E_ENTRY_MISSING' || code === 'E_ENTRY_ESCAPE' || code === 'E_NOT_SELF_CONTAINED') return 400
+    if (code === 'E_NO_NODE' || code === 'E_SANDBOX_START') return 503
+    return 502
+  }
+
+  const sandbox = ctx.subprocess !== undefined
+    ? new SandboxManager({
+      subprocess: ctx.subprocess,
+      logger: ctx.logger ?? console,
+      getRoots: readExternalRoots,
+    })
+    : null
+  if (sandbox !== null) {
+    ctx.effect(() => () => { void sandbox.dispose() }, 'qq-guard: sandbox teardown')
+  }
+
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: EXTERNAL_TEST_ROUTE_PATH,
+      handler: async (req, res) => {
+        try {
+          const fetchSite = req.headers['sec-fetch-site']
+          if (typeof fetchSite === 'string' && fetchSite !== 'same-origin') {
+            sendJson(res, 403, { ok: false, error: { code: 'E_CROSS_SITE', message: 'cross-site request refused' } })
+            return
+          }
+          if (req.method !== 'POST') {
+            sendJson(res, 405, { ok: false, error: { code: 'E_METHOD', message: 'method not allowed' } })
+            return
+          }
+          if (sandbox === null) {
+            sendJson(res, 501, {
+              ok: false,
+              error: { code: 'E_NO_SUBPROCESS', message: 'DSH 没有挂载 subprocess 服务，沙箱不可用' },
+            })
+            return
+          }
+
+          let body
+          try {
+            body = await readJsonBody(req)
+          } catch (error) {
+            sendJson(res, error?.statusCode ?? 400, {
+              ok: false,
+              error: { code: 'E_BODY', message: error?.message ?? String(error) },
+            })
+            return
+          }
+
+          const id = typeof body?.id === 'string' ? body.id.trim() : ''
+          const dir = typeof body?.dir === 'string' ? body.dir.trim() : ''
+          if (!id && !dir) {
+            sendJson(res, 400, {
+              ok: false,
+              error: { code: 'E_BAD_REQUEST', message: '需要 id 或 dir 来定位外部插件' },
+            })
+            return
+          }
+
+          const module = findExternalModule({ id, dir })
+          if (module === null) {
+            sendJson(res, 404, {
+              ok: false,
+              error: { code: 'E_NOT_FOUND', message: '没有在已配置的外部插件目录里找到这个模块' },
+            })
+            return
+          }
+          if (!module.hasEntry) {
+            sendJson(res, 400, {
+              ok: false,
+              error: { code: 'E_ENTRY_MISSING', message: `入口文件不存在：${module.entry || 'index.js'}` },
+            })
+            return
+          }
+          if (module.compat?.tier !== 'self-contained') {
+            sendJson(res, 400, {
+              ok: false,
+              error: {
+                code: 'E_NOT_SELF_CONTAINED',
+                message: `该模块是「${module.compat?.label ?? '未判定'}」，P1 只允许加载自包含模块`,
+                detail: Array.isArray(module.compat?.reasons) ? module.compat.reasons.join('；') : undefined,
+              },
+            })
+            return
+          }
+
+          let entryPath = path.resolve(module.dir, module.entry || 'index.js')
+          if (!existsSync(entryPath)) {
+            sendJson(res, 400, {
+              ok: false,
+              error: { code: 'E_ENTRY_MISSING', message: `入口文件不存在：${entryPath}` },
+            })
+            return
+          }
+          // realpath 二次确认：清单里的 entry 不能借符号链接跳出模块目录。
+          try {
+            const realDir = realpathSync(module.dir)
+            const realEntry = realpathSync(entryPath)
+            if (realEntry !== realDir && !realEntry.startsWith(realDir + path.sep)) {
+              sendJson(res, 400, {
+                ok: false,
+                error: { code: 'E_ENTRY_ESCAPE', message: '入口文件经 realpath 后越出模块目录' },
+              })
+              return
+            }
+            entryPath = realEntry
+          } catch (error) {
+            sendJson(res, 400, {
+              ok: false,
+              error: { code: 'E_ENTRY_MISSING', message: `解析入口失败：${error?.message ?? error}` },
+            })
+            return
+          }
+
+          const outcome = await sandbox.testLoad({
+            id: module.id,
+            dir: module.dir,
+            entryPath,
+            format: module.format,
+          })
+          if (outcome.ok) {
+            sendJson(res, 200, outcome)
+          } else {
+            sendJson(res, sandboxStatus(outcome.error?.code), outcome)
+          }
+        } catch (error) {
+          sendJson(res, 500, {
+            ok: false,
+            error: { code: 'E_HOST', message: error?.message ?? String(error) },
+          })
+        }
+      },
+    }),
+    'qq-guard: external plugin sandbox test route',
+  )
+
+  // ── 清理失效会话（Phase 4）───────────────────────────────────
+  //
+  // DSH 左侧会话堆积的根因：桥接按 QQ 会话建 DSH 会话，映射失效后会重建一条，
+  // 旧的那条如果还活着就永远留在列表里。
+  // 这里做的是「对账」：把**QQ 工作区里、当前映射表里没有的** DSH 会话归档掉。
+  //
+  // 只用 Host 自己的服务（sessionController.list + workspaceRegistry.archiveSession），
+  // 不依赖桥接进程在跑，所以桥接挂了也能清理。
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: CLEANUP_ROUTE_PATH,
+      handler: async (req, res) => {
+        const fetchSite = req.headers['sec-fetch-site']
+        if (typeof fetchSite === 'string' && fetchSite !== 'same-origin') {
+          sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
+          return
+        }
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, reason: 'method not allowed' })
+          return
+        }
+        const sessionController = ctx.get?.('sessionController')
+        const workspaceRegistry = ctx.get?.('workspaceRegistry')
+        if (typeof sessionController?.list !== 'function' || typeof workspaceRegistry?.archiveSession !== 'function') {
+          sendJson(res, 501, {
+            ok: false, reason: 'not-available',
+            detail: '当前 DSH 没有暴露 sessionController / workspaceRegistry，无法清理',
+          })
+          return
+        }
+        const cfg = plainConfig(config) ?? {}
+        const bridgeDir = cfg.bridge?.dir || DEFAULT_BRIDGE_DIR
+        const statePath = path.join(bridgeDir, 'state', 'sessions.json')
+        const bridgeConfigPath = path.join(bridgeDir, 'config.json')
+        let mapped = []
+        try {
+          const state = JSON.parse(readFileSync(statePath, 'utf8'))
+          mapped = Object.values(state?.sessions ?? {}).map(String)
+        } catch { /* 没有状态文件 = 还没建过会话，映射为空 */ }
+        let sessionCwd = ''
+        try {
+          sessionCwd = JSON.parse(readFileSync(bridgeConfigPath, 'utf8'))?.dsh?.sessionCwd ?? ''
+        } catch { /* 读不到就只能清 stale 列表 */ }
+        if (!sessionCwd) {
+          sendJson(res, 400, { ok: false, reason: 'no-session-cwd', detail: '桥接 config.json 里没有 dsh.sessionCwd' })
+          return
+        }
+        const norm = (p) => (typeof p === 'string' && p ? path.resolve(p).toLowerCase() : '')
+        const target = norm(sessionCwd)
+        const mappedSet = new Set(mapped)
+        let value
+        try {
+          value = await sessionController.list({}, new AbortController().signal)
+        } catch (error) {
+          sendJson(res, 500, { ok: false, reason: 'list-failed', detail: error?.message ?? String(error) })
+          return
+        }
+        const items = Array.isArray(value?.items) ? value.items : []
+        // 只在「QQ 工作区」范围内对账，绝不碰用户在别的目录里的会话。
+        const orphans = items.filter((it) => norm(it?.cwd) === target
+          && it?.origin !== 'subagent'
+          && !mappedSet.has(String(it?.sessionId)))
+        let archived = 0
+        const failed = []
+        for (const it of orphans) {
+          try {
+            await workspaceRegistry.archiveSession(it.sessionId)
+            archived++
+          } catch (error) {
+            failed.push({ sessionId: String(it.sessionId), reason: error?.message ?? String(error) })
+          }
+        }
+        sendJson(res, 200, {
+          ok: true,
+          sessionCwd,
+          mapped: mapped.length,
+          candidates: orphans.length,
+          archived,
+          failed,
+        })
+      },
+    }),
+    'qq-guard: session cleanup route',
   )
 
   // ── NapCat 进程管理（批次 4B）─────────────────────────────────

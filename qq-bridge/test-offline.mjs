@@ -8,7 +8,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { auditReply, Bridge } from './src/bridge.mjs'
+import { auditReply, Bridge, matchActivityKeyword, normalizeRhythm } from './src/bridge.mjs'
 import { OneBotClient, parseMessage, splitText, splitBubbles, charCount, typingDelayFor } from './src/onebot.mjs'
 import { discoverDshBaseUrl, listLocalListeningPorts, DSH_BASE_HOST } from './src/dsh.mjs'
 import { pickHotConfig, applyHotConfig, startConfigPolling, CONFIG_ROUTE_PATH } from './src/runtime-config.mjs'
@@ -436,6 +436,57 @@ await check('startConfigPolling 从桩路由拉到配置并热应用', async () 
     assert.ok(synced >= 1, 'onSync 应被调用')
   } finally { stop(); srv.close() }
 })
+await check('pickHotConfig 放行人设新字段（名字/展示名/参与度/附加规则/覆盖）', () => {
+  const hot = pickHotConfig({
+    personaText: '猫娘',
+    personaBotName: '小鱼',
+    personaGroupName: '鱼酱',
+    personaParticipation: 'quiet',
+    personaExtraRules: '别熬夜',
+    personaSystemPrompt: '',
+  })
+  assert.equal(hot.personaBotName, '小鱼')
+  assert.equal(hot.personaGroupName, '鱼酱')
+  assert.equal(hot.personaParticipation, 'quiet')
+  assert.equal(hot.personaExtraRules, '别熬夜')
+  assert.equal(hot.personaSystemPrompt, '')
+})
+
+await check('startConfigPolling：任意人设字段变化都会触发 onPersona（不只 personaText）', async () => {
+  const http = await import('node:http')
+  let payload = {
+    personaBotName: '小鱼', personaGroupName: '', personaParticipation: 'normal',
+    personaText: '', personaExtraRules: '', personaSystemPrompt: '',
+  }
+  const srv = http.createServer((req, res) => {
+    if (req.url !== CONFIG_ROUTE_PATH) { res.writeHead(404); res.end(); return }
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: true, config: payload }))
+  })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  const port = srv.address().port
+  const live = {}
+  const calls = []
+  let synced = 0
+  const stop = startConfigPolling({
+    baseUrl: `http://127.0.0.1:${port}`,
+    liveConfig: live,
+    pollMs: 80,
+    timeoutMs: 1000,
+    onSync: () => { synced++ },
+    onPersona: (hot) => { calls.push(hot); return { ok: true, action: 'upserted-override' } },
+  })
+  try {
+    const deadline = Date.now() + 3000
+    while (synced === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 40))
+    assert.equal(calls.length, 0, '首次同步只记录，不应写人设')
+    payload = { ...payload, personaParticipation: 'quiet' }
+    while (calls.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 40))
+    assert.equal(calls.length, 1, `onPersona 调用 ${calls.length} 次`)
+    assert.equal(calls[0].personaParticipation, 'quiet')
+  } finally { stop(); srv.close() }
+})
+
 await check('startConfigPolling 连不上时静默不抛错', async () => {
   const live = { bubbleMaxChars: 30 }
   const stop = startConfigPolling({
@@ -464,6 +515,25 @@ await check('Bridge.live 有初值，_applyLiveToClient 能刷新客户端', () 
   b._applyLiveToClient()
   assert.equal(b.qq.bubbleMaxChars, 15, '热更新应立即作用于客户端')
   assert.equal(b.qq.groupAtReply, false)
+})
+await check('Bridge.buildPersonaPrompt 把新字段整合成最终系统提示词', () => {
+  const b = new Bridge({
+    config: {
+      dsh: { baseUrl: 'http://127.0.0.1:2852', sessionCwd: '.', workspaceTitle: 'x', agentPreset: 'qq-chat' },
+      onebot: { wsUrl: 'ws://127.0.0.1:1', accessToken: 't' },
+      stateFile: './state/__verify_absent__.json',
+    },
+    logger: { info() {}, warn() {}, error() {} },
+  })
+  b.live.personaText = '你是 DeepSeek，也是群友。'
+  b.live.personaBotName = '小鱼'
+  b.live.personaGroupName = '鱼酱'
+  b.live.personaParticipation = 'quiet'
+  b.live.personaExtraRules = '别熬夜'
+  const prompt = b.buildPersonaPrompt()
+  assert.ok(prompt.includes('【身份】') && prompt.includes('小鱼') && prompt.includes('鱼酱'), prompt)
+  assert.equal(prompt.includes('DeepSeek'), false, '名字没被替换')
+  assert.ok(prompt.includes('【参与度】') && prompt.includes('【管理员附加规则】'), prompt)
 })
 await check('热更新后发送立即按新阈值分片', async () => {
   const b = new Bridge({
@@ -750,13 +820,31 @@ await check('release 只删自己 pid 的锁（不误删新持有者）', () => 
 })
 
 console.log('\n— 插件侧回归：qq-guard 作用域（防再次全局锁死）—')
+/**
+ * 给插件侧回归脚本准备的 env。
+ *
+ * 为什么需要：`test-guard-scope.mjs` / `test-autostart.mjs` 里定位 schemastery 的
+ * 兜底值写成了字符串字面量（`'resolveSchemastery()'`，本意是**调用**那个函数），
+ * 未设 `QQG_SCHEMASTERY` 时会拼出 `file:///resolveSchemastery()`，
+ * 直接抛 ERR_INVALID_FILE_URL_PATH。这里按它们注释里写的办法显式提供路径，
+ * **不改插件文件**（那是 Lead 的范围）；插件侧修好后这行自动退化成无害的显式指定。
+ */
+const pluginTestEnv = (() => {
+  const here = path.dirname(fileURLToPath(import.meta.url))
+  const candidate = path.resolve(
+    here, '../plugins/dsh-qq-guard/node_modules/@deepseek-ai/schemastery/lib/index.mjs')
+  return (!process.env.QQG_SCHEMASTERY && fs.existsSync(candidate))
+    ? { ...process.env, QQG_SCHEMASTERY: candidate }
+    : process.env
+})()
+
 await check('plugins/dsh-qq-guard 作用域回归全绿', async () => {
   const { execFileSync } = await import('node:child_process')
   const path = await import('node:path')
   const { fileURLToPath } = await import('node:url')
   const here = path.dirname(fileURLToPath(import.meta.url))
   const script = path.resolve(here, '../plugins/dsh-qq-guard/test-guard-scope.mjs')
-  const out = execFileSync(process.execPath, [script], { encoding: 'utf8' })
+  const out = execFileSync(process.execPath, [script], { encoding: 'utf8', env: pluginTestEnv })
   assert.match(out, /结果：\d+ 通过 \/ 0 失败/, `插件回归未全绿：\n${out}`)
 })
 
@@ -827,7 +915,7 @@ await check('plugins/dsh-qq-guard NapCat 管理回归全绿', async () => {
   const { fileURLToPath } = await import('node:url')
   const here = path.dirname(fileURLToPath(import.meta.url))
   const script = path.resolve(here, '../plugins/dsh-qq-guard/test-napcat.mjs')
-  const out = execFileSync(process.execPath, [script], { encoding: 'utf8' })
+  const out = execFileSync(process.execPath, [script], { encoding: 'utf8', env: pluginTestEnv })
   assert.match(out, /结果：\d+ 通过 \/ 0 失败/, `NapCat 回归未全绿：\n${out}`)
 })
 
@@ -837,7 +925,7 @@ await check('plugins/dsh-qq-guard bridge.autoStart / 进程管理回归全绿（
   const { fileURLToPath } = await import('node:url')
   const here = path.dirname(fileURLToPath(import.meta.url))
   const script = path.resolve(here, '../plugins/dsh-qq-guard/test-autostart.mjs')
-  const out = execFileSync(process.execPath, [script], { encoding: 'utf8' })
+  const out = execFileSync(process.execPath, [script], { encoding: 'utf8', env: pluginTestEnv })
   assert.match(out, /结果：\d+ 通过 \/ 0 失败/, `autoStart 回归未全绿：\n${out}`)
 })
 
@@ -847,7 +935,7 @@ await check('qq-bridge 人设写入回归全绿', async () => {
   const { fileURLToPath } = await import('node:url')
   const here = path.dirname(fileURLToPath(import.meta.url))
   const script = path.resolve(here, 'test-persona.mjs')
-  const out = execFileSync(process.execPath, [script], { encoding: 'utf8' })
+  const out = execFileSync(process.execPath, [script], { encoding: 'utf8', env: pluginTestEnv })
   assert.match(out, /结果：\d+ 通过 \/ 0 失败/, `人设回归未全绿：\n${out}`)
 })
 
@@ -858,8 +946,320 @@ await check('plugins/dsh-qq-guard 设置数据通路回归全绿', async () => {
   const { fileURLToPath } = await import('node:url')
   const here = path.dirname(fileURLToPath(import.meta.url))
   const script = path.resolve(here, '../plugins/dsh-qq-guard/test-settings-data.mjs')
-  const out = execFileSync(process.execPath, [script], { encoding: 'utf8' })
+  const out = execFileSync(process.execPath, [script], { encoding: 'utf8', env: pluginTestEnv })
   assert.match(out, /结果：\d+ 通过 \/ 0 失败/, `设置数据通路回归未全绿：\n${out}`)
+})
+
+console.log('\n— Phase 4：节奏参数（热配置真实生效）—')
+/**
+ * 造一个只接假 DSH / 假 QQ 的 Bridge（不建会话、不发消息、不读写真实 state）。
+ * 返回 { b, calls }：calls 记录 prompt / archive / 会话创建 / 实际发出的消息。
+ */
+function makeBridge({ rhythm, dsh: dshCfg, stateFile } = {}) {
+  const b = new Bridge({
+    config: {
+      dsh: {
+        baseUrl: 'http://127.0.0.1:1', sessionCwd: '.', workspaceTitle: 'x',
+        agentPreset: 'qq-chat', ...(dshCfg ?? {}),
+      },
+      onebot: { wsUrl: 'ws://127.0.0.1:1', accessToken: 't' },
+      allow: { private: ['1000000001'], groups: ['123456'], allowAllWhenEmpty: false },
+      sendDelayMs: 0,
+      stateFile: stateFile ?? path.join(os.tmpdir(), `qq-bridge-state-${process.pid}-${Math.random().toString(36).slice(2)}.json`),
+      ...(rhythm ? { rhythm } : {}),
+    },
+    logger: { info() {}, warn() {}, error() {} },
+  })
+  const calls = {
+    prompts: [], archived: [], existChecks: [], sent: [], created: 0,
+    exists: true,       // sessionExists 的返回值
+    archiveFails: [],   // 这些 id 的 archiveSession 会抛错
+    reply: '好',
+  }
+  b.dsh = {
+    sessionExists: async (id) => { calls.existChecks.push(id); return calls.exists },
+    ensureWorkspace: async () => 'w1',
+    createSession: async () => `s${++calls.created}`,
+    selectModel: async () => {},
+    archiveSession: async (id) => {
+      calls.archived.push(id)
+      if (calls.archiveFails.includes(id)) throw new Error('archive failed')
+      return { ok: true }
+    },
+    promptAndWait: async (sid, text) => { calls.prompts.push({ sid, text }); return calls.reply },
+  }
+  b.qq.sendPrivate = async (uid, text) => { calls.sent.push({ kind: 'private', uid, text }); return { ok: true, messageIds: ['1'] } }
+  b.qq.sendGroup = async (gid, text) => { calls.sent.push({ kind: 'group', gid, text }); return { ok: true, messageIds: ['1'] } }
+  b.qq._selfId = '999' // 假装登录的是 999，用于 @ 判定
+  return { b, calls }
+}
+
+const privMsg = (text, id = 'pm') => ({
+  kind: 'private', userId: '1000000001', groupId: null, text, messageId: id,
+  raw: { message: [{ type: 'text', data: { text } }] },
+})
+const groupMsg = (text, { at = false, id = 'gm' } = {}) => ({
+  kind: 'group', userId: '1000000001', groupId: '123456', text, messageId: id,
+  raw: {
+    message: at
+      ? [{ type: 'at', data: { qq: '999' } }, { type: 'text', data: { text } }]
+      : [{ type: 'text', data: { text } }],
+  },
+})
+
+await check('normalizeRhythm 缺字段时补默认值，非法值被夹紧', () => {
+  const d = normalizeRhythm(undefined)
+  assert.equal(d.activityLevel, 1)
+  assert.equal(d.debounceWindowMs, 800)
+  assert.equal(d.batchIntervalMs, 2500)
+  assert.deepEqual(d.rateLimit, { perMin: 12, burst: 3, silent: true })
+  assert.deepEqual(d.mute.words, ['闭嘴', '安静', '别刷屏'])
+  assert.equal(d.mute.seconds, 60)
+  const c = normalizeRhythm({ activityLevel: 9, debounceWindowMs: -5, rateLimit: { perMin: 0 } })
+  assert.equal(c.activityLevel, 3, '上限夹紧')
+  assert.equal(c.debounceWindowMs, 0, '下限夹紧')
+  assert.equal(c.rateLimit.perMin, 1)
+})
+await check('关键词匹配是大小写不敏感的子串匹配', () => {
+  assert.equal(matchActivityKeyword('DSH 在吗'), 'dsh')
+  assert.equal(matchActivityKeyword('叫小鱼出来'), '小鱼')
+  assert.equal(matchActivityKeyword('今天天气不错'), null)
+  assert.equal(matchActivityKeyword('', ['dsh']), null)
+})
+
+await check('热配置改 activityLevel 立即生效（不重启），判否不建会话', async () => {
+  const { b, calls } = makeBridge({ rhythm: { activityLevel: 0, debounceWindowMs: 0 } })
+  await b.handleMessage(groupMsg('随便聊聊', { id: 'a1' }))
+  assert.equal(calls.prompts.length, 0, '0 档群聊未 @ 不该回')
+  assert.equal(calls.created, 0, '★ 判否时绝不建会话')
+  b.live.rhythm = { ...b.live.rhythm, activityLevel: 3 }
+  await b.handleMessage(groupMsg('随便聊聊', { id: 'a2' }))
+  assert.equal(calls.prompts.length, 1, '★ 改完不重启，下一句立即按 3 档回复')
+  assert.equal(calls.created, 1)
+})
+await check('activityLevel 0/1/2/3 的群聊判定（私聊永远回）', () => {
+  const { b } = makeBridge({ rhythm: { activityLevel: 0 } })
+  const plain = groupMsg('今天天气不错')
+  const kw = groupMsg('dsh 在吗')
+  const at = groupMsg('在吗', { at: true })
+  assert.equal(b.shouldRespond(plain, plain.text), false, '0 档：普通消息不回')
+  assert.equal(b.shouldRespond(kw, kw.text), false, '0 档：关键词也不回')
+  assert.equal(b.shouldRespond(at, at.text), true, '0 档：@ 必回')
+  b.live.rhythm = { ...b.live.rhythm, activityLevel: 1 }
+  assert.equal(b.shouldRespond(kw, kw.text), true, '1 档：关键词回')
+  assert.equal(b.shouldRespond(plain, plain.text), false, '1 档：普通消息不回')
+  b.live.rhythm = { ...b.live.rhythm, activityLevel: 2, randomChance: 0.15 }
+  assert.equal(b.shouldRespond(kw, kw.text), true, '2 档：关键词仍回')
+  b._random = () => 0.01
+  assert.equal(b.shouldRespond(plain, plain.text), true, '2 档：概率内随机回')
+  b._random = () => 0.99
+  assert.equal(b.shouldRespond(plain, plain.text), false, '2 档：概率外不回')
+  b.live.rhythm = { ...b.live.rhythm, activityLevel: 3 }
+  assert.equal(b.shouldRespond(plain, plain.text), true, '3 档：全回')
+  b.live.rhythm = { ...b.live.rhythm, activityLevel: 0 }
+  const p = privMsg('随便说说')
+  assert.equal(b.shouldRespond(p, p.text), true, '★ 私聊在 0 档也永远回')
+})
+await check('applyHotConfig 写进 live.rhythm 后判定立即变', () => {
+  const { b } = makeBridge({ rhythm: { activityLevel: 0 } })
+  const plain = groupMsg('随便')
+  assert.equal(b.shouldRespond(plain, plain.text), false)
+  applyHotConfig(b.live, pickHotConfig({ rhythm: { activityLevel: 3 } }))
+  assert.equal(b.shouldRespond(plain, plain.text), true)
+})
+await check('防抖：窗口内 3 条合并成 1 次 prompt（换行拼接）', async () => {
+  const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 40 } })
+  await b.handleMessage(groupMsg('第一句', { id: 'd1' }))
+  await b.handleMessage(groupMsg('第二句', { id: 'd2' }))
+  await b.handleMessage(groupMsg('第三句', { id: 'd3' }))
+  assert.equal(calls.prompts.length, 0, '窗口内不该立刻投递')
+  assert.ok(await waitUntil(() => calls.prompts.length > 0, 2000), '窗口结束后应投递')
+  await tick(20) // 给可能的第二次投递留时间
+  assert.equal(calls.prompts.length, 1, `实际 ${calls.prompts.length} 次 prompt`)
+  assert.equal(calls.prompts[0].text, '第一句\n第二句\n第三句')
+})
+await check('防抖：超过窗口的两条分别投递', async () => {
+  const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 30 } })
+  await b.handleMessage(groupMsg('甲', { id: 'e1' }))
+  assert.ok(await waitUntil(() => calls.prompts.length === 1, 1000))
+  await b.handleMessage(groupMsg('乙', { id: 'e2' }))
+  assert.ok(await waitUntil(() => calls.prompts.length === 2, 1000))
+  assert.deepEqual(calls.prompts.map((p) => p.text), ['甲', '乙'])
+})
+await check('热配置改 debounceWindowMs 立即生效', async () => {
+  const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 0 } })
+  await b.handleMessage(groupMsg('一', { id: 'w1' }))
+  assert.equal(calls.prompts.length, 1, '窗口 0 = 立即投递')
+  b.live.rhythm = { ...b.live.rhythm, debounceWindowMs: 40 }
+  await b.handleMessage(groupMsg('二', { id: 'w2' }))
+  await b.handleMessage(groupMsg('三', { id: 'w3' }))
+  assert.equal(calls.prompts.length, 1, '改窗口后应攒着')
+  assert.ok(await waitUntil(() => calls.prompts.length === 2, 1000))
+  assert.equal(calls.prompts[1].text, '二\n三')
+})
+await check('限频：超过 perMin+burst 静默丢弃（silent=true）', async () => {
+  const { b, calls } = makeBridge({
+    rhythm: { activityLevel: 3, debounceWindowMs: 0, rateLimit: { perMin: 2, burst: 1, silent: true } },
+  })
+  for (let i = 0; i < 5; i++) await b.handleMessage(groupMsg(`第${i}条`, { id: `r${i}` }))
+  assert.equal(calls.prompts.length, 3, `perMin=2 + burst=1 → 3 条，实际 ${calls.prompts.length}`)
+  assert.equal(calls.sent.length, 3, '静默模式下超限不回任何提示')
+  assert.equal(b.stats.rateLimited, 2)
+  assert.equal(b.stats.replied, 3, '只统计真正回复')
+})
+await check('限频：silent=false 时回一句提示（提示不计入回复数）', async () => {
+  const { b, calls } = makeBridge({
+    rhythm: { activityLevel: 3, debounceWindowMs: 0, rateLimit: { perMin: 2, burst: 0, silent: false } },
+  })
+  for (let i = 0; i < 4; i++) await b.handleMessage(groupMsg(`第${i}条`, { id: `s${i}` }))
+  assert.equal(calls.prompts.length, 2)
+  assert.equal(b.stats.replied, 2)
+  const hints = calls.sent.filter((s) => s.text.includes('慢一点'))
+  assert.equal(hints.length, 2, `超限两次应各回一次提示，实际 ${hints.length}`)
+})
+await check('禁言：命中 words 后静默，期间不回复也不建会话', async () => {
+  const { b, calls } = makeBridge({
+    rhythm: { activityLevel: 3, debounceWindowMs: 0, mute: { enabled: true, words: ['闭嘴'], seconds: 60 } },
+  })
+  await b.handleMessage(groupMsg('闭嘴', { id: 'mu1' }))
+  assert.equal(calls.prompts.length, 0, '禁言指令本身不回复')
+  assert.equal(calls.created, 0, '不建会话')
+  await b.handleMessage(groupMsg('还在吗', { id: 'mu2' }))
+  assert.equal(calls.prompts.length, 0, '静音期内不回复')
+  assert.equal(b.stats.muted, 1)
+  // 让静音过期（模拟 60s 到点），再看是否恢复
+  b._muted.set('g:123456', Date.now() - 1)
+  await b.handleMessage(groupMsg('现在呢', { id: 'mu3' }))
+  assert.equal(calls.prompts.length, 1, '静音过期后恢复回复')
+})
+await check('禁言开关关闭时「闭嘴」照常回复', async () => {
+  const { b, calls } = makeBridge({
+    rhythm: { activityLevel: 3, debounceWindowMs: 0, mute: { enabled: false, words: ['闭嘴'], seconds: 60 } },
+  })
+  await b.handleMessage(groupMsg('闭嘴', { id: 'mz1' }))
+  assert.equal(calls.prompts.length, 1)
+  assert.equal(b._isMuted('g:123456'), false)
+})
+await check('batchIntervalMs：相邻气泡取 max(原间隔, 批次间隔)', () => {
+  const c = new OneBotClient({ logger: undefined, bubbleMaxChars: 30, batchIntervalMs: 2500 })
+  assert.equal(c._gapBefore(0, ['x']), 2500)
+  assert.ok(c._baseGap(0, ['x']) < 2500, '原间隔仍是分级打字延时')
+  const c2 = new OneBotClient({ logger: undefined })
+  // 未配置时不是 2500，而是原来的分级打字延时（200ms 档 ±15% 抖动）。
+  assert.equal(c2.batchIntervalMs, 0)
+  const g = c2._gapBefore(0, ['x'])
+  assert.ok(g >= 150 && g <= 231, `未配置批次间隔时应沿用原间隔，实际 ${g}`)
+})
+await check('热配置改 batchIntervalMs 立即刷进客户端', () => {
+  const { b } = makeBridge({ rhythm: { batchIntervalMs: 600 } })
+  assert.equal(b.qq.batchIntervalMs, 600)
+  b.live.rhythm = { ...b.live.rhythm, batchIntervalMs: 1200 }
+  b._applyLiveToClient()
+  assert.equal(b.qq.batchIntervalMs, 1200)
+})
+await check('pickHotConfig 放行 rhythm / dsh.archiveStaleSessions，但拒绝 dsh 连接字段', () => {
+  const hot = pickHotConfig({
+    rhythm: { activityLevel: 2, rateLimit: { perMin: 5 } },
+    dsh: { archiveStaleSessions: false, baseUrl: 'http://evil:1', sessionCwd: 'C:\\evil' },
+  })
+  assert.equal(hot.rhythm.activityLevel, 2)
+  assert.equal(hot.dsh.archiveStaleSessions, false)
+  assert.equal('baseUrl' in hot.dsh, false, '★ 连接地址绝不能被设置页覆盖')
+  assert.equal('sessionCwd' in hot.dsh, false)
+})
+
+console.log('\n— 会话失效自动归档（Phase 4）—')
+const makeStateFile = () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-bridge-stale-'))
+  return { dir, stateFile: path.join(dir, 'sessions.json') }
+}
+
+await check('重建失效会话：调用 archiveSession(oldId)，映射更新并落盘', async () => {
+  const { dir, stateFile } = makeStateFile()
+  try {
+    const { b, calls } = makeBridge({ rhythm: { debounceWindowMs: 0 }, stateFile })
+    b.state.sessions['g:123456'] = 'old-g'
+    calls.exists = false
+    const sid = await b.ensureSession('g:123456')
+    assert.equal(calls.archived[0], 'old-g', '应归档旧会话 id')
+    assert.equal(sid, 's1')
+    assert.equal(b.state.sessions['g:123456'], 's1')
+    assert.deepEqual(b.state.stale, [], '归档成功不进 stale')
+    assert.equal(b.state.rebuilds, 1, '重建事件计数')
+    const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+    assert.equal(saved.sessions['g:123456'], 's1')
+    assert.deepEqual(saved.stale, [])
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+await check('归档失败仍成功重建，旧 id 进 stale 并落盘', async () => {
+  const { dir, stateFile } = makeStateFile()
+  try {
+    const { b, calls } = makeBridge({ rhythm: { debounceWindowMs: 0 }, stateFile })
+    b.state.sessions['u:1000000001'] = 'old-u'
+    calls.exists = false
+    calls.archiveFails = ['old-u']
+    const sid = await b.ensureSession('u:1000000001')
+    assert.equal(sid, 's1', '★ 归档失败不能阻塞重建')
+    assert.equal(calls.archived[0], 'old-u', '确实尝试过归档')
+    assert.deepEqual(b.state.stale, ['old-u'])
+    const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+    assert.deepEqual(saved.stale, ['old-u'], 'stale 应落盘')
+    assert.equal(saved.sessions['u:1000000001'], 's1')
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+await check('archiveStaleSessions=false：不归档，只记 stale', async () => {
+  const { dir, stateFile } = makeStateFile()
+  try {
+    const { b, calls } = makeBridge({ dsh: { archiveStaleSessions: false }, stateFile })
+    b.state.sessions['g:123456'] = 'old-g'
+    calls.exists = false
+    await b.ensureSession('g:123456')
+    assert.equal(calls.archived.length, 0, '开关关闭时绝不归档')
+    assert.deepEqual(b.state.stale, ['old-g'])
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+await check('stale 去重且最多保留 100 条', () => {
+  const { b } = makeBridge({})
+  b._noteStale('a')
+  b._noteStale('a')
+  assert.deepEqual(b.state.stale, ['a'], '去重')
+  for (let i = 0; i < 120; i++) b._noteStale(`id-${i}`)
+  assert.equal(b.state.stale.length, 100, '上限 100')
+  assert.equal(new Set(b.state.stale).size, 100)
+  assert.equal(b.state.stale.includes('a'), false, '最老的被挤出去')
+})
+await check('cleanupStale：成功的移除、失败的保留，返回计数并落盘', async () => {
+  const { dir, stateFile } = makeStateFile()
+  try {
+    const { b, calls } = makeBridge({ stateFile })
+    b.state.stale = ['a', 'b', 'c']
+    calls.archiveFails = ['c']
+    const r = await b.cleanupStale()
+    assert.deepEqual(r, { ok: false, archived: 2, failed: 1, remaining: 1 })
+    assert.deepEqual(b.state.stale, ['c'])
+    assert.deepEqual([...calls.archived].sort(), ['a', 'b', 'c'])
+    const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+    assert.deepEqual(saved.stale, ['c'], '清理结果应落盘')
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+await check('cleanupStale 全成功：ok=true、stale 清空', async () => {
+  const { dir, stateFile } = makeStateFile()
+  try {
+    const { b, calls } = makeBridge({ stateFile })
+    b.state.stale = ['x', 'y']
+    const r = await b.cleanupStale()
+    assert.deepEqual(r, { ok: true, archived: 2, failed: 0, remaining: 0 })
+    assert.deepEqual(b.state.stale, [])
+    assert.equal(calls.archived.length, 2)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+await check('cleanupStale({ archive:false }) 只清点不动手', async () => {
+  const { b, calls } = makeBridge({})
+  b.state.stale = ['x', 'y']
+  const r = await b.cleanupStale({ archive: false })
+  assert.deepEqual(r, { ok: true, archived: 0, failed: 0, remaining: 2 })
+  assert.equal(calls.archived.length, 0)
+  assert.deepEqual(b.state.stale, ['x', 'y'], '不动 stale')
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

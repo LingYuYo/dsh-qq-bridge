@@ -12,6 +12,7 @@
   "files": [
     "index.js",
     "client.js",
+    "sandbox/*.mjs",
     "cordis.patch.yml",
     "locale/*.json"
   ],

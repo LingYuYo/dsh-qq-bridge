@@ -79,6 +79,12 @@ copy config.example.json config.json
 | `trimEndPunctuation.enabled` / `.keep` | 是否裁片尾标点（默认 `true`）；`keep` 默认 `["？","！"]`。 |
 | `groupAtReply` | 群聊回复是否 @ 发送者，默认 `true`（私聊永不 @）。 |
 | `groupAtPosition` | @ 挂在哪一片：`"last"`（默认）或 `"first"`。 |
+| `dsh.archiveStaleSessions` | 会话在 DSH 侧失效时是否自动归档旧会话，默认 `true`。见下面「会话失效自动归档」。 |
+| `rhythm.activityLevel` | 响应档位 `0..3`，默认 `1`。`0`=仅 @/私聊，`1`=+关键词，`2`=+随机(0.15)，`3`=全响应。见「响应节奏」。 |
+| `rhythm.debounceWindowMs` | 同会话防抖合并窗口（ms），默认 `800`；窗口内连发多条合并成一次 prompt，`0`=关闭。 |
+| `rhythm.batchIntervalMs` | 多气泡之间的最小间隔（ms），默认 `2500`；`0`=沿用分级打字延时。 |
+| `rhythm.rateLimit.perMin` / `.burst` / `.silent` | 每会话每分钟回复上限（默认 12）、允许突发（默认 3）、超限是否静默（默认 `true`）。 |
+| `rhythm.mute.enabled` / `.words` / `.seconds` | 禁言指令开关（默认 `true`）、词表（默认 `["闭嘴","安静","别刷屏"]`）、时长秒（默认 60）。 |
 
 > **优先级**：DSH 设置页 > `config.json`。没有内置默认值，`napcat.dir` 必须显式填。
 > 桥接每 2 秒轮询设置页，改完约 2 秒内生效，**不需要重启桥接**。
@@ -105,7 +111,7 @@ copy config.example.json config.json
 | NapCat 管理 | 启动 / 停止按钮、三层在线状态、当前账号、安装目录与快速登录号 |
 | OneBot 连接 | WS 地址、Access Token（密码形式，可切换显示）、HTTP API 地址（可选，桥接判断在线已不需要它） |
 | 白名单管理 | `allow.private` / `allow.groups` / `allowAllWhenEmpty`（列表可增删） |
-| 人设配置 | `personaText` 多行文本框 + 保存 / 恢复默认 |
+| 人设配置 | 只读概览卡（名字 / 展示名 / 参与度 / 角色设定前两行）+「⚙️ 编辑人设」弹窗（人设下拉、名字、展示名、参与度、角色设定、附加规则、系统提示词覆盖） |
 | 分片与节奏 | 分片阈值、分级打字延时、群聊 @、片尾标点 |
 
 ### 桥接进程管理
@@ -244,7 +250,18 @@ QQ 账号在线（WS get_status 确认）
 
 ### 人设
 
-`personaText` 非空时覆盖 `qq-chat` preset 的默认人设；留空 = 用默认。
+人设字段（P1.5 起）：`personaText`（角色设定）、`personaBotName`（机器人名字）、
+`personaGroupName`（群内展示名）、`personaParticipation`（quiet / normal / active）、
+`personaExtraRules`（管理员附加规则）、`personaSystemPrompt`（系统提示词覆盖）。
+桥接层 `composePersonaPrompt()` 负责拼出最终系统提示词：
+
+1. `personaSystemPrompt` 非空 → 原样覆盖，其余字段不追加；
+2. 否则 base = `personaText`，为空回落到 preset 默认人设；
+3. 有名字 / 展示名 → 追加身份行，并把默认人设里的 `DeepSeek` 替换成 `personaBotName`；
+4. 追加参与度规则；
+5. 追加管理员附加规则。
+
+全空时返回空串 = 删除 preset 覆盖、回落到内置人设。
 
 **注入方式**（踩过坑，记录原因）：
 
@@ -253,9 +270,9 @@ QQ 账号在线（WS get_status 确认）
   （证据：`dsh-api-session-controller/lib/typert.host.js:1795`）。所以人设不可能随单条消息注入。
 - 人设只能改 preset：preset 的 persona 行注册 `deployment:persona-prefix` 段落，
   且该 preset 用 `complete: true`，人设即唯一系统提示词。
-- 因此桥接在检测到 `personaText` 变化时，把新人设**写回 profile 的用户 patch 层**
-  `~/.dsh/profiles/<profile>/cordis.patch.yml`，以同 id 覆盖 `preset-qq-chat`
-  （见 `src/persona.mjs`）。
+- 因此桥接在检测到任一 persona 字段变化时，先 `bridge.buildPersonaPrompt()` 拼好文本，
+  再**写回 profile 的用户 patch 层** `~/.dsh/profiles/<profile>/cordis.patch.yml`，
+  以同 id 覆盖 `preset-qq-chat`（见 `src/persona.mjs`）。
 - ⚠️ **安全约束**：patch 里同 id 的 `config` 是**整体替换**而非深合并。如果只写一个
   只含 persona 的覆盖块，会把 preset 里其余插件（`tool-ask-user` / `todo_write` /
   `qq-guard` / `compaction`）全部丢掉——**QQ 会话会失去工具门禁**。
@@ -287,6 +304,42 @@ QQ 账号在线（WS get_status 确认）
   - `GET /dsh-qq-guard/config` —— 桥接拉运行期配置（只读）；
   - `POST /dsh-qq-guard/status` + `GET` —— 桥接回推运行状态，供面板显示。
   读取有 HTTP 兜底：remote 不可用时前端改用 `GET config` 只读展示（不能改）。
+
+## 响应节奏（Phase 4）
+
+`rhythm.*` 每次判定都**现读热配置**（`Bridge._rhythm()`），改完下一句消息即生效，
+不需要重启桥接。处理顺序固定为：
+
+```
+白名单 → 禁言指令 → 静音期丢弃 → 响应档位 → 防抖合并 → 限频 → 建会话/prompt → 审计 → 发送
+```
+
+任何一步判否都**不回复、不创建会话**（避免白给 DSH 堆会话）。
+
+- **activityLevel**（群聊；私聊 0..3 档都永远回）：
+  - `0`：只有被 @ 才回；
+  - `1`：@ 或命中关键词才回（默认词表 `dsh` / `小鱼` / `机器人` / `bot`，可用 `rhythm.keywords` 覆盖）；
+  - `2`：在 1 档基础上，未命中关键词时按 `rhythm.randomChance`（默认 0.15）随机回；
+  - `3`：群里所有消息都回。
+  @ 的判定看 OneBot 消息段里的 `at.qq` 是否等于桥接登录号；拿不到登录号时「有 at 段就算被叫」。
+- **debounceWindowMs**：同一会话（`u:<QQ号>` / `g:<群号>`）窗口内的连续消息用换行拼接成
+  一次 prompt，窗口内没有新消息才投递。串行队列（`queues.run`）语义不变，仍然绝不并发。
+  入站合并只影响**发给模型**的文本，与「模型原生换行不合并」的发送红线无关。
+- **rateLimit**：每会话 60 秒滑动窗口，容量 = `perMin + burst`；只统计**真正发出去了**
+  的回复。超限时 `silent=true` 静默丢弃，`false` 则回一句「慢一点」提示（提示不计入回复数）。
+- **mute**：文本命中 `words` 任一词就把该会话静音 `seconds` 秒（内存态，重启清空）。
+  禁言指令本身不回复，静音期内所有消息都不回。
+
+### 会话失效自动归档
+
+`state.sessions` 里的映射在 DSH 侧已不存在时（`sessionExists` 为 false），重建前会
+**best-effort** 归档旧会话：`dsh.archiveSession(oldId)`。规则：
+
+- 归档失败**不阻塞重建**（QQ 用户还在等回复），失败的旧 id 记进 `state.stale`（去重，最多 100 条）；
+- `dsh.archiveStaleSessions=false` 时完全不归档，只把 id 记进 `state.stale`；
+- 只归档「已失效的旧会话」，**绝不**碰仍映射着的会话，也不清空任何会话历史；
+- 重试入口是 `Bridge.cleanupStale({ archive = true })`：遍历 `state.stale` 逐个归档，
+  成功的移出，返回 `{ ok, archived, failed, remaining }`（由 Host 设置页路由调用）。
 
 ## 分片与打字延时
 
@@ -331,6 +384,10 @@ QQ 账号在线（WS get_status 确认）
 **间隔优先级**：`typingDelay.enabled=true`（默认）走上面的**分级延时**，
 `sendIntervalMs` 不生效；置 `false` 时不分片、不延时、整条合并发送，
 `sendIntervalMs` 作为兜底固定间隔（此时只剩 1 条，实际用不到）。
+
+`rhythm.batchIntervalMs`（默认 2500ms）是**下限**：相邻气泡取
+`max(原间隔, batchIntervalMs)`，所以调整它不会让气泡发得比分级延时更快。
+重试同一片时用原间隔，不受批次间隔影响。
 
 > 审计顺序不变：**先对全文做审计，命中则整条不发**，之后才拆分。
 

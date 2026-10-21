@@ -26,12 +26,50 @@ const HOT_KEYS = [
   'typingDelay',
   'flypitDelayTiers',
   'trimEndPunctuation',
-  // 批次 4A-UI：白名单与人设也必须热更新
+  // 批次 4A-UI：白名单与人设也必须热更新。
   'allow',
+  // 人设相关字段（P1.5）：桥接层用它们拼最终系统提示词。
   'personaText',
+  'personaBotName',
+  'personaGroupName',
+  'personaParticipation',
+  'personaExtraRules',
+  'personaSystemPrompt',
+  // Phase 4：节奏参数（响应档位/防抖/限频/禁言）必须热更新。
+  'rhythm',
   // OneBot 连接信息只用于 UI 展示；WS 连接在启动时建立，改它仍需重启桥接。
   'onebot',
 ]
+
+/**
+ * `dsh.*` 下允许热覆盖的子键。
+ *
+ * 为什么不是整个 `dsh` 进白名单：`dsh.baseUrl` / `sessionCwd` 是连接与落盘
+ * 位置，绝不能让设置页改（和第 14 行「拒绝下发连接凭据」同一个理由）。
+ * 这里只放行纯行为开关，按子键收窄。
+ */
+const HOT_DSH_KEYS = ['archiveStaleSessions']
+
+/** 人设相关字段：任何一项变化都要重拼系统提示词（不能只盯 personaText）。 */
+const PERSONA_KEYS = [
+  'personaText',
+  'personaBotName',
+  'personaGroupName',
+  'personaParticipation',
+  'personaExtraRules',
+  'personaSystemPrompt',
+]
+
+/**
+ * 人设字段的稳定签名（用于避免每 2 秒重复写 profile）。
+ * @param {object} source
+ * @returns {string}
+ */
+function personaSignature(source) {
+  const out = {}
+  for (const key of PERSONA_KEYS) out[key] = source?.[key] ?? null
+  return JSON.stringify(out)
+}
 
 /** 路由路径，与 plugins/dsh-qq-guard/index.js 的 CONFIG_ROUTE_PATH 一致。 */
 export const CONFIG_ROUTE_PATH = '/dsh-qq-guard/config'
@@ -54,6 +92,15 @@ export function pickHotConfig(source) {
     const value = source[key]
     if (value === undefined) continue
     out[key] = typeof value === 'object' && value !== null ? JSON.parse(JSON.stringify(value)) : value
+  }
+  // dsh 只挑安全子键（见 HOT_DSH_KEYS），绝不整包透传。
+  const dsh = source.dsh
+  if (dsh && typeof dsh === 'object' && !Array.isArray(dsh)) {
+    const picked = {}
+    for (const key of HOT_DSH_KEYS) {
+      if (key in dsh && dsh[key] !== undefined) picked[key] = dsh[key]
+    }
+    if (Object.keys(picked).length > 0) out.dsh = picked
   }
   return out
 }
@@ -102,8 +149,8 @@ export function startConfigPolling({
   let timer = null
   // 第一次拉取前不打「配置未变」这类噪音；首次成功后记一条，说明链路通了。
   let syncedOnce = false
-  // 上次写入 preset 的人设值：避免每 2 秒重复写盘。
-  let lastPersonaWritten = undefined
+  // 上次写入 preset 的人设签名：避免每 2 秒重复写盘。
+  let lastPersonaSignature = undefined
   // 状态上报失败只告警一次，避免每 2 秒刷屏。
   let statusReportWarned = false
   let statusReportedOnce = false
@@ -135,19 +182,18 @@ export function startConfigPolling({
       // 人设变了 → 写回 profile 的 preset 覆盖（只对新建会话生效）。
       // 首次同步只**记录**当前值，不写盘（避免每次启动都改 profile）。
       try {
-        if (typeof hot.personaText === 'string') {
-          if (lastPersonaWritten === undefined) {
-            lastPersonaWritten = hot.personaText
-          } else if (hot.personaText !== lastPersonaWritten) {
-            const r = onPersona?.(hot.personaText, { previous: lastPersonaWritten })
-            if (r?.ok) {
-              lastPersonaWritten = hot.personaText
-              log.info(r.action === 'removed-override'
-                ? '人设已恢复默认（删除 preset 覆盖）'
-                : '人设已写入 preset 覆盖（对新建 QQ 会话生效）')
-            } else if (r) {
-              log.warn?.(`写人设失败（${r.action}）：${r.detail ?? ''}`)
-            }
+        const signature = personaSignature(hot)
+        if (lastPersonaSignature === undefined) {
+          lastPersonaSignature = signature
+        } else if (signature !== lastPersonaSignature) {
+          const r = onPersona?.(hot, { previous: lastPersonaSignature })
+          if (r?.ok) {
+            lastPersonaSignature = signature
+            log.info(r.action === 'removed-override'
+              ? '人设已恢复默认（删除 preset 覆盖）'
+              : '人设已写入 preset 覆盖（对新建 QQ 会话生效）')
+          } else if (r) {
+            log.warn?.(`写人设失败（${r.action}）：${r.detail ?? ''}`)
           }
         }
       } catch (error) {

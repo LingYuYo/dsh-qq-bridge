@@ -129,7 +129,7 @@ node qq-bridge/test-offline.mjs
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。
-与腾讯、NapCat、DeepSeek 官方均无隶属关系；用你自己的账号做事，后果自负。
+与腾讯、NapCat、DeepSeek 官方均无隶属关系；使用你自己的账号接入 QQ 所产生的一切后果，由你自行承担。
 
 ## 开发流程（本仓库是唯一写入点）
 

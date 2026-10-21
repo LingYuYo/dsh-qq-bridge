@@ -6,7 +6,8 @@
     "agentPreset": "qq-chat",
     "provider": "trae",
     "model": "deepseek-v4.1-flash",
-    "reasoningEffort": "high"
+    "reasoningEffort": "high",
+    "archiveStaleSessions": true
   },
   "onebot": {
     "wsUrl": "ws://127.0.0.1:3001",
@@ -33,5 +34,18 @@
   },
   "groupAtReply": true,
   "groupAtPosition": "last",
+  "personaBotName": "",
+  "personaGroupName": "",
+  "personaParticipation": "normal",
+  "personaText": "",
+  "personaExtraRules": "",
+  "personaSystemPrompt": "",
+  "rhythm": {
+    "activityLevel": 1,
+    "debounceWindowMs": 800,
+    "batchIntervalMs": 2500,
+    "rateLimit": { "perMin": 12, "burst": 3, "silent": true },
+    "mute": { "enabled": true, "words": ["闭嘴", "安静", "别刷屏"], "seconds": 60 }
+  },
   "stateFile": "./state/sessions.json"
 }

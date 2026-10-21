@@ -95,8 +95,9 @@ const stopPolling = startConfigPolling({
   logger,
   liveConfig: bridge.live,
   onSync: () => bridge._applyLiveToClient(),
-  // 人设变化 → 写回 profile 的 preset 覆盖（只对新建会话生效，保留已有会话上下文）。
-  onPersona: (text) => writePersona(text),
+  // 人设变化 → 桥接层拼最终系统提示词（名字/参与度/附加规则/覆盖），
+  // 再写回 profile 的 preset 覆盖（只对新建会话生效，保留已有会话上下文）。
+  onPersona: () => writePersona(bridge.buildPersonaPrompt()),
   // 顺带把运行状态回推给 DSH 设置页的「运行状态」分类（批次 4A）。
   // 批次 5：**不再用 `qq.connected`（WS 建连瞬间恒 false，且不等于账号在线）**，
   // 改由 health.online 推导四态（online/offline/unverified/disconnected）。

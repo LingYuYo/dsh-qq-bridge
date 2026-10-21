@@ -31,8 +31,7 @@ function resolveSchemastery() {
 // 插件本体的 import 需要宿主解析 @deepseek-ai/schemastery；测试时把模块源码
 // 里那行 import 换成本地绝对路径，避免依赖 profile 的 node_modules 布局。
 const SRC = readFileSync(path.join(HERE, 'index.js'), 'utf8')
-const SM_PATH = process.env.QQG_SCHEMASTERY
-  || 'resolveSchemastery()'
+const SM_PATH = resolveSchemastery()
 const patched = SRC.replace(
   /^import Schema from '@deepseek-ai\/schemastery'$/m,
   `import Schema from ${JSON.stringify('file:///' + SM_PATH.replace(/\\/g, '/'))}`,
@@ -176,7 +175,7 @@ await check('preset 内 ctx（composedPreset=qq-chat）+ role=guard → 正常�
 })
 
 console.log('\n— 分派：role=settings 只做设置面 —')
-await check('role=settings 有 webServer → 注册 config/status/napcat/bridge 路由，且不挂 guard', () => {
+await check('role=settings 有 webServer → 注册全部设置面路由，且不挂 guard', () => {
   const { ctx, calls } = makeCtx({ presetId: undefined, hasWebServer: true, settingsAvailable: true, hasSubprocess: true })
   apply(ctx, Config({ role: 'settings' }))
   assert.equal(calls.guard, 0, '★ settings 实例绝不能挂 guard')
@@ -184,10 +183,18 @@ await check('role=settings 有 webServer → 注册 config/status/napcat/bridge 
   const paths = calls.webRoutes.map((r) => r.path).sort()
   assert.deepEqual(paths, [
     '/dsh-qq-guard/bridge',
+    // 清理 QQ 工作区里的失效会话（Phase 4）
+    '/dsh-qq-guard/cleanup-sessions',
     '/dsh-qq-guard/config',
+    // 只读扫描外部插件目录（Phase 4）
+    '/dsh-qq-guard/external-plugins',
+    // P1：外部插件沙箱加载测试
+    '/dsh-qq-guard/external-plugins/test',
     '/dsh-qq-guard/napcat',
+    // 原生目录选择器（NapCat 安装目录的「浏览」按钮）
+    '/dsh-qq-guard/pick-dir',
     '/dsh-qq-guard/status',
-  ], `路由应为 4 条，实际 ${JSON.stringify(paths)}`)
+  ], `路由应为 8 条，实际 ${JSON.stringify(paths)}`)
   assert.ok(calls.webRoutes.every((r) => r.kind === 'exact'))
 })
 await check('role=settings 无 webServer → 安全跳过', () => {

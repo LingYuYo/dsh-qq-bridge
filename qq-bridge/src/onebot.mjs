@@ -460,6 +460,7 @@ export class OneBotClient {
    * @param {number} [opts.bubbleMaxChars=30] 单行语义切阈值
    * @param {number} [opts.mergeMaxChars=15] 参与合并的短行上限
    * @param {number} [opts.sendIntervalMs=500] 分片间隔**兜底**（打字延时关闭时用）
+   * @param {number} [opts.batchIntervalMs=0] 相邻气泡的**最小**间隔（节奏批次间隔；0=不限制）
    * @param {boolean} [opts.typingDelayEnabled=true] 打字延时总开关（关闭 = 不分片、不延时、整条发）
    * @param {string[]} [opts.keepEndPunct] 片尾保留标点，默认 ['？','！']
    * @param {boolean} [opts.trimEndPunctuation=true] 是否裁片尾标点
@@ -478,6 +479,7 @@ export class OneBotClient {
     bubbleMaxChars,
     mergeMaxChars,
     sendIntervalMs,
+    batchIntervalMs,
     typingDelayEnabled,
     keepEndPunct,
     trimEndPunctuation,
@@ -495,6 +497,9 @@ export class OneBotClient {
     this.bubbleMaxChars = positive(bubbleMaxChars, DEFAULT_BUBBLE_MAX_CHARS)
     this.mergeMaxChars = positive(mergeMaxChars, DEFAULT_MERGE_MAX_CHARS)
     this.sendIntervalMs = Number.isFinite(sendIntervalMs) && sendIntervalMs >= 0 ? Number(sendIntervalMs) : DEFAULT_SEND_INTERVAL_MS
+    // 节奏批次间隔（Phase 4）：多气泡之间的**最小**间隔，由 bridge 从热配置刷进来。
+    // 0/未设 = 不额外限制，完全沿用原来的分级打字延时（保持旧行为）。
+    this.batchIntervalMs = Number.isFinite(batchIntervalMs) && batchIntervalMs > 0 ? Number(batchIntervalMs) : 0
     this.typingDelayEnabled = typingDelayEnabled !== false
     this.keepEndPunct = Array.isArray(keepEndPunct) ? keepEndPunct : DEFAULT_KEEP_END_PUNCT
     this.trimEndPunctuation = trimEndPunctuation !== false
@@ -734,7 +739,8 @@ export class OneBotClient {
         }
         if (attempt < SEND_ATTEMPTS) {
           this.log.warn(`QQ 发送被拒（${kind}:${id} 第 ${i + 1}/${chunks.length} 片）：${chunkError}，重试一次`)
-          await sleep(this._gapBefore(i, chunks))
+          // 重试同一片不是「新气泡」，用原间隔，不吃 batchIntervalMs 的 2.5 秒。
+          await sleep(this._baseGap(i, chunks))
         }
       }
 
@@ -754,10 +760,20 @@ export class OneBotClient {
   }
 
   /**
-   * 下一片之前的等待：打字延时开启时按**分级延时**（看上一片的码点数），
-   * 关闭时用 `sendIntervalMs` 兜底固定间隔。
+   * 下一片之前的等待。
+   *
+   * 两段取**较大值**：
+   *   ① 原值：打字延时开启时按分级延时（看上一片的码点数）；关闭时用 sendIntervalMs；
+   *   ② `batchIntervalMs`（节奏批次间隔，来自热配置 rhythm.batchIntervalMs）：
+   *      一轮回复拆成多个气泡时，相邻气泡的最小间隔。0 = 不限制（保持旧行为）。
    */
   _gapBefore(index, chunks) {
+    const base = this._baseGap(index, chunks)
+    return this.batchIntervalMs > 0 ? Math.max(base, this.batchIntervalMs) : base
+  }
+
+  /** 原间隔计算（不含批次间隔）：重试等待也用它，别把重试拖成 2.5 秒。 */
+  _baseGap(index, chunks) {
     if (!this.typingDelayEnabled) return this.sendIntervalMs
     return typingDelayFor(charCount(chunks[index] ?? ''))
   }

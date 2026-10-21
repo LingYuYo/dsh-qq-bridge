@@ -19,6 +19,7 @@ import {
   writePersona, readBundlePresetBlock, extractPrefix, findPresetBlock, findPrefixRange,
   readDefaultPersona,
 } from './src/persona.mjs'
+import { composePersonaPrompt, PERSONA_PARTICIPATION } from './src/bridge.mjs'
 
 let pass = 0, fail = 0
 const check = (name, fn) => {
@@ -141,6 +142,53 @@ check('多行人设可往返读取', () => {
   const block = findPresetBlock(lines)
   const got = extractPrefix(lines.slice(block.start, block.end))
   assert.equal(got, text, `往返不一致：${JSON.stringify(got)}`)
+})
+
+console.log('\n— ⑥ 桥接层拼最终系统提示词（P1.5）—')
+check('什么都没设置 → 空串（删除覆盖、回落到内置）', () => {
+  assert.equal(composePersonaPrompt({ defaultText: '默认人设正文' }), '')
+  assert.equal(composePersonaPrompt({ baseText: '  ', defaultText: '默认人设正文', participation: 'normal' }), '')
+})
+
+check('系统提示词覆盖：非空时原样返回，忽略其它字段', () => {
+  const out = composePersonaPrompt({
+    systemPrompt: '完整的自定义系统提示词',
+    baseText: '角色设定', botName: '小鱼', extraRules: '附加规则', participation: 'active',
+  })
+  assert.equal(out, '完整的自定义系统提示词')
+  assert.ok(!out.includes('小鱼'), '覆盖模式不该追加名字')
+})
+
+check('名字替换：默认人设里的 DeepSeek 被替换 + 追加身份行', () => {
+  const out = composePersonaPrompt({
+    defaultText: '你是 DeepSeek，也是群友。', botName: '林小鱼', groupName: '小鱼',
+  })
+  assert.ok(out.includes('【身份】'), out)
+  assert.ok(out.includes('林小鱼') && out.includes('小鱼'), out)
+  assert.ok(!out.includes('DeepSeek'), `旧名字没被替换：${out}`)
+})
+
+check('角色设定优先于默认人设', () => {
+  const out = composePersonaPrompt({ baseText: '自定义角色', defaultText: '默认角色', participation: 'quiet' })
+  assert.ok(out.includes('自定义角色'))
+  assert.ok(!out.includes('默认角色'))
+  assert.ok(out.includes('【参与度】'))
+})
+
+check('参与度三档的规则不同；非法值回退普通群友', () => {
+  const quiet = composePersonaPrompt({ baseText: '设定', participation: 'quiet' })
+  const active = composePersonaPrompt({ baseText: '设定', participation: 'active' })
+  const fallback = composePersonaPrompt({ baseText: '设定', participation: '???', botName: 'x' })
+  assert.ok(quiet.includes(PERSONA_PARTICIPATION.quiet.rule))
+  assert.ok(active.includes(PERSONA_PARTICIPATION.active.rule))
+  assert.ok(fallback.includes(PERSONA_PARTICIPATION.normal.rule), fallback)
+})
+
+check('管理员附加规则追加在最后', () => {
+  const out = composePersonaPrompt({
+    baseText: '角色设定', botName: '小鱼', participation: 'active', extraRules: '凌晨别发言',
+  })
+  assert.ok(out.trimEnd().endsWith('【管理员附加规则】\n凌晨别发言'), out)
 })
 
 fs.rmSync(tmpDir, { recursive: true, force: true })

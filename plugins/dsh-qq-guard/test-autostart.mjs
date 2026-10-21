@@ -33,8 +33,7 @@ function resolveSchemastery() {
 
 // 与 test-guard-scope.mjs 相同：把宿主解析的 schemastery 换成本地绝对路径。
 const SRC = fs.readFileSync(path.join(HERE, 'index.js'), 'utf8')
-const SM_PATH = process.env.QQG_SCHEMASTERY
-  || 'resolveSchemastery()'
+const SM_PATH = resolveSchemastery()
 const patched = SRC.replace(
   /^import Schema from '@deepseek-ai\/schemastery'$/m,
   `import Schema from ${JSON.stringify('file:///' + SM_PATH.replace(/\\/g, '/'))}`,
