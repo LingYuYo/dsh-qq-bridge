@@ -19,7 +19,7 @@
     "deny": { "private": [], "groups": [] },
     "allowAllWhenEmpty": false
   },
-  "replyTimeoutMs": 180000,
+  "replyTimeoutMs": 20000,
   "sendDelayMs": 400,
   "chunkSize": 1000,
   "bubbleMaxChars": 30,

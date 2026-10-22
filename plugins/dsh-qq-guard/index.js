@@ -82,6 +82,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { NapcatManager, DEFAULT_WS_PORT } from './napcat.mjs'
 import { BridgeRunner, DEFAULT_BRIDGE_DIR } from './bridge-runner.mjs'
 import { SandboxManager } from './sandbox/manager.mjs'
+import { installModelOverride } from './model-override.js'
 import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, realpathSync } from 'node:fs'
 import { builtinModules } from 'node:module'
 import os from 'node:os'
@@ -291,6 +292,40 @@ const Config = Schema.object({
   personaPresetId: Schema.string()
     .description('当前选中的自定义人设 id；空串 = 使用默认人设。')
     .default('').volatile(),
+
+  // ── 模型（无痕热切换 + 失败降级）────────────────────────────
+  // 桥接每条消息前把它 POST 给 `/dsh-qq-guard/model`；插件在 `agent/request` 瀑布里
+  // 覆写这一次请求的 route —— 不走 `session/selectModel`，不动 DSH 全局默认。
+  // 留空 provider = 不接管，会话仍用它当前的模型。
+  model: Schema.object({
+    provider: Schema.string()
+      .description('QQ 会话使用的 provider id。留空 = 不接管（跟随会话当前模型）。')
+      .default('').volatile(),
+    model: Schema.string()
+      .description('模型 id。provider 非空时必须一起填。')
+      .default('').volatile(),
+    reasoningEffort: Schema.string()
+      .description('推理档位 id（如 off/low/high/max）。留空 = 用该模型的默认档。')
+      .default('').volatile(),
+  }).description('QQ 会话使用的模型').default({}),
+  modelFallbacks: Schema.array(Schema.object({
+    provider: Schema.string().required().description('备用 provider id。'),
+    model: Schema.string().required().description('备用模型 id。'),
+  })).description('备用模型（最多 4 个）。主模型超时/报错时按顺序接管，同一轮内生效。')
+    .default([]).volatile(),
+
+  // ── 高级参数（排障 / 调优，一般不用动）──────────────────────
+  // 三个都是「响应链路的时间常数」，面板上收进一张折叠卡，桥接侧全部热读。
+  replyTimeoutMs: Schema.number()
+    .description('桥接等回复上限（毫秒）。超时会取消这一轮并给 QQ 回一句提示。默认 20000。')
+    .default(20000).min(1000).max(600000).volatile(),
+  modelWatchdogMs: Schema.number()
+    .description('静默看门狗：被接管的模型多少毫秒没有任何输出就判定超时、切备用模型（0 = 关闭）。'
+      + '只作用于 QQ 会话下发的路由，不影响浏览器里的会话。')
+    .default(8000).min(0).max(120000).volatile(),
+  antiDebounceMs: Schema.number()
+    .description('消息防抖合并窗口（毫秒）。0 = 沿用「活跃设置」里的 debounceWindowMs（默认 800）。')
+    .default(0).min(0).max(60000).volatile(),
 
   // ── 白名单（批次 4A-UI）──────────────────────────────────────
   // 桥接每处理一条消息都从热配置现读，改完下一条即生效。
@@ -1089,6 +1124,11 @@ export function apply(ctx, config) {
     return
   }
   if (role === 'settings') {
+    // 按请求覆写模型（无痕热切换）：必须装在**顶层实例**、且必须在 applySettings 之前。
+    // 为什么不放进 applySettings：它开头有 `if (ctx.webServer === undefined) return`，
+    // 会让 agent/request 钩子跟着一起被跳过。
+    // 传 config 进去：models 路由要把「设置页当前保存的模型」一起回给面板（LaunchCard 展示用）。
+    installModelOverride(ctx, { config })
     applySettings(ctx, config ?? {})
     return
   }

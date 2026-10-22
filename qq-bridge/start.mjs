@@ -89,13 +89,41 @@ const bridge = new Bridge({ config, logger })
 await bridge.start()
 logger.info('桥接已启动，等待 QQ 消息。按 Ctrl+C 退出。')
 
+// 人设里现在带【底层模型】一行，必须在第一条消息之前就位。
+//
+// 为什么写两次：
+//   ① 启动时 `bridge.live` 还没有 DSH 设置页下发的 `model`（轮询要 2 秒后才有），
+//      这一版只能用 config.json 的 `dsh.provider/model` 兜底 —— DSH 没起来也至少有身份行；
+//   ② 首次同步成功后必须**再写一次校准**，否则设置页里配的模型和身份行会不一致
+//      （轮询只在签名变化时重写，首次同步只记录不写盘，见 runtime-config.mjs）。
+const writePersonaNow = (label) => {
+  try {
+    const result = writePersona(bridge.buildPersonaPrompt())
+    if (result?.ok && result.action === 'upserted-override') logger.info(`人设已写入（${label}）`)
+    else if (result?.ok && result.action === 'removed-override') logger.info(`人设已恢复默认（${label}）`)
+    return result
+  } catch (error) {
+    logger.warn?.(`人设写入失败（不阻塞，${label}）：${error?.message ?? error}`)
+    return undefined
+  }
+}
+writePersonaNow('含底层模型路由')
+
+let firstSyncDone = false
+
 // 从 DSH 设置页热同步运行期配置（批次 4A）。失败不影响收发，继续用 config.json。
 const stopPolling = startConfigPolling({
   baseUrl: config.dsh.baseUrl,
   logger,
   liveConfig: bridge.live,
-  onSync: () => bridge._applyLiveToClient(),
-  // 人设变化 → 桥接层拼最终系统提示词（名字/参与度/附加规则/覆盖），
+  onSync: () => {
+    bridge._applyLiveToClient()
+    if (!firstSyncDone) {
+      firstSyncDone = true
+      writePersonaNow('首次同步后校准模型身份')
+    }
+  },
+  // 人设变化 → 桥接层拼最终系统提示词（名字/参与度/附加规则/覆盖/模型身份），
   // 再写回 profile 的 preset 覆盖（只对新建会话生效，保留已有会话上下文）。
   onPersona: () => writePersona(bridge.buildPersonaPrompt()),
   // 顺带把运行状态回推给 DSH 设置页的「运行状态」分类（批次 4A）。

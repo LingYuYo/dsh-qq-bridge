@@ -336,10 +336,57 @@ export class DshClient {
     return sessionId
   }
 
+  /**
+   * ⚠️ 旧路径，仅保留给兼容/排障：`session/selectModel` 会**顺带把新选择写进
+   * profile 的 agent-default-model**（dsh-api-session-controller/lib/types/commands.js:175
+   * → `agentDefaultModel.saveSelection`），也就是会改 DSH 全局默认。正常聊天不要用，
+   * 用 {@link setSessionModel}。
+   */
   async selectModel(sessionId, provider, model, reasoningEffort) {
     const args = { sessionId, provider, model }
     if (reasoningEffort) args.reasoningEffort = reasoningEffort
     return this.call('session/selectModel', args)
+  }
+
+  /**
+   * 把「这个会话该用哪个模型」写给 qq-guard 插件（无痕热切换）。
+   *
+   * 为什么走插件自己的 HTTP 路由，而不是 `session/selectModel`：
+   *   · selectModel 会落盘全局默认（见上）；
+   *   · 插件在 `agent/request` 瀑布里覆写**这一次请求**的 route，下一请求即生效，
+   *     且完全不动 profile 配置。
+   *
+   * 协议（见 plugins/dsh-qq-guard/model-override.js）：
+   *   POST {sessionId, provider, model, reasoningEffort?, fallbacks?}
+   *   POST {sessionId, mode:'default'}   ← 跟随全局默认（抵消会话 header 的粘性）
+   *
+   * @param {{sessionId:string, provider?:string, model?:string, reasoningEffort?:string, fallbacks?:Array<{provider:string,model:string}>}} request
+   * @returns {Promise<object>} 插件回显的 entry
+   */
+  async setSessionModel({ sessionId, provider, model, reasoningEffort, fallbacks }) {
+    const useDefault = !(provider && model)
+    const body = useDefault
+      ? { sessionId, mode: 'default' }
+      : {
+        sessionId,
+        provider,
+        model,
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        ...(Array.isArray(fallbacks) && fallbacks.length > 0 ? { fallbacks } : {}),
+      }
+    const res = await fetch(`${this.baseUrl}/dsh-qq-guard/model`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: this.ensureCookie() },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    })
+    const payload = await res.json().catch(() => ({}))
+    if (!res.ok || payload?.ok !== true) {
+      const error = new Error(payload?.detail ?? payload?.reason ?? `HTTP ${res.status}`)
+      error.code = payload?.reason
+      throw error
+    }
+    return payload.entry
   }
 
   /**
@@ -461,14 +508,22 @@ export class DshClient {
    *
    * @returns {Promise<string>} 助手回复文本（含换行）；超时抛错。
    */
-  async promptAndWait(sessionId, text, { timeoutMs = 180000, pollMs = 1500, onProgress } = {}) {
+  async promptAndWait(sessionId, text, { timeoutMs = 20000, pollMs = 1500, slowHintMs = 0, onProgress } = {}) {
     const before = await this.turnOutline(sessionId)
     const beforeTurns = before.length
     const beforeSeq = before.at(-1)?.seq ?? -1
     await this.prompt(sessionId, text)
 
-    const deadline = Date.now() + timeoutMs
+    const started = Date.now()
+    const deadline = started + timeoutMs
+    let slowHinted = false
     while (Date.now() < deadline) {
+      // 慢提示：等待超过看门狗时间还没回复时打一条，用户看日志就知道「不是死机，在降级」。
+      if (!slowHinted && slowHintMs > 0 && Date.now() - started >= slowHintMs) {
+        slowHinted = true
+        const seconds = Math.round((Date.now() - started) / 1000)
+        this.logger.warn(`⏳ 等待回复已超 ${seconds} 秒，可能正在触发看门狗降级…`)
+      }
       await new Promise((r) => setTimeout(r, pollMs))
       let outline
       try {
@@ -498,7 +553,22 @@ export class DshClient {
       }
       return latest.response.trim()
     }
-    throw new Error(`等待回复超时（${Math.round(timeoutMs / 1000)}s）`)
+
+    // 超时必须**主动取消** DSH 侧这一轮：
+    //   不取消的话 turn 还在进程里跑，前端会一直转「深度求索中」，
+    //   而且下一次 prompt 会被当成排队消息，看起来像「卡死」。
+    // `session/cancel` 会让 turn/end 以 aborted 收尾，前端状态立刻回落。
+    let cancelled = false
+    try {
+      await this.call('session/cancel', { sessionId })
+      cancelled = true
+    } catch (error) {
+      this.logger.warn?.(`取消失败（不影响报错）：${error.message}`)
+    }
+    const timeoutError = new Error(`等待回复超时（${Math.round(timeoutMs / 1000)}s）`)
+    timeoutError.code = 'TIMEOUT'
+    timeoutError.cancelled = cancelled
+    throw timeoutError
   }
 
   async archiveSession(sessionId) {

@@ -11,6 +11,8 @@ node_modules/
 
 # ── 测试临时产物 ─────────────────────────────────────────
 .tmp-index*.mjs
+# render-preview.mjs 生成的静态版式截图（1.7MB，属于产物不是源码）
+plugins/dsh-qq-guard/preview/
 
 # ── 同步脚本的备份目录（如果 -Live 指到仓库内）───────────
 .sync-backup/

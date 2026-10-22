@@ -150,6 +150,45 @@ check('什么都没设置 → 空串（删除覆盖、回落到内置）', () =>
   assert.equal(composePersonaPrompt({ baseText: '  ', defaultText: '默认人设正文', participation: 'normal' }), '')
 })
 
+console.log('\n— ⑥b 底层模型自我认知（无痕热切换配套）—')
+check('未配置模型 → 不追加任何模型行', () => {
+  const out = composePersonaPrompt({ baseText: '设定', modelRoute: '' })
+  assert.ok(!out.includes('底层模型'), `不该出现模型行：${out}`)
+  assert.ok(!out.includes('DSH'), '不该出现 DSH 字样')
+})
+
+check('配置了模型 → 追加【底层模型】行，路由原样带出', () => {
+  const out = composePersonaPrompt({ baseText: '设定', modelRoute: 'raccoon/sn-deepseek-v4-1-flash-1017' })
+  assert.ok(out.includes('【底层模型】'), `缺少模型行：${out}`)
+  assert.ok(out.includes('raccoon/sn-deepseek-v4-1-flash-1017'), '路由没带出来')
+  assert.ok(out.includes('DSH'), '应说明由 DSH 提供驱动')
+})
+
+check('纯默认人设（没自定义）+ 有模型 → 仍生成覆盖，且带上默认人设正文', () => {
+  const out = composePersonaPrompt({ defaultText: '默认人设正文', modelRoute: 'workbuddy/deepseek-v4.1-flash' })
+  assert.ok(out.includes('默认人设正文'), '覆盖不能把默认人设正文丢掉')
+  assert.ok(out.includes('workbuddy/deepseek-v4.1-flash'), '路由没带出来')
+  // 没自定义时不该凭空造【参与度】段（那会让「什么都没改」看起来像改过）
+  assert.ok(!out.includes('【参与度】'), `不该追加参与度：${out}`)
+})
+
+check('系统提示词覆盖 + 有模型 → 覆盖文本后追加模型行', () => {
+  const out = composePersonaPrompt({ systemPrompt: '完整覆盖', modelRoute: 'raccoon/x' })
+  assert.ok(out.startsWith('完整覆盖'), '覆盖文本要保留在最前')
+  assert.ok(out.includes('raccoon/x'), '模型行没追加')
+})
+
+check('模型行与参与度/附加规则的顺序稳定', () => {
+  const out = composePersonaPrompt({
+    baseText: '设定', participation: 'quiet', extraRules: '规则', modelRoute: 'raccoon/x',
+  })
+  const iRole = out.indexOf('设定')
+  const iPart = out.indexOf('【参与度】')
+  const iRule = out.indexOf('【管理员附加规则】')
+  const iModel = out.indexOf('【底层模型】')
+  assert.ok(iRole < iPart && iPart < iRule && iRule < iModel, `顺序不对：${out}`)
+})
+
 check('系统提示词覆盖：非空时原样返回，忽略其它字段', () => {
   const out = composePersonaPrompt({
     systemPrompt: '完整的自定义系统提示词',

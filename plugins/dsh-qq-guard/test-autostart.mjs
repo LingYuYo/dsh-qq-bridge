@@ -133,7 +133,11 @@ console.log('— ① autoStart:true → 静默拉起 —')
 await check('1.5s 后 spawn 桥接，argv/cwd/stdio 正确', async () => {
   resetAutoStartMark()
   const { ctx, logs, subprocess } = makeCtx()
-  mod.apply(ctx, mod.Config({ role: 'settings', bridge: { autoStart: true } }))
+  // ⚠️ 必须显式给临时目录：默认目录是真实的 qq-bridge，若本机桥接正在运行，
+  // BridgeRunner 的单实例检查会正确判成 already-running-external → 不 spawn，
+  // 这条用例就会假红。这里要测的是 autoStart 的时序与 argv，不是单实例逻辑。
+  const dir = makeBridgeDir()
+  mod.apply(ctx, mod.Config({ role: 'settings', bridge: { dir, autoStart: true } }))
   assert.ok(logs.some((l) => l.text.includes('bridge.autoStart=true')), '应记录 autoStart 已开启')
   assert.equal(subprocess.spawned.length, 0, 'apply 当下不该立刻 spawn（要等 DSH 就绪）')
   const ok = await waitFor(() => subprocess.spawned.length === 1, 3000)
@@ -141,8 +145,8 @@ await check('1.5s 后 spawn 桥接，argv/cwd/stdio 正确', async () => {
   const { spec } = subprocess.spawned[0]
   assert.equal(spec.argv.length, 2)
   assert.ok(spec.argv[1].endsWith('start.mjs'), `入口不对：${spec.argv[1]}`)
-  assert.equal(path.resolve(spec.cwd), DEFAULT_BRIDGE_DIR, `cwd 应为默认桥接目录，实际 ${spec.cwd}`)
-  assert.ok(fs.existsSync(path.join(spec.cwd, 'start.mjs')), '默认桥接目录里应有 start.mjs')
+  assert.equal(path.resolve(spec.cwd), path.resolve(dir), `cwd 应为配置的桥接目录，实际 ${spec.cwd}`)
+  assert.ok(fs.existsSync(path.join(spec.cwd, 'start.mjs')), '桥接目录里应有 start.mjs')
   assert.equal(spec.stdio.stdout, 'pipe', '★ 桥接日志必须 pipe 出来（唯一排障线索）')
   assert.equal(spec.stdio.stderr, 'pipe')
   // 收尾：把假进程 settle 掉，别留悬空 Promise（不影响断言）
@@ -175,7 +179,9 @@ console.log('\n— ③b 配置保存触发插件热重载 → 不重复拉起 �
 await check('同一 DSH 进程内重载插件不会再 spawn 第二个桥接', async () => {
   resetAutoStartMark()
   const { ctx, logs, subprocess } = makeCtx()
-  const config = mod.Config({ role: 'settings', bridge: { autoStart: true } })
+  // 同上：临时目录，避免本机真实桥接在跑时被判成 already-running-external。
+  const dir = makeBridgeDir()
+  const config = mod.Config({ role: 'settings', bridge: { dir, autoStart: true } })
   mod.apply(ctx, config)
   assert.ok(await waitFor(() => subprocess.spawned.length === 1, 3000), '首次装载应拉起桥接')
   // DSH 的 config-editor 保存设置后会 reconcile 并重载本 entry → apply 再来一次

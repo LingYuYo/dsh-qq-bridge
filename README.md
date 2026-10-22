@@ -12,9 +12,18 @@ QQ ──► NapCat (OneBot v11 正向 WS) ──► qq-bridge ──► DSH Web
 
 ## 版本演进
 
-当前版本：**v0.1.1-beta.1**
+当前版本：**v0.2.0-beta.1**
 
-本次新增：
+本次新增（WIP）：
+
+- **模型无痕热切换**：`agent/request` 瀑布里按会话覆写本次请求的 provider/model，不碰 `session/selectModel`、不改 DSH 全局默认；`POST /dsh-qq-guard/model` 为桥接下发的入口。
+- **静默看门狗 + 失败降级**：`llm/stream` 上看门狗把「模型挂着不吐字」翻成终态错误，`agent/request-error` 在同一轮内切到备用模型；`GET /dsh-qq-guard/system-events` 暴露最近 20 条底层事件。
+- **模型自我认知**：人设里动态注入【底层模型】路由行，QQ 里问「你用的什么模型」能如实回答。
+- **NapCat 日志可见**：stdout/stderr 接环形缓冲，面板可看「起不来」的真实原因。
+- **一键启动接真实路由**：左下角卡片按 NapCat → 桥接顺序拉起，状态灯读真实进程。
+- **高级参数**：`replyTimeoutMs` / `modelWatchdogMs` / `antiDebounceMs` 进配置与设置页，桥接热读。
+
+上一版（v0.1.1-beta.1）：
 
 - **外部插件兼容层**：只读扫描 QQ Agent 格式（`plugin.json` / `skill.json`），支持动态配置表单，默认全部关闭。
 - **沙箱执行基础链路（P1）**：`ctx.subprocess` 独立进程 + `--permission` + `module.registerHooks` 拦截 `node:fs` / `node:child_process` / 越界引用，支持对自包含模块执行 `setup()` 冒烟测试。

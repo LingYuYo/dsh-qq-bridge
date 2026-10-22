@@ -44,11 +44,16 @@ profile 顶层实例持有配置，投影到「设置 → QQ 桥接」。左侧�
 
 | Tab | 内容 | 数据来源 |
 | --- | --- | --- |
-| 运行状态 | 桥接状态 / 启停 / 日志、NapCat 进程状态与启停、今日用量概览卡、AI 排障助手输入框 | 状态与启停走真实路由；用量卡与 AI 框为 **Mock 壳** |
+| 运行状态 | 桥接状态 / 启停 / 日志、NapCat 进程状态与启停、**NapCat 日志折叠框**、**系统底层事件折叠面板**、今日用量概览卡、AI 排障助手输入框 | 状态与启停走真实路由；用量卡与 AI 框为 **Mock 壳** |
 | 会话管理 | 左会话列表（含未读红点）+ 右详情（单人设覆盖 / 单独白名单 / 记忆提取 / 删除会话）+ `清理失效会话` | 列表 **Mock**；清理按钮走 **真实 Host 路由** |
 | 技能与插件 | Skill / Plugin / 外部插件 三组卡片，外部插件带兼容标签与 `[测试运行]`，含版本号、齿轮、垃圾桶、拖拽手柄、上下移 | **全部真实配置读写**；沙箱测试走真实 Host 路由 |
-| 全局设置 | 运行节奏（两个大按钮 → 信息发送配置 / 活跃设置 弹窗）、人设概览卡（编辑收进弹窗）、白名单、OneBot、NapCat | **全部真实配置读写** |
+| 全局设置 | 运行节奏（两个大按钮 → 信息发送配置 / 活跃设置 弹窗）、**模型配置（无痕热切换 + 备用模型）**、**高级参数（折叠）**、人设概览卡（编辑收进弹窗）、白名单、OneBot、NapCat | **全部真实配置读写** |
 | 数据与用量 | 纯 CSS 柱状图 + 面积图，按天 / 按模型 / 按插件三张表 | **全部 Mock** |
+
+左下角还有一张**快捷启动卡**（已在导航栏底部、使用引导按钮上方）：状态灯读
+`/dsh-qq-guard/bridge` 与 `/dsh-qq-guard/napcat` 的真实进程状态，按钮按
+**NapCat → 桥接** 顺序真实拉起、按反向顺序停止；当前模型优先读插件 Config 里真正下发的
+`model`（`GET /dsh-qq-guard/config`），没有再显示全局默认。启动失败会显示错误行，绝不假装就绪。
 
 ### Phase 4：技能与插件接真实配置
 
@@ -201,6 +206,108 @@ NapCat 的**启停按钮和进程状态只在「运行状态」页**（紧接「
 Mock 部分刻意没有接数据：新增按钮统一绑 `noop`，等第二阶段再逐个接线。版式可用 `node render-preview.mjs`
 生成静态 HTML（`preview/tab-*.html`，含深色版），不需要开浏览器就能看布局。
 
+## 模型配置：无痕热切换 + 失败降级
+
+QQ 会话切模型，**不能**走 `session/selectModel` —— 它会顺带 `agentDefaultModel.saveSelection()`
+（`dsh-api-session-controller/lib/types/commands.js:175`），也就是**每切一次就把 DSH 桌面端的全局默认改一次**。
+所以本插件改成在 `agent/request` 瀑布里覆写**这一次请求**的 route，全程不写任何全局配置。
+
+### 机制
+
+```
+桥接每条消息前 → POST /dsh-qq-guard/model {sessionId, provider, model, reasoningEffort?, fallbacks?}
+   → 插件内存表 sessionId → 偏好
+   → 该会话每次 LLM 调用前：agent/request 瀑布（prepend）→ 返回 {...config, provider, model, effort}
+   → 循环拿它去 llm.prepareCall → adapter → 上游
+```
+
+- `agent/request` 是发请求前的最后一站（`dsh-agent-loop/lib/index.js:1191`，返回值直接进 `:1201` 的 `prepareCall`），
+  所以覆写**真实生效**，不是改配置等重启。
+- 必须 `{ prepend: true }`：cordis 瀑布先注册的在最外层、外层返回值最终生效（`cordis/src/events.ts`）。
+  插件 HMR 重载后不 prepend 会掉到 selection 钩子内层，覆写静默失效。
+- 会话身份从 payload 拿：`agentEvents` 会把 `agent` 注入 payload（`dsh-agent/lib/index.js:255-270`）。
+- 根 ctx 的监听器收得到 preset 内会话：`scopeTarget` 对无 scope tag 的监听器一律放行（`dsh-scope/lib/index.js:327-338`）。
+
+### 粘性（实测踩到的坑）
+
+`selection.current` 的回落顺序是「待消费的 `model/selection` → **最近一次 `request/header`** → 全局默认」
+（`dsh-api-session-controller/lib/index.js:281-302`）。一旦覆写过，header 里记着新模型，
+**删掉偏好也不会自动回默认**。所以：
+
+- 桥接侧**每条消息都回写具体 provider/model**（「跟随默认」= 先从 `session/modelCatalog` 读 `default` 再原样写回）；
+- 插件侧支持 `POST {sessionId, mode:"default"}` 强制钉回 `agentDefaultModel.currentSelection()`。
+
+### 失败降级
+
+- **正路**：主模型返回 `finish: error`（超时 / 429 / 5xx / 内容审核）时，循环派发 `agent/request-error`
+  （`dsh-agent-loop/lib/index.js:1136`）。内层 `dsh-llm-retry` 先按同一模型重试；它放弃后我们返回 `{kind:'retry'}`，
+  循环重跑本步，这次 `agent/request` 用备用模型。**同一轮内自动接管**。
+- **兜底网**：adapter 在流开始前就抛错（缺 key / NO_ADAPTER）时不会派发 `request-error`，只发 `agent/error`。
+  我们在这里把降级游标推一格；桥接下一条消息重新 POST 同一 route 时**不重置游标**，于是下一轮直接走备用。
+- 换 route（用户改主模型）才重置游标；备用最多 4 个，用尽后不再重试。
+
+### UI
+
+「全局设置 → 模型配置」：当前模型下拉（按 provider 分组）、推理档位、备用模型列表（≤4）、能力警告。
+数据来自 `GET /dsh-qq-guard/models`（Host 侧把 `llm.listProviders → listModels → resolveModelInfo` join 好，
+每个模型自带 `input: ["text","image"]`），**选了纯文本模型会明确警告「发图会被上游拒绝」**。
+
+### 静默看门狗（把「挂着不返回」变成可降级的错误）
+
+**2026-10-22 真机教训**：把主模型设成一个连不上的 provider 时，它把连接挂着、
+62 秒一个 chunk 都不吐。这种情况下**适配器不报错、循环不派发 `agent/request-error`**，
+降级链永远等不到机会 —— 用户只能干等桥接的 180s 超时。
+
+现在插件在 `llm/stream` 瀑布上加了一层看门狗（`modelWatchdogMs`，默认 8000ms，0=关闭）：
+被接管的模型超过这个时间**没有任何 chunk**，就产出终态 `finish(error, code=WATCHDOG_TIMEOUT)`，
+循环收到后照常走 `agent/request-error` → 同轮切备用模型。
+
+三个设计要点：
+
+- **只包被接管的流**：`managedRoutes()` 只包含 QQ 会话的主模型 + 备用模型，
+  浏览器里的会话、子代理一律原样透传，不会把「长思考不吐字」误杀。
+- **错误码故意不叫 `TIMEOUT`**：`TIMEOUT` 在 `dsh-llm-retry` 的可重试名单里，
+  会先同模型重试 5 次，把降级推迟到一分钟以后；未知码直接交给降级链。
+- **不 `await iterator.return()`**：适配器卡在 `await`（不是 yield 点）时 `return()` 永远不 resolve，
+  看门狗会跟着挂死；发出去挂个 `catch` 就够了。
+
+### 系统底层事件（过程可见化）
+
+看门狗切断、切备用、`agent/error` 兜底都发生在 Host 进程内，原本界面上完全无感。
+插件现在维护一个**最近 20 条**的环形队列，`GET /dsh-qq-guard/system-events` 暴露：
+
+```json
+{ "ok": true, "events": [
+  { "ts": 1792..., "at": "2026-10-23T00:16:05.123Z", "level": "error",
+    "kind": "watchdog", "message": "触发看门狗：workbuddy/xxx 8s 无响应，强制中断",
+    "detail": { "route": "workbuddy/xxx", "idleMs": 8000 } }
+] }
+```
+
+- `level`：`error`（红，看门狗）/ `warn`（黄，切备用、抛错）/ `info`
+- `kind`：`watchdog` / `fallback` / `agent-error`
+- 面板「运行状态 → 系统底层事件」折叠面板每 3 秒轮询它；收起时标题里带最新一条。
+
+### 高级参数（折叠卡）
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `replyTimeoutMs` | 20000 | 桥接等回复上限；超时会 `session/cancel` 并给 QQ 回提示 |
+| `modelWatchdogMs` | 8000 | 看门狗切断时间（0=关）；只作用于 QQ 会话下发的路由 |
+| `antiDebounceMs` | 0 | 防抖窗口；0 = 沿用「活跃设置」里的 `debounceWindowMs`（默认 800） |
+
+三个都进了 Config（`.volatile()`）、面板「全局设置 → 高级参数」有输入框，
+桥接侧通过 `runtime-config.mjs` 的 `HOT_KEYS` 热读 —— 改完保存，下一条消息生效，不用重启桥接。
+等待超过看门狗时间还没回复时，桥接日志会打一条 `⏳ 等待回复已超 N 秒，可能正在触发看门狗降级…`。
+
+### 限制
+
+- DSH 原生 UI 的模型选择器不会跟着变（这是不改全局默认的代价）。真实 route 记在会话的 `request/header` 里，
+  用量统计读 header 不受影响。
+- 多模态准入检查看的是会话 selection、不是覆写值（`dsh-api-session-controller/lib/types/commands.js:306-316`），
+  所以「默认模型支持图片、覆写成纯文本模型」时图片会被放行然后上游报错 —— 面板要自己拦。
+- 切换会作废前缀缓存，频繁切要算进成本。
+
 ## HTTP 路由
 
 | 路由 | 用途 |
@@ -211,6 +318,9 @@ Mock 部分刻意没有接数据：新增按钮统一绑 `noop`，等第二阶�
 | `GET/POST /dsh-qq-guard/bridge` | 桥接进程启停与状态 |
 | `GET /dsh-qq-guard/external-plugins` | 只读扫描外部插件目录，返回卡片数据 |
 | `POST /dsh-qq-guard/external-plugins/test` | 在独立沙箱子进程里加载一个自包含外部插件 |
+| `GET/POST/DELETE /dsh-qq-guard/model` | 按会话写/读/清模型偏好（无痕热切换，桥接每条消息前 POST） |
+| `GET /dsh-qq-guard/models` | 模型目录：provider + 模型 + `input` 多模态能力 + 上下文 + 推理档（面板用） |
+| `GET /dsh-qq-guard/system-events` | 系统底层事件：看门狗 / 切备用 / 抛错，最近 20 条（面板用） |
 
 `status` / `napcat` / `bridge` / `external-plugins` 路由只接受同源请求（校验 `sec-fetch-site`），
 非 GET 之外的方法返回 405。
@@ -227,6 +337,7 @@ Mock 部分刻意没有接数据：新增按钮统一绑 `noop`，等第二阶�
 
 ```bash
 node test-guard-scope.mjs     # 门禁作用域（防全局锁死）
+node test-model-override.mjs  # 模型无痕热切换 + 降级链 + 静默看门狗 + 系统事件 + 目录 join（假 ctx，23 例）
 node test-settings-data.mjs   # 设置页数据通路（remote / HTTP 兜底 / 错误可见）
 node test-napcat.mjs          # NapCat 进程管理（假 subprocess，不真起进程）
 node test-status-napcat.mjs   # 运行状态页的 NapCat 面板（启停路由 / 状态刷新 / 设置页只留输入框）
@@ -236,6 +347,7 @@ node test-skills.mjs          # 技能页交互逻辑（拖拽排序 / 上下移
 node test-persona-ui.mjs      # 人设概览卡 + 设置弹窗（名字/展示名/参与度/三块文本/人设增删）
 node test-external-ui.mjs     # 外部插件卡片（三种格式 / 兼容标签 / 描述裁剪 / 过滤 / configSchema 弹窗）
 node test-guide.mjs           # 使用引导三步状态（配置 + 真实 bridge 进程 + 去启动路由 + 按钮/弹窗同源）
+node test-shell-ui.mjs        # 快捷启动卡（真实路由顺序 + 失败态）+ 全局设置「记忆整理」卡
 node test-browse.mjs          # 安装目录「浏览」（首选 uiWorkspace / 兜底路由 / 取消 / 失败）
 node test-pickdir.mjs         # Host 路由 /dsh-qq-guard/pick-dir（native / 取消 / 并发 / 501 / 403）
 node test-host-phase4.mjs     # 外部插件只读扫描（DSH 包 + QQ Agent 清单 + BOM + 兼容标签）+ 清理失效会话

@@ -37,6 +37,13 @@ const HOT_KEYS = [
   'personaSystemPrompt',
   // Phase 4：节奏参数（响应档位/防抖/限频/禁言）必须热更新。
   'rhythm',
+  // 模型配置（无痕热切换 + 失败降级）：设置页改完，下一条消息就按新配置下发。
+  'model',
+  'modelFallbacks',
+  // 高级参数（排障/调优）：全部允许热改，改完下一条消息生效。
+  'replyTimeoutMs',
+  'modelWatchdogMs',
+  'antiDebounceMs',
   // OneBot 连接信息只用于 UI 展示；WS 连接在启动时建立，改它仍需重启桥接。
   'onebot',
 ]
@@ -58,6 +65,9 @@ const PERSONA_KEYS = [
   'personaParticipation',
   'personaExtraRules',
   'personaSystemPrompt',
+  // 模型路由会注入人设（【底层模型】一行），所以它也是人设签名的一部分：
+  // 设置页换模型时必须触发一次重写，否则模型身份会落后于实际请求。
+  'model',
 ]
 
 /**

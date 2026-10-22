@@ -297,9 +297,11 @@ check('有灰色提示「启动/停止操作请前往「运行状态」页」', 
   assert(textOf(hint).includes('启动/停止操作请前往「运行状态」页'), `提示是「${textOf(hint)}」`)
 })
 
-check('设置页不再轮询 NapCat 状态（状态只由运行状态页维护）', () => {
+check('设置页自身不轮询 NapCat 状态（只有左下角快捷启动卡那一次）', () => {
   const statusCalls = calls.slice(beforeSettingsCalls).filter((c) => c.url.includes('/napcat?action=status'))
-  assert(statusCalls.length === 0, `设置页发起了 ${statusCalls.length} 次 NapCat 状态查询`)
+  // 快捷启动卡在导航栏底部（任何 Tab 都在），它的状态灯必须读真实 NapCat 状态，
+  // 所以设置页会看到**它**发起的那一次查询；设置页自己的面板不应再加轮询。
+  assert(statusCalls.length <= 1, `设置页发起了 ${statusCalls.length} 次 NapCat 状态查询（应 ≤1，来自快捷启动卡）`)
 })
 
 /* ── 安装目录为空：fail-closed ──────────────────────────────── */
@@ -318,6 +320,29 @@ check('未配置安装目录 → 启动按钮禁用，状态卡提示去设置',
   assert(textOf(panel).includes('未配置安装目录'), '状态页没有提示未配置安装目录')
 })
 VALUE.napcat.dir = 'D:\\NapCat.52230.Shell'
+
+/* ── 系统底层事件 + 高级参数（2026-10-23 新增）───────────────── */
+console.log('\n系统底层事件 / 高级参数：')
+
+const eventsTree = await renderTab('status')
+check('运行状态页有「系统底层事件」折叠面板', () => {
+  const panel = findAll(eventsTree, (n) => typeof n.props?.className === 'string'
+    && n.props.className.split(/\s+/).includes('qqg-events'))[0]
+  assert(panel, '找不到 .qqg-events 折叠面板')
+  assert(textOf(panel).includes('系统底层事件'), `标题不对：${textOf(panel).slice(0, 60)}`)
+})
+
+const advTree = await renderTab('settings')
+check('全局设置有「高级参数」折叠卡，含三个数值输入', () => {
+  const card = findAll(advTree, (n) => typeof n.props?.className === 'string'
+    && n.props.className.split(/\s+/).includes('qqg-advanced'))[0]
+  assert(card, '找不到 .qqg-advanced 折叠卡')
+  assert(textOf(card).includes('高级参数'), '标题不对')
+  for (const label of ['等待回复上限', '看门狗切断时间', '防抖合并窗口']) {
+    const input = findAll(card, (n) => n.props?.['aria-label'] === label)[0]
+    assert(input, `缺少输入框「${label}」`)
+  }
+})
 
 console.log(`\n结果：${pass} 通过 / ${fail.length} 失败`)
 process.exit(fail.length ? 1 : 0)

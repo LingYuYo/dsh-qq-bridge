@@ -69,7 +69,7 @@ copy config.example.json config.json
 | `allow.private` | 允许的私聊 QQ 号数组。 |
 | `allow.groups` | 允许的群号数组。 |
 | `allow.allowAllWhenEmpty` | **默认 `false`（fail-closed）**：白名单为空时谁都不理。 |
-| `replyTimeoutMs` | 等回复超时，默认 180s。 |
+| `replyTimeoutMs` | 等回复超时，**默认 20s**。超时会顺手 `session/cancel` 取消 DSH 这一轮（否则前端一直转「深度求索中」），并给 QQ 回一句失败提示。 |
 | `sendDelayMs` | 整条回复发送完后的尾部延时；片间延时见下面「分片与打字延时」。 |
 | `chunkSize` | **QQ 单条硬上限**，默认 1000；只用于防「一条太长发不出去」。 |
 | `bubbleMaxChars` | 单行**语义切阈值**，默认 30；换行是气泡边界。 |
@@ -305,6 +305,53 @@ QQ 账号在线（WS get_status 确认）
   - `POST /dsh-qq-guard/status` + `GET` —— 桥接回推运行状态，供面板显示。
   读取有 HTTP 兜底：remote 不可用时前端改用 `GET config` 只读展示（不能改）。
 
+## 模型下发（无痕热切换 + 失败降级）
+
+模型**不再**走 `session/selectModel`（那个会顺带把选择落盘成 DSH 全局默认，
+`dsh-api-session-controller/lib/types/commands.js:175`）。链路改成：
+
+1. 面板「模型配置」写进插件 Config（`model` / `modelFallbacks`），桥接 2 秒内热同步；
+2. 桥接在 `ensureSession()` 和**每条消息 `prompt` 之前**都调一次 `_applyModel(sessionId)`，
+   把 `POST {sessionId, provider, model, reasoningEffort?, fallbacks?}` 发给
+   `/dsh-qq-guard/model`（幂等；配置留空则发 `{mode:'default'}` 强制跟随全局默认）；
+3. 插件在 `agent/request` 瀑布里覆写这一次请求的 route，DSH 全局默认一动不动。
+
+失败降级：主模型超时 / 429 / 5xx / 审核拒绝时，插件用 `agent/request-error` 在同一轮内
+切到 `modelFallbacks` 里的下一个（`{kind:'retry'}` 让循环重跑本步）。备用最多 4 个。
+下发失败（插件没装 / 旧版本 / 模型不可用）只记一条 warn，**不阻塞聊天**，
+这一轮退回会话当前模型。
+
+优先级：设置页的 `model` > `config.json` 里的 `dsh.provider/model/reasoningEffort`（旧配置兜底）。
+
+### 模型自我认知
+
+人设里会动态追加一行：
+
+```
+【底层模型】你当前由 DSH（DeepSeek Harness）提供驱动，底层模型路由为 {provider}/{model}。
+用户问起你用的是什么模型时，照这个路由回答；不要编造别的型号，也不要透露其它系统配置。
+```
+
+`composePersonaPrompt({ modelRoute })` 负责拼这行，`modelRoute` 来自 `bridge._modelRoute()`
+（与 `_applyModel` **同一套优先级**，保证「人设里说的」和「实际请求的」一致）。
+
+落地细节：
+- 启动时先写一次（用 `config.json` 兜底，DSH 没起来也有身份行）；
+- **首次设置同步成功后必须再写一次校准** —— 启动瞬间 `live` 还没有设置页下发的 `model`，
+  不校准就会把旧路由写进人设。`start.mjs` 用 `firstSyncDone` 标记做这件事。
+- 人设签名（`PERSONA_KEYS`）里含 `model`，设置页换模型会触发热重写。
+- 只对**新建** QQ 会话生效；已有会话保留原人设。
+
+### 高级参数（热读）
+
+设置页「全局设置 → 高级参数」有三个时间常数，桥接每 2 秒轮询热读，改完下一条消息生效：
+
+| 字段 | 用法 | 优先级 |
+|---|---|---|
+| `replyTimeoutMs` | `promptAndWait` 的等待上限（默认 20000） | 设置页 > `config.json` > 20000 |
+| `modelWatchdogMs` | 只用于**日志提示**：等待超过它就打 `⏳ 等待回复已超 N 秒，可能正在触发看门狗降级…`（真正的切断在 Host 插件里） | 设置页 > `config.json` > 8000 |
+| `antiDebounceMs` | 防抖合并窗口；0 = 沿用 `rhythm.debounceWindowMs` | 高级参数 > 节奏参数 |
+
 ## 响应节奏（Phase 4）
 
 `rhythm.*` 每次判定都**现读热配置**（`Bridge._rhythm()`），改完下一句消息即生效，
@@ -449,7 +496,8 @@ value = v1.<base64url(JSON{version,authority,issuedAt,expiresAt})>.<base64url(HM
 ## 自测
 
 ```bash
-node test-offline.mjs
+node test-offline.mjs   # 主回归
+node test-timeout.mjs   # 等待超时：默认 20s / 超时必 session/cancel / 错误码 TIMEOUT
 ```
 
 覆盖回复审计、消息解析（array / 字符串 / 混合段）、长文本分片、分气泡（强边界 / 语义切 /

@@ -53,6 +53,11 @@ window.__ModuleLoader__.load({
   white-space: pre-wrap; overflow-wrap: anywhere; }
 .qqg-hint { font-size: 11.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary);
   background: var(--dsw-alias-bg-layer-2); border-radius: 6px; padding: 7px 10px; }
+/* 模型配置卡：备用模型行 + 能力警告 */
+.qqg-hint-warn { color: #b4690e; background: rgba(255, 176, 32, 0.12); }
+.qqg-fb-list { display: flex; flex-direction: column; gap: 8px; align-items: stretch; }
+.qqg-fb-row { display: flex; align-items: center; gap: 8px; }
+.qqg-fb-row .qqg-btn { flex: 0 0 auto; }
 
 /* ── 左导航 + 右内容（主面板）────────────────────────────── */
 .qqg-layout { display: flex; align-items: stretch; width: 100%; min-width: 0; height: 100%; min-height: 0;
@@ -96,8 +101,24 @@ window.__ModuleLoader__.load({
   background: var(--dsw-alias-bg-layer-2); border: 1px solid var(--dsw-alias-border-l1);
   border-radius: 6px; font-family: var(--ds-font-family-code, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: 11px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
-/* 状态小标签（NapCat 页「已停止」用）*/
-.qqg-tag { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
+/* 系统底层事件（看门狗 / 降级 / 抛错）：时间线 + 红黄分级 */
+.qqg-events { margin-top: 8px; }
+.qqg-event-list { margin: 6px 0 0; padding: 6px 10px; max-height: 220px; overflow: auto;
+  background: var(--dsw-alias-bg-layer-2); border: 1px solid var(--dsw-alias-border-l1); border-radius: 6px; }
+.qqg-ev { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; line-height: 1.5; }
+.qqg-ev-time { flex: 0 0 auto; font-family: var(--ds-font-family-code, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10.5px; color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); }
+.qqg-ev-msg { min-width: 0; font-size: 11.5px; overflow-wrap: anywhere; }
+.qqg-ev-error .qqg-ev-msg { color: #b42318; font-weight: 600; }
+.qqg-ev-warn .qqg-ev-msg { color: #b4690e; }
+.qqg-ev-info .qqg-ev-msg { color: var(--dsw-alias-label-secondary); }
+/* 高级参数折叠卡 */
+.qqg-advanced { border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-2); padding: 0 12px; }
+.qqg-advanced > summary { cursor: pointer; user-select: none; padding: 10px 0; font-size: 12.5px;
+  font-weight: 600; color: var(--dsw-alias-label-primary); }
+.qqg-advanced .qqg-group { border: none; padding: 0; margin: 0 0 10px; background: transparent; }
+/* 状态小标签（NapCat 页「已停止」用）*/.qqg-tag { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
   border-radius: 999px; padding: 1px 9px; border: 1px solid var(--dsw-alias-border-l2);
   background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); white-space: nowrap; }
 .qqg-tag-ok { color: var(--dsw-alias-state-success-primary);
@@ -204,6 +225,28 @@ window.__ModuleLoader__.load({
 .qqg-nav-guide-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .qqg-nav-guide-done { flex: 0 0 auto; font-size: 10.5px; color: var(--dsw-alias-label-secondary);
   font-variant-numeric: tabular-nums; }
+/* 左下角快捷启动卡（第一批 UI 壳）：状态灯 + 当前模型 + 一键启动。
+   放在 .qqg-nav-foot 里、使用引导按钮上方；尺寸按 186px 导航宽收紧。 */
+.qqg-launch { box-sizing: border-box; display: flex; flex-direction: column; gap: 8px;
+  margin-bottom: 8px; padding: 10px; border-radius: 10px;
+  background: var(--qqg-inset-bg); border: 1px solid var(--dsw-alias-border-l1); }
+.qqg-launch-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.qqg-launch-state { font-size: 11.5px; color: var(--dsw-alias-label-secondary); white-space: nowrap; }
+.qqg-launch-model { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
+.qqg-launch-model-label { flex: 0 0 auto; font-size: 10px; color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); }
+.qqg-launch-model-name { min-width: 0; font-size: 10.5px; color: var(--dsw-alias-label-secondary);
+  font-family: var(--ds-font-family-code, ui-monospace, SFMono-Regular, Menlo, monospace);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qqg-launch-btn { box-sizing: border-box; width: 100%; display: inline-flex; align-items: center;
+  justify-content: center; gap: 6px; font: inherit; font-size: 12px; line-height: 1.4;
+  padding: 6px 8px; border-radius: 8px; cursor: pointer; white-space: nowrap;
+  color: var(--dsw-alias-label-primary-foreground); background: var(--dsw-alias-button-primary-fill);
+  border: 1px solid transparent; transition: filter .12s ease; }
+.qqg-launch-btn:hover:enabled { filter: brightness(1.06); }
+.qqg-launch-btn:disabled { opacity: .55; cursor: default; }
+/* 启动失败的错误行：单行省略，完整内容在 title 里 */
+.qqg-launch-err { font-size: 10.5px; line-height: 1.4; color: #b42318;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ── 卡片 ─────────────────────────────────────────────────── */
 /* 卡片底色/描边沿用 DSH 自己的设置卡 token：
@@ -612,6 +655,10 @@ window.__ModuleLoader__.load({
       { name: '其他', calls: 401, tokens: 96600, cost: 1.32, share: 9 },
     ]
 
+    /* 左下角快捷启动卡的「当前模型」：第一批是壳，先取用量表里的主模型。
+       第二批接真实来源（Host 暴露的 agent 默认模型 / 桥接热配置）时替换这里。 */
+    const MOCK_CURRENT_MODEL = MOCK_USAGE_MODELS[0].name
+
     const MOCK_USAGE_PLUGINS = [
       { name: 'QQ 桥接', calls: 2840, tokens: 812400, cost: 9.82, share: 44 },
       { name: '记忆提取', calls: 1620, tokens: 468200, cost: 6.11, share: 25 },
@@ -656,6 +703,9 @@ window.__ModuleLoader__.load({
       bulb: ['M9.2 18h5.6', 'M10 21h4',
         'M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2v.1h5v-.1c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z'],
       check: ['M5 12.5l4.5 4.5L19 7.5'],
+      // 快捷启动按钮用的小三角（play）/ 停止用的方块（stop）。
+      play: ['M8.5 5.5v13l9.5-6.5z'],
+      stop: ['M7 7h10v10H7z'],
       // 六边形点阵拖拽手柄：两列共 6 个实心小圆点。
       dots: ['M9.5 6.5h.01', 'M14.5 6.5h.01', 'M9.5 12h.01', 'M14.5 12h.01', 'M9.5 17.5h.01', 'M14.5 17.5h.01'],
     }
@@ -706,6 +756,10 @@ window.__ModuleLoader__.load({
       'bridge.autoStart': false,
       // 人设参与度默认「普通群友」（与 Host 侧重拼系统提示词时的默认值一致）。
       personaParticipation: 'normal',
+      // 高级参数默认值与 Host 侧 Config 保持一致。
+      replyTimeoutMs: 20000,
+      modelWatchdogMs: 8000,
+      antiDebounceMs: 0,
     }
 
     /** 按点分路径取值（'typingDelay.enabled' → value.typingDelay.enabled）。 */
@@ -1087,9 +1141,49 @@ window.__ModuleLoader__.load({
       return [snap, () => setTick((v) => v + 1)]
     }
 
+    /** ISO 时间 → 本地 HH:MM:SS（事件时间线用）。 */
+    function clockOf(iso) {
+      if (typeof iso !== 'string') return ''
+      const date = new Date(iso)
+      if (Number.isNaN(date.getTime())) return ''
+      const pad = (n) => String(n).padStart(2, '0')
+      return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+    }
+
+    /**
+     * 系统底层事件（看门狗触发 / 切备用模型 / 抛错）：3 秒轮询 Host 的只读路由。
+     *
+     * 这些动作全在 Host 进程里发生，界面上原本完全无感；面板把它们摊开成时间线，
+     * 用户看到「回复慢」时能立刻判断是不是降级链在工作。
+     */
+    function useSystemEvents(enabled = true) {
+      const [events, setEvents] = React.useState([])
+      React.useEffect(() => {
+        if (!enabled) return undefined
+        let stopped = false
+        let timer = null
+        const load = async () => {
+          try {
+            const res = await fetch('/dsh-qq-guard/system-events', {
+              headers: { accept: 'application/json' }, credentials: 'include',
+            })
+            if (res.ok) {
+              const body = await res.json().catch(() => ({}))
+              if (!stopped && Array.isArray(body?.events)) setEvents(body.events)
+            }
+          } catch { /* 事件读不到不影响主面板 */ }
+          if (!stopped) timer = setTimeout(load, 3000)
+        }
+        void load()
+        return () => { stopped = true; if (timer) clearTimeout(timer) }
+      }, [enabled])
+      return events
+    }
+
     function StatusSection({ get, writable }) {
       const live = useBridgeStatus(true)
       const [proc, refreshProc] = useBridgeProc(true)
+      const sysEvents = useSystemEvents(true)
       const [busy, setBusy] = React.useState(null)
       const [err, setErr] = React.useState(null)
 
@@ -1170,6 +1264,22 @@ window.__ModuleLoader__.load({
 
         err ? h('div', { className: 'qqg-status qqg-status-err' }, err) : null,
         proc?.lastError ? h('div', { className: 'qqg-detail' }, `上次错误：${proc.lastError}`) : null,
+
+        // 系统底层事件：看门狗 / 降级 / 抛错。默认收起，标题里带最新一条，扫一眼就知道有没有事。
+        h('details', { className: 'qqg-logbox qqg-events' },
+          h('summary', null,
+            `系统底层事件（最近 ${sysEvents.length} 条` +
+            (sysEvents.length > 0 ? `：${sysEvents.at(-1)?.message ?? ''}` : '，暂无') + '）'),
+          sysEvents.length === 0
+            ? h('div', { className: 'qqg-hint' }, '还没有底层事件。看门狗触发、切备用模型、请求抛错都会记在这里。')
+            : h('div', { className: 'qqg-event-list' },
+              [...sysEvents].reverse().map((event, index) => h('div', {
+                key: `${event.ts ?? index}-${index}`,
+                className: 'qqg-ev qqg-ev-' + (event.level ?? 'info'),
+              },
+              h('span', { className: 'qqg-ev-time' }, clockOf(event.at)),
+              h('span', { className: 'qqg-ev-msg' },
+                `${event.level === 'error' ? '⛔' : event.level === 'warn' ? '⚠️' : '·'} ${event.message ?? ''}`))))),
 
         proc?.logTail?.length
           ? h('details', { className: 'qqg-logbox' },
@@ -1471,6 +1581,196 @@ window.__ModuleLoader__.load({
           : null)
     }
 
+    /**
+     * 模型配置卡片：无痕热切换 + 失败降级 + 多模态拦截。
+     *
+     * 数据来源：`GET /dsh-qq-guard/models`。Host 侧已经把
+     * `llm.listProviders()` → `listModels()` → `resolveModelInfo()` join 好了，
+     * 所以每个模型自带 `input`（`["text","image"]`）、`contextWindow`、`reasoning`，
+     * 面板不用再拼两个接口。
+     *
+     * 写入：`write()` → `settings.mutate(ns='qq-guard')` → profile 配置 → 桥接 2 秒内热应用；
+     * 桥接每条消息前再 POST 给 `/dsh-qq-guard/model`，插件在 `agent/request` 里覆写单次请求。
+     * 全程不碰 `session/selectModel`，**不会改 DSH 全局默认**。
+     */
+    function ModelSection({ get, write, writable }) {
+      const [catalog, setCatalog] = React.useState(null)
+      const [error, setError] = React.useState(null)
+      React.useEffect(() => {
+        let stopped = false
+        const load = async () => {
+          try {
+            const res = await fetch('/dsh-qq-guard/models', {
+              headers: { accept: 'application/json' },
+              credentials: 'include',
+            })
+            const body = await res.json().catch(() => ({}))
+            if (stopped) return
+            if (!res.ok || body?.ok !== true) { setError(body?.reason ?? `HTTP ${res.status}`); return }
+            setCatalog(body)
+            setError(null)
+          } catch (e) { if (!stopped) setError(e?.message ?? String(e)) }
+        }
+        void load()
+        return () => { stopped = true }
+      }, [])
+
+      const providers = catalog?.providers ?? []
+      const flat = []
+      for (const provider of providers) {
+        for (const model of provider.models ?? []) {
+          flat.push({ ...model, provider: provider.id, providerName: provider.name })
+        }
+      }
+      const byKey = new Map(flat.map((m) => [`${m.provider}/${m.id}`, m]))
+      const curProvider = String(get('model.provider') ?? '')
+      const curModel = String(get('model.model') ?? '')
+      const curKey = curProvider !== '' && curModel !== '' ? `${curProvider}/${curModel}` : ''
+      const cur = byKey.get(curKey)
+      // 能力未知（模型不在目录里）时不吓唬人：只有明确的 ["text"] 才判定不支持图片。
+      const textOnly = Array.isArray(cur?.input) && !cur.input.includes('image')
+      const fallbacks = Array.isArray(get('modelFallbacks')) ? get('modelFallbacks') : []
+      const defaultLabel = catalog?.default
+        ? `全局默认（${catalog.default.provider}/${catalog.default.model}）`
+        : '跟随全局默认'
+
+      const optionNodes = (selectedKey) => [
+        h('option', { key: '__default', value: '' }, defaultLabel),
+        ...providers.map((provider) => h('optgroup', { key: provider.id, label: provider.name || provider.id },
+          (provider.models ?? []).map((model) => h('option', {
+            key: `${provider.id}/${model.id}`,
+            value: `${provider.id}/${model.id}`,
+          }, `${model.name || model.id}${Array.isArray(model.input) && !model.input.includes('image') ? '（纯文本）' : ''}`)))),
+      ]
+
+      const chooseCurrent = (key) => {
+        const target = byKey.get(key)
+        if (!target) {
+          write('model.provider', '')
+          write('model.model', '')
+          write('model.reasoningEffort', '')
+          return
+        }
+        write('model.provider', target.provider)
+        write('model.model', target.id)
+        // 换模型后旧档位可能不合法，清掉让它走新模型的默认档。
+        const effortIds = (target.reasoning?.efforts ?? []).map((item) => item.id)
+        const effort = String(get('model.reasoningEffort') ?? '')
+        if (effort !== '' && !effortIds.includes(effort)) write('model.reasoningEffort', '')
+      }
+
+      const pickFallback = (index, key) => {
+        const next = fallbacks.slice()
+        if (key === '') next.splice(index, 1)
+        else {
+          const target = byKey.get(key)
+          if (!target) return
+          next[index] = { provider: target.provider, model: target.id }
+        }
+        write('modelFallbacks', next)
+      }
+
+      const addFallback = () => {
+        const used = new Set(fallbacks.map((fb) => `${fb.provider}/${fb.model}`))
+        if (curKey !== '') used.add(curKey)
+        const candidate = flat.find((m) => !used.has(`${m.provider}/${m.id}`))
+        if (!candidate) return
+        write('modelFallbacks', [...fallbacks, { provider: candidate.provider, model: candidate.id }])
+      }
+
+      const effortNodes = (cur?.reasoning?.efforts ?? []).map((item) =>
+        h('option', { key: item.id, value: item.id }, item.name || item.id))
+
+      return h('div', { className: 'qqg-group' },
+        h('div', { className: 'qqg-group-title' }, '模型配置'),
+        h('div', { className: 'qqg-hint' },
+          '无痕热切换：只改 QQ 会话下一次请求用的模型，不动 DSH 全局默认；改完下一条消息生效。'),
+
+        error !== null ? h('div', { className: 'qqg-hint qqg-hint-warn' }, `读取模型目录失败：${error}`) : null,
+
+        h(Field, { label: '当前模型', desc: '留空 = 跟随全局默认（显式下发默认值，避免会话粘在旧模型上）。' },
+          h('select', {
+            className: 'qqg-input qqg-input-grow', value: curKey,
+            disabled: !writable || flat.length === 0,
+            'aria-label': '当前模型',
+            onChange: (e) => chooseCurrent(e.target.value),
+          }, optionNodes(curKey))),
+
+        textOnly
+          ? h('div', { className: 'qqg-hint qqg-hint-warn' },
+            '⚠️ 该模型不支持图片输入（input 只有 text）：QQ 里发图会被上游拒绝，请换成带「图片」能力的模型。')
+          : null,
+
+        cur !== undefined && effortNodes.length > 0
+          ? h(Field, { label: '推理档位', desc: '留空 = 用该模型自己的默认档。' },
+            h('select', {
+              className: 'qqg-input qqg-input-grow',
+              value: String(get('model.reasoningEffort') ?? ''),
+              disabled: !writable,
+              'aria-label': '推理档位',
+              onChange: (e) => write('model.reasoningEffort', e.target.value),
+            }, h('option', { value: '' }, '模型默认'), effortNodes))
+          : null,
+
+        h(Field, {
+          label: '备用模型',
+          desc: `主模型超时或报错时按顺序接管（同一轮内生效）；最多 4 个，当前 ${fallbacks.length}/4。`,
+        },
+        h('div', { className: 'qqg-fb-list' },
+          fallbacks.map((fb, index) => h('div', { className: 'qqg-fb-row', key: `${index}-${fb.provider}/${fb.model}` },
+            h('select', {
+              className: 'qqg-input qqg-input-grow',
+              value: `${fb.provider}/${fb.model}`,
+              disabled: !writable,
+              'aria-label': `备用模型 ${index + 1}`,
+              onChange: (e) => pickFallback(index, e.target.value),
+            }, optionNodes(''), byKey.has(`${fb.provider}/${fb.model}`)
+              ? null
+              : h('option', { value: `${fb.provider}/${fb.model}` }, `${fb.provider}/${fb.model}（当前不可用）`)),
+            h('button', {
+              type: 'button', className: 'qqg-btn qqg-btn-ghost',
+              disabled: !writable,
+              'aria-label': `移除备用模型 ${index + 1}`,
+              onClick: () => pickFallback(index, ''),
+            }, '移除'))),
+          fallbacks.length < 4
+            ? h('button', {
+              type: 'button', className: 'qqg-btn',
+              disabled: !writable || flat.length === 0,
+              onClick: addFallback,
+            }, '＋ 添加备用模型')
+            : h('div', { className: 'qqg-hint' }, '已达上限 4 个。'))))
+    }
+
+    /**
+     * 高级参数（折叠卡）。
+     *
+     * 三个「响应链路时间常数」：桥接等待上限、静默看门狗、防抖窗口。
+     * 平时不用动；排障时改完保存，桥接 2 秒内热读生效。
+     */
+    function AdvancedSection({ get, write, writable }) {
+      return h('details', { className: 'qqg-advanced' },
+        h('summary', null, '高级参数（排障 / 调优，一般不用动）'),
+        h('div', { className: 'qqg-group' },
+          h(Field, { label: '等待回复上限', desc: '毫秒。桥接等这么久还没回复就取消这一轮并给 QQ 回一句提示。默认 20000。' },
+            h(NumberField, {
+              value: get('replyTimeoutMs'), min: 1000, max: 600000, disabled: !writable,
+              ariaLabel: '等待回复上限', onCommit: (n) => write('replyTimeoutMs', n),
+            })),
+          h(Field, { label: '看门狗切断时间', desc: '毫秒。QQ 会话用的模型超过这个时间没有任何输出，就判定超时并切备用模型。0 = 关闭。默认 8000。' },
+            h(NumberField, {
+              value: get('modelWatchdogMs'), min: 0, max: 120000, disabled: !writable,
+              ariaLabel: '看门狗切断时间', onCommit: (n) => write('modelWatchdogMs', n),
+            })),
+          h(Field, { label: '防抖合并窗口', desc: '毫秒。同一人连续短消息在这个窗口内合并成一次请求。0 = 沿用「活跃设置」里的窗口（默认 800）。' },
+            h(NumberField, {
+              value: get('antiDebounceMs'), min: 0, max: 60000, disabled: !writable,
+              ariaLabel: '防抖合并窗口', onCommit: (n) => write('antiDebounceMs', n),
+            })),
+          h('div', { className: 'qqg-hint' },
+            '改完保存即生效：桥接每 2 秒轮询一次配置，下一条消息就按新值走。')))
+    }
+
     function SplitSection({ get, write, writable }) {
       return h(React.Fragment, null,
         h('div', { className: 'qqg-group' },
@@ -1656,6 +1956,15 @@ window.__ModuleLoader__.load({
         actError ? h('div', { className: 'qqg-status qqg-status-err' }, actError) : null,
         error ? h('div', { className: 'qqg-status qqg-status-err' }, error) : null,
         snap?.lastError ? h('div', { className: 'qqg-detail' }, `上次错误：${snap.lastError}`) : null,
+
+        // NapCat 日志：和桥接日志同一套折叠框。
+        // 为什么必须有：端口被占 / QQ 未登录 / 缺运行库这些原因只打在 NapCat 自己的输出里，
+        // 进程一退出就什么都不剩，面板不给看就只能靠猜。
+        snap?.logTail?.length
+          ? h('details', { className: 'qqg-logbox' },
+            h('summary', null, `NapCat 最近日志（${snap.logTail.length} 行）`),
+            h('pre', { className: 'qqg-log' }, snap.logTail.join('\n')))
+          : h('div', { className: 'qqg-hint' }, '还没有 NapCat 日志（进程未启动过）。启动失败时这里会显示它自己的报错。'),
 
         h('div', { className: 'qqg-hint' },
           '启动前会先探测端口，已在跑就直接复用，不会双开。停止顺序：先 TERM，5 秒宽限后强制结束进程树。'))
@@ -3102,6 +3411,178 @@ window.__ModuleLoader__.load({
               h('li', null, '这些字段桥接每 2 秒轮询一次，保存后通常 2 秒内生效。'))))))
     }
 
+    /**
+     * 左下角快捷启动卡（真实链路）。
+     *
+     * 启动顺序 **NapCat → 桥接**：桥接启动时要连 NapCat 的正向 WS，
+     * 顺序反了会先连不上再等重连（虽然能自愈，但启动时间翻倍）。
+     * 停止顺序反过来：**桥接 → NapCat**，先断消息源再收容器，避免桥接在
+     * NapCat 已死时刷一堆 ECONNREFUSED。
+     *
+     * 状态灯不自己猜：桥接存活读 `/dsh-qq-guard/bridge` 轮询（useBridgeProc），
+     * NapCat 读 `/dsh-qq-guard/napcat` 的三层判定（useNapcatProcess，
+     * 进程 + WS 端口 + get_status）。两边都是真实状态，不再有本地假动画。
+     */
+    function LaunchCard({ model: fallbackModel }) {
+      const [proc, refreshProc] = useBridgeProc(true)
+      const { snap: napcat, refresh: refreshNapcat } = useNapcatProcess(true)
+      const [catalog, setCatalog] = React.useState(null)
+      // 插件 Config 里真正下发的 model（比 models 路由更实时，Host 没重启也能读）。
+      const [configModel, setConfigModel] = React.useState(null)
+      // 'napcat' | 'bridge' | 'stopping' | null：当前正在做哪一步
+      const [busy, setBusy] = React.useState(null)
+      const [err, setErr] = React.useState(null)
+
+      React.useEffect(() => {
+        let stopped = false
+        const json = (url) => fetch(url, { headers: { accept: 'application/json' }, credentials: 'include' })
+          .then((res) => res.json())
+          .catch(() => ({}))
+        // 两个来源：
+        //   · `/config` —— 插件 Config 的平面快照，带 `model`，**不依赖 Host 是否重启**；
+        //   · `/models` —— 模型目录 + 全局默认（Host 侧 join 好的多模态能力）。
+        Promise.all([json('/dsh-qq-guard/config'), json('/dsh-qq-guard/models')]).then(([cfg, catalogBody]) => {
+          if (stopped) return
+          setConfigModel(cfg?.config?.model ?? null)
+          if (catalogBody?.ok === true) setCatalog(catalogBody)
+        })
+        return () => { stopped = true }
+      }, [])
+
+      const modelLabel = (() => {
+        // 优先读设置页真正下发的 model（桥接实际用的就是这个），其次 models 路由的 configured，
+        // 最后才是全局默认 —— 顺序不能反，否则「跟随默认」和「已配置」会显示成同一个。
+        const live = configModel
+        if (live && live.provider && live.model) return `${live.provider}/${live.model}`
+        const configured = catalog?.configured
+        if (configured && configured.provider && configured.model) {
+          return `${configured.provider}/${configured.model}`
+        }
+        if (catalog?.default) return `${catalog.default.provider}/${catalog.default.model}（默认）`
+        return fallbackModel ?? '读取中…'
+      })()
+
+      const post = async (base, action) => {
+        const res = await fetch(`${base}?action=${action}`, {
+          method: 'POST', credentials: 'include',
+          headers: { accept: 'application/json' },
+        })
+        const body = await res.json().catch(() => ({}))
+        if (!res.ok || body?.ok === false) {
+          throw new Error(body?.detail ?? body?.reason ?? `HTTP ${res.status}`)
+        }
+        return body
+      }
+
+      const napcatState = napcat?.state ?? null
+      const napcatUp = napcatState === 'online'
+        || napcatState === 'running-unverified'
+        || napcatState === 'external'
+      const bridgeUp = proc?.alive === true
+      const ready = bridgeUp && napcatUp
+      const starting = busy !== null
+
+      const launch = async () => {
+        if (starting) return
+        setErr(null)
+        try {
+          if (!napcatUp) {
+            setBusy('napcat')
+            await post('/dsh-qq-guard/napcat', 'start')
+          }
+          setBusy('bridge')
+          await post('/dsh-qq-guard/bridge', 'start')
+        } catch (error) {
+          setErr(error?.message ?? String(error))
+        } finally {
+          setBusy(null)
+          refreshProc()
+          refreshNapcat()
+        }
+      }
+
+      const shutdown = async () => {
+        if (starting) return
+        setErr(null)
+        try {
+          setBusy('stopping')
+          if (bridgeUp) await post('/dsh-qq-guard/bridge', 'stop')
+          if (napcatUp) await post('/dsh-qq-guard/napcat', 'stop')
+        } catch (error) {
+          setErr(error?.message ?? String(error))
+        } finally {
+          setBusy(null)
+          refreshProc()
+          refreshNapcat()
+        }
+      }
+
+      const dotCls = err !== null ? 'qqg-dot-err' : starting ? 'qqg-dot-warn' : ready ? 'qqg-dot-ok' : 'qqg-dot-idle'
+      const stateText = err !== null
+        ? '启动失败'
+        : starting
+          ? (busy === 'napcat' ? '启动 NapCat…' : busy === 'bridge' ? '启动桥接…' : '停止中…')
+          : ready ? '就绪' : napcatState === 'starting' ? 'NapCat 启动中…' : '未就绪'
+      const buttonLabel = busy === 'stopping'
+        ? '停止中…'
+        : starting
+          ? '启动中…'
+          : ready ? '停止' : '一键启动 QQ + NapCat'
+
+      return h('div', { className: 'qqg-launch' },
+        h('div', { className: 'qqg-launch-top' },
+          h('span', { className: 'qqg-launch-state' },
+            h('span', { className: 'qqg-dot ' + dotCls }),
+            stateText)),
+        h('div', { className: 'qqg-launch-model', title: `当前模型：${modelLabel}` },
+          h('span', { className: 'qqg-launch-model-label' }, '当前模型'),
+          h('span', { className: 'qqg-launch-model-name' }, modelLabel)),
+        err !== null
+          ? h('div', { className: 'qqg-launch-err', title: err }, err.length > 60 ? `${err.slice(0, 60)}…` : err)
+          : null,
+        h('button', {
+          type: 'button', className: 'qqg-launch-btn',
+          disabled: starting,
+          title: ready
+            ? '停止桥接进程与 NapCat（按 桥接 → NapCat 顺序）'
+            : '一键启动：先拉起 NapCat，再启动桥接（状态轮询真实进程）',
+          onClick: ready ? shutdown : launch,
+        },
+        h(Glyph, { name: ready ? 'stop' : 'play', size: 12 }),
+        buttonLabel))
+    }
+
+    /**
+     * 全局设置 · 记忆整理（第一批 UI 壳，纯前端 Mock）。
+     *
+     * 三个控件先用组件内 state；第二批把 state 换成 remote.settings 的
+     * `memory.*` 字段（schema 在 index.js 补），开关/输入走 mutate 真实写盘。
+     */
+    function MemoryPanel() {
+      const [enabled, setEnabled] = React.useState(true)
+      const [sameModel, setSameModel] = React.useState(true)
+      const [cooldownMs, setCooldownMs] = React.useState(21600000)
+      return h(Panel, {
+        title: '记忆整理',
+        desc: '把会话里的长期事实整理进记忆空间。Mock 阶段只切换界面状态，不写配置。',
+      },
+      h(Field, { label: '启用记忆自动整理', desc: '按冷却时间自动抽取并整理长期记忆。' },
+        h(Switch, {
+          checked: enabled, ariaLabel: '启用记忆自动整理',
+          onChange: (next) => setEnabled(next),
+        })),
+      h(Field, { label: '使用同模型', desc: '整理时复用当前会话的模型，不再单独指定。' },
+        h(Switch, {
+          checked: sameModel, disabled: !enabled, ariaLabel: '使用同模型',
+          onChange: (next) => setSameModel(next),
+        })),
+      h(Field, { label: '整理冷却时间（毫秒）', desc: '两次自动整理之间的最小间隔，默认 21600000（6 小时）。' },
+        h(NumberField, {
+          value: cooldownMs, min: 60000, max: 604800000, disabled: !enabled,
+          ariaLabel: '整理冷却时间（毫秒）', onCommit: (next) => setCooldownMs(next),
+        })))
+    }
+
     function SettingsTab({ get, write, writable, form, pickDirectory }) {
       const common = { get, write, writable, form, pickDirectory }
       const [sendOpen, setSendOpen] = React.useState(false)
@@ -3139,6 +3620,10 @@ window.__ModuleLoader__.load({
               h('span', { className: 'qqg-bigbtn-desc' }, '响应档位 · 防抖合并 · 批次间隔 · 指令禁言')),
             h('span', { className: 'qqg-bigbtn-arrow' }, h(Glyph, { name: 'chevron', size: 15 })))))),
 
+        h(MemoryPanel),
+
+        h('div', { id: 'qqg-anchor-model', className: 'qqg-anchor' }, h(ModelSection, common)),
+        h('div', { id: 'qqg-anchor-advanced', className: 'qqg-anchor' }, h(AdvancedSection, common)),
         h('div', { id: 'qqg-anchor-persona', className: 'qqg-anchor' }, h(PersonaSection, common)),
         h('div', { id: 'qqg-anchor-allow', className: 'qqg-anchor' }, h(AllowSection, common)),
         h('div', { id: 'qqg-anchor-onebot', className: 'qqg-anchor' }, h(OneBotSection, common)),
@@ -3381,6 +3866,8 @@ window.__ModuleLoader__.load({
             h('span', { className: 'qqg-nav-text' }, s.label),
             s.badge ? h('span', { className: 'qqg-nav-badge' }, s.badge) : null))),
           h('div', { className: 'qqg-nav-foot' },
+            // 快捷启动卡：使用引导按钮上方（第一批 UI 壳，Mock）。
+            h(LaunchCard, { model: MOCK_CURRENT_MODEL }),
             h('button', {
               type: 'button', className: 'qqg-nav-guide',
               title: '三步把 QQ 桥接跑通',

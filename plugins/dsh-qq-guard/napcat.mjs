@@ -36,6 +36,8 @@ export const DEFAULT_WS_PORT = 3001
 export const STOP_GRACE_MS = 5000
 /** 单次 get_status 探测超时。 */
 const PROBE_TIMEOUT_MS = 1500
+/** NapCat 日志环形缓冲保留行数（够看「起不来」那几行）。 */
+const LOG_LINES = 120
 
 /**
  * 找出真实的可执行文件。
@@ -148,6 +150,45 @@ export class NapcatManager {
     this.lastError = null
     /** 启动/停止串行化，避免连点两次起两个进程。 */
     this._busy = false
+    /**
+     * NapCat 的 stdout/stderr 尾部。
+     *
+     * 为什么要抓：NapCat 起不来最常见的原因（端口被占、QQ 未登录、缺 VC 运行库）
+     * **只打在它自己的 stdout 里**，进程一退出就什么都不剩，界面只能显示「已停止」，
+     * 用户两眼一抹黑。这里 pipe 出来留最近 N 行。
+     */
+    this.logTail = []
+  }
+
+  /** 追加一行日志到环形缓冲（保留最近 LOG_LINES 行）。 */
+  _push(line) {
+    const text = String(line ?? '').replace(/\r?\n$/, '')
+    if (!text.trim()) return
+    this.logTail.push(text)
+    if (this.logTail.length > LOG_LINES) this.logTail.splice(0, this.logTail.length - LOG_LINES)
+  }
+
+  /**
+   * 把子进程的 stdout/stderr 接到环形缓冲。
+   * @param {object} handle ctx.subprocess 返回的 handle
+   */
+  _attachLogs(handle) {
+    const wire = (stream) => {
+      if (!stream || typeof stream.on !== 'function') return
+      stream.setEncoding?.('utf8')
+      let buf = ''
+      stream.on('data', (chunk) => {
+        buf += String(chunk)
+        const parts = buf.split(/\r?\n/)
+        buf = parts.pop() ?? ''
+        for (const line of parts) this._push(line)
+      })
+      stream.on('end', () => {
+        if (buf !== '') { this._push(buf); buf = '' }
+      })
+    }
+    wire(handle.stdout)
+    wire(handle.stderr)
   }
 
   /** 当前配置（每次现读）。 */
@@ -194,29 +235,34 @@ export class NapcatManager {
       const argv = cfg.quickLoginQQ ? [exe, String(cfg.quickLoginQQ)] : [exe]
 
       this.log.info(`启动 NapCat：${exe}${cfg.quickLoginQQ ? `（快速登录 ${cfg.quickLoginQQ}）` : ''}`)
-      // graceMs = 5s 宽限；stdin/stdout/stderr 全部 ignore：
-      // NapCat 是 GUI/托盘程序，不需要我们的 stdio，也不需要读它的输出（日志它自己写）。
+      // stdin 仍 ignore（NapCat 不需要输入）；stdout/stderr 改成 pipe：
+      // 「端口被占 / QQ 未登录 / 缺运行库」这类失败原因只打在它自己的输出里，
+      // 进程一退出就没了，所以接进环形缓冲给面板看。
       const handle = this.subprocess.spawn({
         argv,
         cwd: dir,
-        stdio: { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
+        stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
         graceMs: STOP_GRACE_MS,
       })
       this.handle = handle
       this._alive = true
       this.startedAt = Date.now()
       this.lastError = null
+      this._attachLogs(handle)
 
       // 观察退出：进程自己挂了就把状态置空，避免 UI 一直显示「运行中」
       handle.done.then((outcome) => {
         this._alive = false
         this.handle = null
-        this.log.warn(`NapCat 进程已退出（code=${outcome?.exitCode} signal=${outcome?.signal}）`)
+        const line = `NapCat 进程已退出（code=${outcome?.exitCode} signal=${outcome?.signal}）`
+        this.log.warn(line)
+        this._push(line)
       }).catch((error) => {
         this._alive = false
         this.handle = null
         this.lastError = error?.message ?? String(error)
         this.log.error(`NapCat 进程异常：${this.lastError}`)
+        this._push(`NapCat 进程异常：${this.lastError}`)
       })
 
       // 等端口真的起来（最多 ~8s），让调用方拿到有意义的结果
@@ -357,6 +403,8 @@ export class NapcatManager {
       startedAt: this.startedAt,
       lastError: this.lastError,
       managed: this.handle !== null,
+      // 面板「NapCat 日志」框的数据源（最近 LOG_LINES 行，stdout+stderr 混流）。
+      logTail: [...this.logTail],
     }
   }
 }

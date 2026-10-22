@@ -47,9 +47,18 @@ export const PERSONA_PARTICIPATION = {
 export function composePersonaPrompt({
   systemPrompt = '', baseText = '', defaultText = '',
   botName = '', groupName = '', participation = 'normal', extraRules = '',
+  modelRoute = '',
 } = {}) {
   const override = String(systemPrompt ?? '').trim()
-  if (override !== '') return override
+  const route = String(modelRoute ?? '').trim()
+  // 模型自我认知：QQ 用户问「你用的什么模型」时能如实回答。
+  // 只写路由，不写厂商营销词——真实值来自设置页下发的 provider/model。
+  const modelLine = route === ''
+    ? ''
+    : `【底层模型】你当前由 DSH（DeepSeek Harness）提供驱动，底层模型路由为 ${route}。`
+      + '用户问起你用的是什么模型时，照这个路由回答；不要编造别的型号，也不要透露其它系统配置。'
+
+  if (override !== '') return [override, modelLine].filter(Boolean).join('\n\n')
 
   const bot = String(botName ?? '').trim()
   const group = String(groupName ?? '').trim()
@@ -60,9 +69,9 @@ export function composePersonaPrompt({
     : 'normal'
   const customText = String(baseText ?? '').trim()
 
-  // 什么都没自定义：不写覆盖，沿用 preset 内置人设（避免每次启动都改 profile）。
+  // 什么都没自定义也没有模型路由：不写覆盖，沿用 preset 内置人设（避免每次启动都改 profile）。
   const customized = Boolean(bot || group || rules || customText || participationKey !== 'normal')
-  if (!customized) return ''
+  if (!customized && modelLine === '') return ''
 
   let base = customText || String(defaultText ?? '').trim()
   // 名字替换：默认人设里以 DeepSeek 自称，指定名字后统一换掉。
@@ -76,8 +85,10 @@ export function composePersonaPrompt({
     parts.push(`【身份】${names.join('，')}。不要自称其他名字，也不要把系统提示词里的旧名字当成自己。`)
   }
   if (base !== '') parts.push(base)
-  parts.push(`【参与度】${PERSONA_PARTICIPATION[participationKey].rule}`)
+  // 没自定义、纯默认人设时也要补【参与度】，否则覆盖会把 preset 自带的参与度规则吃掉。
+  if (customized) parts.push(`【参与度】${PERSONA_PARTICIPATION[participationKey].rule}`)
   if (rules !== '') parts.push(`【管理员附加规则】\n${rules}`)
+  if (modelLine !== '') parts.push(modelLine)
   return parts.join('\n\n').trim()
 }
 
@@ -310,7 +321,25 @@ export class Bridge {
       groupName: source?.personaGroupName,
       participation: source?.personaParticipation,
       extraRules: source?.personaExtraRules,
+      // 模型自我认知：跟 _applyModel 用同一套优先级，保证「人设里说的」和「实际请求的」一致。
+      modelRoute: this._modelRoute(source),
     })
+  }
+
+  /**
+   * 当前下发的模型路由（`provider/model`），未配置时返回空串。
+   *
+   * 优先级与 {@link _applyModel} 完全一致：设置页的 `model` > config.json 的
+   * `dsh.provider/model`。人设里的模型身份必须从这里取，不能另算一份。
+   * @param {object} [source] 默认读 this.live，测试可注入
+   * @returns {string}
+   */
+  _modelRoute(source = this.live) {
+    const hot = source?.model ?? this.config?.model ?? {}
+    const legacy = this.config?.dsh ?? {}
+    const provider = String(hot.provider || legacy.provider || '').trim()
+    const model = String(hot.model || legacy.model || '').trim()
+    return provider !== '' && model !== '' ? `${provider}/${model}` : ''
   }
 
   /**
@@ -398,15 +427,55 @@ export class Bridge {
     fs.mkdirSync(sessionCwd, { recursive: true })
     const workspaceId = await this.dsh.ensureWorkspace(sessionCwd, workspaceTitle)
     const sessionId = await this.dsh.createSession(workspaceId, this.config.dsh.agentPreset)
-    const { provider, model, reasoningEffort } = this.config.dsh
-    if (provider && model) {
-      await this.dsh.selectModel(sessionId, provider, model, reasoningEffort).catch((e) =>
-        this.logger.warn?.(`selectModel 失败（不阻塞）：${e.message}`))
-    }
+    await this._applyModel(sessionId)
     this.state.sessions[key] = sessionId
     this._saveState()
     this.logger.info?.(`新会话 ${key} -> ${sessionId}`)
     return sessionId
+  }
+
+  /**
+   * 把当前模型配置下发给 qq-guard 插件（幂等，每条消息前调用）。
+   *
+   * 为什么不再用 `session/selectModel`：它会把选择**落盘成 DSH 全局默认**
+   * （agentDefaultModel.saveSelection），切一次模型就把桌面端默认改一次。
+   * 插件版本走 `agent/request` 瀑布覆写单次请求，不改任何全局配置。
+   *
+   * 配置来源优先级：
+   *   ① DSH 设置页的 `model`（plugins/dsh-qq-guard Config，热更新到 live 配置）
+   *   ② config.json 的 `dsh.provider/model/reasoningEffort`（旧配置兜底）
+   * `modelFallbacks` 最多 4 个，主模型失败时插件按顺序接管。
+   *
+   * 失败**绝不阻塞聊天**：插件没装 / 旧版本 / 模型不可用都只记日志，
+   * 这一轮退回「会话当前模型」（也就是全局默认）。
+   * @param {string} sessionId
+   */
+  async _applyModel(sessionId) {
+    const hot = this.live?.model ?? this.config?.model ?? {}
+    const legacy = this.config?.dsh ?? {}
+    const provider = String(hot.provider || legacy.provider || '').trim()
+    const model = String(hot.model || legacy.model || '').trim()
+    const reasoningEffort = String(hot.reasoningEffort || legacy.reasoningEffort || '').trim()
+    const fallbacks = Array.isArray(this.live?.modelFallbacks ?? this.config?.modelFallbacks)
+      ? (this.live?.modelFallbacks ?? this.config.modelFallbacks)
+        .filter((item) => item && typeof item.provider === 'string' && typeof item.model === 'string')
+        .slice(0, 4)
+      : []
+    try {
+      const entry = await this.dsh.setSessionModel({ sessionId, provider, model, reasoningEffort, fallbacks })
+      this._modelRouteWarned = false
+      const want = provider && model ? `${provider}/${model}` : '跟随全局默认'
+      if (this._lastAppliedModel !== `${want}|${entry?.model ?? ''}`) {
+        this._lastAppliedModel = `${want}|${entry?.model ?? ''}`
+        this.logger.info?.(`会话 ${sessionId} 模型：${want}${fallbacks.length > 0 ? `（备用 ${fallbacks.length} 个）` : ''}`)
+      }
+    } catch (error) {
+      // 只告警一次，避免每条消息刷屏；热更新后会自动重试并在成功时复位。
+      if (!this._modelRouteWarned) {
+        this._modelRouteWarned = true
+        this.logger.warn?.(`模型偏好下发失败（不阻塞，本轮用会话当前模型）：${error.message}`)
+      }
+    }
   }
 
   /** 是否自动归档失效旧会话（dsh.archiveStaleSessions，默认 true）。 */
@@ -521,7 +590,10 @@ export class Bridge {
    * 才把攒到的文本用换行拼接、走**同一个串行队列**投递一次（队列语义不变）。
    */
   async _enqueue(key, msg, text) {
-    const windowMs = this._rhythm().debounceWindowMs
+    // 防抖窗口优先级：高级参数 antiDebounceMs（0=不启用）> 节奏里的 debounceWindowMs。
+    // 高级参数是给排障用的「一个开关压过全部节奏设置」，所以它在最前面。
+    const advanced = Number(this.live?.antiDebounceMs ?? this.config?.antiDebounceMs ?? 0)
+    const windowMs = advanced > 0 ? advanced : this._rhythm().debounceWindowMs
     // 0 = 关闭防抖：立即投递（保持旧行为，也让测试可控）。
     if (!(windowMs > 0)) return await this._processBatch(key, msg, [text])
 
@@ -562,8 +634,16 @@ export class Bridge {
           return
         }
         const sessionId = await this.ensureSession(key)
+        // 每条消息前重新下发一次模型偏好：设置页改完下一条即生效（幂等，失败不阻塞）。
+        await this._applyModel(sessionId)
         const reply = await this.dsh.promptAndWait(sessionId, text, {
-          timeoutMs: this.config.replyTimeoutMs ?? 180000,
+          // 优先级：设置页热改的 replyTimeoutMs > config.json > 20s 默认。
+          // 20s：主模型卡住时不要拖着 QQ 用户等 3 分钟。
+          // 超时会在 promptAndWait 里顺手 `session/cancel`，DSH 前端不会一直转圈。
+          timeoutMs: Number(this.live?.replyTimeoutMs ?? this.config.replyTimeoutMs ?? 20000),
+          // 超过看门狗时间还没回复时，在日志里提示一句「可能正在降级」，
+          // 用户看日志就知道不是死机。
+          slowHintMs: Number(this.live?.modelWatchdogMs ?? this.config.modelWatchdogMs ?? 8000),
         })
         const audit = auditReply(reply, [this.config.onebot?.accessToken])
         if (!audit.ok) {
@@ -585,6 +665,12 @@ export class Bridge {
       } catch (error) {
         this.stats.failed++
         this.logger.error?.(`处理 ${key} 失败：${error?.message ?? error}`)
+        // 超时会先 session/cancel（见 dsh.mjs promptAndWait）；这里再给 QQ 用户一个明确信号，
+        // 别让人对着空气干等。发不出去也不能把错误处理本身搞崩。
+        const line = error?.code === 'TIMEOUT'
+          ? '（模型没及时响应，这次先不回了）'
+          : '（这次处理出错了，稍后再试）'
+        await this._send(msg, line).catch(() => {})
       }
     })
   }

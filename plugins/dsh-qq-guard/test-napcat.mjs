@@ -127,7 +127,9 @@ await check('传 QQ 号作为 argv[1]，cwd 是 NapCat 目录，graceMs=5000', a
   assert.ok(fs.existsSync(spec.cwd), 'cwd 应存在')
   assert.equal(spec.graceMs, STOP_GRACE_MS, '宽限应为 5000ms')
   assert.equal(spec.stdio.stdin, 'ignore')
-  assert.equal(spec.stdio.stdout, 'ignore')
+  // stdout/stderr 必须 pipe：NapCat 起不来的原因（端口被占 / 未登录）只在它自己的输出里。
+  assert.equal(spec.stdio.stdout, 'pipe', 'NapCat 日志要能读到（面板「NapCat 日志」框）')
+  assert.equal(spec.stdio.stderr, 'pipe')
 })
 await check('不填 QQ 号时只有一个参数', async () => {
   const fake = makeFakeSubprocess()
