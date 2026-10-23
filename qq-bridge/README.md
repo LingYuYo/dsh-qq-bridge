@@ -645,6 +645,9 @@ node test-timeout.mjs   # 等待超时：默认 20s / 超时必 session/cancel /
 ## 已知限制
 
 - 只处理文本（图片/表情转成 `[图片]`/`[表情]` 占位符），不做图片理解与语音。
+  2026-10-23 已接图片理解与 TTS（WIP），真机问题见插件 README 的
+  「待修复（2026-10-24 真机测试记录）」——人设 section 未生效、人设每 2 秒重复推送、
+  `qq_send_voice` 不在工具列表、`web_search` 未接上。明天继续。
 - 不转发 `ask_user_question` 提问与工具审批到 QQ（与 qq-bridge 不同，本期未实现）。
 - 未实现 `/reset` 等斜杠命令。
 - 会话映射存 `state/sessions.json`，DSH 侧会话被归档后会自动重建。

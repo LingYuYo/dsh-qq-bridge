@@ -523,6 +523,59 @@ node render-preview.mjs       # 生成 preview/*.html 静态版式（含弹窗�
 
 `qq-bridge/test-offline.mjs` 会串跑这四组。
 
+## 待修复（2026-10-24 真机测试记录）
+
+> 今天只记录，不修。下列都是真机现场证据，明天开新会话从这里继续。
+
+### 1. 人设没进系统提示：单人设保存「失效」+ 被全局 Harness / 记忆提示覆盖（P0）
+
+- **现象**：设置页保存单人设后，QQ 会话回复仍是助手腔；模型侧提示里出现
+  `You are an AI agent powered by DeepSeek Harness`、`Agent Teams is available in this session`、
+  `MNEMON RUNTIME MEMORY PROTOCOL`。
+- **实测**（2026-10-24 00:15，某个 QQ 群会话）：该会话最近一条 `system/message`
+  长度 10595，内容是**全局 Harness 系统提示**，不是 guard `deployment:persona-prefix`
+  的 complete section。
+- **结论**：guard 的动态人设 section 这次没有生效。`applyPersonaSection` 注册失败时
+  只 `console.warn`，日志里没浮出来；restrict 正常（全局危险工具被隐藏）说明
+  `applyGuard` 确实继续执行了，问题在 section 注册本身。
+- **排查方向**：`ctx.get('systemPrompt')` 是否可用 / `ctx.inject(['systemPrompt'])` 是否触发 /
+  `getSectionOrder('DEPLOYMENT_PERSONA_PREFIX')` 是否在新版本抛错 /
+  `section({ complete: true })` 语义是否变了。先看 DSH 控制台有没有
+  `[qq-guard] role=guard 找不到 systemPrompt 服务` 这类 warn。
+- 单人设保存链路（UI → session-ops → bridge state → plugin personaState）有离线单测，
+  但**没有 section 承载，保存了也看不见效果**；两者要一起验证，别只盯着保存按钮。
+
+### 2. 人设每 2 秒被重复推送（日志刷屏 + 可能盖掉单人设）
+
+- **现象**：桥接日志每 2 秒一条「全局人设已推送（设置页人设变化，6701 字）」。
+- **根因**：`qq-bridge/src/runtime-config.mjs` 里 `const r = onPersona?.(...)`，而
+  `start.mjs` 的 `onPersona` 是 `() => { void pushGlobalPersona(...) }`，返回 undefined
+  → `lastPersonaSignature` 永远不更新 → 每轮轮询都当成「变了」再推一次。
+- **修法**：让 `onPersona` 返回 `{ ok: boolean }`，或把签名更新移到推送成功之后。
+- **影响**：日志被刷没（TTS 报错被挤出 40 行 `logTail`，排障困难）；持续把全局人设
+  推给插件，也可能让单人设的状态更乱。
+
+### 3. 发语音失败（工具不可见 + 发送链路未验证）（P1）
+
+- **现象**：真机让它发语音，模型回复「没有语音通道」，发送报错。
+- **实测**：QQ 会话最近两次 `request/header`（23:55 / 23:58）的工具列表都是 35 个，
+  **没有 `qq_send_voice`**，也没有 `web_search`。工具根本没进模型可见清单，
+  模型当然说没有通道。
+- **头号嫌疑**：`index.js` 的 `applyVoiceTool` 绕过 `@deepseek-ai/dsh-tools` 的 `defineTool`，
+  直接把参数 spec 当 `parameters` 传给 `ctx.tools.register`；registry 需要的是 JSON Schema
+  （root `type: "object"` + `properties` + `required[]`）。参考 `dsh-tool-todo/lib/index.js`，
+  所有工具都经 `defineTool`。
+- **次嫌疑**（等工具可见后才遇到）：NapCat 的 `record` 段 `base64://` + mp3 可能不被当前
+  版本接受，需要 silk；要落盘 mp3 用 `file://` 实测，并看 `sendVoice` 返回的 retcode。
+- **修复顺序**：① 让 `qq_send_voice` 出现在 header 工具列表；② 再验证合成与发送，
+  日志里的 `已发送语音 …` / `语音发送失败 … retcode` 是判据。
+
+### 4. 网页搜索同样没接上（P2）
+
+- `web_search` 不在 QQ 会话工具列表里，技能开着也调不到。
+- 需要确认 `@deepseek-ai/dsh-tool-web` 是否 agent-scope 注册、qq-chat preset 要不要显式加一行；
+  只改 guard 的放行名单不够。
+
 ## 许可
 
 MIT。与 DeepSeek 官方无隶属关系。
