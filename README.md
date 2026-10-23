@@ -12,9 +12,20 @@ QQ ──► NapCat (OneBot v11 正向 WS) ──► qq-bridge ──► DSH Web
 
 ## 版本演进
 
-当前版本：**v0.2.0-beta.1**
+当前版本：**v0.3.0-alpha**
 
 本次新增（WIP）：
+
+- **多模态与交互**
+  - **群聊 @ 文本格式修复**：入站把 `at` 段转成 `@昵称 `（拿不到昵称退回 `@QQ号 `），并保证与正文之间有一个空格。
+  - **图片理解实装**：下载 QQ 图片转 Base64（或直接使用 URL），按 DSH 多模态格式投递；带模型能力探测与纯文本降级。
+  - **TTS 发语音工具注册（WIP）**：`qq_send_voice` + Edge TTS / OpenAI 兼容 TTS，经 NapCat `record` 段发送。
+- **配置自由度**
+  - **打字延时分档阈值可自定义**：短句上限 / 中等上限 / 长句触发三个字数边界（默认 10 / 14 / 15）与三档毫秒基准都能在设置页改。
+  - **人设支持自定义命名**：选中自定义人设后可直接改名字，保存写回 `personaPresets`。
+  - **活跃设置防抖 / 限频实装**：防抖窗口、每分钟上限、超限静默、指令禁言全部按真实配置生效；并受「防抖合并 / 频率控制」插件开关控制。
+
+上一版（v0.2.0-beta.1）：
 
 - **模型无痕热切换**：`agent/request` 瀑布里按会话覆写本次请求的 provider/model，不碰 `session/selectModel`、不改 DSH 全局默认；`POST /dsh-qq-guard/model` 为桥接下发的入口。
 - **静默看门狗 + 失败降级**：`llm/stream` 上看门狗把「模型挂着不吐字」翻成终态错误，`agent/request-error` 在同一轮内切到备用模型；`GET /dsh-qq-guard/system-events` 暴露最近 20 条底层事件。
@@ -23,12 +34,21 @@ QQ ──► NapCat (OneBot v11 正向 WS) ──► qq-bridge ──► DSH Web
 - **一键启动接真实路由**：左下角卡片按 NapCat → 桥接顺序拉起，状态灯读真实进程。
 - **高级参数**：`replyTimeoutMs` / `modelWatchdogMs` / `antiDebounceMs` 进配置与设置页，桥接热读。
 
-上一版（v0.1.1-beta.1）：
+更早（v0.1.1-beta.1）：
 
 - **外部插件兼容层**：只读扫描 QQ Agent 格式（`plugin.json` / `skill.json`），支持动态配置表单，默认全部关闭。
 - **沙箱执行基础链路（P1）**：`ctx.subprocess` 独立进程 + `--permission` + `module.registerHooks` 拦截 `node:fs` / `node:child_process` / 越界引用，支持对自包含模块执行 `setup()` 冒烟测试。
 - **人设系统重构**：概览卡片 + 独立编辑弹窗，支持机器人名字、参与度、管理员附加规则、系统提示词覆盖，桥接层拼接逻辑同步更新。
 - **UI 布局收尾**：左下角一键启动卡片、记忆整理面板、外部插件卡片描述裁剪与过滤。
+
+## 已知问题 (Known Issues)
+
+> 2026-10-24 真机测试记录，明天开新会话继续修。详细排查方向见
+> [`plugins/dsh-qq-guard/README.md`](plugins/dsh-qq-guard/README.md) 的「待修复」一节。
+
+- **单人设注入被底层系统提示词覆盖，且每 2 秒重复推送**：QQ 会话的 `system/message` 实测整段是全局 Harness 提示（含 Agent Teams / MNEMON），guard 的 persona section 没生效；桥接日志同时每 2 秒刷一条「全局人设已推送」。
+- **发语音 `qq_send_voice` 工具未注册进 schema**：工具注册时未使用 `@deepseek-ai/dsh-tools` 的 `defineTool`，参数 schema 形态不对，模型侧工具列表里看不到它。
+- **`web_search` 工具放行名单未生效**：QQ 会话工具列表里没有 `web_search`，技能开着也调不到；只改 guard 放行名单不够，需确认工具本身是否注册进了该 preset 作用域。
 
 ## 仓库结构
 
@@ -118,7 +138,7 @@ node qq-bridge/test-offline.mjs
 
 ## 已知限制
 
-- 只处理文本；图片/表情转成 `[图片]` / `[表情]` 占位符，不做图片理解与语音。
+- 图片理解与 TTS 发语音已接（WIP，见上面 Known Issues）；表情等仍以 `[表情]` 占位符形式进入文本。
 - 不把 `ask_user_question` 与工具审批转发到 QQ。
 - 未实现 `/reset` 等斜杠命令。
 - 人设改动只对**新建** QQ 会话生效，已有会话保留原人设与上下文。
