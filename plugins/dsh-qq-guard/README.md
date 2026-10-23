@@ -44,11 +44,11 @@ profile 顶层实例持有配置，投影到「设置 → QQ 桥接」。左侧�
 
 | Tab | 内容 | 数据来源 |
 | --- | --- | --- |
-| 运行状态 | 桥接状态 / 启停 / 日志、NapCat 进程状态与启停、**NapCat 日志折叠框**、**系统底层事件折叠面板**、今日用量概览卡、AI 排障助手输入框 | 状态与启停走真实路由；用量卡与 AI 框为 **Mock 壳** |
+| 运行状态 | 桥接状态 / 启停 / 日志、NapCat 进程状态与启停、**NapCat 日志折叠框**、**系统底层事件折叠面板**、今日用量概览卡、AI 排障助手输入框 | 状态与启停走真实路由；**今日用量卡读真实 `/usage`**；AI 框为 **Mock 壳** |
 | 会话管理 | 左会话列表（含未读红点）+ 右详情（单人设覆盖 / 单独白名单 / 记忆提取 / 删除会话）+ `清理失效会话` | 列表 **Mock**；清理按钮走 **真实 Host 路由** |
 | 技能与插件 | Skill / Plugin / 外部插件 三组卡片，外部插件带兼容标签与 `[测试运行]`，含版本号、齿轮、垃圾桶、拖拽手柄、上下移 | **全部真实配置读写**；沙箱测试走真实 Host 路由 |
 | 全局设置 | 运行节奏（两个大按钮 → 信息发送配置 / 活跃设置 弹窗）、**模型配置（无痕热切换 + 备用模型）**、**高级参数（折叠）**、人设概览卡（编辑收进弹窗）、白名单、OneBot、NapCat | **全部真实配置读写** |
-| 数据与用量 | 纯 CSS 柱状图 + 面积图，按天 / 按模型 / 按插件三张表 | **全部 Mock** |
+| 数据与用量 | 近 7 天柱状图 + Token 面积图，按天 / 按模型 / 按会话三张表，外加**峰谷时段设置**与**忙/闲两套单价配置卡** | **全部真实 `/usage` 数据**（5 秒轮询），成本按事件时刻分峰谷计价 |
 
 左下角还有一张**快捷启动卡**（已在导航栏底部、使用引导按钮上方）：状态灯读
 `/dsh-qq-guard/bridge` 与 `/dsh-qq-guard/napcat` 的真实进程状态，按钮按
@@ -302,11 +302,52 @@ QQ 会话切模型，**不能**走 `session/selectModel` —— 它会顺带 `ag
 
 ### 限制
 
-- DSH 原生 UI 的模型选择器不会跟着变（这是不改全局默认的代价）。真实 route 记在会话的 `request/header` 里，
-  用量统计读 header 不受影响。
+- DSH 原生 UI 的模型选择器不会跟着变（这是不改全局默认的代价）。真实 route 由
+  `assistant/message.data.message.source` 记录，用量统计按它归因，不受影响。
 - 多模态准入检查看的是会话 selection、不是覆写值（`dsh-api-session-controller/lib/types/commands.js:306-316`），
   所以「默认模型支持图片、覆写成纯文本模型」时图片会被放行然后上游报错 —— 面板要自己拦。
 - 切换会作废前缀缓存，频繁切要算进成本。
+
+## 数据与用量（真实统计）
+
+数据源只有一条：Host 进程内的 `session/event` —— 只认 `assistant/message.data.usage`
+（重试那次再读 `assistant/attempt.data.stream` 里最后一个 usage chunk），`turn/end`
+只用来算成功率。**不读日志、不走 `session/follow`。**
+
+- **范围**：只统计 QQ 工作区（`cwd === dsh.sessionCwd` 或 `sessions.json` 映射命中），
+  `origin === 'subagent'` 与浏览器会话一律排除。
+- **口径**：`inputTokens` 是未命中缓存的输入，prompt 总量 = input + cacheRead + cacheWrite；
+  `reasoningTokens` 已含在 output 里，不重复加。`assistant/message` 与 `assistant/attempt`
+  都计一次调用（失败/重试的上游调用也真实计费）。
+- **去重**：每个会话维护 `liveSeq / backfillSeq / firstLiveSeq` 三个水位，重启、重复回填、
+  回填与在线监听交错都不会重复计数。
+- **回填**：启动 2.5s 后用官方 `ctx.sessionPersistence.list() + open(id,'read')` 扫一遍
+  已存在的 QQ 会话；`POST /dsh-qq-guard/usage/backfill` 可手动补跑（幂等）。
+- **落盘**：`qq-bridge/state/usage-stats.json`（原子写 + 1.5s 防抖，`state/` 不进仓库）。
+  存储版本 v3：模型桶里额外保存 `peak` / `offPeak` 两份 token 明细，成本按事件发生的
+  时刻分别套忙时/闲时单价。旧版本文件启动时会被备份成 `.bak` 并靠回填重建。
+- **成本（峰谷计价）**：DSH 只报 token、不报单价；面板「单价配置」卡写 `Config.usagePricing`，
+  每个 `provider/model` 两套费率：`peak` 与 `offPeak`，各含输入 / 输出 / 缓存读 / 缓存写
+  四项，单位「元 / 百万 token」。四项全 0 = 未配置 → 成本显示「—」，不假装免费。
+  - 忙时窗口由 `Config.peakHours` 决定（默认 `08:30-00:30`）：**支持逗号分隔多段**，
+    例如 `09:00-12:00, 14:00-18:00`；每段左闭右开，`start > end` 表示跨午夜。
+  - `Config.timezone`（默认 `Asia/Shanghai`）决定日期与时刻的换算时区。
+  - `Config.peakOnlyWorkdays`：开启后周六 / 周日整天空闲时。
+  - 节假日 / 调休读同目录的 `holidays.json`（与 `usage-stats.mjs` 同目录）：
+    ```json
+    { "workdays": ["2026-10-17"], "holidays": ["2026-10-19"] }
+    ```
+    优先级：`holidays` 命中 → 整天 Off-Peak；否则 `workdays` 命中 → 按工作日走忙时时段；
+    都没命中再看 `peakOnlyWorkdays`；最后按时段窗口判断。
+  - 缓存写入按 `cacheWrite` 单价单独计费（以前只算读）。
+  - 旧版扁平单价（`{ input, output, ... }`）仍兼容：同时套到忙时/闲时两套，面板首次编辑时
+    自动迁移成嵌套结构，已填数字不会丢。
+  - 峰谷规则是**记录时**分类的。规则变化会写进统计文件签名：重启 DSH 时发现签名不一致会
+    自动备份 `.bak`、清空并按新规则回填重算；不想重启也可以手动
+    `POST /dsh-qq-guard/usage/backfill?rebuild=1`。
+
+面板侧 `useUsage()` 每 5 秒拉一次 `GET /dsh-qq-guard/usage`，失败保留上一份数据；
+「今日用量概览」用 `days=2`（今日 + 昨日算环比），「数据与用量」用 `days=7`。
 
 ## HTTP 路由
 
@@ -321,6 +362,8 @@ QQ 会话切模型，**不能**走 `session/selectModel` —— 它会顺带 `ag
 | `GET/POST/DELETE /dsh-qq-guard/model` | 按会话写/读/清模型偏好（无痕热切换，桥接每条消息前 POST） |
 | `GET /dsh-qq-guard/models` | 模型目录：provider + 模型 + `input` 多模态能力 + 上下文 + 推理档（面板用） |
 | `GET /dsh-qq-guard/system-events` | 系统底层事件：看门狗 / 切备用 / 抛错，最近 20 条（面板用） |
+| `GET /dsh-qq-guard/usage?days=7` | 真实用量聚合：今日 / 昨日 / 趋势 / 按天 / 按模型 / 按会话（面板 5 秒轮询） |
+| `POST /dsh-qq-guard/usage/backfill` | 手动补跑历史回填（幂等；启动时也会自动跑一次）。带 `?rebuild=1` 时先清空再按当前峰谷规则重算 |
 
 `status` / `napcat` / `bridge` / `external-plugins` 路由只接受同源请求（校验 `sec-fetch-site`），
 非 GET 之外的方法返回 405。
@@ -343,6 +386,8 @@ node test-napcat.mjs          # NapCat 进程管理（假 subprocess，不真起
 node test-status-napcat.mjs   # 运行状态页的 NapCat 面板（启停路由 / 状态刷新 / 设置页只留输入框）
 node test-autostart.mjs       # autoStart / 单实例 / 崩溃重启上限
 node test-render.mjs          # 五个 Tab + 七个弹窗的渲染冒烟（假 React）
+node test-usage-stats.mjs     # 用量拦截 / 去重 / 多段峰谷 / 工作日节假日 / 规则变化重建 / 回填幂等 / 两条路由（18 例）
+node test-usage-ui.mjs        # 用量页真实数据接线（轮询 / 图表 / 三表 / 多段峰谷 / 工作日开关 / 单价写回，11 例）
 node test-skills.mjs          # 技能页交互逻辑（拖拽排序 / 上下移 / 增删 / 弹窗 / Esc / autoStart 开关）
 node test-persona-ui.mjs      # 人设概览卡 + 设置弹窗（名字/展示名/参与度/三块文本/人设增删）
 node test-external-ui.mjs     # 外部插件卡片（三种格式 / 兼容标签 / 描述裁剪 / 过滤 / configSchema 弹窗）

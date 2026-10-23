@@ -194,7 +194,7 @@ check('状态灯默认「未就绪」，并显示当前模型', () => {
   assert(joined.includes('未就绪'), `状态灯文案不对：${joined}`)
   assert(byClass(card, 'qqg-dot-idle').length === 1, '未就绪应配 idle 状态灯')
   const model = textOf(byClass(card, 'qqg-launch-model-name')[0])
-  assert(model === 'deepseek-v4.1-flash', `当前模型显示为「${model}」`)
+  assert(model === '跟随全局默认', `当前模型显示为「${model}」`)
   assert(joined.includes('一键启动 QQ + NapCat'), '缺少启动按钮文案')
 })
 

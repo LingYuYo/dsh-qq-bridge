@@ -134,6 +134,16 @@ const VALUE = {
   onebot: { wsUrl: 'ws://127.0.0.1:3001', accessToken: '' },
   napcat: { dir: 'D:\\NapCat.52230.Shell', quickLoginQQ: '1000000001' },
   bridge: { dir: '', autoStart: true },
+  model: { provider: 'trae', model: 'deepseek-v4.1-flash', reasoningEffort: '' },
+  peakHours: '09:00-12:00, 14:00-18:00',
+  peakOnlyWorkdays: true,
+  timezone: 'Asia/Shanghai',
+  usagePricing: [{
+    provider: 'trae',
+    model: 'deepseek-v4.1-flash',
+    peak: { input: 2, output: 8, cacheRead: 0.5, cacheWrite: 0.2 },
+    offPeak: { input: 1, output: 4, cacheRead: 0.25, cacheWrite: 0.1 },
+  }],
 }
 const form = {
   getSnapshot: () => ({ status: 'ready', value: VALUE, writable: true, source: 'remote' }),

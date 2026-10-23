@@ -582,12 +582,34 @@ window.__ModuleLoader__.load({
   font-size: 11.5px; color: var(--dsw-alias-label-secondary); }
 .qqg-dropzone:hover { border-color: color-mix(in srgb, var(--qqg-accent) 55%, var(--qqg-card-bd));
   color: var(--dsw-alias-label-primary); }
+
+/* ── 用量页：峰谷时段 + 单价配置 ──────────────────────────── */
+.qqg-peak-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+.qqg-peak-field { flex: 1 1 260px; min-width: 0; }
+.qqg-peak-toggle { margin-top: 8px; padding-top: 10px;
+  border-top: 1px solid var(--dsw-alias-border-l1); }
+.qqg-price-list { display: flex; flex-direction: column; }
+.qqg-price-row { display: flex; flex-direction: column; gap: 8px; padding: 12px 0;
+  border-top: 1px solid var(--dsw-alias-border-l1); }
+.qqg-price-row:first-child { border-top: 0; padding-top: 0; }
+.qqg-price-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.qqg-price-model { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; min-width: 0; }
+.qqg-price-provider { font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
+.qqg-price-periods { display: flex; flex-direction: column; gap: 6px; }
+.qqg-price-period { display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; }
+.qqg-price-period-label { flex: 0 0 90px; padding-bottom: 7px; font-size: 10.5px; font-weight: 600;
+  color: var(--dsw-alias-label-secondary); }
+.qqg-price-field { flex: 1 1 88px; min-width: 74px; display: flex; flex-direction: column; gap: 4px; }
+.qqg-price-label { font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
+.qqg-price-field .qqg-input { width: 100%; font-variant-numeric: tabular-nums; }
+.qqg-price-foot { display: flex; align-items: center; gap: 8px; margin-top: 12px; flex-wrap: wrap;
+  font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
 `
 
-    /* ══════════ Mock 数据（本阶段只喂 UI，不接任何真实逻辑）══════════ */
-    const MOCK_TODAY = { calls: 1284, tokens: 386420, cost: 4.82 }
-    const MOCK_TREND = { calls: 12.4, tokens: 8.1, cost: -3.2 }
-
+    /* ══════════ 本地演示数据（只剩「会话管理」页在用）══════════ */
+    // 用量数据（今日概览 / 数据与用量）已全部接 Host 的 /dsh-qq-guard/usage，
+    // 这里不再保留任何用量假数字。
     const MOCK_SESSIONS = [
       {
         id: 's1', name: '翎羽', qq: '10001', kind: '私聊', initial: '翎', unread: 3,
@@ -633,38 +655,6 @@ window.__ModuleLoader__.load({
         persona: '', allow: false,
         messages: [{ from: 'them', text: '【已拦截】推广内容', time: '昨天' }],
       },
-    ]
-
-    /* 技能 / 插件列表：本机 QQ 桥接业务的硬编码数据（不再是 DSH 平台自带的假清单）。
-       ver / 作者 / 说明都按真实业务编的，第二阶段接真实装载时按 id 对表即可。 */
-    const MOCK_USAGE_DAYS = [
-      { day: '10-15', calls: 642, tokens: 182340, cost: 2.28, ok: 98.4 },
-      { day: '10-16', calls: 715, tokens: 204880, cost: 2.56, ok: 99.1 },
-      { day: '10-17', calls: 588, tokens: 161200, cost: 2.01, ok: 97.8 },
-      { day: '10-18', calls: 903, tokens: 268400, cost: 3.35, ok: 99.4 },
-      { day: '10-19', calls: 1102, tokens: 331760, cost: 4.14, ok: 98.9 },
-      { day: '10-20', calls: 1216, tokens: 362100, cost: 4.52, ok: 99.2 },
-      { day: '10-21', calls: 1284, tokens: 386420, cost: 4.82, ok: 99.0 },
-    ]
-
-    const MOCK_USAGE_MODELS = [
-      { name: 'deepseek-v4.1-flash', calls: 3120, tokens: 962400, cost: 11.24, share: 48 },
-      { name: 'doubao-seed-1.6', calls: 1420, tokens: 402100, cost: 6.02, share: 22 },
-      { name: 'deepseek-v4.1', calls: 860, tokens: 318800, cost: 5.66, share: 13 },
-      { name: 'qwen3-235b-a22b', calls: 540, tokens: 141200, cost: 2.14, share: 8 },
-      { name: '其他', calls: 401, tokens: 96600, cost: 1.32, share: 9 },
-    ]
-
-    /* 左下角快捷启动卡的「当前模型」：第一批是壳，先取用量表里的主模型。
-       第二批接真实来源（Host 暴露的 agent 默认模型 / 桥接热配置）时替换这里。 */
-    const MOCK_CURRENT_MODEL = MOCK_USAGE_MODELS[0].name
-
-    const MOCK_USAGE_PLUGINS = [
-      { name: 'QQ 桥接', calls: 2840, tokens: 812400, cost: 9.82, share: 44 },
-      { name: '记忆提取', calls: 1620, tokens: 468200, cost: 6.11, share: 25 },
-      { name: '网页搜索', calls: 980, tokens: 302600, cost: 4.28, share: 15 },
-      { name: '会话清理', calls: 620, tokens: 182400, cost: 2.02, share: 10 },
-      { name: '其他', calls: 282, tokens: 96500, cost: 1.15, share: 6 },
     ]
 
     /** 未接线的按钮统一绑它（本阶段只搭壳）。 */
@@ -754,6 +744,12 @@ window.__ModuleLoader__.load({
       'trimEndPunctuation.enabled': true,
       // 与 Host 侧 Config 的 bridge.autoStart 默认值保持一致（默认关，fail-closed）。
       'bridge.autoStart': false,
+      // 用量成本价目表默认空 = 未配置，成本显示「—」。
+      usagePricing: [],
+      // 峰谷判定的默认时段/时区（与 Host 侧 Config 默认值保持一致）。
+      peakHours: '08:30-00:30',
+      peakOnlyWorkdays: false,
+      timezone: 'Asia/Shanghai',
       // 人设参与度默认「普通群友」（与 Host 侧重拼系统提示词时的默认值一致）。
       personaParticipation: 'normal',
       // 高级参数默认值与 Host 侧 Config 保持一致。
@@ -1178,6 +1174,48 @@ window.__ModuleLoader__.load({
         return () => { stopped = true; if (timer) clearTimeout(timer) }
       }, [enabled])
       return events
+    }
+
+    /**
+     * 真实用量 hook（Host 的 GET /dsh-qq-guard/usage）。
+     *
+     * 5 秒轮询：聊天发生在 Host 进程里，浏览器没有对应的推送通道；
+     * 轮询是最省事且天然自愈的方式，和桥接状态灯同一个套路。
+     * 轮询失败不清空上一份数据（网络抖一下不该让面板闪成空白）。
+     */
+    function useUsage(days = 7) {
+      const [snap, setSnap] = React.useState({ status: 'loading', data: null, error: null })
+      React.useEffect(() => {
+        let stopped = false
+        let timer = null
+        const load = async () => {
+          try {
+            const res = await fetch(`/dsh-qq-guard/usage?days=${days}`, {
+              headers: { accept: 'application/json' },
+              credentials: 'include',
+            })
+            const body = await res.json().catch(() => ({}))
+            if (stopped) return
+            if (!res.ok || body?.ok !== true) {
+              setSnap((prev) => (prev.data
+                ? { ...prev, status: 'ready' }
+                : { status: 'error', data: null, error: body?.detail ?? body?.reason ?? `HTTP ${res.status}` }))
+            } else {
+              setSnap({ status: 'ready', data: body, error: null })
+            }
+          } catch (error) {
+            if (!stopped) {
+              setSnap((prev) => (prev.data
+                ? { ...prev, status: 'ready' }
+                : { status: 'error', data: null, error: String(error?.message ?? error) }))
+            }
+          }
+          if (!stopped) timer = setTimeout(load, 5000)
+        }
+        void load()
+        return () => { stopped = true; if (timer) clearTimeout(timer) }
+      }, [days])
+      return snap
     }
 
     function StatusSection({ get, writable }) {
@@ -2108,6 +2146,58 @@ window.__ModuleLoader__.load({
 
     function fmtNum(n) { return n.toLocaleString('zh-CN') }
 
+    /**
+     * 成本展示：`null` = 该路由没配单价（Host 端刻意返回 null），显示「—」。
+     * 金额可能很小（一次调用几厘钱），小于 1 分时给个区间提示，不四舍五入成 0。
+     */
+    function fmtCost(cost) {
+      if (cost === null || cost === undefined) return '—'
+      const value = Number(cost)
+      if (!Number.isFinite(value)) return '—'
+      if (value > 0 && value < 0.01) return '<¥0.01'
+      return '¥' + value.toFixed(2)
+    }
+
+    /** 「较昨日 +12.3%」；null（昨天没数据）时返回 null，由调用方决定兜底文案。 */
+    function fmtTrend(value) {
+      if (value === null || value === undefined) return null
+      const n = Number(value)
+      if (!Number.isFinite(n)) return null
+      if (Math.abs(n) < 0.05) return '与昨日持平'
+      return `较昨日 ${n > 0 ? '+' : ''}${n.toFixed(1)}%`
+    }
+
+    function trendClass(value) {
+      if (value === null || value === undefined) return ''
+      return Number(value) >= 0 ? 'qqg-up' : 'qqg-down'
+    }
+
+    /** 单段 HH:MM-HH:MM 校验（与 Host parsePeakHours 同口径）。 */
+    function isValidPeakSegment(text) {
+      const match = /^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$/.exec(String(text ?? ''))
+      if (!match) return false
+      const [startHour, startMinute, endHour, endMinute] = [Number(match[1]), Number(match[2]), Number(match[3]), Number(match[4])]
+      return startHour <= 23 && endHour <= 23 && startMinute <= 59 && endMinute <= 59
+    }
+
+    /** 多段时段校验：英文逗号分隔，每段都要合法，至少一段。 */
+    function isValidPeakHours(text) {
+      const segments = String(text ?? '').split(',').map((part) => part.trim()).filter(Boolean)
+      return segments.length > 0 && segments.every(isValidPeakSegment)
+    }
+
+    /** IANA 时区 → 「UTC+8」这样的展示（取当前时刻的偏移）。 */
+    function timezoneOffsetLabel(timeZone) {
+      try {
+        const parts = new Intl.DateTimeFormat('en-US', { timeZone, timeZoneName: 'shortOffset' })
+          .formatToParts(new Date())
+        const name = parts.find((part) => part.type === 'timeZoneName')?.value ?? ''
+        return name.replace('GMT', 'UTC') || String(timeZone)
+      } catch {
+        return String(timeZone)
+      }
+    }
+
     /* ══════════ 通用模态框 ══════════ */
     /**
      * 统一弹窗：遮罩 + 卡片 + 标题栏 + 底部按钮区。
@@ -2228,22 +2318,43 @@ window.__ModuleLoader__.load({
     }
 
 
-    /** 今日用量概览（Mock）。 */
+    /** 今日用量概览（真实数据：/dsh-qq-guard/usage?days=2，5 秒刷新）。 */
     function TodayUsage() {
+      const usage = useUsage(2)
+      const data = usage.data
+      const today = data?.today ?? null
+      const trend = data?.trend ?? {}
+      const priced = data?.pricing?.configured === true
+      const pending = usage.status === 'loading'
+      const apiFailed = usage.status === 'error'
+      const footOf = (value) => fmtTrend(value) ?? (pending ? '统计中…' : '较昨日 —')
       return h(Panel, {
         title: '今日用量概览',
-        desc: 'Mock 数据，接入统计后端后替换。',
-        right: h('span', { className: 'qqg-pill qqg-pill-accent' }, '今日'),
+        desc: apiFailed
+          ? `用量接口读不到：${usage.error}`
+          : '真实数据：Host 拦截 assistant/message 的 usage，每 5 秒刷新。',
+        right: h('span', { className: 'qqg-pill qqg-pill-accent' },
+          apiFailed ? '接口异常' : (priced ? '今日' : '今日 · 成本未配置')),
       },
       h('div', { className: 'qqg-stats' },
-        h(StatCard, { label: '调用次数', value: fmtNum(MOCK_TODAY.calls), unit: '次',
-          foot: `较昨日 +${MOCK_TREND.calls}%`, footCls: 'qqg-up' }),
-        h(StatCard, { label: 'Token 消耗', value: fmtNum(MOCK_TODAY.tokens), unit: 'tokens',
-          foot: `较昨日 +${MOCK_TREND.tokens}%`, footCls: 'qqg-up' }),
-        h(StatCard, { label: '预估成本', value: '¥' + MOCK_TODAY.cost.toFixed(2),
-          foot: `较昨日 ${MOCK_TREND.cost}%`, footCls: 'qqg-down' }),
-        h(StatCard, { label: '成功回复', value: '99.0', unit: '%',
-          foot: '失败 12 次 · 拦截 37 次' })))
+        h(StatCard, {
+          label: '调用次数', value: fmtNum(today?.calls ?? 0), unit: '次',
+          foot: footOf(trend.calls), footCls: trendClass(trend.calls),
+        }),
+        h(StatCard, {
+          label: 'Token 消耗', value: fmtNum(today?.tokens ?? 0), unit: 'tokens',
+          foot: footOf(trend.tokens), footCls: trendClass(trend.tokens),
+        }),
+        h(StatCard, {
+          label: '预估成本', value: fmtCost(today?.cost ?? null),
+          foot: priced ? (fmtTrend(trend.cost) ?? '较昨日 —') : '未配置单价（成本显示 —）',
+          footCls: priced ? trendClass(trend.cost) : '',
+        }),
+        h(StatCard, {
+          label: '成功回复', value: today?.ok == null ? '—' : today.ok.toFixed(1),
+          unit: today?.ok == null ? '' : '%',
+          foot: today ? `完成 ${today.turnOk} · 失败 ${today.turnFail}` : (apiFailed ? '接口异常' : '统计中…'),
+        })))
     }
 
     /** AI 排障助手（只有壳）。 */
@@ -3459,7 +3570,7 @@ window.__ModuleLoader__.load({
           return `${configured.provider}/${configured.model}`
         }
         if (catalog?.default) return `${catalog.default.provider}/${catalog.default.model}（默认）`
-        return fallbackModel ?? '读取中…'
+        return fallbackModel ?? '跟随全局默认'
       })()
 
       const post = async (base, action) => {
@@ -3640,18 +3751,24 @@ window.__ModuleLoader__.load({
         }))
     }
 
-    /* ══════════ Tab 5 · 数据与用量（Mock）══════════ */
-    /** 纯 CSS 柱状图：每根柱子 = 一个 div，高度按数据换算成 px（避免百分比高度在 flex 里失真）。 */
-    function BarChart({ rows, valueKey }) {
-      const max = Math.max(...rows.map((r) => r[valueKey]))
+    /* ══════════ Tab 5 · 数据与用量（真实数据）══════════ */
+    /**
+     * 纯 CSS 柱状图：每根柱子 = 一个 div，高度按数据换算成 px（避免百分比高度在 flex 里失真）。
+     * valueOf 取数值（成本可能是 null，按 0 画但标签显示「—」），format 负责显示文案。
+     */
+    function BarChart({ rows, valueOf, format }) {
+      const values = rows.map((row) => Number(valueOf(row)) || 0)
+      const max = Math.max(1, ...values)
       const MAX_BAR_PX = 132
       return h('div', { className: 'qqg-chart' },
-        rows.map((r) => {
-          const px = Math.max(6, Math.round((r[valueKey] / max) * MAX_BAR_PX))
-          return h('div', { key: r.day, className: 'qqg-chart-col', title: `${r.day} · ${fmtNum(r[valueKey])}` },
-            h('div', { className: 'qqg-chart-val' }, fmtNum(r[valueKey])),
+        rows.map((row) => {
+          const value = Number(valueOf(row)) || 0
+          const px = Math.max(6, Math.round((value / max) * MAX_BAR_PX))
+          const label = format ? format(row) : fmtNum(value)
+          return h('div', { key: row.day, className: 'qqg-chart-col', title: `${row.day} · ${label}` },
+            h('div', { className: 'qqg-chart-val' }, label),
             h('div', { className: 'qqg-chart-bar', style: { height: px + 'px' } }),
-            h('div', { className: 'qqg-chart-day' }, r.day.slice(3)))
+            h('div', { className: 'qqg-chart-day' }, String(row.day).slice(5)))
         }))
     }
 
@@ -3663,12 +3780,15 @@ window.__ModuleLoader__.load({
      * 不引任何图表库。
      */
     function AreaChart({ rows, valueKey }) {
-      const max = Math.max(...rows.map((r) => r[valueKey]))
-      const min = Math.min(...rows.map((r) => r[valueKey]))
+      if (rows.length === 0) {
+        return h('div', { className: 'qqg-status' }, '最近 7 天还没有用量数据')
+      }
+      const max = Math.max(...rows.map((row) => row[valueKey]))
+      const min = Math.min(...rows.map((row) => row[valueKey]))
       const span = max - min || 1
-      const pts = rows.map((r, i) => {
+      const pts = rows.map((row, i) => {
         const x = (i / Math.max(rows.length - 1, 1)) * 100
-        const y = 92 - ((r[valueKey] - min) / span) * 76
+        const y = 92 - ((row[valueKey] - min) / span) * 76
         return [x, y]
       })
       const areaPoly = ['0% 100%', ...pts.map(([x, y]) => `${x.toFixed(2)}% ${y.toFixed(2)}%`), '100% 100%'].join(', ')
@@ -3686,7 +3806,7 @@ window.__ModuleLoader__.load({
             title: `${rows[i].day} · ${fmtNum(rows[i][valueKey])}`,
           }))),
         h('div', { className: 'qqg-area-labels' },
-          rows.map((r) => h('span', { key: r.day }, r.day.slice(3)))))
+          rows.map((row) => h('span', { key: row.day }, String(row.day).slice(5)))))
     }
 
     function UsageTable({ cols, rows }) {
@@ -3699,20 +3819,232 @@ window.__ModuleLoader__.load({
               c.render ? c.render(r) : r[c.key])))))))
     }
 
-    const shareCell = (r) => h('div', { className: 'qqg-share' },
-      h('div', { className: 'qqg-share-track' },
-        h('div', { className: 'qqg-share-fill', style: { width: Math.min(r.share, 100) + '%' } })),
-      h('span', { className: 'qqg-muted' }, r.share + '%'))
+    const shareCell = (r) => {
+      const share = Number(r.share)
+      const width = Number.isFinite(share) ? Math.max(0, Math.min(share, 100)) : 0
+      return h('div', { className: 'qqg-share' },
+        h('div', { className: 'qqg-share-track' },
+          h('div', { className: 'qqg-share-fill', style: { width: width + '%' } })),
+        h('span', { className: 'qqg-muted' }, Number.isFinite(share) ? share + '%' : '—'))
+    }
 
-    function UsageTab() {
+    /** 单价输入：本地 draft + 失焦/回车提交，避免每敲一个字符就写一次 profile 配置。 */
+    function PriceInput({ label, value, disabled, onCommit }) {
+      const [draft, setDraft] = React.useState(String(value ?? 0))
+      React.useEffect(() => { setDraft(String(value ?? 0)) }, [value])
+      const commit = () => {
+        if (disabled) return
+        const n = Number(draft)
+        onCommit(Number.isFinite(n) && n >= 0 ? n : 0)
+      }
+      return h('label', { className: 'qqg-price-field' },
+        h('span', { className: 'qqg-price-label' }, label),
+        h('input', {
+          className: 'qqg-input', type: 'number', min: 0, step: '0.01',
+          value: draft, disabled, 'aria-label': label,
+          onChange: (e) => setDraft(e.target.value),
+          onBlur: commit,
+          onKeyDown: (e) => { if (e.key === 'Enter' && e.currentTarget?.blur) e.currentTarget.blur() },
+        }))
+    }
+
+    /** 两档计费：忙时 / 闲时，各 4 个框。 */
+    const PRICE_PERIODS = [
+      ['peak', '忙时 Peak'],
+      ['offPeak', '闲时 Off-Peak'],
+    ]
+    const PRICE_FIELDS = [
+      ['input', '输入'],
+      ['output', '输出'],
+      ['cacheRead', '缓存读'],
+      ['cacheWrite', '缓存写'],
+    ]
+
+    const zeroRateSet = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })
+
+    /**
+     * 峰谷时段设置：一个时段输入框。
+     *
+     * 时区不在这里改（默认跟本机 UTC+8，Host 侧配置项仍在），
+     * 输入格式与 Host 的 parsePeakHours 同口径，存进 `peakHours`。
+     */
+    function PeakHoursCard({ get, write, writable }) {
+      const configured = String(get('peakHours') ?? '08:30-00:30')
+      const timezone = String(get('timezone') ?? 'Asia/Shanghai')
+      const onlyWorkdays = get('peakOnlyWorkdays') === true
+      const [draft, setDraft] = React.useState(configured)
+      const [error, setError] = React.useState('')
+      React.useEffect(() => { setDraft(configured); setError('') }, [configured])
+      const commit = () => {
+        if (!writable) return
+        const text = draft.trim()
+        if (!isValidPeakHours(text)) {
+          setError('格式应为 HH:MM-HH:MM，多段用英文逗号分隔，例如 09:00-12:00, 14:00-18:00')
+          return
+        }
+        setError('')
+        if (text !== configured) write('peakHours', text)
+      }
+      return h(Panel, {
+        title: '峰谷时段设置',
+        desc: `使用本地时区（${timezoneOffsetLabel(timezone)}，${timezone}）。`
+          + '多段用英文逗号分隔，例如 09:00-12:00, 14:00-18:00；跨午夜写 08:30-00:30。',
+        right: h('span', { className: 'qqg-pill' + (error ? '' : ' qqg-pill-accent') },
+          error ? '格式有误' : '忙时窗口'),
+      },
+      h('div', { className: 'qqg-peak-row' },
+        h('label', { className: 'qqg-field qqg-peak-field' },
+          h('span', { className: 'qqg-field-label' }, '忙时时段'),
+          h('input', {
+            className: 'qqg-input', type: 'text',
+            value: draft, disabled: !writable,
+            placeholder: '09:00-12:00, 14:00-18:00', 'aria-label': '峰谷时段',
+            onChange: (e) => { setDraft(e.target.value); if (error) setError('') },
+            onBlur: commit,
+            onKeyDown: (e) => { if (e.key === 'Enter' && e.currentTarget?.blur) e.currentTarget.blur() },
+          }),
+          h('span', { className: 'qqg-field-hint' },
+            error || '每段左闭右开；start = end 视为全天忙时。'))),
+      h('div', { className: 'qqg-peak-toggle' },
+        h(SwitchField, {
+          label: '仅在工作日生效',
+          hint: '开启后周六 / 周日整天空闲时；节假日与调休读同目录 holidays.json（workdays 优先，其次 holidays）。',
+          value: onlyWorkdays,
+          disabled: !writable,
+          onChange: (next) => { if (writable) write('peakOnlyWorkdays', next === true) },
+        })),
+      h('div', { className: 'qqg-price-foot' },
+        h('span', null, '节假日 / 调休在 holidays.json：workdays = 调休上班日，holidays = 法定节假日。'),
+        writable ? null : h('span', null, '当前配置只读，无法保存。')))
+    }
+
+    /**
+     * 单价配置卡：每一条真实出现过的 provider/model 一块，
+     * 忙时 / 闲时各 4 个输入框（输入、输出、缓存读、缓存写），写进 `usagePricing`。
+     */
+    function PricingCard({ get, write, writable, models, priced }) {
+      const rules = Array.isArray(get('usagePricing')) ? get('usagePricing') : []
+      const configuredProvider = String(get('model.provider') ?? '')
+      const configuredModel = String(get('model.model') ?? '')
+      const rows = []
+      for (const item of models) {
+        if (!item?.provider || !item?.model) continue
+        if (rows.some((row) => row.provider === item.provider && row.model === item.model)) continue
+        rows.push({ provider: item.provider, model: item.model })
+      }
+      if (configuredProvider && configuredModel
+        && !rows.some((row) => row.provider === configuredProvider && row.model === configuredModel)) {
+        rows.unshift({ provider: configuredProvider, model: configuredModel })
+      }
+      const ruleOf = (provider, model) => rules.find(
+        (rule) => String(rule?.provider ?? '') === provider && String(rule?.model ?? '') === model,
+      )
+      // 旧版扁平结构（升级前已经填过单价的人）读作「peak / offPeak 同价」，
+      // 第一次编辑时顺手迁移成嵌套结构，不让已填数字凭空消失。
+      // 注意：新 Schema 会把缺失的 peak/offPeak 补成全 0 对象，所以要看「有没有非 0」，
+      // 不能只看对象是否存在。
+      const flatLegacy = (rule) => ['input', 'output', 'cacheRead', 'cacheWrite']
+        .some((field) => Number(rule?.[field]) > 0)
+      const pickRates = (source) => ({
+        input: Number(source?.input) || 0,
+        output: Number(source?.output) || 0,
+        cacheRead: Number(source?.cacheRead) || 0,
+        cacheWrite: Number(source?.cacheWrite) || 0,
+      })
+      const ratesSome = (rates) => ['input', 'output', 'cacheRead', 'cacheWrite']
+        .some((field) => Number(rates?.[field]) > 0)
+      const effectiveRates = (rule, period) => {
+        const nested = rule?.[period]
+        if (ratesSome(nested)) return pickRates(nested)
+        if (flatLegacy(rule)) return pickRates(rule)
+        return pickRates(nested)
+      }
+      const commit = (provider, model, period, field, value) => {
+        if (!write) return
+        const next = Array.isArray(get('usagePricing')) ? get('usagePricing').map((rule) => ({ ...rule })) : []
+        const index = next.findIndex(
+          (rule) => String(rule?.provider ?? '') === provider && String(rule?.model ?? '') === model,
+        )
+        const source = index >= 0 ? next[index] : { provider, model }
+        const peak = { ...zeroRateSet(), ...effectiveRates(source, 'peak') }
+        const offPeak = { ...zeroRateSet(), ...effectiveRates(source, 'offPeak') }
+        const chosen = period === 'peak' ? peak : offPeak
+        chosen[field] = value
+        const entry = { provider, model, peak, offPeak }
+        if (index >= 0) next[index] = entry
+        else next.push(entry)
+        write('usagePricing', next)
+      }
+      const rulePriced = (rule) => Boolean(rule)
+        && (periodRatesSome(effectiveRates(rule, 'peak')) || periodRatesSome(effectiveRates(rule, 'offPeak')))
+
+      return h(Panel, {
+        title: '单价配置',
+        desc: '单位：元 / 百万 token（美元请自行换算后填数字）。忙时 / 闲时各一套，四项全为 0 = 未配置，成本列显示「—」。',
+        right: h('span', { className: 'qqg-pill' + (priced ? ' qqg-pill-accent' : '') },
+          priced ? '已配置' : '未配置'),
+      },
+      rows.length === 0
+        ? h('div', { className: 'qqg-status' },
+          '还没有可配的模型：等桥接跑一轮，或先在「全局设置 → 模型」里选一个模型。')
+        : h('div', { className: 'qqg-price-list' }, rows.map((item) => {
+          const rule = ruleOf(item.provider, item.model)
+          return h('div', { className: 'qqg-price-row', key: `${item.provider}/${item.model}` },
+            h('div', { className: 'qqg-price-head' },
+              h('span', { className: 'qqg-price-model', title: item.model }, item.model),
+              h('span', { className: 'qqg-price-provider' }, item.provider),
+              h('span', { className: 'qqg-pill' + (rulePriced(rule) ? ' qqg-pill-accent' : '') },
+                rulePriced(rule) ? '已配置' : '未配置')),
+            h('div', { className: 'qqg-price-periods' }, PRICE_PERIODS.map(([period, periodLabel]) => {
+              const rates = effectiveRates(rule, period)
+              return h('div', { className: 'qqg-price-period', key: period },
+                h('span', { className: 'qqg-price-period-label' }, periodLabel),
+                PRICE_FIELDS.map(([field, fieldLabel]) => h(PriceInput, {
+                  key: field,
+                  label: `${periodLabel}-${fieldLabel}`,
+                  value: Number(rates[field] ?? 0),
+                  disabled: !writable,
+                  onCommit: (value) => commit(item.provider, item.model, period, field, value),
+                })))
+            })))
+        })),
+      h('div', { className: 'qqg-price-foot' },
+        h('span', null, '输入 = 未命中缓存的 prompt；缓存读 = cacheRead；缓存写 = cacheWrite；输出已含 reasoning。'),
+        writable ? null : h('span', null, '当前配置只读，无法保存。')))
+    }
+
+    /** 一套费率里是否至少有一个非 0（面板上的「已配置」小标签用）。 */
+    function periodRatesSome(rates) {
+      if (!rates || typeof rates !== 'object') return false
+      return ['input', 'output', 'cacheRead', 'cacheWrite'].some((field) => Number(rates[field]) > 0)
+    }
+
+    function UsageTab({ get, write, writable }) {
       const [dim, setDim] = React.useState('calls')
+      const usage = useUsage(7)
+      const data = usage.data
+      const days = Array.isArray(data?.days) ? data.days : []
+      const models = Array.isArray(data?.models) ? data.models : []
+      const sessions = Array.isArray(data?.sessions) ? data.sessions : []
+      const priced = data?.pricing?.configured === true
+      const backfill = data?.backfill
       const dimLabel = { calls: '调用次数', tokens: 'Token', cost: '成本' }
+      const chartValue = (row) => (dim === 'cost' ? (row.cost ?? 0) : (row[dim] ?? 0))
+      const chartLabel = (row) => (dim === 'cost' ? fmtCost(row.cost) : fmtNum(row[dim] ?? 0))
+      const hasData = days.some((day) => (day?.calls ?? 0) > 0)
+      const statusPill = usage.status === 'error'
+        ? h('span', { className: 'qqg-pill qqg-pill-accent' }, '接口异常')
+        : h('span', { className: 'qqg-pill' },
+          backfill?.running ? '回填中…' : (backfill?.done ? '已回填历史' : '实时统计'))
+
       return h('div', { className: 'qqg-stack' },
         h(TabHead, {
           title: '数据与用量',
-          desc: '图表与表格均为 Mock 数据，用于确认版式；接统计接口后替换数据源即可。',
+          desc: usage.status === 'error'
+            ? `用量接口读不到：${usage.error}`
+            : '真实数据来自 Host 的 assistant/message 用量事件；图表与表格每 5 秒刷新。',
           tags: h(React.Fragment, null,
-            h('span', { className: 'qqg-pill qqg-pill-accent' }, 'Mock'),
+            statusPill,
             h('span', { className: 'qqg-pill' }, '近 7 天')),
         }),
         h(Panel, {
@@ -3722,50 +4054,62 @@ window.__ModuleLoader__.load({
             ['calls', 'tokens', 'cost'].map((k) => h('button', {
               key: k, type: 'button',
               className: 'qqg-btn' + (dim === k ? ' qqg-btn-primary' : ''),
+              disabled: k === 'cost' && !priced,
+              title: k === 'cost' && !priced ? '先在下方「单价配置」里填一个非 0 单价' : undefined,
               onClick: () => setDim(k),
             }, dimLabel[k]))),
         },
-        h(BarChart, { rows: MOCK_USAGE_DAYS, valueKey: dim }),
+        h(BarChart, { rows: days, valueOf: chartValue, format: chartLabel }),
         h('div', { className: 'qqg-legend' },
           h('span', { className: 'qqg-legend-item' },
             h('span', { className: 'qqg-legend-swatch' }), dimLabel[dim])),
+        hasData ? null : h('div', { className: 'qqg-status' },
+          usage.status === 'loading' ? '正在读取用量…' : '最近 7 天还没有用量记录。'),
         h('div', { style: { borderTop: '1px solid var(--dsw-alias-border-l1)', paddingTop: 14 } },
           h('div', { className: 'qqg-panel-desc' }, 'Token 消耗走势（面积图）'),
-          h(AreaChart, { rows: MOCK_USAGE_DAYS, valueKey: 'tokens' }))),
+          h(AreaChart, { rows: days, valueKey: 'tokens' }))),
+
+        h(PeakHoursCard, { get, write, writable }),
+        h(PricingCard, { get, write, writable, models, priced }),
 
         h('div', { className: 'qqg-cols' },
-          h(Panel, { title: '按天统计', desc: '占位表格，字段与后端约定后再接。' },
+          h(Panel, { title: '按天统计', desc: '按本地日历天聚合，成功率 = 完成轮次 / 总轮次。' },
             h(UsageTable, {
               cols: [
-                { key: 'day', label: '日期' },
-                { key: 'calls', label: '调用', num: true, render: (r) => fmtNum(r.calls) },
-                { key: 'tokens', label: 'Token', num: true, render: (r) => fmtNum(r.tokens) },
-                { key: 'cost', label: '成本', num: true, render: (r) => '¥' + r.cost.toFixed(2) },
-                { key: 'ok', label: '成功率', num: true, render: (r) => r.ok.toFixed(1) + '%' },
+                { key: 'day', label: '日期', render: (r) => String(r.day).slice(5) },
+                { key: 'calls', label: '调用', num: true, render: (r) => fmtNum(r.calls ?? 0) },
+                { key: 'input', label: '输入', num: true, render: (r) => fmtNum(r.input ?? 0) },
+                { key: 'output', label: '输出', num: true, render: (r) => fmtNum(r.output ?? 0) },
+                { key: 'cacheRead', label: '缓存命中', num: true, render: (r) => fmtNum(r.cacheRead ?? 0) },
+                { key: 'cost', label: '成本', num: true, render: (r) => fmtCost(r.cost) },
+                { key: 'ok', label: '成功率', num: true, render: (r) => (r.ok == null ? '—' : r.ok.toFixed(1) + '%') },
               ],
-              rows: MOCK_USAGE_DAYS,
+              rows: days,
             })),
-          h(Panel, { title: '按模型统计', desc: '占位表格。' },
+          h(Panel, { title: '按模型统计', desc: '按实际路由归因，备用模型会单独计数。' },
             h(UsageTable, {
               cols: [
                 { key: 'name', label: '模型' },
-                { key: 'calls', label: '调用', num: true, render: (r) => fmtNum(r.calls) },
-                { key: 'tokens', label: 'Token', num: true, render: (r) => fmtNum(r.tokens) },
-                { key: 'cost', label: '成本', num: true, render: (r) => '¥' + r.cost.toFixed(2) },
+                { key: 'calls', label: '调用', num: true, render: (r) => fmtNum(r.calls ?? 0) },
+                { key: 'input', label: '输入', num: true, render: (r) => fmtNum(r.input ?? 0) },
+                { key: 'output', label: '输出', num: true, render: (r) => fmtNum(r.output ?? 0) },
+                { key: 'cacheRead', label: '缓存命中', num: true, render: (r) => fmtNum(r.cacheRead ?? 0) },
+                { key: 'cost', label: '成本', num: true, render: (r) => fmtCost(r.cost) },
                 { key: 'share', label: '占比', render: shareCell },
               ],
-              rows: MOCK_USAGE_MODELS,
+              rows: models,
             }))),
-        h(Panel, { title: '按插件统计', desc: '占位表格。' },
+        h(Panel, { title: '按会话统计', desc: '按 QQ 私聊 / 群聊聚合；重建过的会话会合并到同一个号。' },
           h(UsageTable, {
             cols: [
-              { key: 'name', label: '插件 / 技能' },
-              { key: 'calls', label: '调用', num: true, render: (r) => fmtNum(r.calls) },
-              { key: 'tokens', label: 'Token', num: true, render: (r) => fmtNum(r.tokens) },
-              { key: 'cost', label: '成本', num: true, render: (r) => '¥' + r.cost.toFixed(2) },
+              { key: 'label', label: '会话' },
+              { key: 'kind', label: '类型' },
+              { key: 'calls', label: '调用', num: true, render: (r) => fmtNum(r.calls ?? 0) },
+              { key: 'tokens', label: 'Token', num: true, render: (r) => fmtNum(r.tokens ?? 0) },
+              { key: 'cost', label: '成本', num: true, render: (r) => fmtCost(r.cost) },
               { key: 'share', label: '占比', render: shareCell },
             ],
-            rows: MOCK_USAGE_PLUGINS,
+            rows: sessions,
           })))
     }
 
@@ -3823,11 +4167,17 @@ window.__ModuleLoader__.load({
 
       // 引导按钮上的「x/3」：与弹窗共用 guideSteps/guideProgress，口径完全一致。
       const guide = guideProgress(guideSteps(get, guideProc))
+      // 启动卡的模型兜底：用配置里真实下发的 model（不是假常量）；留空 = 跟随全局默认。
+      const launchModel = (() => {
+        const provider = String(get('model.provider') ?? '')
+        const model = String(get('model.model') ?? '')
+        return provider && model ? `${provider}/${model}` : undefined
+      })()
 
       let body
       if (active === 'sessions') body = h(SessionsTab)
       else if (active === 'skills') body = h(SkillsTab, { ...common, pickDirectory: props?.pickDirectory })
-      else if (active === 'usage') body = h(UsageTab)
+      else if (active === 'usage') body = h(UsageTab, common)
       else if (active === 'settings') body = h(SettingsTab, { ...common, pickDirectory: props?.pickDirectory })
       else {
         // 运行状态：既有状态/启停/日志 + 今日用量 + AI 排障助手。
@@ -3866,8 +4216,8 @@ window.__ModuleLoader__.load({
             h('span', { className: 'qqg-nav-text' }, s.label),
             s.badge ? h('span', { className: 'qqg-nav-badge' }, s.badge) : null))),
           h('div', { className: 'qqg-nav-foot' },
-            // 快捷启动卡：使用引导按钮上方（第一批 UI 壳，Mock）。
-            h(LaunchCard, { model: MOCK_CURRENT_MODEL }),
+            // 快捷启动卡：模型名由卡内自己从 /config + /models 读真实值；这里只传配置兜底。
+            h(LaunchCard, { model: launchModel }),
             h('button', {
               type: 'button', className: 'qqg-nav-guide',
               title: '三步把 QQ 桥接跑通',

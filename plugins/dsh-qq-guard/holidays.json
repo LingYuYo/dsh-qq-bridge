@@ -1,0 +1,5 @@
+{
+  "_comment": "调休上班日写进 workdays（按工作日走忙时时段），法定节假日写进 holidays（整天按 Off-Peak）。日期格式 YYYY-MM-DD，可随时增删；改完重启 DSH 生效。",
+  "workdays": [],
+  "holidays": []
+}

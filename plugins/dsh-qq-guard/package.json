@@ -12,6 +12,8 @@
   "files": [
     "index.js",
     "client.js",
+    "usage-stats.mjs",
+    "holidays.json",
     "sandbox/*.mjs",
     "cordis.patch.yml",
     "locale/*.json"

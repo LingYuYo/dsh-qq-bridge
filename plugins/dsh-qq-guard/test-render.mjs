@@ -174,7 +174,9 @@ for (const tab of ['status', 'sessions', 'skills', 'settings', 'usage']) {
     // Phase 3：引导改成按钮+弹窗，分片/打字延时合并成「运行节奏」两个大按钮。
     settings: ['运行节奏', '信息发送配置', '活跃设置', '使用引导',
       '人设配置', '白名单管理', 'OneBot 连接', 'NapCat 进程'],
-    usage: ['数据与用量', '按天统计', '按模型统计', '按插件统计', 'Token 消耗走势'],
+    // 用量页已全部接真实数据：假数据删除，新增「峰谷时段设置 / 单价配置 / 按会话统计」。
+    usage: ['数据与用量', '按天统计', '按模型统计', '按会话统计', '单价配置', '峰谷时段设置',
+      '仅在工作日生效', 'Token 消耗走势'],
   }[tab]
   const missing = expect.filter((k) => !joined.includes(k))
   if (missing.length) throw new Error(`Tab「${tab}」缺少内容：${missing.join('、')}`)

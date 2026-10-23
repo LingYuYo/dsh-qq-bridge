@@ -194,7 +194,10 @@ await check('role=settings 有 webServer → 注册全部设置面路由，且�
     // 原生目录选择器（NapCat 安装目录的「浏览」按钮）
     '/dsh-qq-guard/pick-dir',
     '/dsh-qq-guard/status',
-  ], `路由应为 8 条，实际 ${JSON.stringify(paths)}`)
+    // 真实用量统计（数据与用量面板）+ 历史回填
+    '/dsh-qq-guard/usage',
+    '/dsh-qq-guard/usage/backfill',
+  ], `路由应为 10 条，实际 ${JSON.stringify(paths)}`)
   assert.ok(calls.webRoutes.every((r) => r.kind === 'exact'))
 })
 await check('role=settings 无 webServer → 安全跳过', () => {

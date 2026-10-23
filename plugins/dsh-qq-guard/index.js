@@ -83,6 +83,15 @@ import { NapcatManager, DEFAULT_WS_PORT } from './napcat.mjs'
 import { BridgeRunner, DEFAULT_BRIDGE_DIR } from './bridge-runner.mjs'
 import { SandboxManager } from './sandbox/manager.mjs'
 import { installModelOverride } from './model-override.js'
+import {
+  UsageScope,
+  UsageStatsStore,
+  USAGE_BACKFILL_ROUTE_PATH,
+  USAGE_FILE_NAME,
+  USAGE_ROUTE_PATH,
+  handleUsageBackfillRoute,
+  handleUsageRoute,
+} from './usage-stats.mjs'
 import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, realpathSync } from 'node:fs'
 import { builtinModules } from 'node:module'
 import os from 'node:os'
@@ -213,6 +222,23 @@ const SAFE_PREFIXES = ['mcp__']
 //
 // `.volatile()` 是必须的：Settings 的表单只展示 volatile 字段
 // （证据：dsh-settings/lib/types/schema.js:43-54 `volatileForm`，非 volatile 直接返回 undefined）。
+/**
+ * 一档费率：四项均为「元 / 百万 token」。
+ *
+ * 为什么单独抽出来：闲时 / 忙时结构完全一样，抽一份既少重复，也保证两边字段不漂移
+ * （少一个 cacheWrite，成本就会静默漏算缓存写入）。
+ */
+const RateConfig = Schema.object({
+  input: Schema.number().default(0).min(0)
+    .description('未命中缓存的输入单价（元 / 百万 token）。'),
+  output: Schema.number().default(0).min(0)
+    .description('输出单价（元 / 百万 token；reasoning 已包含在 output 里）。'),
+  cacheRead: Schema.number().default(0).min(0)
+    .description('缓存命中读取单价（元 / 百万 token）。'),
+  cacheWrite: Schema.number().default(0).min(0)
+    .description('缓存写入单价（元 / 百万 token）。'),
+}).description('一档 token 单价')
+
 const Config = Schema.object({
   // ⚠️ 绝对不要给 role 加 .default()。默认值会让「没显式声明的实例」也拿到
   // guard/settings，从而再次触发下面第 1 条讲的全 profile 锁死事故。
@@ -313,6 +339,35 @@ const Config = Schema.object({
     model: Schema.string().required().description('备用模型 id。'),
   })).description('备用模型（最多 4 个）。主模型超时/报错时按顺序接管，同一轮内生效。')
     .default([]).volatile(),
+
+  // ── 用量成本价目表（「数据与用量」面板）──────────────────────
+  //
+  // DSH 只报 token，不报单价（token-meter 没有任何货币概念），所以成本只能自己维护。
+  // 单位统一为「元 / 百万 token」；忙时 / 闲时两套费率，某套四项全为 0 = 没配，
+  // 面板显示「—」，绝不填 0 假装免费。模型留空表示该 provider 下所有模型都套这一档。
+  usagePricing: Schema.array(Schema.object({
+    provider: Schema.string().required()
+      .description('provider id，例如 trae / opencode-go / raccoon。'),
+    model: Schema.string().default('')
+      .description('模型 id；留空或 * 表示该 provider 下所有模型通用。'),
+    peak: RateConfig.default({})
+      .description('忙时（Peak）单价：服务商高峰时段的计费。'),
+    offPeak: RateConfig.default({})
+      .description('闲时（Off-Peak）单价：服务商非高峰时段的计费。'),
+  })).description('用量成本价目表：按 provider + model 配忙时 / 闲时两套单价。')
+    .default([]).volatile(),
+
+  // 忙时时段用哪个时区判断。默认跟随本机（UTC+8）；时段格式 HH:MM-HH:MM，可跨午夜。
+  peakHours: Schema.string()
+    .description('忙时时段：单段或逗号分隔多段（HH:MM-HH:MM，左闭右开，可跨午夜）。'
+      + '例如 09:00-12:00, 14:00-18:00。')
+    .default('08:30-00:30').volatile(),
+  peakOnlyWorkdays: Schema.boolean()
+    .description('仅工作日生效：周六/周日整天空闲时（holidays.json 里的 workdays 仍按工作日算）。')
+    .default(false).volatile(),
+  timezone: Schema.string()
+    .description('判断忙时/闲时用的 IANA 时区，默认 Asia/Shanghai（UTC+8）。')
+    .default('Asia/Shanghai').volatile(),
 
   // ── 高级参数（排障 / 调优，一般不用动）──────────────────────
   // 三个都是「响应链路的时间常数」，面板上收进一张折叠卡，桥接侧全部热读。
@@ -1305,6 +1360,94 @@ function applySettings(ctx, config) {
     }),
     'qq-guard: bridge runtime config route',
   )
+
+  // ── 真实用量统计（「数据与用量」面板）────────────────────────────
+  //
+  // 数据源只有一个：Host 进程内的 `session/event`。`assistant/message.data.usage`
+  // 是 DSH 里唯一带真实 token 的地方（`turn/end` 没有用量）；`session/follow` 是给
+  // 远程客户端的，日志又是多帧 zstd——在这里拦最省事、最准、也最实时。
+  // 细节（字段语义 / 去重 / 回填）见 usage-stats.mjs 文件头。
+  const usageLogger = ctx.logger ?? console
+  const usageScope = new UsageScope({
+    bridgeDir: () => (plainConfig(config)?.bridge?.dir || DEFAULT_BRIDGE_DIR),
+    logger: usageLogger,
+  })
+  const usageStore = new UsageStatsStore({
+    file: () => path.join(usageScope.dir(), 'state', USAGE_FILE_NAME),
+    getPricing: () => plainConfig(config)?.usagePricing ?? [],
+    getPeakHours: () => plainConfig(config)?.peakHours ?? '08:30-00:30',
+    getPeakOnlyWorkdays: () => plainConfig(config)?.peakOnlyWorkdays === true,
+    getTimezone: () => plainConfig(config)?.timezone ?? 'Asia/Shanghai',
+    scope: usageScope,
+    logger: usageLogger,
+  })
+
+  // 统计失败绝不能影响对话：逐条兜住，只留日志。
+  ctx.on('session/event', (session, event) => {
+    try {
+      usageStore.ingest(session, event)
+    } catch (error) {
+      usageLogger.warn?.(`[qq-guard] 用量事件处理失败（已忽略）：${error?.message ?? error}`)
+    }
+  })
+
+  const runUsageBackfill = async (persistence) => {
+    try {
+      const result = await usageStore.backfillAll(persistence)
+      if (result.error) {
+        usageLogger.warn?.(`[qq-guard] 用量回填未完全成功：${result.error}`)
+      } else {
+        usageLogger.info?.(`[qq-guard] 用量回填完成：扫描 ${result.scanned} 个 QQ 会话，导入 ${result.imported} 个事件`)
+      }
+    } catch (error) {
+      usageLogger.warn?.(`[qq-guard] 用量回填失败（不影响在线统计）：${error?.message ?? error}`)
+    }
+  }
+
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: USAGE_ROUTE_PATH,
+      handler: (req, res) => handleUsageRoute(req, res, { store: usageStore, scope: usageScope }),
+    }),
+    'qq-guard: usage stats route',
+  )
+
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: USAGE_BACKFILL_ROUTE_PATH,
+      handler: (req, res) => {
+        // 路由 handler 可能是同步调用，这里自己吃掉 Promise，避免 unhandled rejection。
+        Promise.resolve(handleUsageBackfillRoute(req, res, {
+          store: usageStore,
+          scope: usageScope,
+          getPersistence: () => ctx.get?.('sessionPersistence'),
+        })).catch((error) => {
+          if (res.writableEnded) return
+          try {
+            res.statusCode = 500
+            res.setHeader('content-type', 'application/json; charset=utf-8')
+            res.end(JSON.stringify({ ok: false, reason: 'internal', detail: String(error?.message ?? error) }))
+          } catch { /* 连接已断开 */ }
+        })
+      },
+    }),
+    'qq-guard: usage backfill route',
+  )
+
+  // 卸载/热重载前把未落盘的增量写掉。
+  ctx.effect(() => () => { usageStore.flush() }, 'qq-guard: usage flush on unload')
+
+  // 历史回填：等 sessionPersistence 就绪后延后 2.5s 跑一次，避开启动时的会话恢复 I/O。
+  // 只用官方接口（list + open('read') + read），不自己解 zstd、不读盘上格式。
+  ctx.inject(['sessionPersistence'], (persistenceCtx) => {
+    const timer = setTimeout(() => {
+      const persistence = persistenceCtx.get('sessionPersistence')
+      if (persistence) void runUsageBackfill(persistence)
+    }, 2500)
+    persistenceCtx.effect(() => () => clearTimeout(timer), 'qq-guard: usage backfill timer')
+  })
 
   // ── 原生目录选择器（NapCat 安装目录的「浏览」按钮）──────────────
   //
