@@ -53,21 +53,33 @@ const check = async (name, fn) => {
 }
 
 /** 造一个假的 ctx，记录所有注册行为。 */
-function makeCtx({ presetId, hasWebServer = false, settingsAvailable = false, hasSubprocess = false } = {}) {
-  const calls = { restrict: 0, guard: 0, webRoutes: [], effects: [], inj: [], warn: [] }
+function makeCtx({ presetId, hasWebServer = false, settingsAvailable = false, hasSubprocess = false, systemPrompt = undefined } = {}) {
+  const calls = { restrict: 0, guard: 0, guardFn: null, registeredTools: [], webRoutes: [], effects: [], inj: [], warn: [] }
   const ctx = {
     get(name) {
       if (name === 'agentPresets') {
         return { composedPreset: () => presetId }
       }
+      if (name === 'systemPrompt') return systemPrompt
       return undefined
     },
     on() { return () => {} },
     effect(fn) { calls.effects.push(fn); try { fn() } catch { /* 忽略 */ } return () => {} },
-    inject(_deps, fn) { calls.inj.push(fn); if (settingsAvailable) fn(makeSettingsCtx(calls)) },
+    inject(deps, fn) {
+      calls.inj.push(fn)
+      // systemPrompt 是全局服务：这里模拟「注入成功后拿到子 ctx」。
+      if (Array.isArray(deps) && deps.includes('systemPrompt') && systemPrompt) {
+        fn({
+          get: (name) => (name === 'systemPrompt' ? systemPrompt : ctx.get(name)),
+          effect: ctx.effect,
+          inject: ctx.inject,
+        })
+      } else if (settingsAvailable) fn(makeSettingsCtx(calls))
+    },
     tools: {
       restrict() { calls.restrict++ },
-      guard() { calls.guard++ },
+      guard(fn) { calls.guard++; calls.guardFn = fn },
+      register(definition) { calls.registeredTools.push(definition); return () => {} },
     },
     webServer: hasWebServer ? {
       register(route) { calls.webRoutes.push(route); return () => {} },
@@ -191,13 +203,19 @@ await check('role=settings 有 webServer → 注册全部设置面路由，且�
     // P1：外部插件沙箱加载测试
     '/dsh-qq-guard/external-plugins/test',
     '/dsh-qq-guard/napcat',
+    // NapCat 登录二维码截图（qrcode.png → 浏览器）
+    '/dsh-qq-guard/napcat-qr',
+    // 单人设覆盖（桥接每条消息前 POST；guard 实例动态 section 现读）
+    '/dsh-qq-guard/persona',
     // 原生目录选择器（NapCat 安装目录的「浏览」按钮）
     '/dsh-qq-guard/pick-dir',
+    // 会话指令队列（清空 / 删除 / 单人设；桥接 2 秒轮询）
+    '/dsh-qq-guard/session-ops',
     '/dsh-qq-guard/status',
     // 真实用量统计（数据与用量面板）+ 历史回填
     '/dsh-qq-guard/usage',
     '/dsh-qq-guard/usage/backfill',
-  ], `路由应为 10 条，实际 ${JSON.stringify(paths)}`)
+  ], `路由应为 13 条，实际 ${JSON.stringify(paths)}`)
   assert.ok(calls.webRoutes.every((r) => r.kind === 'exact'))
 })
 await check('role=settings 无 webServer → 安全跳过', () => {
@@ -233,6 +251,19 @@ await check('GET 返回当前 config，非 GET 返回 405', async () => {
   route.handler({ method: 'POST', headers: {} }, res2)
   assert.equal(res2.status, 405)
 })
+await check('GET /config 带 features（桥接与 guard 共用同一份开关判断）', () => {
+  const { ctx, calls } = makeCtx({ presetId: undefined, hasWebServer: true, settingsAvailable: true })
+  apply(ctx, Config({ role: 'settings' }))
+  const route = calls.webRoutes[0]
+  const res = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+  route.handler({ method: 'GET', headers: {} }, res)
+  const parsed = JSON.parse(res.body)
+  assert.equal(parsed.ok, true)
+  assert.equal(parsed.config.features.voice, true)
+  assert.equal(parsed.config.features.vision, true)
+  assert.equal(parsed.config.features.search, true)
+  assert.equal(parsed.config.features.guard, true)
+})
 await check('跨站请求被拒（sec-fetch-site）', async () => {
   const { ctx, calls } = makeCtx({ presetId: undefined, hasWebServer: true, settingsAvailable: true })
   apply(ctx, Config({ role: 'settings' }))
@@ -240,6 +271,123 @@ await check('跨站请求被拒（sec-fetch-site）', async () => {
   const res = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
   route.handler({ method: 'GET', headers: { 'sec-fetch-site': 'cross-site' } }, res)
   assert.equal(res.status, 403)
+})
+
+console.log('\n— 动态人设 section（替代 preset 里的静态 persona 行）—')
+await check('guard 注册 deployment:persona-prefix，complete:true + 动态 text', () => {
+  const sections = []
+  const fakePrompt = {
+    section(spec) { sections.push(spec); return () => {} },
+    getSectionOrder() { return 0 },
+    suppressRuntimeContext() { sections.push('suppress'); return () => {} },
+  }
+  const { ctx } = makeCtx({ presetId: 'qq-chat', systemPrompt: fakePrompt })
+  apply(ctx, Config({ role: 'guard', personaDefault: '默认人设正文' }))
+  const section = sections.find((s) => typeof s === 'object' && s.name === 'deployment:persona-prefix')
+  assert.ok(section, '没有注册 persona section')
+  assert.equal(section.complete, true, '必须是 complete section（唯一系统提示词）')
+  assert.equal(typeof section.text, 'function', 'text 必须是函数才能按会话动态')
+  assert.equal(section.text({ agent: { session: { id: 's-other' } } }), '默认人设正文', '没单人设时回落到 personaDefault')
+  assert.ok(sections.includes('suppress'), '应关掉运行时上下文注入')
+})
+await check('单人设覆盖优先；清空后回退全局/默认', () => {
+  const sections = []
+  const fakePrompt = {
+    section(spec) { sections.push(spec); return () => {} },
+    getSectionOrder() { return 0 },
+    suppressRuntimeContext() { return () => {} },
+  }
+  const { ctx } = makeCtx({ presetId: 'qq-chat', systemPrompt: fakePrompt })
+  apply(ctx, Config({ role: 'guard', personaDefault: '默认人设正文' }))
+  const section = sections.find((s) => typeof s === 'object' && s.name === 'deployment:persona-prefix')
+  mod.setGlobalPersonaText('全局人设')
+  mod.setSessionPersonaText('g:123456', '群专属人设')
+  assert.equal(section.text({ agent: { session: { id: 'g:123456' } } }), '群专属人设')
+  assert.equal(section.text({ agent: { session: { id: 'u:1' } } }), '全局人设')
+  mod.setSessionPersonaText('g:123456', '')
+  assert.equal(section.text({ agent: { session: { id: 'g:123456' } } }), '全局人设')
+  mod.setGlobalPersonaText('')
+  assert.equal(section.text({ agent: { session: { id: 'u:1' } } }), '默认人设正文')
+})
+
+console.log('\n— Phase 6：技能/插件开关 → 工具门禁真实响应 —')
+await check('itemEnabledIn：没配置数组时用默认清单（技能默认开启）', () => {
+  const cfg = Config({ role: 'settings' })
+  assert.equal(mod.itemEnabledIn(cfg, 'sk-voice'), true)
+  assert.equal(mod.itemEnabledIn(cfg, 'pl-guard', 'plugin'), true)
+})
+await check('itemEnabledIn：配置了数组就以数组为准，删掉 = 关闭', () => {
+  const cfg = Config({
+    role: 'settings',
+    skills: [{ id: 'sk-voice', name: '发语音', enabled: false }],
+    plugins: [{ id: 'pl-guard', name: '工具门禁', enabled: true }],
+  })
+  assert.equal(mod.itemEnabledIn(cfg, 'sk-voice'), false)
+  assert.equal(mod.itemEnabledIn(cfg, 'sk-search'), false, '数组里没有 = 用户删了 = 关闭')
+  assert.equal(mod.itemEnabledIn(cfg, 'pl-guard', 'plugin'), true)
+})
+await check('readFeatureFlags：把开关聚合成桥接/guard 共用的布尔', () => {
+  const cfg = Config({ role: 'settings' })
+  const flags = mod.readFeatureFlags(cfg)
+  assert.deepEqual(flags, {
+    voice: true, vision: true, search: true, guard: true, debounce: true, rateLimit: true,
+  })
+})
+await check('guard：网页搜索开启 → web_search 放行；关闭 → 执行期拒绝', () => {
+  const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })
+  mod.bindFeatureConfigSource(Config({ role: 'settings' }))
+  apply(ctx, Config({ role: 'guard' }))
+  assert.equal(calls.guardFn({ name: 'web_search' }), undefined, '技能开启时应放行')
+  assert.equal(calls.guardFn({ name: 'web_fetch' }), undefined)
+
+  mod.bindFeatureConfigSource(Config({
+    role: 'settings',
+    skills: [{ id: 'sk-search', name: '网页搜索', enabled: false }],
+  }))
+  assert.match(String(calls.guardFn({ name: 'web_search' })), /网页搜索/, '关掉后必须执行期拒绝')
+})
+await check('guard：工具门禁插件关闭 → 不再做 deny-by-default 拦截', () => {
+  const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })
+  mod.bindFeatureConfigSource(Config({
+    role: 'settings',
+    plugins: [{ id: 'pl-guard', name: '工具门禁', enabled: false }],
+  }))
+  apply(ctx, Config({ role: 'guard' }))
+  assert.equal(calls.guardFn({ name: 'ops_bash' }), undefined, '开关关闭 = 用户明确放弃执行期白名单')
+  // 恢复默认，避免污染后续用例
+  mod.bindFeatureConfigSource(null)
+})
+await check('qq_send_voice 注册在 preset 作用域（guard 实例自己注册，不是全局）', () => {
+  const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })
+  apply(ctx, Config({ role: 'guard' }))
+  const tool = calls.registeredTools.find((t) => t.name === 'qq_send_voice')
+  assert.ok(tool, '没有注册 qq_send_voice')
+  assert.equal(typeof tool.execute, 'function')
+  assert.ok(tool.parameters.text, '参数里应有 text')
+})
+await check('qq_send_voice：技能关闭 → 执行抛错且不入队', async () => {
+  mod.bindFeatureConfigSource(Config({
+    role: 'settings',
+    skills: [{ id: 'sk-voice', name: '发语音', enabled: false }],
+  }))
+  const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })
+  apply(ctx, Config({ role: 'guard' }))
+  const tool = calls.registeredTools.find((t) => t.name === 'qq_send_voice')
+  const before = mod.sessionOpsSnapshot().queued
+  await assert.rejects(() => tool.execute({ text: '你好' }, { agent: { id: 's-1' } }), /发语音/)
+  assert.equal(mod.sessionOpsSnapshot().queued, before, '关掉的技能不该入队')
+})
+await check('qq_send_voice：开启 → 入队（桥接按 sessionId 反查 QQ 会话）', async () => {
+  mod.bindFeatureConfigSource(Config({ role: 'settings' }))
+  const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })
+  apply(ctx, Config({ role: 'guard' }))
+  const tool = calls.registeredTools.find((t) => t.name === 'qq_send_voice')
+  const before = mod.sessionOpsSnapshot().queued
+  const value = await tool.execute({ text: '你好呀' }, { agent: { id: 'session-abc' } })
+  assert.equal(value.queued, true)
+  assert.equal(value.chars, 3)
+  assert.ok(mod.sessionOpsSnapshot().queued > before, '应该进了会话指令队列')
+  mod.bindFeatureConfigSource(null)
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

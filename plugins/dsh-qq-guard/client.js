@@ -99,8 +99,34 @@ window.__ModuleLoader__.load({
 .qqg-logbox summary { cursor: pointer; user-select: none; padding: 2px 0; }
 .qqg-log { margin: 6px 0 0; padding: 8px 10px; max-height: 220px; overflow: auto;
   background: var(--dsw-alias-bg-layer-2); border: 1px solid var(--dsw-alias-border-l1);
-  border-radius: 6px; font-family: var(--ds-font-family-code, ui-monospace, SFMono-Regular, Menlo, monospace);
-  font-size: 11px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+  border-radius: 6px;
+  /* 日志里可能出现 ASCII 块字符（NapCat 二维码/进度条）：必须严格等宽、
+     letter-spacing 为 0、行高贴近 1，否则同一行里的方块会被拉宽或压扁。 */
+  font-family: Consolas, "Cascadia Mono", "Courier New", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; line-height: 1.2; letter-spacing: 0; word-spacing: 0; tab-size: 4;
+  font-variant-ligatures: none;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* ── NapCat 登录二维码 ─────────────────────────────────────────
+   必须「白底 + 纯黑 + 等宽 + 行高 1」：二维码靠方块拼正方形，任何一项不对
+   （主题色文字、非等宽字体、line-height 1.5）都会让手机扫不出来。 */
+.qqg-qr-card { margin-top: 10px; padding: 12px; border-radius: 10px;
+  background: #fff; border: 1px solid var(--dsw-alias-border-l1);
+  display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.qqg-qr-title { font-size: 12px; font-weight: 600; color: #111; }
+.qqg-qr-img { display: block; width: 294px; height: 294px; background: #fff;
+  /* 二维码规范要求四周留至少 4 个模块的静默区；147px 图按 2 倍显示时 1 模块 ≈14px，
+     所以用 padding 撑出白边（背景是 #fff，padding 也算白底）。 */
+  padding: 32px; box-sizing: content-box;
+  /* 147×147 的 1-bit PNG 放大 2 倍，pixelated 保证边缘是硬像素而不是糊成一团。 */
+  image-rendering: pixelated; }
+.qqg-qr-pre { margin: 0; padding: 0; background: #fff; color: #000;
+  font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+  font-size: 10px; line-height: 1; letter-spacing: 0; word-spacing: 0;
+  font-variant-ligatures: none;
+  white-space: pre; overflow: auto; max-width: 100%; }
+.qqg-qr-cap { font-size: 11px; line-height: 1.5; color: #333; text-align: center; }
+.qqg-qr-hint { font-size: 11px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
 /* 系统底层事件（看门狗 / 降级 / 抛错）：时间线 + 红黄分级 */
 .qqg-events { margin-top: 8px; }
 .qqg-event-list { margin: 6px 0 0; padding: 6px 10px; max-height: 220px; overflow: auto;
@@ -272,6 +298,10 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-secondary); white-space: nowrap; }
 .qqg-pill-accent { color: var(--qqg-accent); border-color: color-mix(in srgb, var(--qqg-accent) 40%, transparent);
   background: color-mix(in srgb, var(--qqg-accent) 10%, transparent); }
+/* 「已接入」= 已实装，绿色；未实装沿用默认中性色。 */
+.qqg-pill-ok { color: var(--dsw-alias-state-success-primary);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-success-primary) 42%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 10%, transparent); }
 
 /* ── 统计卡 ───────────────────────────────────────────────── */
 .qqg-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 12px; }
@@ -358,6 +388,7 @@ window.__ModuleLoader__.load({
 .qqg-tile-sub { font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
 .qqg-tile-desc { flex: 1 1 auto; font-size: 11.5px; line-height: 1.55; color: var(--dsw-alias-label-secondary); }
 .qqg-tile-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.qqg-tile-flags { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
 
 /* ── 使用引导（导航底部按钮 + 弹窗内的三步清单）────────────── */
 .qqg-onboard { display: flex; flex-direction: column; gap: 9px; }
@@ -572,6 +603,8 @@ window.__ModuleLoader__.load({
 .qqg-persona-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
 .qqg-persona-select { flex: 1 1 220px; min-width: 0; }
+/* 选中自定义人设后出现在工具栏里的「人设名称」输入框。 */
+.qqg-persona-name { flex: 1 1 160px; min-width: 120px; }
 /* toolbar 放进 .qqg-pform 后由父级 gap 控制间距，这里只留分割线内边距。 */
 .qqg-pform .qqg-persona-toolbar { margin-bottom: 0; }
 
@@ -605,57 +638,16 @@ window.__ModuleLoader__.load({
 .qqg-price-field .qqg-input { width: 100%; font-variant-numeric: tabular-nums; }
 .qqg-price-foot { display: flex; align-items: center; gap: 8px; margin-top: 12px; flex-wrap: wrap;
   font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
+/* 会话管理：长 ID / 长标题在 kv 行里必须截断，不能把整行撑爆。 */
+.qqg-kv b.qqg-kv-ellipsis { max-width: 62%; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.qqg-note { font-size: 11px; line-height: 1.6; color: var(--dsw-alias-label-secondary); }
 `
 
-    /* ══════════ 本地演示数据（只剩「会话管理」页在用）══════════ */
-    // 用量数据（今日概览 / 数据与用量）已全部接 Host 的 /dsh-qq-guard/usage，
-    // 这里不再保留任何用量假数字。
-    const MOCK_SESSIONS = [
-      {
-        id: 's1', name: '翎羽', qq: '10001', kind: '私聊', initial: '翎', unread: 3,
-        time: '14:32', preview: '分片规则改好了吗？', online: true, tag: '白名单',
-        persona: '你是一只傲娇猫娘，说话带「哼」，但正经问题会认真答。',
-        allow: true,
-        messages: [
-          { from: 'them', text: '在吗，桥接是不是又断了', time: '14:20' },
-          { from: 'me', text: '没断，NapCat 在线，刚重连过 WS。', time: '14:21' },
-          { from: 'them', text: '行，那分片规则改好了吗？', time: '14:32' },
-        ],
-      },
-      {
-        id: 's2', name: '摸鱼群', qq: '20002', kind: '群聊', initial: '摸', unread: 12,
-        time: '14:18', preview: '[图片] 今天这破网又炸了', online: true, tag: '白名单',
-        persona: '', allow: true,
-        messages: [
-          { from: 'them', text: '今天这破网又炸了', time: '14:16' },
-          { from: 'them', text: '[图片]', time: '14:18' },
-        ],
-      },
-      {
-        id: 's3', name: '硬件折腾群', qq: '20003', kind: '群聊', initial: '硬', unread: 0,
-        time: '13:52', preview: '固态换完温度掉了 8 度', online: true, tag: '白名单',
-        persona: '', allow: true,
-        messages: [{ from: 'them', text: '固态换完温度掉了 8 度', time: '13:52' }],
-      },
-      {
-        id: 's4', name: '路人甲', qq: '30004', kind: '私聊', initial: '路', unread: 0,
-        time: '12:07', preview: '你好，请问你是机器人吗', online: false, tag: '未放行',
-        persona: '', allow: false,
-        messages: [{ from: 'them', text: '你好，请问你是机器人吗', time: '12:07' }],
-      },
-      {
-        id: 's5', name: '电子系毕设群', qq: '20005', kind: '群聊', initial: '电', unread: 0,
-        time: '昨天', preview: '答辩时间定了，下周三上午', online: false, tag: '白名单',
-        persona: '', allow: true,
-        messages: [{ from: 'them', text: '答辩时间定了，下周三上午', time: '昨天' }],
-      },
-      {
-        id: 's6', name: '广告号', qq: '40006', kind: '私聊', initial: '广', unread: 0,
-        time: '昨天', preview: '【已拦截】推广内容', online: false, tag: '已拦截',
-        persona: '', allow: false,
-        messages: [{ from: 'them', text: '【已拦截】推广内容', time: '昨天' }],
-      },
-    ]
+    /* ══════════ 真实数据源（会话列表）══════════ */
+    // 「会话管理」页不再使用本地假数据：桥接进程把每个 QQ 会话的
+    // 未读数 / 昵称 / DSH 映射 / 最近一条消息预览随运行状态一起上报，
+    // 前端只渲染 `status.sessions`（见 useBridgeStatus）。
 
     /** 未接线的按钮统一绑它（本阶段只搭壳）。 */
     const noop = () => {}
@@ -741,6 +733,10 @@ window.__ModuleLoader__.load({
       'flypitDelayTiers.short': 200,
       'flypitDelayTiers.medium': 450,
       'flypitDelayTiers.long': 800,
+      // 打字延时的字数档位边界（与 Host 侧 typingDelayCharTiers 默认值一致）。
+      'typingDelayCharTiers.shortMax': 10,
+      'typingDelayCharTiers.mediumMax': 14,
+      'typingDelayCharTiers.longMin': 15,
       'trimEndPunctuation.enabled': true,
       // 与 Host 侧 Config 的 bridge.autoStart 默认值保持一致（默认关，fail-closed）。
       'bridge.autoStart': false,
@@ -756,6 +752,11 @@ window.__ModuleLoader__.load({
       replyTimeoutMs: 20000,
       modelWatchdogMs: 8000,
       antiDebounceMs: 0,
+      // 语音合成（「发语音」技能的后端）默认值：Edge 免 Key，音色用晓伊。
+      'voice.provider': 'edge',
+      'voice.baseUrl': '',
+      'voice.apiKey': '',
+      'voice.voice': 'zh-CN-XiaoyiNeural',
     }
 
     /** 按点分路径取值（'typingDelay.enabled' → value.typingDelay.enabled）。 */
@@ -999,10 +1000,48 @@ window.__ModuleLoader__.load({
       })
     }
 
+    /**
+     * 带本地草稿的滑条。
+     *
+     * 为什么不能直接用受控 range：value 来自异步配置回读，拖动时 React 还按旧值
+     * 重绘 thumb，看上去就是「拖不动」。这里先用本地 draft 跟手，
+     * 松手（pointerup）或键盘抬起（keyup）才提交一次 onCommit(数字)。
+     */
+    function Slider({ value, min, max, step, disabled, ariaLabel, onCommit }) {
+      const initial = Number(value ?? min)
+      const [draft, setDraft] = React.useState(initial)
+      // 配置回读 / 「恢复默认」时把草稿拉回真实值（拖动过程中不覆盖本地值）。
+      React.useEffect(() => { setDraft(Number(value ?? min)) }, [value])
+      const pending = React.useRef(initial)
+      const move = (next) => {
+        const n = Number(next)
+        if (!Number.isFinite(n)) return
+        pending.current = n
+        setDraft(n)
+      }
+      const commit = () => {
+        if (disabled) return
+        if (pending.current !== Number(value)) onCommit(pending.current)
+      }
+      return h('input', {
+        type: 'range', className: 'qqg-slider',
+        min, max, step: step ?? 1,
+        value: draft,
+        disabled,
+        'aria-label': ariaLabel,
+        onInput: (e) => move(e.target.value),
+        onChange: (e) => move(e.target.value),
+        onPointerUp: commit,
+        onKeyUp: commit,
+        // 鼠标拖到滑块外松手时 pointerup 可能不落在 input 上，失焦再兜一次。
+        onBlur: commit,
+      })
+    }
+
     /** 内置面板的左侧导航分类（Phase 2：五个主 Tab）。 */
     const SECTIONS = [
       { id: 'status', label: '运行状态', icon: 'status' },
-      { id: 'sessions', label: '会话管理', icon: 'sessions', badge: MOCK_SESSIONS.filter((s) => s.unread > 0).length },
+      { id: 'sessions', label: '会话管理', icon: 'sessions' },
       { id: 'skills', label: '技能与插件', icon: 'skills' },
       { id: 'settings', label: '全局设置', icon: 'settings' },
       { id: 'usage', label: '数据与用量', icon: 'usage' },
@@ -1083,6 +1122,7 @@ window.__ModuleLoader__.load({
             type: 'button',
             className: 'qqg-btn',
             disabled: disabled || !draft.trim(),
+            'aria-label': `${ariaLabel ?? '列表'} 添加`,
             onClick: add,
           }, addLabel ?? '添加')))
     }
@@ -1144,6 +1184,26 @@ window.__ModuleLoader__.load({
       if (Number.isNaN(date.getTime())) return ''
       const pad = (n) => String(n).padStart(2, '0')
       return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+    }
+
+    /** 毫秒时间戳 → 本地 HH:MM（二维码生成时间用）。 */
+    function clockOfMs(ms) {
+      const value = Number(ms)
+      if (!Number.isFinite(value) || value <= 0) return ''
+      const date = new Date(value)
+      const pad = (n) => String(n).padStart(2, '0')
+      return `${pad(date.getHours())}:${pad(date.getMinutes())}`
+    }
+
+    /** 毫秒时长 → 「3 分钟前」这种短文案。 */
+    function agoText(ms) {
+      const value = Number(ms)
+      if (!Number.isFinite(value) || value < 0) return ''
+      if (value < 60_000) return '刚刚'
+      const minutes = Math.floor(value / 60_000)
+      if (minutes < 60) return `${minutes} 分钟前`
+      const hours = Math.floor(minutes / 60)
+      return `${hours} 小时前`
     }
 
     /**
@@ -1373,6 +1433,7 @@ window.__ModuleLoader__.load({
     function AllowSection({ get, write, writable, form }) {
       const priv = get('allow.private')
       const groups = get('allow.groups')
+      const admins = get('allow.admins')
       const allowAll = get('allow.allowAllWhenEmpty') === true
       // 数组不能整体 set 后靠路径猜测，这里直接写整段 allow。
       const setAllow = (patch) => {
@@ -1393,6 +1454,15 @@ window.__ModuleLoader__.load({
             ariaLabel: '群白名单',
             onChange: (next) => setAllow({ groups: next }),
           })),
+        h(Field, {
+          label: '管理员 QQ 号',
+          desc: '只有名单里的人能发 / 开头的指令（/reset、/clear、/model 等）；其他人发指令会被直接拦下并回提示，不会消耗 token。',
+        },
+          h(ListEditor, {
+            items: Array.isArray(admins) ? admins : [], disabled: !writable, placeholder: '输入管理员 QQ 号后回车',
+            ariaLabel: '管理员 QQ 号',
+            onChange: (next) => setAllow({ admins: next }),
+          })),
         h(Field, { label: '白名单为空时放行全部', desc: '⚠️ 打开后任何人都能让 bot 回话，慎用。' },
           h(Switch, {
             checked: allowAll, disabled: !writable,
@@ -1400,7 +1470,8 @@ window.__ModuleLoader__.load({
             onChange: (v) => setAllow({ allowAllWhenEmpty: v }),
           })),
         h('div', { className: 'qqg-hint' },
-          '白名单每次收到消息都从最新配置现读，保存后下一条消息立即生效，无需重启桥接。'))
+          '白名单每次收到消息都从最新配置现读，保存后下一条消息立即生效，无需重启桥接。',
+          '管理员身份只对 / 指令生效，不会绕过白名单。'))
     }
 
     /** 参与度三档：id 与桥接 composePersonaPrompt 的 key 一一对应。 */
@@ -1464,6 +1535,11 @@ window.__ModuleLoader__.load({
           text: '',
         }))
       }
+      /** 改名只动 draft.presets 里当前选中项的 name，保存时随整组一起写回。 */
+      const renamePreset = (name) => setDraft((prev) => ({
+        ...prev,
+        presets: prev.presets.map((item) => (item.id === prev.selected ? { ...item, name } : item)),
+      }))
       const save = () => {
         if (!form || !writable) return
         // 选中的自定义人设跟着角色设定文本一起更新。
@@ -1546,7 +1622,18 @@ window.__ModuleLoader__.load({
             type: 'button', className: 'qqg-btn', disabled: !writable || draft.selected === '',
             title: draft.selected === '' ? '当前是默认人设，没有可删除的自定义人设' : '删除当前选中的自定义人设',
             onClick: removePreset,
-          }, '删除当前自定义人设')),
+          }, '删除当前自定义人设'),
+          // 只对自定义人设显示：默认人设没有名字可改。
+          draft.selected !== ''
+            ? h('input', {
+              className: 'qqg-input qqg-persona-name',
+              value: selectedPreset?.name ?? '',
+              placeholder: '人设名称',
+              disabled: !writable,
+              'aria-label': '人设名称',
+              onChange: (e) => renamePreset(e.target.value),
+            })
+            : null),
 
         // 第一排：名字 / 展示名 / 参与度（固定 200px，并排紧凑，不占满整行）
         h('div', { className: 'qqg-prow' },
@@ -1809,7 +1896,66 @@ window.__ModuleLoader__.load({
             '改完保存即生效：桥接每 2 秒轮询一次配置，下一条消息就按新值走。')))
     }
 
+    /**
+     * 语音合成（TTS）配置卡。
+     *
+     * provider=edge 走微软 Edge 朗读（免 Key）；provider=openai 走任意 OpenAI 兼容的
+     * `/v1/audio/speech`（要 baseUrl + apiKey）。这里只负责把配置写回 `voice.*`，
+     * 合成和发送都在桥接进程里做；真正要发语音还得在「技能与插件」里开启「发语音」。
+     */
+    function VoiceSection({ get, write, writable }) {
+      const provider = String(get('voice.provider') ?? 'edge')
+      const openai = provider === 'openai'
+      return h(Panel, {
+        title: '语音合成（TTS）',
+        desc: '「发语音」技能的后端。Edge 免 Key；OpenAI 兼容接口要自己的 baseUrl 与 Key。',
+        right: h('span', { className: 'qqg-pill' }, openai ? 'OpenAI 兼容' : 'Edge（免 Key）'),
+      },
+      h(Field, { label: '语音引擎', desc: 'edge = 微软 Edge 朗读（免 Key）；openai = 任意 OpenAI 兼容 TTS 接口。' },
+        h('select', {
+          className: 'qqg-input qqg-input-grow', value: provider, disabled: !writable,
+          'aria-label': '语音引擎',
+          onChange: (e) => write('voice.provider', e.target.value),
+        },
+        h('option', { value: 'edge' }, 'Edge（免 Key）'),
+        h('option', { value: 'openai' }, 'OpenAI 兼容'))),
+      openai
+        ? h(Field, { label: '接口地址（baseUrl）', desc: 'OpenAI 兼容 TTS 的基础地址，末尾不要带 /audio/speech。' },
+          h('input', {
+            className: 'qqg-input qqg-input-grow',
+            value: String(get('voice.baseUrl') ?? ''),
+            placeholder: 'https://api.openai.com/v1', disabled: !writable,
+            'aria-label': '接口地址（baseUrl）',
+            onChange: (e) => write('voice.baseUrl', e.target.value),
+          }))
+        : null,
+      openai
+        ? h(Field, { label: 'API Key', desc: '只存在本机 profile 配置里；输入框按密码显示。' },
+          h('input', {
+            type: 'password', className: 'qqg-input qqg-input-grow',
+            value: String(get('voice.apiKey') ?? ''),
+            placeholder: 'sk-…', disabled: !writable, autoComplete: 'off',
+            'aria-label': '语音 API Key',
+            onChange: (e) => write('voice.apiKey', e.target.value),
+          }))
+        : null,
+      h(Field, { label: '音色（voice）', desc: 'Edge 用短名：zh-CN-XiaoyiNeural / zh-CN-XiaoxiaoNeural；OpenAI 用 alloy 等。' },
+        h('input', {
+          className: 'qqg-input qqg-input-grow',
+          value: String(get('voice.voice') ?? ''),
+          placeholder: 'zh-CN-XiaoyiNeural', disabled: !writable,
+          'aria-label': '音色',
+          onChange: (e) => write('voice.voice', e.target.value),
+        })),
+      h('div', { className: 'qqg-hint' },
+        '提示：还得到「技能与插件」里开启「发语音」，桥接才会把回复合成为语音条。'))
+    }
+
     function SplitSection({ get, write, writable }) {
+      // 字数档位边界可配：毫秒档的标签跟着当前值走，不再写死 10 / 14 / 15。
+      const shortMax = Number(get('typingDelayCharTiers.shortMax') ?? 10)
+      const mediumMax = Number(get('typingDelayCharTiers.mediumMax') ?? 14)
+      const longMin = Number(get('typingDelayCharTiers.longMin') ?? 15)
       return h(React.Fragment, null,
         h('div', { className: 'qqg-group' },
           h('div', { className: 'qqg-group-title' }, '分片'),
@@ -1835,21 +1981,38 @@ window.__ModuleLoader__.load({
               checked: get('typingDelay.enabled') !== false, disabled: !writable,
               ariaLabel: '打字延时总开关', onChange: (v) => write('typingDelay.enabled', v),
             })),
-          h(Field, { label: '短句（<10 字）', desc: '毫秒。实际会在 ±15% 内抖动，且不低于 150ms。' },
+          h(Field, { label: `短句（<${shortMax} 字）`, desc: '毫秒。实际会在 ±15% 内抖动，且不低于 150ms。' },
             h(NumberField, {
               value: get('flypitDelayTiers.short'), min: 0, max: 60000, disabled: !writable,
               ariaLabel: '短句延时', onCommit: (n) => write('flypitDelayTiers.short', n),
             })),
-          h(Field, { label: '中等（10~14 字）', desc: '毫秒。' },
+          h(Field, { label: `中等（${shortMax}~${mediumMax} 字）`, desc: '毫秒。' },
             h(NumberField, {
               value: get('flypitDelayTiers.medium'), min: 0, max: 60000, disabled: !writable,
               ariaLabel: '中等句延时', onCommit: (n) => write('flypitDelayTiers.medium', n),
             })),
-          h(Field, { label: '长句（15+ 字）', desc: '毫秒。' },
+          h(Field, { label: `长句（${longMin}+ 字）`, desc: '毫秒。' },
             h(NumberField, {
               value: get('flypitDelayTiers.long'), min: 0, max: 60000, disabled: !writable,
               ariaLabel: '长句延时', onCommit: (n) => write('flypitDelayTiers.long', n),
             })),
+          h(Field, { label: '短句上限字数', desc: '字数 < 该值走短句档。默认 10。' },
+            h(NumberField, {
+              value: get('typingDelayCharTiers.shortMax'), min: 1, max: 500, disabled: !writable,
+              ariaLabel: '短句上限字数', onCommit: (n) => write('typingDelayCharTiers.shortMax', n),
+            })),
+          h(Field, { label: '中等上限字数', desc: '短句上限 ~ 该值（含）走中等档。默认 14。' },
+            h(NumberField, {
+              value: get('typingDelayCharTiers.mediumMax'), min: 1, max: 500, disabled: !writable,
+              ariaLabel: '中等上限字数', onCommit: (n) => write('typingDelayCharTiers.mediumMax', n),
+            })),
+          h(Field, { label: '长句触发字数', desc: '字数 >= 该值走长句档。默认 15。' },
+            h(NumberField, {
+              value: get('typingDelayCharTiers.longMin'), min: 1, max: 500, disabled: !writable,
+              ariaLabel: '长句触发字数', onCommit: (n) => write('typingDelayCharTiers.longMin', n),
+            })),
+          h('div', { className: 'qqg-hint' },
+            '档位边界：字数 < 短句上限 → 短句档；短句上限 ~ 中等上限 → 中等档；字数 >= 长句触发 → 长句档。'),
           h(Field, { label: '兜底固定间隔', desc: '毫秒。仅当分级延时关闭时生效。' },
             h(NumberField, {
               value: get('sendIntervalMs'), min: 0, max: 60000, disabled: !writable,
@@ -1900,6 +2063,71 @@ window.__ModuleLoader__.load({
         return () => { stopped = true; if (timer) clearTimeout(timer) }
       }, [enabled, tick])
       return { snap, error, refresh: () => setTick((v) => v + 1) }
+    }
+
+    /** 二维码超过这个年龄就认为过期（QQ 二维码约 2 分钟有效，给 5 分钟余量）。 */
+    const QR_FRESH_MS = 5 * 60 * 1000
+
+    /**
+     * NapCat 登录二维码卡片。
+     *
+     * 优先用 NapCat 自己落盘的 qrcode.png（147×147 的 1-bit PNG，放大 2 倍 +
+     * image-rendering: pixelated 就是清晰的黑白方块）；没有图时退回从日志里
+     * 抽出来的 ASCII 二维码，用「白底黑字 + 等宽 + line-height 1」单独渲染。
+     *
+     * 为什么不能直接丢在普通日志框里：日志框是主题色文字、行高 1.5，
+     * 半方块字符会被压扁，手机扫不出来（2026-10-23 掉登录时实测踩到）。
+     */
+    function NapcatQrCard({ snap }) {
+      // 已经在线 / 日志判定登录成功后就不需要二维码了，别占面板位置
+      // （掉登录 / 未确认 / 已停止才显示）。loggedIn 兜住「没配 HTTP API、
+      // state 只能到 running-unverified」的情况——扫码成功后面板必须自动收起。
+      if (snap?.state === 'online' || snap?.loggedIn === true) return null
+      const image = snap?.qrImage ?? null
+      const ascii = typeof snap?.qr?.text === 'string' ? snap.qr.text : ''
+      const age = Number(image?.ageMs)
+      const fresh = Number.isFinite(age) && age <= QR_FRESH_MS
+      const imageAt = Number(image?.mtime)
+      const asciiAt = Number(snap?.qr?.at)
+      // 日志里的 ASCII 二维码没有「重刷」信号，用抓到它的时间判断新旧：
+      // 超过 10 分钟基本已经失效，收进折叠框当历史记录。
+      const asciiFresh = Number.isFinite(asciiAt) && Date.now() - asciiAt <= 10 * 60 * 1000
+
+      const imageCard = (caption) => h('div', { className: 'qqg-qr-card' },
+        h('div', { className: 'qqg-qr-title' }, 'NapCat 登录二维码'),
+        h('img', {
+          className: 'qqg-qr-img',
+          src: `/dsh-qq-guard/napcat-qr?v=${Math.round(imageAt) || 0}`,
+          alt: 'NapCat 登录二维码',
+          width: 294,
+          height: 294,
+        }),
+        h('div', { className: 'qqg-qr-cap' }, caption))
+
+      // ① 最新落盘图片：最稳，优先。
+      if (image && fresh) {
+        return imageCard(`手机 QQ 扫码登录 · 生成于 ${clockOfMs(imageAt)}（约 2 分钟有效）`)
+      }
+      // ② 日志里刚打印的 ASCII 二维码：图片没有/过期时的兜底。
+      if (ascii && asciiFresh) {
+        return h('div', { className: 'qqg-qr-card' },
+          h('div', { className: 'qqg-qr-title' }, 'NapCat 登录二维码'),
+          h('pre', { className: 'qqg-qr-pre' }, ascii),
+          h('div', { className: 'qqg-qr-cap' },
+            '从 NapCat 日志中提取。扫不出来就重启 NapCat，让它重新落一张图片版。'))
+      }
+      // ③ 只剩过期图片 / 过期 ASCII：收进折叠框，别占着面板骗人。
+      if (image) {
+        return h('details', { className: 'qqg-logbox' },
+          h('summary', null, `上次登录二维码（${agoText(age) || '未知时间'}，可能已过期）`),
+          imageCard(`生成于 ${clockOfMs(imageAt)}，已过去 ${agoText(age) || '一段时间'}；二维码会过期，请重启 NapCat 刷新`))
+      }
+      if (ascii) {
+        return h('details', { className: 'qqg-logbox' },
+          h('summary', null, `上次登录二维码（${agoText(Date.now() - asciiAt) || '未知时间'}，可能已过期）`),
+          h('pre', { className: 'qqg-qr-pre' }, ascii))
+      }
+      return null
     }
 
     /**
@@ -1994,6 +2222,10 @@ window.__ModuleLoader__.load({
         actError ? h('div', { className: 'qqg-status qqg-status-err' }, actError) : null,
         error ? h('div', { className: 'qqg-status qqg-status-err' }, error) : null,
         snap?.lastError ? h('div', { className: 'qqg-detail' }, `上次错误：${snap.lastError}`) : null,
+
+        // 登录二维码：单独一张白底卡片（图片优先，ASCII 兜底）。
+        // 放在日志框上面 —— 掉登录时用户第一眼要的是能扫的东西，不是日志。
+        h(NapcatQrCard, { snap }),
 
         // NapCat 日志：和桥接日志同一套折叠框。
         // 为什么必须有：端口被占 / QQ 未登录 / 缺运行库这些原因只打在 NapCat 自己的输出里，
@@ -2180,9 +2412,20 @@ window.__ModuleLoader__.load({
       return startHour <= 23 && endHour <= 23 && startMinute <= 59 && endMinute <= 59
     }
 
-    /** 多段时段校验：英文逗号分隔，每段都要合法，至少一段。 */
+    /**
+     * 归一化多段时段的**分隔符**（与 Host `normalizePeakSeparators` 同口径）。
+     *
+     * 用户手输时常混用中文分号 / 中文逗号 / 英文分号；这些字符在 `split(',')`
+     * 下不会被切开，整段会被判成非法，然后静默按「全天忙时」算成本。
+     * 所以校验和写回前先统一成英文逗号。
+     */
+    function normalizePeakSeparators(text) {
+      return String(text ?? '').replace(/[；;，]/g, ',')
+    }
+
+    /** 多段时段校验：英文逗号分隔（中文分号/逗号会先归一化），每段都要合法，至少一段。 */
     function isValidPeakHours(text) {
-      const segments = String(text ?? '').split(',').map((part) => part.trim()).filter(Boolean)
+      const segments = normalizePeakSeparators(text).split(',').map((part) => part.trim()).filter(Boolean)
       return segments.length > 0 && segments.every(isValidPeakSegment)
     }
 
@@ -2387,136 +2630,243 @@ window.__ModuleLoader__.load({
     }
 
     /* ══════════ Tab 2 · 会话管理（Mock）══════════ */
-    function SessionsTab() {
-      const [list, setList] = React.useState(MOCK_SESSIONS)
-      const [selected, setSelected] = React.useState(MOCK_SESSIONS[0].id)
-      const [allowOverride, setAllowOverride] = React.useState({})
+    /** 时间戳 → 会话列表里的相对时间（今天 HH:MM / 昨天 / MM-DD）。 */
+    function sessionTime(ts) {
+      const value = Number(ts)
+      if (!Number.isFinite(value) || value <= 0) return '—'
+      const date = new Date(value)
+      const now = new Date()
+      const pad = (n) => String(n).padStart(2, '0')
+      const sameDay = date.getFullYear() === now.getFullYear()
+        && date.getMonth() === now.getMonth() && date.getDate() === now.getDate()
+      if (sameDay) return `${pad(date.getHours())}:${pad(date.getMinutes())}`
+      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+      if (value >= todayStart - 86400000) return '昨天'
+      return `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+    }
+
+    /** 头像字：昵称/群名首字；空则用「?」。 */
+    function initialOf(text) {
+      const value = String(text ?? '').trim()
+      return value ? Array.from(value)[0] : '?'
+    }
+
+    /**
+     * 会话管理（真实数据）。
+     *
+     * 数据源只有一个：桥接进程随运行状态上报的 `sessions` 数组
+     * （Host 白名单路由 → 前端 3 秒轮询）。桥接没起来时 `live` 为 null，
+     * 这里显示「等待上报」，绝不用假数据顶上。
+     *
+     * 「单人设覆盖 / 清空上下文 / 删除会话」排在后续批次：按钮明确置灰并标注，
+     * 不做「点了没反应」的假交互。
+     */
+    /**
+     * 提交一条会话指令（入 Host 队列，桥接 2 秒内轮询执行）。
+     * @param {{op:'persona'|'clear'|'delete', key:string, text?:string}} body
+     */
+    async function postSessionOp(body) {
+      const res = await fetch('/dsh-qq-guard/session-ops', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const payload = await res.json().catch(() => ({}))
+      if (!res.ok || payload?.ok !== true) {
+        throw new Error(payload?.detail ?? payload?.reason ?? ('HTTP ' + res.status))
+      }
+      return payload
+    }
+
+    function SessionsTab({ live }) {
+      const rows = Array.isArray(live?.sessions) ? live.sessions : null
+      const [selectedKey, setSelectedKey] = React.useState('')
       const [personaDraft, setPersonaDraft] = React.useState({})
-      const [confirmDel, setConfirmDel] = React.useState(false)
-      const cur = list.find((s) => s.id === selected) ?? list[0]
-      // 删到空列表时不能继续渲染详情，给个空态。
-      if (!cur) {
+      const [busy, setBusy] = React.useState(null)
+      const [notice, setNotice] = React.useState(null)
+      const [confirm, setConfirm] = React.useState(null)
+      const cur = rows === null ? null : (rows.find((s) => s.key === selectedKey) ?? rows[0] ?? null)
+      const totalUnread = rows === null ? 0 : rows.reduce((sum, s) => sum + (Number(s.unread) || 0), 0)
+      const draftPersona = cur === null ? '' : String(personaDraft[cur.key] ?? cur.persona ?? '')
+      const savedPersona = cur === null ? '' : String(cur.persona ?? '')
+      const personaDirty = draftPersona !== savedPersona
+
+      if (rows === null) {
         return h('div', { className: 'qqg-stack' },
-          h(TabHead, { title: '会话管理', desc: '本页为 Mock 数据，未接真实会话服务。' }),
-          h(Panel, { title: '会话列表为空', desc: 'Mock 阶段删除只影响本次页面状态，刷新即恢复。' },
-            h('div', { className: 'qqg-actions' },
-              h('button', {
-                type: 'button', className: 'qqg-btn qqg-btn-primary',
-                onClick: () => { setList(MOCK_SESSIONS); setSelected(MOCK_SESSIONS[0].id) },
-              }, '恢复 Mock 数据'))))
+          h(TabHead, { title: '会话管理', desc: '真实会话列表由桥接进程上报；桥接没起来时这里是空的。' }),
+          h(Panel, {
+            title: '等待桥接上报',
+            desc: '会话数据随运行状态一起上报（每 2 秒一次）。先到「运行状态」页确认桥接已启动。',
+          }),
+          h('div', { className: 'qqg-note' },
+            '桥接进程负责维护 QQ 会话 ↔ DSH 会话的映射、未读数与标题；',
+            h('br'),
+            '它没运行时，设置页无法凭空知道有哪些会话。'))
       }
-      const allow = allowOverride[cur.id] ?? cur.allow
-      const persona = personaDraft[cur.id] ?? cur.persona
-      const doDelete = () => {
-        const rest = list.filter((s) => s.id !== cur.id)
-        setList(rest)
-        if (rest.length > 0) setSelected(rest[0].id)
-        setConfirmDel(false)
+
+      if (rows.length === 0) {
+        return h('div', { className: 'qqg-stack' },
+          h(TabHead, {
+            title: '会话管理',
+            desc: '还没有任何 QQ 会话。白名单里的联系人发一条消息，就会自动建会话并出现在这里。',
+            tags: h('span', { className: 'qqg-pill qqg-pill-accent' }, '实时 3 秒'),
+          }),
+          h(Panel, { title: '暂无会话', desc: '桥接已在上报，只是还没建立过任何会话。' }))
       }
+
+      const displayName = (row) => String(row.name || row.qq || row.key || '')
+      const kindLabel = (row) => (row.kind === 'group' ? '群聊' : '私聊')
+
+      /** 提交指令；成功后给一行提示（真正的结果由 2 秒后的轮询体现）。 */
+      const submit = async (body, label) => {
+        setBusy(body.op)
+        setNotice(null)
+        try {
+          await postSessionOp(body)
+          setNotice({ kind: 'ok', text: label + '已提交，桥接会在 2 秒内执行。' })
+        } catch (error) {
+          setNotice({ kind: 'err', text: label + '失败：' + (error?.message ?? error) })
+        } finally {
+          setBusy(null)
+        }
+      }
+
+      const savePersona = () => {
+        if (cur === null) return undefined
+        const text = String(personaDraft[cur.key] ?? cur.persona ?? '').trim()
+        setPersonaDraft((map) => ({ ...map, [cur.key]: text }))
+        return submit({ op: 'persona', key: cur.key, text }, '单人设')
+      }
+      const resetPersona = () => {
+        if (cur === null) return undefined
+        setPersonaDraft((map) => ({ ...map, [cur.key]: '' }))
+        return submit({ op: 'persona', key: cur.key, text: '' }, '恢复全局人设')
+      }
+      const ask = (op) => setConfirm({ op, key: cur.key, name: displayName(cur) })
 
       return h('div', { className: 'qqg-stack' },
         h(TabHead, {
           title: '会话管理',
-          desc: '按会话覆盖人设与白名单；本页为 Mock 数据，未接真实会话服务。',
+          desc: 'QQ 会话 ↔ DSH 会话的真实映射：标题、未读数与最近消息都来自桥接进程。',
           tags: h(React.Fragment, null,
-            h('span', { className: 'qqg-pill' }, `${list.length} 个会话`),
-            h('span', { className: 'qqg-pill qqg-pill-accent' }, 'Mock')),
+            h('span', { className: 'qqg-pill' }, rows.length + ' 个会话'),
+            h('span', { className: 'qqg-pill' + (totalUnread > 0 ? ' qqg-pill-accent' : '') },
+              totalUnread > 0 ? totalUnread + ' 条未读' : '全部已读'),
+            h('span', { className: 'qqg-pill' }, '实时 3 秒')),
         }),
         h('div', { className: 'qqg-split' },
           h('div', { className: 'qqg-session-list', 'aria-label': '会话列表' },
-            list.map((s) => h('div', {
-              key: s.id,
-              className: 'qqg-session' + (s.id === selected ? ' qqg-session-on' : ''),
+            rows.map((s) => h('div', {
+              key: s.key,
+              className: 'qqg-session' + (s.key === cur.key ? ' qqg-session-on' : ''),
               role: 'button', tabIndex: 0,
-              onClick: () => setSelected(s.id),
-              onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') setSelected(s.id) },
+              onClick: () => setSelectedKey(s.key),
+              onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') setSelectedKey(s.key) },
             },
-            h('div', { className: 'qqg-avatar' }, s.initial),
+            h('div', { className: 'qqg-avatar' }, initialOf(displayName(s))),
             h('div', { className: 'qqg-session-main' },
               h('div', { className: 'qqg-session-top' },
-                h('span', { className: 'qqg-session-name' }, s.name),
-                h('span', { className: 'qqg-session-time' }, s.time)),
-              h('div', { className: 'qqg-session-preview' }, s.preview)),
+                h('span', { className: 'qqg-session-name' }, displayName(s)),
+                h('span', { className: 'qqg-session-time' }, sessionTime(s.lastAt))),
+              h('div', { className: 'qqg-session-preview' },
+                (s.persona ? '[单人设] ' : '') + (s.lastText || (s.sessionId ? '（还没收到消息）' : '（等待首条消息建会话）')))),
             s.unread > 0 ? h('span', { className: 'qqg-unread' }, s.unread > 99 ? '99+' : s.unread) : null))),
 
           h('div', { className: 'qqg-session-detail' },
             h(Panel, null,
               h('div', { className: 'qqg-detail-head' },
-                h('div', { className: 'qqg-avatar qqg-avatar-lg' }, cur.initial),
+                h('div', { className: 'qqg-avatar qqg-avatar-lg' }, initialOf(displayName(cur))),
                 h('div', { className: 'qqg-detail-meta' },
-                  h('div', { className: 'qqg-detail-name' }, cur.name),
+                  h('div', { className: 'qqg-detail-name' }, displayName(cur)),
                   h('div', { className: 'qqg-detail-sub' },
                     h('span', { className: 'qqg-mono' }, cur.qq),
-                    h('span', { className: 'qqg-pill' }, cur.kind),
-                    h('span', { className: 'qqg-pill ' + (cur.online ? 'qqg-pill-accent' : '') },
-                      cur.online ? '在线' : '离线'),
-                    h('span', { className: 'qqg-pill' }, cur.tag))),
+                    h('span', { className: 'qqg-pill' }, kindLabel(cur)),
+                    cur.persona ? h('span', { className: 'qqg-pill qqg-pill-accent' }, '单人设') : null,
+                    cur.unread > 0
+                      ? h('span', { className: 'qqg-pill qqg-pill-accent' }, cur.unread + ' 条未读')
+                      : h('span', { className: 'qqg-pill' }, '已读'))),
                 h('div', { className: 'qqg-actions' },
-                  h('button', { type: 'button', className: 'qqg-btn', onClick: noop }, '打开会话'),
-                  h('button', { type: 'button', className: 'qqg-btn', onClick: noop }, '清空上下文'),
+                  h('button', {
+                    type: 'button', className: 'qqg-btn',
+                    disabled: busy !== null || !cur.sessionId,
+                    title: cur.sessionId ? '归档当前会话并新建同名会话' : '该会话还没建立 DSH 会话',
+                    onClick: () => ask('clear'),
+                  }, busy === 'clear' ? '提交中…' : '清空上下文'),
                   h('button', {
                     type: 'button', className: 'qqg-btn qqg-btn-danger',
-                    onClick: () => setConfirmDel(true),
-                  }, '删除会话')))),
+                    disabled: busy !== null || !cur.sessionId,
+                    title: cur.sessionId ? '归档该会话并删除本地映射' : '该会话还没建立 DSH 会话',
+                    onClick: () => ask('delete'),
+                  }, busy === 'delete' ? '提交中…' : '删除会话')))),
+            notice
+              ? h('div', { className: 'qqg-status' + (notice.kind === 'err' ? ' qqg-status-err' : '') }, notice.text)
+              : null,
+            h(Panel, { title: '会话信息', desc: 'DSH 标题在创建 / 接管会话时按「私聊-昵称 / 群聊-群名(群号)」强制对齐。' },
+              h('div', { className: 'qqg-list' },
+                h('div', { className: 'qqg-kv' }, h('span', null, '会话 key'), h('b', { className: 'qqg-mono' }, cur.key)),
+                h('div', { className: 'qqg-kv' }, h('span', null, 'DSH 会话 ID'),
+                  h('b', { className: 'qqg-mono qqg-kv-ellipsis' }, cur.sessionId || '（未建立）')),
+                h('div', { className: 'qqg-kv' }, h('span', null, 'DSH 标题'),
+                  h('b', { className: 'qqg-kv-ellipsis' }, cur.title || '（待对齐）')),
+                h('div', { className: 'qqg-kv' }, h('span', null, '最近活动'), h('b', null, sessionTime(cur.lastAt))))),
             h(Panel, {
               title: '单人设覆盖',
-              desc: '留空则沿用全局人设；保存后对该会话生效。',
-              right: h('span', { className: 'qqg-pill' }, `${[...persona].length} 字`),
+              desc: '留空 = 沿用全局人设。保存后桥接下一条消息前推给插件，即时生效；只影响这个 QQ 会话。',
+              right: h('span', { className: 'qqg-pill' }, String(draftPersona.length) + ' 字'),
             },
-            h('textarea', {
-              className: 'qqg-ai-input', rows: 5,
-              placeholder: '为该会话单独指定人设…',
-              value: persona,
-              'aria-label': '单人设覆盖',
-              onChange: (e) => setPersonaDraft((m) => ({ ...m, [cur.id]: e.target.value })),
-            }),
-            h('div', { className: 'qqg-textarea-actions' },
-              h('button', { type: 'button', className: 'qqg-btn qqg-btn-primary', onClick: noop }, '保存人设'),
-              h('button', {
-                type: 'button', className: 'qqg-btn',
-                onClick: () => setPersonaDraft((m) => ({ ...m, [cur.id]: '' })),
-              }, '恢复全局'))),
-
-            h(Panel, { title: '单独白名单', desc: '关闭后该会话不再进白名单，消息直接丢弃。' },
-              h('div', { className: 'qqg-row' },
-                h('div', { className: 'qqg-label' },
-                  h('div', { className: 'qqg-label-main' }, '允许该会话'),
-                  h('div', { className: 'qqg-label-desc' }, '仅对本会话生效，不影响全局白名单。')),
-                h('div', { className: 'qqg-control' },
-                  h(Switch, {
-                    checked: allow, ariaLabel: '单独白名单开关',
-                    onChange: (v) => setAllowOverride((m) => ({ ...m, [cur.id]: v })),
-                  })))),
-
+              h('textarea', {
+                className: 'qqg-ai-input', rows: 5,
+                placeholder: '为该会话单独指定人设…（留空恢复全局）',
+                value: draftPersona,
+                'aria-label': '单人设覆盖',
+                disabled: busy === 'persona',
+                onChange: (e) => setPersonaDraft((map) => ({ ...map, [cur.key]: e.target.value })),
+              }),
+              h('div', { className: 'qqg-textarea-actions' },
+                h('button', {
+                  type: 'button', className: 'qqg-btn qqg-btn-primary',
+                  disabled: busy !== null || !personaDirty,
+                  onClick: savePersona,
+                }, busy === 'persona' ? '保存中…' : '保存人设'),
+                h('button', {
+                  type: 'button', className: 'qqg-btn',
+                  disabled: busy !== null || savedPersona === '',
+                  onClick: resetPersona,
+                }, '恢复全局'))),
             h(Panel, {
-              title: '记忆提取',
-              desc: '从该会话抽取长期事实写入记忆空间。',
+              title: '最近消息',
+              desc: '桥接只保留最后一条消息的预览；完整历史在 DSH 会话里。',
             },
-            h('div', { className: 'qqg-actions' },
-              h('button', { type: 'button', className: 'qqg-btn qqg-btn-primary', onClick: noop }, '提取记忆'),
-              h('button', { type: 'button', className: 'qqg-btn', onClick: noop }, '查看已提取'))),
-
-            h(Panel, { title: '最近消息', desc: 'Mock 展示。' },
               h('div', { className: 'qqg-list' },
-                cur.messages.map((m, i) => h('div', {
-                  key: i, className: 'qqg-msg' + (m.from === 'me' ? ' qqg-msg-me' : ''),
-                },
-                h('div', { className: 'qqg-msg-meta' },
-                  (m.from === 'me' ? 'bot' : cur.name) + ' · ' + m.time),
-                h('div', null, m.text)))))
-          )
+                h('div', { className: 'qqg-msg' },
+                  h('div', { className: 'qqg-msg-meta' }, displayName(cur) + ' · ' + sessionTime(cur.lastAt)),
+                  h('div', null, cur.lastText || '（还没有消息预览）')))))
         ),
-
         h(ConfirmModal, {
-          open: confirmDel,
-          title: `删除会话「${cur.name}」？`,
-          desc: '会移除该会话的人设覆盖、白名单设置与本地缓存。Mock 阶段只在本次页面状态里删除，刷新即恢复。',
-          confirmText: '删除会话',
-          danger: true,
-          onCancel: () => setConfirmDel(false),
-          onConfirm: doDelete,
+          open: confirm !== null,
+          title: confirm?.op === 'delete'
+            ? '删除会话「' + (confirm?.name ?? '') + '」？'
+            : '清空上下文「' + (confirm?.name ?? '') + '」？',
+          desc: confirm?.op === 'delete'
+            ? '会归档该 DSH 会话并删除本地映射。下次有人发消息会重新建会话；QQ 聊天记录不受影响。'
+            : '会归档当前 DSH 会话（可在 DSH 归档里找回），并新建一条同名会话。QQ 聊天记录不受影响。',
+          confirmText: confirm?.op === 'delete' ? '删除会话' : '清空上下文',
+          danger: confirm?.op === 'delete',
+          onCancel: () => setConfirm(null),
+          onConfirm: () => {
+            const target = confirm
+            setConfirm(null)
+            if (target) void submit({ op: target.op, key: target.key }, target.op === 'delete' ? '删除会话' : '清空上下文')
+          },
         })
       )
+    }
+
+    /** 已真实接入桥接 / Host 的条目 id；其余只加「开发中」标签，不动配置。 */
+    const IMPLEMENTED_IDS = {
+      skill: ['sk-voice', 'sk-vision', 'sk-search'],
+      plugin: ['pl-guard', 'pl-debounce', 'pl-ratelimit'],
     }
 
     /* ══════════ Tab 3 · 技能与插件（Mock）══════════ */
@@ -2525,7 +2875,7 @@ window.__ModuleLoader__.load({
      * 原生 HTML5 拖拽：卡片本身 draggable，手柄只是视觉提示（按住卡片任意位置都能拖）。
      * 上下箭头是拖拽的降级方案，键盘用户也能排序。
      */
-    function MockTile({ item, index, total, onToggle, onSettings, onDelete, onMove,
+    function MockTile({ item, index, total, implemented, onToggle, onSettings, onDelete, onMove,
       dragging, dragOver, onDragStart, onDragEnd, onDragOver, onDrop }) {
       const cls = ['qqg-tile']
       if (dragging) cls.push('qqg-tile-dragging')
@@ -2558,7 +2908,10 @@ window.__ModuleLoader__.load({
           }, h(Glyph, { name: 'trash', size: 14 })))),
       h('div', { className: 'qqg-tile-desc' }, item.desc),
       h('div', { className: 'qqg-tile-foot' },
-        h('span', { className: 'qqg-status' }, item.enabled ? '已启用' : '已停用'),
+        h('div', { className: 'qqg-tile-flags' },
+          h('span', { className: 'qqg-pill' + (implemented ? ' qqg-pill-ok' : '') },
+            implemented ? '已接入' : '开发中'),
+          h('span', { className: 'qqg-status' }, item.enabled ? '已启用' : '已停用')),
         h('div', { className: 'qqg-tile-arrows' },
           h('button', {
             type: 'button', className: 'qqg-icon-btn', title: '上移',
@@ -2960,6 +3313,7 @@ window.__ModuleLoader__.load({
           ? h('div', { className: 'qqg-hint' }, '清单为空。可以点右上角添加，或在配置文件里编辑。')
           : list.map((it, i) => h(MockTile, {
             key: it.id, item: it, index: i, total: list.length,
+            implemented: (IMPLEMENTED_IDS[kind] ?? []).includes(it.id),
             onToggle: flip(kind),
             onSettings: (item) => setSettingsTarget({ kind, item }),
             onDelete: (item) => setDeleteTarget({ kind, item }),
@@ -3447,13 +3801,12 @@ window.__ModuleLoader__.load({
         h('div', null,
           h('div', { className: 'qqg-group-title' }, '响应档位'),
           h('div', { className: 'qqg-field', style: { marginTop: 10 } },
-            h('input', {
-              type: 'range', className: 'qqg-slider',
+            h(Slider, {
               min: 0, max: ACTIVITY_LEVELS.length - 1, step: 1,
               value: level,
               disabled: !writable,
-              'aria-label': '响应档位',
-              onChange: (e) => set('rhythm.activityLevel', Number(e.target.value)),
+              ariaLabel: '响应档位',
+              onCommit: (v) => set('rhythm.activityLevel', v),
             }),
             h('div', { className: 'qqg-slider-ticks' },
               ACTIVITY_LEVELS.map((l) => h('span', {
@@ -3735,6 +4088,7 @@ window.__ModuleLoader__.load({
 
         h('div', { id: 'qqg-anchor-model', className: 'qqg-anchor' }, h(ModelSection, common)),
         h('div', { id: 'qqg-anchor-advanced', className: 'qqg-anchor' }, h(AdvancedSection, common)),
+        h('div', { id: 'qqg-anchor-voice', className: 'qqg-anchor' }, h(VoiceSection, common)),
         h('div', { id: 'qqg-anchor-persona', className: 'qqg-anchor' }, h(PersonaSection, common)),
         h('div', { id: 'qqg-anchor-allow', className: 'qqg-anchor' }, h(AllowSection, common)),
         h('div', { id: 'qqg-anchor-onebot', className: 'qqg-anchor' }, h(OneBotSection, common)),
@@ -3877,18 +4231,20 @@ window.__ModuleLoader__.load({
       React.useEffect(() => { setDraft(configured); setError('') }, [configured])
       const commit = () => {
         if (!writable) return
-        const text = draft.trim()
+        // 先归一化分隔符，再把归一化后的文本存进去：配置里永远只留英文逗号。
+        const text = normalizePeakSeparators(draft).trim()
         if (!isValidPeakHours(text)) {
-          setError('格式应为 HH:MM-HH:MM，多段用英文逗号分隔，例如 09:00-12:00, 14:00-18:00')
+          setError('格式应为 HH:MM-HH:MM，多段用逗号分隔（中文分号/逗号也认），例如 09:00-12:00, 14:00-18:00')
           return
         }
         setError('')
+        setDraft(text)
         if (text !== configured) write('peakHours', text)
       }
       return h(Panel, {
         title: '峰谷时段设置',
         desc: `使用本地时区（${timezoneOffsetLabel(timezone)}，${timezone}）。`
-          + '多段用英文逗号分隔，例如 09:00-12:00, 14:00-18:00；跨午夜写 08:30-00:30。',
+          + '多段用逗号分隔（中文分号、中文逗号会自动换成英文逗号），例如 09:00-12:00, 14:00-18:00；跨午夜写 08:30-00:30。',
         right: h('span', { className: 'qqg-pill' + (error ? '' : ' qqg-pill-accent') },
           error ? '格式有误' : '忙时窗口'),
       },
@@ -4126,6 +4482,8 @@ window.__ModuleLoader__.load({
       // 引导按钮上的计数要包含桥接进程的真实状态，所以把轮询提到面板这一层：
       // 弹窗与底部按钮共用同一份 proc，避免两个状态源各算各的。
       const [guideProc, refreshGuideProc] = useBridgeProc(true)
+      // 会话管理用的真实列表（桥接上报）。同样提到面板层：导航红点与页面共用一份数据。
+      const sessionsLive = useBridgeStatus(true)
 
       const get = (path) => {
         const v = getPath(value, path)
@@ -4175,7 +4533,7 @@ window.__ModuleLoader__.load({
       })()
 
       let body
-      if (active === 'sessions') body = h(SessionsTab)
+      if (active === 'sessions') body = h(SessionsTab, { live: sessionsLive })
       else if (active === 'skills') body = h(SkillsTab, { ...common, pickDirectory: props?.pickDirectory })
       else if (active === 'usage') body = h(UsageTab, common)
       else if (active === 'settings') body = h(SettingsTab, { ...common, pickDirectory: props?.pickDirectory })
@@ -4196,6 +4554,11 @@ window.__ModuleLoader__.load({
           h(AiAssistant))
       }
 
+      // 导航角标 = 有未读的会话数（真实数据；桥接未上报时为 0）。
+      const sessionsUnread = Array.isArray(sessionsLive?.sessions)
+        ? sessionsLive.sessions.filter((row) => Number(row.unread) > 0).length
+        : 0
+
       return h('div', { className: 'qqg-layout' },
         h('style', null, CSS),
         h('style', null, CSS2),
@@ -4214,7 +4577,9 @@ window.__ModuleLoader__.load({
             },
             h('span', { className: 'qqg-nav-icon' }, h(Glyph, { name: s.icon, size: 15 })),
             h('span', { className: 'qqg-nav-text' }, s.label),
-            s.badge ? h('span', { className: 'qqg-nav-badge' }, s.badge) : null))),
+            s.id === 'sessions' && sessionsUnread > 0
+              ? h('span', { className: 'qqg-nav-badge' }, sessionsUnread > 99 ? '99+' : sessionsUnread)
+              : null))),
           h('div', { className: 'qqg-nav-foot' },
             // 快捷启动卡：模型名由卡内自己从 /config + /models 读真实值；这里只传配置兜底。
             h(LaunchCard, { model: launchModel }),

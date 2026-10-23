@@ -68,6 +68,7 @@ copy config.example.json config.json
 | `onebot.wsUrl` / `accessToken` | NapCat 正向 WS 地址与 token，须与 NapCat 配置一致。 |
 | `allow.private` | 允许的私聊 QQ 号数组。 |
 | `allow.groups` | 允许的群号数组。 |
+| `allow.admins` | 管理员 QQ 号数组：只有这些人能发 `/` 开头的指令；其他人直接回「权限不足」，不投递 DSH。管理员不绕过白名单。 |
 | `allow.allowAllWhenEmpty` | **默认 `false`（fail-closed）**：白名单为空时谁都不理。 |
 | `replyTimeoutMs` | 等回复超时，**默认 20s**。超时会顺手 `session/cancel` 取消 DSH 这一轮（否则前端一直转「深度求索中」），并给 QQ 回一句失败提示。 |
 | `sendDelayMs` | 整条回复发送完后的尾部延时；片间延时见下面「分片与打字延时」。 |
@@ -248,41 +249,67 @@ QQ 账号在线（WS get_status 确认）
 杀掉第一个后残留锁的 pid 已死，下一个桥接会自动清理并正常连上。
 
 
-### 人设
+### 人设（2026-10-23 改为动态 section）
 
-人设字段（P1.5 起）：`personaText`（角色设定）、`personaBotName`（机器人名字）、
+人设字段：`personaText`（角色设定）、`personaBotName`（机器人名字）、
 `personaGroupName`（群内展示名）、`personaParticipation`（quiet / normal / active）、
-`personaExtraRules`（管理员附加规则）、`personaSystemPrompt`（系统提示词覆盖）。
-桥接层 `composePersonaPrompt()` 负责拼出最终系统提示词：
+`personaExtraRules`（管理员附加规则）、`personaSystemPrompt`（系统提示词覆盖）、
+`personaDefault`（preset 内置默认正文，来自插件 `cordis.patch.yml` 的 guard 子行）。
+
+`composePersonaPrompt()` 仍在桥接层负责拼最终文本：
 
 1. `personaSystemPrompt` 非空 → 原样覆盖，其余字段不追加；
-2. 否则 base = `personaText`，为空回落到 preset 默认人设；
+2. 否则 base = `personaText`，为空回落到 `personaDefault`；
 3. 有名字 / 展示名 → 追加身份行，并把默认人设里的 `DeepSeek` 替换成 `personaBotName`；
 4. 追加参与度规则；
-5. 追加管理员附加规则。
+5. 追加管理员附加规则；
+6. 有模型路由时追加【底层模型】行。
 
-全空时返回空串 = 删除 preset 覆盖、回落到内置人设。
+**注入方式变了（不再写 profile patch）**：
 
-**注入方式**（踩过坑，记录原因）：
+- preset 里已删掉静态 `dsh-persona` 行；改由 `role: guard` 实例注册
+  `deployment:persona-prefix` 动态 section（`complete: true`）。
+- 桥接通过 Host 路由 `POST /dsh-qq-guard/persona` 推文本：
+  - 全局：启动 / 设置页变化时 `{mode:'default', text}`；
+  - 单人设：**每条消息前** `{sessionId, text}`（单人设 > 全局；没配单人设时推全局文本）。
+- 为什么每条消息都推：DSH 重启后插件内存态会丢，而桥接不重启；每轮重推即可自愈，
+  代价只是一次本地 HTTP。
+- 非管理员发言时，推送的文本末尾追加「拒绝清空记忆/重置会话/改配置」的提示
+  （`ADMIN_GUARD_NOTE`），所以同一个人设可以按发言人切换行为，不用往对话里塞系统消息。
+- **生效范围**：不再是「只对新建会话生效」——动态 section 每次组装现读，保存后下一条消息即生效。
+- 「恢复默认人设」= 单人设置空 → 桥接回落到全局 → 全局为空则用 `personaDefault`。
 
-- `session/prompt` **不支持**单次覆盖 system prompt —— 它的严格 schema 只接受
-  `{requestId, sessionId, mode, content, clientTimeZone}` 且 `additionalProperties: false`
-  （证据：`dsh-api-session-controller/lib/typert.host.js:1795`）。所以人设不可能随单条消息注入。
-- 人设只能改 preset：preset 的 persona 行注册 `deployment:persona-prefix` 段落，
-  且该 preset 用 `complete: true`，人设即唯一系统提示词。
-- 因此桥接在检测到任一 persona 字段变化时，先 `bridge.buildPersonaPrompt()` 拼好文本，
-  再**写回 profile 的用户 patch 层** `~/.dsh/profiles/<profile>/cordis.patch.yml`，
-  以同 id 覆盖 `preset-qq-chat`（见 `src/persona.mjs`）。
-- ⚠️ **安全约束**：patch 里同 id 的 `config` 是**整体替换**而非深合并。如果只写一个
-  只含 persona 的覆盖块，会把 preset 里其余插件（`tool-ask-user` / `todo_write` /
-  `qq-guard` / `compaction`）全部丢掉——**QQ 会话会失去工具门禁**。
-  所以 `persona.mjs` 的做法是：从插件自己的 bundle patch 读出 preset **完整定义**，
-  只替换 `persona.prefix`，再把完整定义写进用户 patch。回归用例
-  `test-persona.mjs` 专门锁死这条红线（断言 `@local/dsh-qq-guard` 仍在覆盖块里）。
-- **生效范围**：只对**新建** QQ 会话生效。已有会话保留原人设与上下文，不重建。
-  想让老会话也用新人设：删掉 `~/.dsh/profiles/<profile>/cordis.patch.yml` 里的人设覆盖块
-  并重启 DSH，或在 DSH 里归档该会话后重发消息（会重建）。
-- 「恢复默认人设」= 删除用户 patch 里的覆盖块，回落到 bundle 层默认人设。
+### 管理员权限（/ 指令）
+
+- `allow.admins`（数组，设置页「白名单管理 → 管理员 QQ 号」）。
+- 收到以 `/` 开头的消息：发送者不在名单 → 回 `⚠️ 权限不足，只有管理员才能执行此指令。`，
+  **不投递 DSH**，未读清零；在名单 → 正常投递（等 DSH/后续指令实现处理）。
+- 管理员身份**不绕过白名单**：不在 `allow.private` / `allow.groups` 里，普通消息仍会被挡。
+- 配置每次现读（热更新），改完下一条生效。
+
+### 会话指令（清空 / 删除 / 单人设保存）
+
+UI 无法直接改 `state/sessions.json`（桥接会覆盖），所以走「队列 + 轮询」：
+
+```
+UI → POST /dsh-qq-guard/session-ops {op,key,text?}   （Host 队列，30s 租约，5 分钟 TTL）
+桥接每 2s → GET 同一路由 → 执行 → POST {results} 回执
+```
+
+- `clear`：归档旧会话（`stopActivity: true`，否则活跃会话归档失败）→ 同工作区建新会话
+  → 重新对齐标题 → 未读清零；归档失败也继续建。
+- `delete`：归档旧会话（同样 stopActivity）+ 删除本地映射；归档失败仍删映射。
+- `persona`：写 `sessions.json` 的 `persona` 并立即推送。
+- 轮询器在 `src/session-ops.mjs`，失败只记一次 warn，不影响聊天。
+
+### 批量修正历史标题
+
+```bash
+node tools/rename-sessions.mjs            # 预演（默认）
+node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔）
+```
+
+只改有映射且标题不符的会话；计划函数在 `src/rename-plan.mjs`（离线用例覆盖）。
 
 ### 实现要点（插件侧）
 
@@ -388,6 +415,45 @@ QQ 账号在线（WS get_status 确认）
 - 重试入口是 `Bridge.cleanupStale({ archive = true })`：遍历 `state.stale` 逐个归档，
   成功的移出，返回 `{ ok, archived, failed, remaining }`（由 Host 设置页路由调用）。
 
+### 会话标题与未读（设置页「会话管理」的真实数据源）
+
+`state/sessions` 的值从「裸 sessionId 字符串」升级成对象；旧文件**读入时自动迁移**，
+不丢映射、不需要手工改：
+
+```json
+"sessions": {
+  "u:1234567890": {
+    "sessionId": "session-105cd393-…",
+    "unread": 0,
+    "kind": "private",
+    "qq": "1234567890",
+    "name": "翎羽",
+    "title": "私聊-翎羽",
+    "lastAt": 1792471261621,
+    "lastText": "小鱼下午好",
+    "nameAt": 1792471261621
+  }
+}
+```
+
+**强制命名**（`Bridge._ensureSessionTitle`）：
+
+- 规则由 `sessionTitleFor` 统一：`私聊-昵称` / `群聊-群名(群号)`（群号必带，同名群在侧栏无法区分）。
+- 建会话后**立刻**调 DSH 的 `session/rename`。一旦标题以 `source: 'user'` 落盘，
+  DSH 自己的自动标题（fallback / LLM）就不会再覆盖它；DSH 那个「向」就是这么来的——
+  实测日志里 fallback 是「小鱼下午好」，标题 LLM 返回了单字「向」。
+- 接管已有会话时只在「标题没对齐过」时再改一次；DSH 每次 rename 都会 resume 会话，不能每轮都调。
+- 昵称 / 群名来源：私聊 `get_stranger_info`（失败退消息事件里的 `sender.card||nickname`），
+  群聊 `get_group_info`（群名不在消息事件里）。缓存 `NAME_TTL_MS=30min`，
+  失败退回号码，**命名失败绝不阻塞聊天**。
+
+**未读**（`_noteIncoming` / `_noteReplied`）：
+
+- 通过白名单的消息一律 `unread+1` 并更新 `lastAt` / `lastText`（80 字预览），
+  包括随后被响应档位跳过 / 静音 / 限频的——红点语义是「有人找你」，不是「模型回没回」。
+- 只有**真的发到 QQ** 才清零；发送失败、超时、被安全策略拦下（但仍回了提示语）都按实际发送结果处理。
+- 数据随 `/dsh-qq-guard/status` 的 `sessions` 字段上报（`buildBridgeStatus`），Host 再给设置页轮询。
+
 ## 分片与打字延时
 
 **模型换行 = 气泡边界**：模型用换行分段时，桥接**不二次切**，直接按行发多条。
@@ -404,8 +470,11 @@ QQ 账号在线（WS get_status 确认）
    URL 不拆（不做短链）。识别在 `splitBubbles` 入口做。
 5. **结尾标点**：发送层裁掉每片末尾空白与标点，`？`/`！` 默认保留（可配
    `trimEndPunctuation.keep`）；代码块、链接例外。
-6. **打字延时**：按分片**码点数**分级 —— <10 字 200ms / 10~14 字 450ms /
-   15~30 字 800ms，±15% 抖动，下限 150ms。emoji 代理对算 1 个码点、不拆。
+6. **打字延时**：按分片**码点数**分级 —— 默认 <10 字 200ms / 10~14 字 450ms /
+   15+ 字 800ms，±15% 抖动，下限 150ms。emoji 代理对算 1 个码点、不拆。
+   三档的**字数边界**（`typingDelayCharTiers.shortMax/mediumMax/longMin`）与
+   **毫秒基准**（`flypitDelayTiers.short/medium/long`）都可在设置页改，桥接 2 秒内热读；
+   边界写反（如 20/10/5）会被归一化成单调递增，不会出现分档错乱。
 
 ### 群聊 @ 回复
 
@@ -421,11 +490,18 @@ QQ 账号在线（WS get_status 确认）
 ```json
 [
   { "type": "at",   "data": { "qq": "发送者QQ号" } },
-  { "type": "text", "data": { "text": "这一片的正文" } }
+  { "type": "text", "data": { "text": " 这一片的正文" } }
 ]
 ```
 
+注意 `text` 段**开头有一个空格**（2026-10-23 修）：OneBot 的 at 段本身不携带空白，
+两个段紧挨着会渲染成「@群友收到」，模型和群友都会看错。
+
 不带 @ 的分片仍是纯文本字符串。代码块 / URL 作为原子块原样放进 `text` 段，不被破坏。
+
+**入站 @**（也是 2026-10-23 修）：收到群消息时，`at` 段转成 `@昵称 `（拿不到昵称就
+`@QQ号 `，`@all` → `@全体成员 `），与后面的正文之间一定有空格。昵称来源是
+「同一个群里最近说过话的人」的内存缓存，不额外打 NapCat API；没说过话就退回 QQ 号。
 
 
 **间隔优先级**：`typingDelay.enabled=true`（默认）走上面的**分级延时**，
@@ -437,6 +513,53 @@ QQ 账号在线（WS get_status 确认）
 重试同一片时用原间隔，不受批次间隔影响。
 
 > 审计顺序不变：**先对全文做审计，命中则整条不发**，之后才拆分。
+
+## 图片理解 / 发语音 / 技能开关（Phase 6，2026-10-23）
+
+设置页「技能与插件」的开关不再只是 UI：Host 把六个已实装开关算成 `features`
+（`voice / vision / search / guard / debounce / rateLimit`）随 `/dsh-qq-guard/config`
+下发，桥接每 2 秒热读。未同步到时按默认（全开）走。
+
+### 图片理解（sk-vision）
+
+- 收到 `type: "image"` 段时，`onebot.mjs` 把它单独抽成 `images[]`（`url` / `file` / `size`），
+  `text` 里仍保留 `[图片]` 占位（日志/审计用）。
+- 桥接按 `url`（没有就 `file`）下载：支持 http(s) / `data:` / `base64://` / `file://` /
+  绝对路径；单张 ≤ 8MB，一条消息最多 4 张；只接受 PNG / JPEG / GIF / WebP（DSH 附件的白名单）。
+- 下载后转成 DSH prompt content 的 image part：
+  `[{ type:'text', text }, { type:'image', data:<canonical base64>, mediaType }]`，
+  走 `session/prompt` 投递给模型。
+- 三道闸：技能关闭 / 模型未声明支持 image / 图片下载失败 → **退回纯文本**并附一句
+  「你看不到图片内容，别编造」，绝不让模型假装看见。
+- DSH 的 admission 按**会话当前选择**的模型校验图片能力（无痕模型覆写不改会话选择），
+  所以被拒时会自动降级重试一次纯文本。新会话的**第一条**消息如果就是图片，可能会
+  走到这条降级；先聊一句文字后就会按覆写路由放行。
+- 纯图片消息（没有文字）不再被丢弃：文本兜底为「（对方只发了图片，没有文字）」。
+
+### 发语音（sk-voice）
+
+- guard 实例在 preset 作用域注册 `qq_send_voice` 工具（`text` 必填，`voice` 可选），
+  执行时只把任务入队（`sessionId + text + voice`）——插件不碰 NapCat。
+- 桥接轮询会话指令时执行 `voice` op：按 `sessionId` 反查 QQ 会话 key → TTS 合成 →
+  `send_group_msg` / `send_private_msg` 的 `record` 段（`base64://...`）发送。
+- TTS 实现 `src/tts.mjs`，零 npm 依赖：
+  - `edge`（默认，免 Key）：微软 Edge 朗读 WebSocket，带 Sec-MS-GEC 签名，输出 mp3；
+  - `openai`：任意 OpenAI 兼容 `POST /v1/audio/speech`（baseUrl + apiKey）。
+- 单条上限 240 字（约 60 秒）。mp3 → QQ 语音的转码由 NapCat 完成；NapCat 不支持时
+  发送会失败，日志里有 retcode，不会卡住聊天。
+- 技能关闭时工具执行期直接拒绝（guard 层），UI 上也会标「开发中」以外的状态。
+
+### 网页搜索（sk-search）
+
+- 开启：guard 执行期放行 `web_search` / `web_fetch`（DSH 原生联网工具）；
+- 关闭：执行期拒绝。人设里也会多一行「可以联网检索」的能力说明，只在开启时出现。
+
+### 工具门禁 / 防抖 / 限频（pl-*）
+
+- `pl-guard` 关闭 = **显式放弃执行期白名单**（schema 层 `restrict` 仍隐藏全局危险工具，
+  但 agent-scope 工具不再被 guard 拦）。设置页有高风险提示，默认开启。
+- `pl-debounce` 关闭：不再攒防抖窗口，消息立即投递。
+- `pl-ratelimit` 关闭：不做每会话每分钟限频。
 
 ## 运行
 

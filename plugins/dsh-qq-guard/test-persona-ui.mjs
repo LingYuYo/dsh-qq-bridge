@@ -305,6 +305,37 @@ check('选择已有自定义人设 → 角色设定回填', () => {
   btnByText(tree, '取消').props.onClick()
 })
 
+check('自定义人设可改名，保存写回 personaPresets[].name', () => {
+  let tree = renderSettings()
+  btnByText(tree, '⚙️ 编辑人设').props.onClick()
+  tree = repaint()
+  const nameInput = () => findAll(tree, (n) => n.tag === 'input'
+    && n.props?.['aria-label'] === '人设名称')[0]
+  // 先切回默认人设：默认人设没有名字可改，输入框不该出现。
+  findAll(tree, (n) => n.tag === 'select' && n.props?.['aria-label'] === '选择人设')[0]
+    .props.onChange({ target: { value: '' } })
+  tree = repaint()
+  assert(!nameInput(), '默认人设下不该显示「人设名称」输入框')
+  // 选自定义人设 → 出现改名输入框，初值是当前 name。
+  findAll(tree, (n) => n.tag === 'select' && n.props?.['aria-label'] === '选择人设')[0]
+    .props.onChange({ target: { value: 'p1' } })
+  tree = repaint()
+  assert(nameInput(), '选中自定义人设后缺「人设名称」输入框')
+  const toolbar = findAll(tree, (n) => n.props?.className === 'qqg-persona-toolbar')[0]
+  assert(findAll(toolbar, (n) => n.props?.['aria-label'] === '人设名称').length === 1,
+    '「人设名称」输入框应在人设工具栏里')
+  assert(nameInput().props.value === '猫娘', `初始名称不对：${nameInput().props.value}`)
+  nameInput().props.onChange({ target: { value: '傲娇猫娘' } })
+  tree = repaint()
+  // 下拉选项文案跟着 draft 同步（保存前就该看到新名字）。
+  const options = findAll(tree, (n) => n.tag === 'option').map(textOf)
+  assert(options.includes('傲娇猫娘'), `下拉没同步新名字：${options.join('、')}`)
+  btnByText(tree, '保存').props.onClick()
+  tree = repaint()
+  const preset = VALUE.personaPresets.find((p) => p.id === 'p1')
+  assert(preset && preset.name === '傲娇猫娘', `改名没写回：${JSON.stringify(VALUE.personaPresets)}`)
+})
+
 check('删除当前自定义人设 → 清空选择并回落到默认', () => {
   let tree = renderSettings()
   btnByText(tree, '⚙️ 编辑人设').props.onClick()

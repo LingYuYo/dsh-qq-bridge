@@ -243,7 +243,7 @@ const MODALS = [
   { name: 'modal-tile-settings', tab: 'skills', idx: 2, value: { kind: 'skill', item: TEST_SKILL }, title: '技能设置' },
   { name: 'modal-tile-delete', tab: 'skills', idx: 3, value: { kind: 'plugin', item: TEST_PLUGIN }, title: '删除确认' },
   { name: 'modal-tile-add', tab: 'skills', idx: 4, value: 'skill', title: '添加技能' },
-  { name: 'modal-session-delete', tab: 'sessions', idx: 4, value: true, title: '会话删除' },
+  // 会话删除确认框已随「删除会话」功能排到下一批，本批只接真实列表与未读。
   // 引导弹窗已挪到左侧导航底部，开关是 SettingsPanel 的 #2（guideOpen），不在 SettingsTab 里。
   { name: 'modal-guide', tab: 'settings', panelHook: 2, value: true, title: '使用引导' },
   // SettingsTab：分片/打字延时已合并成两个大按钮，弹窗开关是 #0 sendOpen / #1 activeOpen。

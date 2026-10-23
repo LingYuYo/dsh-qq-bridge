@@ -25,6 +25,8 @@ const HOT_KEYS = [
   'groupAtPosition',
   'typingDelay',
   'flypitDelayTiers',
+  // 打字延时的字数档位（2026-10-23）：短句上限 / 中等上限 / 长句触发。
+  'typingDelayCharTiers',
   'trimEndPunctuation',
   // 批次 4A-UI：白名单与人设也必须热更新。
   'allow',
@@ -35,8 +37,20 @@ const HOT_KEYS = [
   'personaParticipation',
   'personaExtraRules',
   'personaSystemPrompt',
+  // preset 内置默认人设：preset 里已删静态 persona 行，正文搬到插件 Config。
+  // 热同步拿到后 buildPersonaPrompt 才有兜底文本。
+  'personaDefault',
   // Phase 4：节奏参数（响应档位/防抖/限频/禁言）必须热更新。
   'rhythm',
+  // Phase 6：技能开关（发语音/图片理解/网页搜索/工具门禁）必须热更新 ——
+  // 桥接据此决定「要不要把图片喂给模型」「要不要发语音」「防抖/限频是否启用」。
+  // features 是 Host 侧按同一份逻辑算好的派生值（skills/plugins → 布尔），
+  // 桥接优先用它，避免两个进程各写一套 id 判断而漂移。
+  'skills',
+  'plugins',
+  'features',
+  // 语音合成配置（provider / baseUrl / apiKey / voice）：桥接进程负责真正合成。
+  'voice',
   // 模型配置（无痕热切换 + 失败降级）：设置页改完，下一条消息就按新配置下发。
   'model',
   'modelFallbacks',
@@ -65,6 +79,8 @@ const PERSONA_KEYS = [
   'personaParticipation',
   'personaExtraRules',
   'personaSystemPrompt',
+  // 默认人设变化也要重推（它决定「什么都没自定义」时的人设正文）。
+  'personaDefault',
   // 模型路由会注入人设（【底层模型】一行），所以它也是人设签名的一部分：
   // 设置页换模型时必须触发一次重写，否则模型身份会落后于实际请求。
   'model',

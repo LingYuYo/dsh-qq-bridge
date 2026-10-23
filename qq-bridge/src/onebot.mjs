@@ -25,8 +25,13 @@ const DEFAULT_MERGE_MAX_CHARS = 15
 const MIN_FIRST_PIECE_CHARS = 6
 const DEFAULT_SEND_INTERVAL_MS = 500
 const DEFAULT_DEDUP_CAPACITY = 500
-// 打字延时分级：<10 → 200ms；10~14 → 450ms；15~30（含更长的原子块）→ 800ms。
-const TYPING_DELAY_TIERS = [[10, 200], [15, 450], [Infinity, 800]]
+// 打字延时分级：<10 → 200ms；10~14 → 450ms；15+ → 800ms。
+// 2026-10-23：三档的**字数边界**与**毫秒基准**都改成可配置（设置页 → 信息发送配置），
+// 这里的常量只作兜底，见 typingDelayFor 的第三参。
+/** 字数边界默认值（与插件 Config 的 typingDelayCharTiers 默认值保持一致）。 */
+export const DEFAULT_TYPING_CHAR_TIERS = Object.freeze({ shortMax: 10, mediumMax: 14, longMin: 15 })
+/** 毫秒基准默认值（与插件 Config 的 flypitDelayTiers 默认值保持一致）。 */
+export const DEFAULT_TYPING_MS_TIERS = Object.freeze({ short: 200, medium: 450, long: 800 })
 const TYPING_DELAY_JITTER = 0.15
 const TYPING_DELAY_MIN_MS = 150
 // 片尾标点默认保留「？！」（问号感叹号承载语气，不能裁）。
@@ -61,10 +66,42 @@ export function escapeCqText(text) {
   return String(text ?? '').replace(/\[CQ:/gi, '[CQ：')
 }
 
+/**
+ * 抽出图片段（2026-10-23，任务 5）。
+ *
+ * OneBot/NapCat 的 image 段通常带 `url`（可直接下载）和 `file`（文件名/本地路径）。
+ * 桥接优先用 url；没有 url 时把 file 原样交给下载器（支持 http / file:// / 绝对路径）。
+ * 只做结构提取，不在这里发网络请求——下载逻辑在 bridge.mjs，便于注入测试。
+ *
+ * @param {Array|string} message OneBot 消息段
+ * @returns {Array<{url:string, file:string, summary:string, size:number}>}
+ */
+export function extractImages(message) {
+  if (!Array.isArray(message)) return []
+  const out = []
+  for (const seg of message) {
+    if (!seg || seg.type !== 'image') continue
+    const data = seg.data && typeof seg.data === 'object' ? seg.data : {}
+    const url = String(data.url ?? '').trim()
+    const file = String(data.file ?? '').trim()
+    const summary = String(data.summary ?? data.sub_type ?? '').trim()
+    if (!url && !file) continue
+    const size = Number(data.file_size)
+    out.push({
+      url: url || file,
+      file,
+      summary,
+      size: Number.isFinite(size) && size > 0 ? size : 0,
+    })
+  }
+  return out
+}
+
 /** 字符串格式消息里的 CQ 码转纯文本（array 格式不走这里）。 */
 export function cqToText(text) {
   return String(text ?? '')
-    .replace(/\[CQ:at,[^\]]*qq=([^,\]]+)[^\]]*\]/gi, (_, qq) => (String(qq) === 'all' ? '@全体成员' : `@${qq}`))
+    // @ 后面必须留一个空格：否则「@123你好」会被模型当成一个整体。
+    .replace(/\[CQ:at,[^\]]*qq=([^,\]]+)[^\]]*\]/gi, (_, qq) => (String(qq) === 'all' ? '@全体成员 ' : `@${qq} `))
     .replace(/\[CQ:image[^\]]*\]/gi, '[图片]')
     .replace(/\[CQ:(?:m?face|sface)[^\]]*\]/gi, '[表情]')
     .replace(/\[CQ:record[^\]]*\]/gi, '[语音]')
@@ -75,15 +112,26 @@ export function cqToText(text) {
     .replace(/\[CQ:(?:reply|poke|shake|anonymous|rps|dice)[^\]]*\]/gi, '')
     .replace(/\[CQ:([a-z]+)[^\]]*\]/gi, (_, type) => `[${type}]`)
     .replace(/&#91;/g, '[').replace(/&#93;/g, ']').replace(/&#44;/g, ',')
+    .replace(/[ \t]{2,}/gu, ' ')
+    .trim()
 }
 
 /**
  * 消息段转纯文本。
- * text → 原文；image → [图片]；at → @QQ号；其余常见类型给占位符。
+ *
+ * @ 的格式（2026-10-23 修）：
+ *   · 群里 @ 某人 → `@昵称 `（昵称取自 data.name / 调用方解析器；拿不到就 `@QQ号 `）；
+ *   · `@全体成员 `；
+ *   · **@ 和后面的正文之间必须有空格**，否则模型看到的是 `@1000000001你好`，
+ *     既分不清 @ 目标，也读不出这是两个 token。
+ *
  * @param {Array|string} message array 格式消息段，或 CQ 字符串
  * @param {string} [rawMessage] message 为空时兜底
+ * @param {{resolveAtName?: (qq:string) => string|undefined}} [options]
+ *   昵称解析器：由 OneBotClient 用「群成员发言缓存」实现（不额外打 API）。
  */
-export function parseMessage(message, rawMessage = '') {
+export function parseMessage(message, rawMessage = '', options = {}) {
+  const resolveAtName = typeof options?.resolveAtName === 'function' ? options.resolveAtName : null
   if (Array.isArray(message)) {
     const parts = []
     for (const seg of message) {
@@ -95,7 +143,12 @@ export function parseMessage(message, rawMessage = '') {
         case 'image': parts.push('[图片]'); break
         case 'at': {
           const qq = String(data.qq ?? '')
-          parts.push(qq === 'all' ? '@全体成员' : `@${qq}`)
+          if (qq === 'all') { parts.push('@全体成员 '); break }
+          // 昵称优先级：段里自带的 name > 群成员发言缓存 > QQ 号。
+          // （OneBot 标准 at 段只有 qq；部分实现会额外带 name。）
+          const inline = String(data.name ?? '').trim()
+          const cached = inline === '' && resolveAtName ? String(resolveAtName(qq) ?? '').trim() : ''
+          parts.push(`@${inline || cached || qq} `)
           break
         }
         case 'face': case 'mface': case 'sface': parts.push('[表情]'); break
@@ -109,7 +162,8 @@ export function parseMessage(message, rawMessage = '') {
         default: parts.push(`[${type}]`)
       }
     }
-    return parts.join('').trim() || cqToText(rawMessage).trim()
+    // 归一化空白：text 段自己带的空格 + @ 尾巴的空格叠在一起时只留一个。
+    return parts.join('').replace(/[ \t]{2,}/gu, ' ').trim() || cqToText(rawMessage).trim()
   }
   if (typeof message === 'string' && message) return cqToText(message).trim()
   if (typeof rawMessage === 'string') return rawMessage.trim()
@@ -378,19 +432,60 @@ function splitByLines(text, hard) {
 }
 
 /**
- * 分级打字延时：按分片**码点**数选基准，±15% 抖动，下限 150ms。
- * <10 → 200ms；10~14 → 450ms；15+ → 800ms。
+ * 分级打字延时：按分片**码点**数选档，±15% 抖动，下限 150ms。
+ *
+ * 档位边界与毫秒基准都可配置（2026-10-23）：
+ *   · `charTiers`：{ shortMax, mediumMax, longMin } —— 默认 <10 / 10~14 / 15+；
+ *   · `msTiers`：{ short, medium, long } —— 默认 200 / 450 / 800。
+ *
+ * 兼容旧调用：`typingDelayFor(n, rand)` 仍然走默认档位。
+ *
  * @param {number} chars
  * @param {() => number} [rand=Math.random]
+ * @param {{charTiers?:object, msTiers?:object}} [tiers]
  */
-export function typingDelayFor(chars, rand = Math.random) {
+export function typingDelayFor(chars, rand = Math.random, tiers = {}) {
   const n = Number.isFinite(chars) ? chars : 0
-  let base = TYPING_DELAY_TIERS[TYPING_DELAY_TIERS.length - 1][1]
-  for (const [limit, ms] of TYPING_DELAY_TIERS) {
-    if (n < limit) { base = ms; break }
-  }
+  const charTiers = normalizeTypingCharTiers(tiers?.charTiers)
+  const msTiers = normalizeTypingMsTiers(tiers?.msTiers)
+  let base
+  if (n < charTiers.shortMax) base = msTiers.short
+  else if (n <= charTiers.mediumMax || n < charTiers.longMin) base = msTiers.medium
+  else base = msTiers.long
   const jitter = 1 + (rand() * 2 - 1) * TYPING_DELAY_JITTER
   return Math.max(TYPING_DELAY_MIN_MS, Math.round(base * jitter))
+}
+
+/**
+ * 归一化字数档位：任何非法值都回落到默认，且保证边界单调
+ * （shortMax ≤ mediumMax < longMin），避免设置页写成 20/10/5 之后分档错乱。
+ * @param {unknown} source
+ * @returns {{shortMax:number, mediumMax:number, longMin:number}}
+ */
+export function normalizeTypingCharTiers(source) {
+  const raw = source && typeof source === 'object' && !Array.isArray(source) ? source : {}
+  const num = (value, fallback) => {
+    const n = Number(value)
+    return Number.isFinite(n) && n >= 1 ? Math.floor(n) : fallback
+  }
+  const shortMax = num(raw.shortMax, DEFAULT_TYPING_CHAR_TIERS.shortMax)
+  const mediumMax = Math.max(shortMax, num(raw.mediumMax, DEFAULT_TYPING_CHAR_TIERS.mediumMax))
+  const longMin = Math.max(mediumMax + 1, num(raw.longMin, DEFAULT_TYPING_CHAR_TIERS.longMin))
+  return { shortMax, mediumMax, longMin }
+}
+
+/** 归一化三档毫秒基准（负数/非数字回落默认）。 */
+export function normalizeTypingMsTiers(source) {
+  const raw = source && typeof source === 'object' && !Array.isArray(source) ? source : {}
+  const num = (value, fallback) => {
+    const n = Number(value)
+    return Number.isFinite(n) && n >= 0 ? n : fallback
+  }
+  return {
+    short: num(raw.short, DEFAULT_TYPING_MS_TIERS.short),
+    medium: num(raw.medium, DEFAULT_TYPING_MS_TIERS.medium),
+    long: num(raw.long, DEFAULT_TYPING_MS_TIERS.long),
+  }
 }
 
 /**
@@ -466,6 +561,8 @@ export class OneBotClient {
    * @param {boolean} [opts.trimEndPunctuation=true] 是否裁片尾标点
    * @param {boolean} [opts.groupAtReply=true] 群聊回复时是否 @ 发送者
    * @param {'first'|'last'} [opts.groupAtPosition='last'] @ 挂在哪一片
+   * @param {object} [opts.typingDelayCharTiers] 字数档位边界 { shortMax, mediumMax, longMin }
+   * @param {object} [opts.typingDelayMsTiers] 三档毫秒基准 { short, medium, long }
    * @param {number} [opts.dedupCapacity=500]
    */
   constructor({
@@ -481,6 +578,8 @@ export class OneBotClient {
     sendIntervalMs,
     batchIntervalMs,
     typingDelayEnabled,
+    typingDelayCharTiers,
+    typingDelayMsTiers,
     keepEndPunct,
     trimEndPunctuation,
     groupAtReply,
@@ -501,6 +600,10 @@ export class OneBotClient {
     // 0/未设 = 不额外限制，完全沿用原来的分级打字延时（保持旧行为）。
     this.batchIntervalMs = Number.isFinite(batchIntervalMs) && batchIntervalMs > 0 ? Number(batchIntervalMs) : 0
     this.typingDelayEnabled = typingDelayEnabled !== false
+    // 字数档位 / 毫秒基准（2026-10-23）：由 bridge 从热配置刷进来；
+    // 未设时用默认值，行为与旧版一致（<10 / 10~14 / 15+，200 / 450 / 800ms）。
+    this.typingDelayCharTiers = normalizeTypingCharTiers(typingDelayCharTiers)
+    this.typingDelayMsTiers = normalizeTypingMsTiers(typingDelayMsTiers)
     this.keepEndPunct = Array.isArray(keepEndPunct) ? keepEndPunct : DEFAULT_KEEP_END_PUNCT
     this.trimEndPunctuation = trimEndPunctuation !== false
     this.groupAtReply = groupAtReply !== false
@@ -518,6 +621,11 @@ export class OneBotClient {
     this._handlers = new Set()
     this._seen = new Set()
     this._seenOrder = []
+    // 群成员昵称缓存（2026-10-23）：@ 段通常只有 QQ 号，没有昵称。
+    // 这里记录「最近说过话的人」的显示名，parseMessage 遇到 @ 时按 key 查。
+    // 只做内存缓存，不额外打 NapCat API；30 分钟没说话就自然淘汰。
+    this._atNames = new Map() // `${groupId|'u'}:${qq}` -> { name, at }
+    this._atNamesCap = 2000
     this._selfId = null
     this._nickname = null
     this._health = {
@@ -660,6 +768,47 @@ export class OneBotClient {
     return await this._sendText('group', groupId, text, at)
   }
 
+  /**
+   * 发一条 QQ 语音（record 段，2026-10-23「发语音」技能）。
+   *
+   * 为什么用 `base64://` 而不是文件路径：
+   *   · 桥接进程不保证和 NapCat 共享同一个文件系统视图；
+   *   · 落盘还要处理清理（语音文件攒多了很占地方）。
+   * NapCat 对 record 段的 file 支持 base64://，内部会转码成 QQ 语音所需格式。
+   *
+   * @param {'private'|'group'} kind
+   * @param {string|number} targetId QQ 号 / 群号
+   * @param {string} base64 纯 base64（不带 data: 前缀）
+   * @param {{atUserId?:string}} [opts]
+   * @returns {Promise<{ok:boolean, messageIds:string[], error?:string, bytes?:number}>}
+   */
+  async sendVoice(kind, targetId, base64, { atUserId } = {}) {
+    const id = String(targetId ?? '').trim()
+    if (!/^\d+$/.test(id) || id === '0') {
+      return { ok: false, messageIds: [], error: `${kind === 'private' ? 'user_id' : 'group_id'} 必须是正整数：${targetId}` }
+    }
+    const data = String(base64 ?? '').trim()
+    if (!data) return { ok: false, messageIds: [], error: '语音内容为空' }
+    const message = []
+    if (kind === 'group' && atUserId !== undefined && /^\d+$/.test(String(atUserId).trim())) {
+      message.push({ type: 'at', data: { qq: String(atUserId).trim() } })
+      message.push({ type: 'text', data: { text: ' ' } })
+    }
+    message.push({ type: 'record', data: { file: `base64://${data}` } })
+    const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg'
+    const params = kind === 'private' ? { user_id: Number(id), message } : { group_id: Number(id), message }
+    try {
+      const res = await this.call(action, params)
+      if (res?.status === 'ok' && Number(res?.retcode) === 0) {
+        const mid = res?.data?.message_id
+        return { ok: true, messageIds: mid === undefined || mid === null ? [] : [String(mid)], bytes: data.length }
+      }
+      return { ok: false, messageIds: [], error: `retcode=${res?.retcode} status=${res?.status}` }
+    } catch (error) {
+      return { ok: false, messageIds: [], error: error?.message ?? String(error) }
+    }
+  }
+
   // ── 内部实现 ────────────────────────────────────────────────────────────
 
   /**
@@ -677,9 +826,12 @@ export class OneBotClient {
       && /^\d+$/.test(String(atUserId).trim())
     if (!needAt) return escapeCqText(text)
     // at 放文本**前面**：QQ 客户端里 @ 会高亮成「@昵称」，正文跟在其后读起来自然。
+    // at 与正文之间必须有一个空格（2026-10-23 修）：OneBot 的 at 段本身不负责空白，
+    // 两个段紧挨着渲染出来就是「@群友你好」，模型和群友都会看错。
+    const body = escapeCqText(String(text ?? '').replace(/^[ \t]+/u, ''))
     return [
       { type: 'at', data: { qq: String(atUserId).trim() } },
-      { type: 'text', data: { text: escapeCqText(text) } },
+      { type: 'text', data: { text: ' ' + body } },
     ]
   }
 
@@ -775,7 +927,39 @@ export class OneBotClient {
   /** 原间隔计算（不含批次间隔）：重试等待也用它，别把重试拖成 2.5 秒。 */
   _baseGap(index, chunks) {
     if (!this.typingDelayEnabled) return this.sendIntervalMs
-    return typingDelayFor(charCount(chunks[index] ?? ''))
+    return typingDelayFor(charCount(chunks[index] ?? ''), Math.random, {
+      charTiers: this.typingDelayCharTiers,
+      msTiers: this.typingDelayMsTiers,
+    })
+  }
+
+  /**
+   * 记一个群成员/私聊对象的显示名，供 @ 解析用。
+   * 只在消息事件里顺手记，不发额外请求。
+   * @param {string} scopeKey 群号或 'u'
+   * @param {string} qq
+   * @param {string} name
+   */
+  _rememberName(scopeKey, qq, name) {
+    const key = `${scopeKey}:${qq}`
+    const value = String(name ?? '').trim()
+    if (!value) return
+    this._atNames.delete(key) // 重新插入到 Map 尾部，保持 LRU 顺序
+    this._atNames.set(key, { name: value, at: Date.now() })
+    while (this._atNames.size > this._atNamesCap) {
+      this._atNames.delete(this._atNames.keys().next().value)
+    }
+  }
+
+  /** 查群成员昵称；超过 30 分钟没说话就当未知（可能已改名/退群）。 */
+  _nameOf(scopeKey, qq) {
+    const hit = this._atNames.get(`${scopeKey}:${qq}`)
+    if (!hit) return ''
+    if (Date.now() - hit.at > 30 * 60 * 1000) {
+      this._atNames.delete(`${scopeKey}:${qq}`)
+      return ''
+    }
+    return hit.name
   }
 
   _buildUrl() {
@@ -1007,13 +1191,24 @@ export class OneBotClient {
     const rawSender = packet.sender && typeof packet.sender === 'object' ? packet.sender : {}
     const userId = String(packet.user_id ?? rawSender.user_id ?? '')
     if (!userId) return null
+    // 群成员昵称缓存：先记下当前发言人，parseMessage 解析 @ 时就能把
+    // 「@1000000001」变成「@小明」。私聊用 'u' 作为作用域。
+    const scopeKey = kind === 'group' ? String(packet.group_id ?? '') : 'u'
+    const senderName = String(rawSender.card || rawSender.nickname || '')
+    if (scopeKey) this._rememberName(scopeKey, userId, senderName)
+    const message = packet.message
     return {
       kind,
       userId,
       groupId: kind === 'group' ? String(packet.group_id ?? '') || null : null,
-      text: parseMessage(packet.message, packet.raw_message),
+      text: parseMessage(message, packet.raw_message, {
+        resolveAtName: (qq) => this._nameOf(scopeKey, qq),
+      }),
+      // 图片段单独抽出来：text 里仍保留 [图片] 占位（审计/日志用），
+      // 但桥接要拿 url 去下载，喂给支持多模态的模型（2026-10-23，任务 5）。
+      images: extractImages(message),
       messageId: packet.message_id === undefined || packet.message_id === null ? '' : String(packet.message_id),
-      senderName: String(rawSender.card || rawSender.nickname || ''),
+      senderName,
       sender: rawSender,
       selfId: packet.self_id === undefined || packet.self_id === null ? null : String(packet.self_id),
       time: Number.isFinite(Number(packet.time)) ? Number(packet.time) : null,

@@ -44,8 +44,8 @@ profile 顶层实例持有配置，投影到「设置 → QQ 桥接」。左侧�
 
 | Tab | 内容 | 数据来源 |
 | --- | --- | --- |
-| 运行状态 | 桥接状态 / 启停 / 日志、NapCat 进程状态与启停、**NapCat 日志折叠框**、**系统底层事件折叠面板**、今日用量概览卡、AI 排障助手输入框 | 状态与启停走真实路由；**今日用量卡读真实 `/usage`**；AI 框为 **Mock 壳** |
-| 会话管理 | 左会话列表（含未读红点）+ 右详情（单人设覆盖 / 单独白名单 / 记忆提取 / 删除会话）+ `清理失效会话` | 列表 **Mock**；清理按钮走 **真实 Host 路由** |
+| 运行状态 | 桥接状态 / 启停 / 日志、NapCat 进程状态与启停、**NapCat 日志折叠框**、**登录二维码卡片（图片优先 / ASCII 兜底）**、**系统底层事件折叠面板**、今日用量概览卡、AI 排障助手输入框 | 状态与启停走真实路由；**今日用量卡读真实 `/usage`**；二维码直接读 NapCat 落盘的 `qrcode.png`；AI 框为 **Mock 壳** |
+| 会话管理 | 左会话列表（昵称 / 群名、未读红点、最近一条消息预览）+ 右详情（DSH 映射与标题、单人设覆盖、清空上下文、删除会话） | **全部真实**：列表来自桥接上报；清空/删除/单人设走 Host 指令队列 + 桥接 2 秒轮询 |
 | 技能与插件 | Skill / Plugin / 外部插件 三组卡片，外部插件带兼容标签与 `[测试运行]`，含版本号、齿轮、垃圾桶、拖拽手柄、上下移 | **全部真实配置读写**；沙箱测试走真实 Host 路由 |
 | 全局设置 | 运行节奏（两个大按钮 → 信息发送配置 / 活跃设置 弹窗）、**模型配置（无痕热切换 + 备用模型）**、**高级参数（折叠）**、人设概览卡（编辑收进弹窗）、白名单、OneBot、NapCat | **全部真实配置读写** |
 | 数据与用量 | 近 7 天柱状图 + Token 面积图，按天 / 按模型 / 按会话三张表，外加**峰谷时段设置**与**忙/闲两套单价配置卡** | **全部真实 `/usage` 数据**（5 秒轮询），成本按事件时刻分峰谷计价 |
@@ -127,6 +127,29 @@ profile 顶层实例持有配置，投影到「设置 → QQ 桥接」。左侧�
 
 「信息发送配置」弹窗用的是既有分片字段（`bubbleMaxChars`、`mergeMaxChars`、`chunkSize`、
 `typingDelay`、`flypitDelayTiers`、`sendIntervalMs`、`groupAt*`、`trimEndPunctuation`），本来就是真实读写。
+2026-10-23 起多了 `typingDelayCharTiers`（短句上限 / 中等上限 / 长句触发三个字数边界，
+默认 10 / 14 / 15），三档毫秒字段的标签会跟着这些阈值动态显示。
+
+### Phase 6：技能与插件真实接入（2026-10-23）
+
+12 张卡片里，下面这些不再是空壳（其余在 UI 上标「开发中」）：
+
+| 条目 | 真实行为 |
+| --- | --- |
+| 图片理解 `sk-vision` | 桥接下载 QQ 图片 → base64 → 按 DSH prompt content 的 image part 投递；模型不支持时退回纯文本并如实说明 |
+| 网页搜索 `sk-search` | `tools.guard` 放行 `web_search` / `web_fetch`；关闭即执行期拒绝 |
+| 发语音 `sk-voice` | guard 注册 `qq_send_voice` 工具 → 入队 → 桥接 Edge TTS / OpenAI 兼容 TTS 合成 → NapCat record 段发送 |
+| 工具门禁 `pl-guard` | `tools.guard` 总开关；关闭 = 显式放弃执行期白名单（restrict 仍隐藏全局工具，UI 有红字警告） |
+| 防抖合并 `pl-debounce` | 关闭则消息不再攒窗口，立即投递 |
+| 频率控制 `pl-ratelimit` | 关闭则不做每会话每分钟限频 |
+
+`GET /dsh-qq-guard/config` 额外返回 `features`（上述六个开关的派生布尔），
+桥接与 guard 共用同一份判断，避免两端各写一套 id 逻辑而漂移。桥接每 2 秒热读，
+改完下一条消息生效。
+
+语音合成配置在「全局设置 → 语音合成（TTS）」：provider = `edge`（免 Key）或
+`openai`（baseUrl + apiKey），音色默认 `zh-CN-XiaoyiNeural`。合成在桥接进程里做，
+插件只写配置 + 入队；NapCat 负责 mp3 → QQ 语音的转码，失败会写日志、不影响聊天。
 
 ### Phase 4：清理失效会话
 
@@ -154,7 +177,8 @@ profile 顶层实例持有配置，投影到「设置 → QQ 桥接」。左侧�
 - 通用 `Modal`：遮罩 + 卡片，Esc / 点遮罩 / 右上角 × 三种关闭方式。
 - 技能与插件卡片：原生 HTML5 `draggable` 拖拽排序，另有 `↑`/`↓` 按钮作为降级方案（键盘可用）。
 - 齿轮打开设置弹窗（左表单 / 右说明），垃圾桶与删除会话走 `ConfirmModal` 二次确认。
-- 「活跃设置」的参数（响应档位、防抖窗口、批次间隔、指令禁言）目前只存组件内 state，**不写配置**。
+- 「活跃设置」的参数（响应档位、防抖窗口、批次间隔、指令禁言）全部绑到 `rhythm.*` 真实配置，
+  改完写盘、桥接 2 秒内热读；滑条用本地草稿跟手，松手才提交（受控 range 直接吃异步回读会「拖不动」）。
 - 「全局设置」页顶部不再有引导卡片或按钮，引导只从左侧导航底部进入。
 
 ### NapCat 安装目录的「浏览」按钮
@@ -175,6 +199,27 @@ profile 顶层实例持有配置，投影到「设置 → QQ 桥接」。左侧�
 
 输入框用 `flex: 1` + `min-width: 0` 自适应（`.qqg-dir-row`），长路径不会撑破卡片；
 `napcat.dir` 为空时输入框下方有红字「未配置安装目录，NapCat 无法启动」，选完自动消失。
+
+### NapCat 登录二维码（2026-10-23 掉登录后补）
+
+NapCat 掉登录时，二维码有两种来源，面板**优先用图片**：
+
+1. **NapCat 自己落盘的截图**：`<napcatDir>/versions/<ver>/resources/app/napcat/cache/qrcode.png`
+   （147×147 的 1-bit PNG，旧布局 `<napcatDir>/qrcode.png` 也认）。Host 新增只读路由
+   `GET /dsh-qq-guard/napcat-qr` 把这张图发给浏览器（同源、no-store、nosniff、realpath 限定在
+   NapCat 目录内、4MB 上限）。前端把它放进**白底卡片**、放大 2 倍 + `image-rendering: pixelated`，
+   四周用 padding 留出静默区，手机直接扫码。
+2. **终端 ASCII 二维码兜底**：NapCat 用 `qrcode-terminal` 的 small 模式打印（字符集只有
+   `█ ▀ ▄ 空格`）。Host 在收日志时识别连续方块行（≥6 行），从 `logTail` 里**单独抽出来**，
+   存成 `qr.text` 随状态一起上报；前端用「白底黑字 + 等宽 + `line-height: 1` + `letter-spacing: 0`」
+   单独渲染。不足 6 行的零散方块会回填日志，绝不吞。
+
+顺带修掉的两个坑：
+- 日志进来先 `stripAnsi` 去掉颜色/光标转义，否则 `\x1b[32m` 之类的垃圾会占满日志框；
+- 普通日志框也改成严格等宽（Consolas 优先）、`letter-spacing: 0`、行高收紧到 1.2——
+  ASCII 方块不会再被压扁。
+- 已在线（`state=online`）时**不显示二维码**，避免拿一张过期二维码误导扫码；
+  过期图片（>5 分钟）收进折叠框，只在掉登录/未确认/已停止时展示。
 
 ### NapCat 启停的位置（运行状态页）
 
@@ -203,8 +248,78 @@ NapCat 的**启停按钮和进程状态只在「运行状态」页**（紧接「
 
 改完即时生效（桥接轮询 `/dsh-qq-guard/config` 热更新），只有换插件代码才需要重启 DSH。
 
-Mock 部分刻意没有接数据：新增按钮统一绑 `noop`，等第二阶段再逐个接线。版式可用 `node render-preview.mjs`
-生成静态 HTML（`preview/tab-*.html`，含深色版），不需要开浏览器就能看布局。
+### 会话管理接真实数据（本批）
+
+「会话管理」不再有本地假数据。链路只有一条：
+
+```
+桥接进程（唯一知道 QQ 会话 ↔ DSH 会话映射的地方）
+  → POST /dsh-qq-guard/status { ..., sessions: [{key, sessionId, kind, qq, name, title, unread, lastAt, lastText}] }
+  → Host 白名单收敛（sanitizeSessionRow，最多 100 条，body 上限 64KB）
+  → 前端 useBridgeStatus 3 秒轮询 → 列表 / 详情 / 导航红点
+```
+
+- **列表**：昵称或群名、私聊/群聊、未读数、相对时间、最后一条消息预览；按最近活动倒序。
+- **详情**：`u:<QQ>` / `g:<群号>` key、DSH 会话 ID、已对齐的 DSH 标题、最近活动、最近消息。
+- **空态**：桥接没上报时显示「等待桥接上报」，**绝不用假数据顶上**；桥接在跑但还没会话时显示引导文案。
+- **未读口径**：通过白名单的消息 `+1`（包括被响应档位跳过 / 静音 / 限频的），真正把回复发到 QQ 后清零；
+  发送失败或超时不清零。
+- **单人设 / 清空 / 删除**已解锁（见下文两节）。
+
+桥接侧的命名与状态维护见 `qq-bridge/README.md` 的「会话标题与未读」一节。
+
+### 单人设覆盖（动态 persona section）
+
+2026-10-23 的架构调整：preset 里**删掉了静态 `dsh-persona` 行**，改由 `role: guard` 实例注册
+动态 section。
+
+- section 名 `deployment:persona-prefix`，`complete: true`（唯一系统提示词），`text` 是函数：
+  每次组装现读共享状态 → 单人设 > 全局人设 > `personaDefault` 兜底。
+  为什么不走 `system-prompt/assemble` 瀑布：preset 的 `complete` section 在瀑布后会被强制还原，
+  改 `assembly.sections` 是白改（证据：`dsh-system-prompt/lib/index.js:398-405`）。
+- 数据通道：桥接**每条消息前** `POST /dsh-qq-guard/persona {sessionId, text}`（含非管理员提示词）；
+  启动 / 设置页改动时 `{mode:'default', text}` 推全局人设。失败只记日志，不阻塞聊天。
+- UI：会话详情里的「单人设覆盖」保存后走队列（见下），桥接写入 `sessions.json` 并立即推送；
+  下一条消息前还会再推一次，所以 DSH 重启后也能自愈。
+- 兜底文本来源：`cordis.patch.yml` 里 guard 子行的 `personaDefault`；
+  `/config` 路由会把它合并进返回值，桥接据此拼 `buildPersonaPrompt()`。
+
+### 会话指令队列（清空 / 删除 / 单人设保存）
+
+```
+UI POST /dsh-qq-guard/session-ops {op, key, text?}
+  → Host 内存队列（同 key+op 去重，50 条上限，5 分钟 TTL）
+  → 桥接每 2 秒 GET 同一路由（Host 给 30s 租约，防重复执行非幂等操作）
+  → 桥接执行 → POST {results:[...]} → Host 移除
+```
+
+- `clear`：归档旧会话（**必须带 `stopActivity:true`**，活跃会话否则 `workspace/session-active`）
+  → 同工作区建新会话 → 重新对齐标题 → 未读清零。归档失败也继续建新会话（旧会话记 stale 待清理）。
+- `delete`：归档旧会话（同样 stopActivity）+ 从 `sessions.json` 删除映射；归档失败仍删映射，
+  否则 UI 上「删不掉」。
+- `persona`：写 `sessions.json` 的 `persona` 字段并立即推送；空串 = 恢复全局。
+- UI：两个按钮二次确认，提交后显示「已提交，桥接会在 2 秒内执行」，列表随 3 秒轮询更新。
+
+### 管理员权限（`allow.admins`）
+
+- 配置：`allow.admins`（设置页「白名单管理」里的「管理员 QQ 号」列表，回车添加 Tag）。
+- 桥接拦截：**以 `/` 开头的消息**只有 `allow.admins` 里的人能发；其他人直接回
+  `⚠️ 权限不足，只有管理员才能执行此指令。` 并丢弃，**不投递 DSH**（省 token）。
+- 管理员身份**不绕过白名单**：不在 `allow.private/groups` 里照样被挡。
+- 非管理员发言时，人设末尾追加一段「拒绝清空记忆/重置会话/改配置」的提示（每轮现拼）。
+- 以后加 `/reset`、`/clear`、`/model` 等指令时，只需沿用同一入口即可。
+
+### 历史标题批量修正
+
+```bash
+node tools/rename-sessions.mjs            # 预演
+node tools/rename-sessions.mjs --apply    # 真改
+```
+
+只处理 `sessions.json` 里有映射、且标题不符合「私聊-昵称 / 群聊-群名(群号)」的会话；幂等可重跑。
+源码：`tools/rename-sessions.mjs` + `qq-bridge/src/rename-plan.mjs`（计划函数有离线用例）。
+
+版式可用 `node render-preview.mjs` 生成静态 HTML（`preview/tab-*.html`，含深色版），不需要开浏览器就能看布局。
 
 ## 模型配置：无痕热切换 + 失败降级
 

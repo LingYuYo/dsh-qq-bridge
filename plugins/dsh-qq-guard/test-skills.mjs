@@ -132,6 +132,8 @@ const VALUE = {
   ...CONFIG_CATALOG,
   bubbleMaxChars: 30, mergeMaxChars: 15, chunkSize: 1000, sendIntervalMs: 500,
   typingDelay: { enabled: true }, flypitDelayTiers: { short: 200, medium: 450, long: 800 },
+  typingDelayCharTiers: { shortMax: 10, mediumMax: 14, longMin: 15 },
+  voice: { provider: 'edge', baseUrl: '', apiKey: '', voice: 'zh-CN-XiaoyiNeural' },
   groupAtReply: true, groupAtPosition: 'last', trimEndPunctuation: { enabled: true },
   personaText: '', personaPresetDefault: '', allow: { private: [], groups: [], allowAllWhenEmpty: false },
   onebot: { wsUrl: '', accessToken: '' }, napcat: { dir: '', quickLoginQQ: '' },
@@ -362,45 +364,34 @@ function sessionNames(tree) {
   return findAll(tree, (n) => n.props?.className === 'qqg-session-name').map(textOf)
 }
 
-check('删除会话：确认后从列表消失', () => {
-  let tree = resetTab('sessions')
-  const before = sessionNames(tree)
-  eq(before.length, 6, '初始 6 条')
-  btnByText(tree, '删除会话').props.onClick()
-  tree = renderTab()
-  // 确认框里的确认按钮文案也是「删除会话」
-  const confirmBtns = findAll(tree, (n) => n.tag === 'button' && textOf(n).trim() === '删除会话')
-  eq(confirmBtns.length, 2, '页面上有两个同名按钮（触发器 + 确认）')
-  confirmBtns[confirmBtns.length - 1].props.onClick()
-  tree = renderTab()
-  const after = sessionNames(tree)
-  eq(after.length, before.length - 1, '数量减一')
-  if (after.includes(before[0])) throw new Error(`「${before[0]}」没被删掉`)
-})
-
-check('删除全部会话后显示空态', () => {
-  let tree = resetTab('sessions')
-  for (let i = 0; i < 8; i++) {
-    if (sessionNames(tree).length === 0) break
-    const delBtns = findAll(tree, (n) => n.tag === 'button' && textOf(n).trim() === '删除会话')
-    delBtns[0].props.onClick()
-    tree = renderTab()
-    const conf = findAll(tree, (n) => n.tag === 'button' && textOf(n).trim() === '删除会话')
-    conf[conf.length - 1].props.onClick()
-    tree = renderTab()
-  }
+check('会话管理：桥接未上报时显示等待态，不再有假会话', () => {
+  const tree = resetTab('sessions')
+  eq(sessionNames(tree).length, 0, '★ 不允许再渲染假的会话列表')
   const joined = textOf(tree)
-  if (!joined.includes('会话列表为空')) throw new Error('没有出现空态')
+  if (!joined.includes('等待桥接上报')) throw new Error('没有出现「等待桥接上报」空态')
 })
 
-check('取消删除：列表不变', () => {
-  let tree = resetTab('sessions')
-  const before = sessionNames(tree)
-  btnByText(tree, '删除会话').props.onClick()
+check('会话管理：页面明确说明数据来自桥接进程', () => {
+  const tree = resetTab('sessions')
+  const joined = textOf(tree)
+  if (!joined.includes('桥接进程')) throw new Error('缺少「数据由桥接上报」的说明')
+})
+
+check('管理员 QQ 号：输入后添加/删除，写回 allow.admins', () => {
+  VALUE.allow.admins = []
+  let tree = resetTab('settings')
+  const input = () => findAll(tree, (n) => n.tag === 'input' && n.props?.['aria-label'] === '管理员 QQ 号')[0]
+  if (!input()) throw new Error('缺「管理员 QQ 号」输入框')
+  input().props.onChange({ target: { value: '1000000001' } })
   tree = renderTab()
-  btnByText(tree, '取消').props.onClick()
+  btn(tree, '管理员 QQ 号 添加').props.onClick()
   tree = renderTab()
-  eq(sessionNames(tree), before, '取消后列表不变')
+  eq(VALUE.allow.admins, ['1000000001'], '写回 allow.admins')
+  const remove = findAll(tree, (n) => n.tag === 'button' && n.props?.['aria-label'] === '删除 1000000001')[0]
+  if (!remove) throw new Error('缺删除管理员按钮')
+  remove.props.onClick()
+  tree = renderTab()
+  eq(VALUE.allow.admins, [], '删除后清空')
 })
 
 /* ── 全局设置：两个弹窗 + 运行节奏大按钮 ───────────────────── */
@@ -473,7 +464,11 @@ check('点「信息发送配置」打开分片+打字延时弹窗', () => {
   findAll(tree, (n) => n.props?.className === 'qqg-bigbtn')[0].props.onClick()
   tree = renderTab()
   const joined = textOf(tree)
-  for (const k of ['单行语义切阈值', '碎片合并上限', 'QQ 单条硬上限', '分级打字延时', '短句（<10 字）']) {
+  // 毫秒档标签跟随字数档位当前值，期望文案按夹具动态拼。
+  const tiers = VALUE.typingDelayCharTiers
+  for (const k of ['单行语义切阈值', '碎片合并上限', 'QQ 单条硬上限', '分级打字延时',
+    `短句（<${tiers.shortMax} 字）`, `中等（${tiers.shortMax}~${tiers.mediumMax} 字）`, `长句（${tiers.longMin}+ 字）`,
+    '短句上限字数', '中等上限字数', '长句触发字数']) {
     if (!joined.includes(k)) throw new Error(`发送配置弹窗缺「${k}」`)
   }
 })
@@ -492,17 +487,105 @@ check('点「活跃设置」打开档位+防抖+禁言弹窗', () => {
   eq([slider.props.min, slider.props.max], [0, 3], '滑条范围 0~3')
 })
 
-check('活跃设置：滑条写回 rhythm.activityLevel（真实配置）', () => {
+check('活跃设置：滑条拖动只改草稿，松手才写回 rhythm.activityLevel', () => {
   let tree = resetTab('settings')
   findAll(tree, (n) => n.props?.className === 'qqg-bigbtn')[1].props.onClick()
   tree = renderTab()
   const slider = findAll(tree, (n) => n.tag === 'input' && n.props?.type === 'range')[0]
   if (!slider) throw new Error('缺少响应档位滑条')
-  slider.props.onChange({ target: { value: '3' } })
-  if (VALUE.rhythm.activityLevel !== 3) throw new Error('没写回配置，实际 ' + VALUE.rhythm.activityLevel)
+  eq([slider.props.min, slider.props.max], [0, 3], '滑条范围 0~3')
+  // 模拟拖到 3：拖动过程中只更新本地草稿，不写配置（否则会因异步回读把 thumb 弹回）。
+  slider.props.onInput({ target: { value: '3' } })
+  eq(VALUE.rhythm.activityLevel, 1, '拖动过程中不该写配置')
+  slider.props.onPointerUp()
+  eq(VALUE.rhythm.activityLevel, 3, '松手后应写回配置')
   tree = renderTab()
   const joined = textOf(tree)
   if (!joined.includes('全响应')) throw new Error('界面没跟着配置更新')
+})
+
+check('打字延时：三个字数档位可改并写回 typingDelayCharTiers.*', () => {
+  let tree = resetTab('settings')
+  findAll(tree, (n) => n.props?.className === 'qqg-bigbtn')[0].props.onClick()
+  tree = renderTab()
+  const field = (label) => findAll(tree, (n) => n.tag === 'input'
+    && n.props?.['aria-label'] === label)[0]
+  const shortNode = field('短句上限字数')
+  if (!shortNode) throw new Error('缺少「短句上限字数」输入框')
+  eq(String(shortNode.props.value), '10', '短句上限默认 10')
+  const commit = (label, value) => {
+    let node = field(label)
+    if (!node) throw new Error(`缺少「${label}」`)
+    node.props.onChange({ target: { value } })
+    tree = renderTab()
+    node = field(label)
+    node.props.onBlur()
+    tree = renderTab()
+  }
+  commit('短句上限字数', '12')
+  commit('中等上限字数', '18')
+  commit('长句触发字数', '20')
+  eq(VALUE.typingDelayCharTiers, { shortMax: 12, mediumMax: 18, longMin: 20 }, '字数档位写回')
+  // 毫秒档标签要跟着新边界走，不能停在默认的 10 / 14 / 15。
+  const joined = textOf(tree)
+  for (const k of ['短句（<12 字）', '中等（12~18 字）', '长句（20+ 字）']) {
+    if (!joined.includes(k)) throw new Error(`毫秒档标签没跟随配置更新：缺「${k}」`)
+  }
+})
+
+check('语音合成：默认 Edge 隐藏 baseUrl / Key，切到 openai 后可写回 voice.*', () => {
+  VALUE.voice = { provider: 'edge', baseUrl: '', apiKey: '', voice: 'zh-CN-XiaoyiNeural' }
+  let tree = resetTab('settings')
+  const voiceSelect = () => findAll(tree, (n) => n.tag === 'select'
+    && n.props?.['aria-label'] === '语音引擎')[0]
+  if (!voiceSelect()) throw new Error('缺少「语音引擎」下拉')
+  eq(voiceSelect().props.value, 'edge', '默认 Edge')
+  if (findAll(tree, (n) => n.props?.['aria-label'] === '接口地址（baseUrl）').length) {
+    throw new Error('Edge 模式不该显示 baseUrl')
+  }
+  voiceSelect().props.onChange({ target: { value: 'openai' } })
+  eq(VALUE.voice.provider, 'openai', '写回 voice.provider')
+  tree = renderTab()
+  const input = (label) => findAll(tree, (n) => n.tag === 'input'
+    && n.props?.['aria-label'] === label)[0]
+  const baseUrl = input('接口地址（baseUrl）')
+  if (!baseUrl) throw new Error('openai 模式缺少 baseUrl')
+  baseUrl.props.onChange({ target: { value: 'https://api.openai.com/v1' } })
+  eq(VALUE.voice.baseUrl, 'https://api.openai.com/v1', '写回 voice.baseUrl')
+  const apiKey = input('语音 API Key')
+  if (!apiKey) throw new Error('openai 模式缺少 API Key')
+  eq(apiKey.props.type, 'password', 'API Key 应为密码框')
+  apiKey.props.onChange({ target: { value: 'sk-test' } })
+  eq(VALUE.voice.apiKey, 'sk-test', '写回 voice.apiKey')
+  input('音色').props.onChange({ target: { value: 'alloy' } })
+  eq(VALUE.voice.voice, 'alloy', '写回 voice.voice')
+})
+
+check('技能卡片：已实装显示「已接入」，其余显示「开发中」', () => {
+  // 前面的排序 / 删除用例会改 VALUE.skills；这里先还原夹具，避免依赖执行顺序。
+  VALUE.skills = CONFIG_CATALOG.skills.map((x) => ({ ...x }))
+  VALUE.plugins = CONFIG_CATALOG.plugins.map((x) => ({ ...x }))
+  const tree = resetSkills()
+  const tileOf = (name) => findAll(tree, (n) => n.props?.className === 'qqg-tile')
+    .find((t) => textOf(findAll(t, (x) => x.props?.className === 'qqg-tile-name')[0]) === name)
+  const tagOf = (name) => {
+    const tile = tileOf(name)
+    if (!tile) throw new Error(`找不到卡片「${name}」`)
+    return findAll(tile, (n) => typeof n.props?.className === 'string'
+      && n.props.className.split(' ').includes('qqg-pill'))[0]
+  }
+  const textOfTag = (name) => textOf(tagOf(name))
+  eq(textOfTag('发语音'), '已接入', 'sk-voice')
+  eq(textOfTag('图片理解'), '已接入', 'sk-vision')
+  eq(textOfTag('网页搜索'), '已接入', 'sk-search')
+  eq(textOfTag('记忆提取'), '开发中', 'sk-memory')
+  eq(textOfTag('防抖合并'), '已接入', 'pl-debounce')
+  eq(textOfTag('频率控制'), '已接入', 'pl-ratelimit')
+  eq(textOfTag('上下文压缩'), '开发中', 'pl-compact')
+  // 用 CSS class 区分状态：已接入带 qqg-pill-ok，开发中不带。
+  const hasOkClass = (name) => tagOf(name).props.className.split(' ').includes('qqg-pill-ok')
+  if (!hasOkClass('发语音')) throw new Error('「已接入」标签缺少 qqg-pill-ok')
+  if (hasOkClass('记忆提取')) throw new Error('「开发中」标签不该带 qqg-pill-ok')
 })
 
 check('活跃设置：禁言开关写回 rhythm.mute.enabled', () => {

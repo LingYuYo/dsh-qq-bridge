@@ -255,6 +255,65 @@ check('在线且由本插件托管时：启动禁用、停止可点', () => {
   assert(btnByText(afterStart, '停止').props.disabled !== true, '运行中停止应可点')
 })
 
+/* ── 掉登录：二维码单独成卡（图片优先，ASCII 兜底）─────────── */
+napcatStatus = { ...ONLINE, state: 'offline', qrImage: { mtime: Date.now() - 30_000, size: 593, ageMs: 30_000 } }
+const qrTree = await repaintAndFlush()
+check('最新二维码：用 NapCat 落盘的图片单独渲染', () => {
+  const panel = panelOf(qrTree, 'NapCat 进程')
+  const img = findAll(panel, (n) => n.tag === 'img')[0]
+  assert(img, '缺二维码图片')
+  assert(String(img.props.src).includes('/dsh-qq-guard/napcat-qr?v='), `src 不对：${img.props.src}`)
+  assert(textOf(panel).includes('手机 QQ 扫码登录'), '缺扫码提示文案')
+})
+
+napcatStatus = {
+  ...ONLINE,
+  state: 'offline',
+  qrImage: { mtime: Date.now() - 30 * 60_000, size: 593, ageMs: 30 * 60_000 },
+  qr: { text: '▄▄▄▄▄▄\n██████\n█    █\n▀▀▀▀▀▀', lines: 4, at: Date.now() },
+}
+const asciiQrTree = await repaintAndFlush()
+check('图片过期时退回日志提取的 ASCII 二维码（独立白底块）', () => {
+  const panel = panelOf(asciiQrTree, 'NapCat 进程')
+  const pre = findAll(panel, (n) => n.props?.className === 'qqg-qr-pre')[0]
+  assert(pre, '缺 ASCII 二维码块')
+  assert(textOf(pre).includes('█'), 'ASCII 二维码内容不对')
+  assert(textOf(panel).includes('从 NapCat 日志中提取'), '缺兜底说明')
+})
+
+napcatStatus = {
+  ...ONLINE,
+  state: 'offline',
+  qr: { text: '▄▄▄▄▄▄\n██████\n▀▀▀▀▀▀', lines: 3, at: Date.now() - 30 * 60_000 },
+}
+const staleAsciiTree = await repaintAndFlush()
+check('ASCII 二维码过期后收进折叠框，不再占主面板', () => {
+  const panel = panelOf(staleAsciiTree, 'NapCat 进程')
+  assert(!findAll(panel, (n) => n.props?.className === 'qqg-qr-card')[0], '过期二维码不该用主卡片')
+  assert(textOf(panel).includes('上次登录二维码'), '应折叠成「上次登录二维码」')
+})
+
+napcatStatus = { ...ONLINE, qrImage: { mtime: Date.now() - 30_000, size: 593, ageMs: 30_000 } }
+const onlineQrTree = await repaintAndFlush()
+check('已在线时不显示二维码（过期二维码不该占地方、误导扫码）', () => {
+  const panel = panelOf(onlineQrTree, 'NapCat 进程')
+  assert(!findAll(panel, (n) => n.tag === 'img')[0], '在线时不应出现二维码图片')
+})
+
+/* 没配 HTTP API 时 state 只能到 running-unverified；靠日志里的 loggedIn 自动收起。 */
+napcatStatus = {
+  ...ONLINE,
+  state: 'running-unverified',
+  loggedIn: true,
+  qrImage: { mtime: Date.now() - 20_000, size: 593, ageMs: 20_000 },
+}
+const loggedInTree = await repaintAndFlush()
+check('日志判定登录成功（loggedIn）后二维码自动收起', () => {
+  const panel = panelOf(loggedInTree, 'NapCat 进程')
+  assert(!findAll(panel, (n) => n.tag === 'img')[0], '★ 扫码成功后二维码不该继续挂在面板上')
+})
+napcatStatus = ONLINE
+
 check('点停止 → POST /dsh-qq-guard/napcat?action=stop', async () => {
   const before = calls.filter((c) => c.url.includes('/napcat?action=stop')).length
   btnByText(afterStart, '停止').props.onClick()

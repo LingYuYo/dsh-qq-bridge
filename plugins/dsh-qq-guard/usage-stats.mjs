@@ -319,7 +319,24 @@ export function parsePeakHours(raw) {
 }
 
 /**
+ * 归一化多段时段的**分隔符**。
+ *
+ * 用户手输时段时常混用中文分号 / 中文逗号（`；` `，`）和英文分号（`;`），
+ * 这些字符在 `split(',')` 下不会被切开，整段会被 `parsePeakHours` 判为非法，
+ * 然后静默落到「全天忙时」——成本整体偏高且没有任何报错。
+ * 所以解析前统一替换成英文逗号。
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+export function normalizePeakSeparators(raw) {
+  if (typeof raw !== 'string') return ''
+  return raw.replace(/[；;，]/gu, ',')
+}
+
+/**
  * 解析多段时段：逗号分隔，例如 `09:00-12:00, 14:00-18:00`。
+ * 中文分号 / 中文逗号 / 英文分号都会先归一化成英文逗号（见 {@link normalizePeakSeparators}）。
  * 非法段直接跳过；一段都不合法返回 null（调用方按「全天忙时」兜底，避免低估成本）。
  * @param {unknown} raw
  * @returns {Array<{start:number,end:number}>|null}
@@ -327,7 +344,7 @@ export function parsePeakHours(raw) {
 export function parsePeakWindows(raw) {
   if (typeof raw !== 'string') return null
   const windows = []
-  for (const segment of raw.split(',')) {
+  for (const segment of normalizePeakSeparators(raw).split(',')) {
     const window = parsePeakHours(segment)
     if (window) windows.push(window)
   }
@@ -538,8 +555,13 @@ export class UsageScope {
       const map = new Map()
       try {
         const parsed = JSON.parse(readFileSync(statePath, 'utf8'))
-        for (const [key, sessionId] of Object.entries(parsed?.sessions ?? {})) {
-          if (typeof sessionId === 'string' && sessionId) map.set(sessionId, key)
+        for (const [key, value] of Object.entries(parsed?.sessions ?? {})) {
+          // 新版桥接把值升级成了对象（{ sessionId, unread, name, ... }）；
+          // 旧版是裸 sessionId 字符串。两种都要认，否则升级瞬间统计会「丢会话」。
+          const id = typeof value === 'string'
+            ? value
+            : (typeof value?.sessionId === 'string' ? value.sessionId : '')
+          if (id) map.set(id, key)
         }
       } catch { /* 还没建过会话：映射为空 */ }
       this.sessionMap = map

@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { Bridge } from './src/bridge.mjs'
 import { DshClient } from './src/dsh.mjs'
 import { startConfigPolling } from './src/runtime-config.mjs'
-import { writePersona } from './src/persona.mjs'
+import { startSessionOpsPolling } from './src/session-ops.mjs'
 import { buildBridgeStatus } from './src/status.mjs'
 import { acquireInstanceLock } from './src/instance-lock.mjs'
 
@@ -91,23 +91,22 @@ logger.info('桥接已启动，等待 QQ 消息。按 Ctrl+C 退出。')
 
 // 人设里现在带【底层模型】一行，必须在第一条消息之前就位。
 //
-// 为什么写两次：
+// preset 里已经删掉静态 persona 行，默认人设正文由插件的动态 section 承载：
+// 桥接把 buildPersonaPrompt() 的结果 POST 给插件（mode:'default'），
+// guard 实例的 section text 每次组装现读，所以**不需要**改 profile 文件，也不受
+// 「只对新建会话生效」的限制。
+//
+// 为什么推两次：
 //   ① 启动时 `bridge.live` 还没有 DSH 设置页下发的 `model`（轮询要 2 秒后才有），
-//      这一版只能用 config.json 的 `dsh.provider/model` 兜底 —— DSH 没起来也至少有身份行；
-//   ② 首次同步成功后必须**再写一次校准**，否则设置页里配的模型和身份行会不一致
-//      （轮询只在签名变化时重写，首次同步只记录不写盘，见 runtime-config.mjs）。
-const writePersonaNow = (label) => {
-  try {
-    const result = writePersona(bridge.buildPersonaPrompt())
-    if (result?.ok && result.action === 'upserted-override') logger.info(`人设已写入（${label}）`)
-    else if (result?.ok && result.action === 'removed-override') logger.info(`人设已恢复默认（${label}）`)
-    return result
-  } catch (error) {
-    logger.warn?.(`人设写入失败（不阻塞，${label}）：${error?.message ?? error}`)
-    return undefined
-  }
+//      先用 config.json 的 `dsh.provider/model` 兜底 —— 至少有身份行；
+//   ② 首次同步成功后必须**再推一次校准**，否则设置页里配的模型和身份行会不一致。
+const pushGlobalPersona = async (label) => {
+  const text = bridge.buildPersonaPrompt()
+  const ok = await bridge.setGlobalPersona(text)
+  if (ok) logger.info(`全局人设已推送（${label}，${text.length} 字）`)
+  return ok
 }
-writePersonaNow('含底层模型路由')
+await pushGlobalPersona('含底层模型路由')
 
 let firstSyncDone = false
 
@@ -120,21 +119,32 @@ const stopPolling = startConfigPolling({
     bridge._applyLiveToClient()
     if (!firstSyncDone) {
       firstSyncDone = true
-      writePersonaNow('首次同步后校准模型身份')
+      void pushGlobalPersona('首次同步后校准模型身份')
     }
   },
-  // 人设变化 → 桥接层拼最终系统提示词（名字/参与度/附加规则/覆盖/模型身份），
-  // 再写回 profile 的 preset 覆盖（只对新建会话生效，保留已有会话上下文）。
-  onPersona: () => writePersona(bridge.buildPersonaPrompt()),
+  // 人设变化 → 重拼最终系统提示词（名字/参与度/附加规则/覆盖/模型身份），推给插件。
+  onPersona: () => { void pushGlobalPersona('设置页人设变化') },
   // 顺带把运行状态回推给 DSH 设置页的「运行状态」分类（批次 4A）。
   // 批次 5：**不再用 `qq.connected`（WS 建连瞬间恒 false，且不等于账号在线）**，
   // 改由 health.online 推导四态（online/offline/unverified/disconnected）。
   getStatus: () => buildBridgeStatus({
     health: bridge.qq?.health,
     counts: bridge.stats,
+    // 只有桥接进程知道每个 QQ 会话的未读 / 昵称 / DSH 映射，
+    // 一起上报给 Host，设置页「会话管理」才有真实数据。
+    sessions: bridge.sessionViews(),
     // 能走到这里说明刚成功拉过 DSH 的配置路由，链路是通的。
     dshOk: true,
   }),
+})
+
+// 会话指令轮询（清空上下文 / 删除会话 / 保存单人设）：
+// UI 入队 → 这里每 2 秒取一次并执行，执行结果回传。失败不影响聊天主链路。
+// 地址用 getter 现读 bridge.dsh.baseUrl：DSH 重启换端口后桥接已能自愈，轮询器跟着走。
+const stopOpsPolling = startSessionOpsPolling({
+  getBaseUrl: () => bridge.dsh?.baseUrl,
+  bridge,
+  logger,
 })
 
 let stopping = false
@@ -143,6 +153,7 @@ const shutdown = async (sig) => {
   stopping = true
   logger.info(`收到 ${sig}，正在停止…`)
   stopPolling()
+  stopOpsPolling()
   logger.info(`统计：${JSON.stringify(bridge.stats)}`)
   await bridge.stop().catch(() => {})
   process.exit(0)

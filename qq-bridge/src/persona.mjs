@@ -214,7 +214,34 @@ function dedentBlock(blockLines) {
   return blockLines.map((l) => (l.trim() === '' ? '' : l.slice(common)))
 }
 
-/** 读出当前 bundle 的默认人设（给 UI 的「恢复默认」按钮做参考）。 */
+/**
+ * 读出当前 bundle 的默认人设。
+ *
+ * 2026-10-23 起 preset 里不再有静态 `dsh-persona` 行（改由 guard 实例动态注册），
+ * 默认人设正文搬到 guard 子行的 `personaDefault: |-`。这里优先读它；
+ * 读不到再退回老布局（preset 里的 persona `prefix:`），兼容还没升级的 patch。
+ */
 export function readDefaultPersona(bundleFile = BUNDLE_PATCH) {
+  try {
+    const text = fs.readFileSync(bundleFile, 'utf8')
+    const lines = text.split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      const match = /^(\s*)personaDefault:\s*\|[-+]?\s*$/.exec(lines[i])
+      if (!match) continue
+      const keyIndent = match[1].length
+      const body = []
+      for (let j = i + 1; j < lines.length; j++) {
+        const line = lines[j]
+        if (line.trim() === '') { body.push(''); continue }
+        if (/^(\s*)/.exec(line)[1].length <= keyIndent) break
+        body.push(line)
+      }
+      while (body.length > 0 && body[body.length - 1].trim() === '') body.pop()
+      const nonEmpty = body.filter((l) => l.trim() !== '')
+      if (nonEmpty.length === 0) return ''
+      const common = Math.min(...nonEmpty.map((l) => /^(\s*)/.exec(l)[1].length))
+      return body.map((l) => (l.trim() === '' ? '' : l.slice(common))).join('\n')
+    }
+  } catch { /* 文件读不到就走老布局 */ }
   try { return extractPrefix(readBundlePresetBlock(bundleFile)) } catch { return '' }
 }

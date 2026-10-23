@@ -17,6 +17,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   NapcatManager, resolveNapcatExe, isPortListening, DEFAULT_WS_PORT, STOP_GRACE_MS,
+  stripAnsi, extractQrBlock, findQrcodeImage,
 } from './napcat.mjs'
 
 let pass = 0, fail = 0
@@ -271,6 +272,89 @@ await check('启动中再点启动返回 busy，不重复 spawn', async () => {
   assert.equal(fake.spawned.length, 1, '★ 连点两次只能起一个进程')
   fake.finishExit(0)
   await p1
+})
+
+console.log('\n— ⑨ 登录二维码：ANSI / ASCII 提取 / 落盘图片 —')
+await check('stripAnsi 去掉颜色与光标转义', () => {
+  assert.equal(stripAnsi('\u001b[32m绿色\u001b[0m'), '绿色')
+  assert.equal(stripAnsi('\u001b[2J\u001b[1;1H'), '')
+  assert.equal(stripAnsi('纯文本'), '纯文本')
+})
+await check('二维码块从日志流里被单独收走，普通日志不被吞', () => {
+  const fake = makeFakeSubprocess()
+  const mgr = new NapcatManager({ subprocess: fake, logger, getConfig: () => ({ napcatDir: FIXTURE_DIR, wsPort: 1 }) })
+  const width = 23
+  const top = '▄'.repeat(width)
+  const bottom = '▀'.repeat(width)
+  // qrcode-terminal 的 small 模式：每行首尾是 █，中间是方块/空格。
+  const body = Array.from({ length: 11 }, (_, i) => '█' + (i % 2 === 0 ? ' '.repeat(width - 2) : '█'.repeat(width - 2)) + '█')
+  for (const line of [top, ...body, bottom]) mgr._push(line)
+  mgr._push('二维码已保存，等待扫码…')
+  assert.ok(mgr.qrText, '应提取出二维码块')
+  assert.equal(mgr.qrLines, 13, `应保留 13 行，实际 ${mgr.qrLines}`)
+  assert.ok(mgr.qrAt > 0)
+  assert.equal(mgr.logTail.includes('二维码已保存，等待扫码…'), true, '后续普通日志照常保留')
+  assert.equal(mgr.logTail.some((l) => l.includes('█')), false, '★ 二维码行不应混进普通日志')
+})
+await check('零散方块（不足 6 行）回填日志，绝不吞', () => {
+  const fake = makeFakeSubprocess()
+  const mgr = new NapcatManager({ subprocess: fake, logger, getConfig: () => ({ napcatDir: FIXTURE_DIR, wsPort: 1 }) })
+  mgr._push('█'.repeat(20))
+  mgr._push('加载中…')
+  assert.equal(mgr.qrText, null, '孤立一行方块不是二维码')
+  assert.equal(mgr.logTail.length, 2, '方块行应回填进日志')
+})
+await check('extractQrBlock 取最长一段', () => {
+  const width = 20
+  const block = ['▄'.repeat(width), '█'.repeat(width), '█'.repeat(width), '█'.repeat(width),
+    '█'.repeat(width), '█'.repeat(width), '█'.repeat(width), '▀'.repeat(width)]
+  const found = extractQrBlock(['普通日志', ...block, '结束'])
+  assert.ok(found, '应识别出二维码')
+  assert.equal(found.lines, 8)
+  assert.equal(extractQrBlock(['普通日志']), null)
+})
+await check('findQrcodeImage 认识 versions/<ver>/resources/app/napcat/cache/qrcode.png 布局', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'napcat-qr-'))
+  try {
+    const nested = path.join(dir, 'versions', '9.9.33-52230', 'resources', 'app', 'napcat', 'cache')
+    fs.mkdirSync(nested, { recursive: true })
+    const file = path.join(nested, 'qrcode.png')
+    fs.writeFileSync(file, Buffer.from('fake-png-bytes'))
+    const found = findQrcodeImage(dir)
+    assert.ok(found, '应找到嵌套路径的二维码')
+    assert.equal(path.resolve(found.file), path.resolve(file))
+    assert.equal(found.size, 14)
+    // 老布局 <dir>/qrcode.png 也认
+    const flat = fs.mkdtempSync(path.join(os.tmpdir(), 'napcat-qr-flat-'))
+    try {
+      fs.writeFileSync(path.join(flat, 'qrcode.png'), Buffer.from('x'))
+      assert.ok(findQrcodeImage(flat), '应找到根目录的 qrcode.png')
+    } finally { fs.rmSync(flat, { recursive: true, force: true }) }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+await check('findQrcodeImage 没目录/没文件返回 null', () => {
+  assert.equal(findQrcodeImage(''), null)
+  assert.equal(findQrcodeImage('D:\\__no_such_napcat_qr__'), null)
+})
+await check('日志出现「登录成功」→ loggedIn=true；新二维码出现后复位 false', () => {
+  const fake = makeFakeSubprocess()
+  const mgr = new NapcatManager({ subprocess: fake, logger, getConfig: () => ({ napcatDir: FIXTURE_DIR, wsPort: 1 }) })
+  mgr._push('QQ 登录成功，正在启动 NapCat…')
+  assert.equal(mgr.loggedIn, true, '登录成功应置位')
+  const width = 23
+  const body = Array.from({ length: 11 }, () => '█' + ' '.repeat(width - 2) + '█')
+  for (const line of ['▄'.repeat(width), ...body, '▀'.repeat(width)]) mgr._push(line)
+  mgr._push('等待扫码…')
+  assert.equal(mgr.loggedIn, false, '★ 重新出现二维码说明又掉线了，loggedIn 必须复位')
+})
+await check('snapshot 带 qr / qrImage / loggedIn 字段（无图时为 null）', async () => {
+  const fake = makeFakeSubprocess()
+  const mgr = new NapcatManager({ subprocess: fake, logger, getConfig: () => ({ napcatDir: FIXTURE_DIR, wsPort: 1 }) })
+  const snap = await mgr.snapshot()
+  assert.equal(snap.qr, null)
+  assert.equal(snap.qrImage, null)
+  assert.equal(snap.loggedIn, false)
+  assert.ok(Array.isArray(snap.logTail))
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

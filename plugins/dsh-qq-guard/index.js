@@ -79,7 +79,7 @@ export const inject = ['tools', 'webServer', 'subprocess']
 
 // Config 用的 Schemastery：官方包，随 DSH 一起解析（本插件不声明依赖）。
 import Schema from '@deepseek-ai/schemastery'
-import { NapcatManager, DEFAULT_WS_PORT } from './napcat.mjs'
+import { NapcatManager, DEFAULT_WS_PORT, findQrcodeImage } from './napcat.mjs'
 import { BridgeRunner, DEFAULT_BRIDGE_DIR } from './bridge-runner.mjs'
 import { SandboxManager } from './sandbox/manager.mjs'
 import { installModelOverride } from './model-override.js'
@@ -96,6 +96,44 @@ import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, realpat
 import { builtinModules } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+
+/**
+ * 从本插件自带的 cordis.patch.yml 里读 guard 子行的 `personaDefault`。
+ *
+ * 为什么需要：preset 里已删掉静态 persona 行，默认人设正文只能放在 guard 子行的
+ * config 里；但 `/dsh-qq-guard/config` 由**顶层 settings 实例**提供，它的 Config
+ * 里没有这个字段。桥接要靠它拼 buildPersonaPrompt()，所以这里直接从自己的 patch
+ * 文件读一遍，合并进 /config 的返回值。
+ *
+ * 只认 `personaDefault: |-` 块标量（我们自己写的格式），不引 YAML 依赖。
+ * @returns {string}
+ */
+export function readGuardPersonaDefault(file = path.join(HERE, 'cordis.patch.yml')) {
+  let lines
+  try { lines = readFileSync(file, 'utf8').split('\n') } catch { return '' }
+  for (let i = 0; i < lines.length; i++) {
+    const match = /^(\s*)personaDefault:\s*\|[-+]?\s*$/.exec(lines[i])
+    if (!match) continue
+    const keyIndent = match[1].length
+    const body = []
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j]
+      if (line.trim() === '') { body.push(''); continue }
+      const indent = /^(\s*)/.exec(line)[1].length
+      if (indent <= keyIndent) break
+      body.push(line)
+    }
+    while (body.length > 0 && body[body.length - 1].trim() === '') body.pop()
+    const nonEmpty = body.filter((line) => line.trim() !== '')
+    if (nonEmpty.length === 0) return ''
+    const common = Math.min(...nonEmpty.map((line) => /^(\s*)/.exec(line)[1].length))
+    return body.map((line) => (line.trim() === '' ? '' : line.slice(common))).join('\n')
+  }
+  return ''
+}
 
 /**
  * 技能 / 插件清单的默认值（Phase 4）。
@@ -261,10 +299,24 @@ const Config = Schema.object({
       .default(true).volatile(),
   }).description('打字延时').default({}),
   flypitDelayTiers: Schema.object({
-    short: Schema.number().description('<10 字档的基准延时(ms)').default(200).min(0).max(60000).volatile(),
-    medium: Schema.number().description('10~14 字档的基准延时(ms)').default(450).min(0).max(60000).volatile(),
-    long: Schema.number().description('15+ 字档的基准延时(ms)').default(800).min(0).max(60000).volatile(),
+    short: Schema.number().description('<短句上限字数 档的基准延时(ms)').default(200).min(0).max(60000).volatile(),
+    medium: Schema.number().description('中等档的基准延时(ms)').default(450).min(0).max(60000).volatile(),
+    long: Schema.number().description('长句档的基准延时(ms)').default(800).min(0).max(60000).volatile(),
   }).description('分级打字延时的三档基准值').default({}),
+  // 字数档位阈值（2026-10-23）：三档边界从写死改成可配置。
+  // 语义：字数 < shortMax → 短句；shortMax..mediumMax → 中等；≥ longMin → 长句。
+  // 桥接侧 onebot.mjs 从热配置读它，不在这里算延时。
+  typingDelayCharTiers: Schema.object({
+    shortMax: Schema.number()
+      .description('短句上限字数：字数 < 该值走短句档（默认 10）。')
+      .default(10).min(1).max(500).volatile(),
+    mediumMax: Schema.number()
+      .description('中等上限字数：短句上限 ~ 该值（含）走中等档（默认 14）。')
+      .default(14).min(1).max(500).volatile(),
+    longMin: Schema.number()
+      .description('长句触发字数：字数 >= 该值走长句档（默认 15）。')
+      .default(15).min(1).max(500).volatile(),
+  }).description('打字延时的字数档位阈值').default({}),
   sendIntervalMs: Schema.number()
     .description('兜底固定间隔(ms)：仅当打字延时关闭时生效。')
     .default(500).min(0).max(60000).volatile(),
@@ -289,6 +341,12 @@ const Config = Schema.object({
   // 留空 = 用 preset 自带的默认人设。
   personaText: Schema.string()
     .description('自定义人设。非空时覆盖 qq-chat preset 的默认人设；留空则用默认。')
+    .default('').volatile(),
+  // preset 里不再挂静态 persona 行：默认人设正文存在这里，由 role: guard 实例
+  // 动态注册成 `deployment:persona-prefix` section（按会话取覆盖，取不到用这段兜底）。
+  // 由 cordis.patch.yml 的 guard 子行提供，正常不需要在设置页改。
+  personaDefault: Schema.string()
+    .description('preset 内置默认人设（role: guard 动态 section 的兜底文本）。')
     .default('').volatile(),
   personaPresetDefault: Schema.string()
     .description('当前 preset 的默认人设（只读快照，供 UI 的「恢复默认」按钮参考）。')
@@ -340,6 +398,25 @@ const Config = Schema.object({
   })).description('备用模型（最多 4 个）。主模型超时/报错时按顺序接管，同一轮内生效。')
     .default([]).volatile(),
 
+  // ── 语音合成（「发语音」技能的真实后端）─────────────────────
+  // provider=edge 走微软 Edge 朗读接口（免 Key）；provider=openai 走任意
+  // OpenAI 兼容 /v1/audio/speech（需要 baseUrl + apiKey）。合成在桥接进程里做，
+  // 通过 NapCat 的 record 段发出去 —— 插件本身不连线，只负责把配置热同步下去。
+  voice: Schema.object({
+    provider: Schema.union(['edge', 'openai'])
+      .description('edge = Edge TTS（免 Key）；openai = OpenAI 兼容 /v1/audio/speech。')
+      .default('edge').volatile(),
+    baseUrl: Schema.string()
+      .description('OpenAI 兼容接口的 baseUrl（仅 provider=openai 时需要），如 https://api.openai.com/v1。')
+      .default('').volatile(),
+    apiKey: Schema.string()
+      .description('OpenAI 兼容接口的 API Key（仅 provider=openai 时需要）。')
+      .default('').role('secret').volatile(),
+    voice: Schema.string()
+      .description('音色名。Edge：zh-CN-XiaoyiNeural / zh-CN-XiaoxiaoNeural；OpenAI：alloy 等。')
+      .default('zh-CN-XiaoyiNeural').volatile(),
+  }).description('语音合成（发语音技能）').default({}),
+
   // ── 用量成本价目表（「数据与用量」面板）──────────────────────
   //
   // DSH 只报 token，不报单价（token-meter 没有任何货币概念），所以成本只能自己维护。
@@ -390,6 +467,11 @@ const Config = Schema.object({
       .default([]).volatile(),
     groups: Schema.array(Schema.string())
       .description('允许的群号。')
+      .default([]).volatile(),
+    // 管理员：只有名单里的 QQ 号能触发 `/` 开头的指令（/reset、/clear、/model 等）。
+    // 非管理员发指令会被桥接直接拦下并回提示，不会投递给 DSH（省 token）。
+    admins: Schema.array(Schema.string())
+      .description('管理员 QQ 号：只有这些人能执行 / 开头的指令。')
       .default([]).volatile(),
     allowAllWhenEmpty: Schema.boolean()
       .description('白名单为空时是否放行所有人。默认 false（fail-closed，安全）。')
@@ -518,6 +600,10 @@ const CONFIG_ROUTE_PATH = '/dsh-qq-guard/config'
 const STATUS_ROUTE_PATH = '/dsh-qq-guard/status'
 /** 路由路径：NapCat 进程启停与状态（批次 4B）。 */
 const NAPCAT_ROUTE_PATH = '/dsh-qq-guard/napcat'
+/** 路由路径：NapCat 登录二维码截图（qrcode.png → 浏览器）。 */
+const NAPCAT_QR_ROUTE_PATH = '/dsh-qq-guard/napcat-qr'
+/** 二维码图片大小上限：正常 147×147 只有几百字节，4MB 是防被替换成巨型文件。 */
+const NAPCAT_QR_MAX_BYTES = 4 * 1024 * 1024
 /** 路由路径：桥接进程启停与状态（批次 4B 补充）。 */
 const BRIDGE_ROUTE_PATH = '/dsh-qq-guard/bridge'
 /** 路由路径：调起系统原生「选择文件夹」对话框（NapCat 安装目录的「浏览」按钮）。 */
@@ -528,6 +614,192 @@ const EXTERNAL_ROUTE_PATH = '/dsh-qq-guard/external-plugins'
 const EXTERNAL_TEST_ROUTE_PATH = '/dsh-qq-guard/external-plugins/test'
 /** 路由路径：清理 QQ 工作区里失效的会话（Phase 4）。 */
 const CLEANUP_ROUTE_PATH = '/dsh-qq-guard/cleanup-sessions'
+/** 路由路径：单人设覆盖（桥接每条消息前 POST；guard 实例只读共享内存）。 */
+const PERSONA_ROUTE_PATH = '/dsh-qq-guard/persona'
+/** 路由路径：会话指令队列（UI POST 入队，桥接 2 秒轮询取出执行）。 */
+const SESSION_OPS_ROUTE_PATH = '/dsh-qq-guard/session-ops'
+/** 单人设文本长度上限（字符）：防一条 10MB 的人设把内存和日志撑爆。 */
+const PERSONA_MAX_CHARS = 20000
+/** 指令队列：最多挂起多少条 / 多久没被桥接取走就作废。 */
+const SESSION_OPS_CAP = 50
+const SESSION_OPS_TTL_MS = 5 * 60 * 1000
+
+/**
+ * 人设共享状态。
+ *
+ * ⚠️ 为什么是模块级而不是插件实例字段：本插件被装载两次（preset 内的
+ * role: guard 与 profile 顶层的 role: settings），两者是**同一个 ESM 模块实例**。
+ * 顶层实例（有 webServer）收 HTTP 请求写这份状态，guard 实例注册的
+ * system-prompt section 的 text 函数在每次组装时现读 —— 于是改完下一条消息即生效。
+ * （同进程共享内存，不落盘；桥接每条消息都会重新 POST，DSH 重启后自然恢复。）
+ */
+const personaState = {
+  /** 全局默认人设（桥接启动/配置变化时推送；空 = 用 preset 的 personaDefault）。 */
+  global: '',
+  /** sessionId → 单人设文本。 */
+  sessions: new Map(),
+}
+
+/** 设置全局默认人设（桥接推送）。空串 = 清除，回落到 preset 内置人设。 */
+export function setGlobalPersonaText(text) {
+  personaState.global = typeof text === 'string' ? text.slice(0, PERSONA_MAX_CHARS) : ''
+  return personaState.global
+}
+
+/** 设置某会话的单人设；空串 = 恢复全局默认。 */
+export function setSessionPersonaText(sessionId, text) {
+  const id = String(sessionId ?? '').trim()
+  if (!id) return undefined
+  const value = typeof text === 'string' ? text.slice(0, PERSONA_MAX_CHARS) : ''
+  if (value.trim() === '') personaState.sessions.delete(id)
+  else {
+    personaState.sessions.set(id, value)
+    // 防御：长期运行下会话可能很多；单人设只保留最近 500 个（Map 插入序，删最旧）。
+    while (personaState.sessions.size > 500) {
+      const oldest = personaState.sessions.keys().next().value
+      personaState.sessions.delete(oldest)
+    }
+  }
+  return value
+}
+
+/**
+ * 取某会话最终人设：单人设 > 全局 > preset 内置兜底。
+ * @param {string|undefined} sessionId
+ * @param {string} fallback preset 里配置的 personaDefault
+ */
+export function personaTextForSession(sessionId, fallback = '') {
+  const id = String(sessionId ?? '').trim()
+  if (id && personaState.sessions.has(id)) return personaState.sessions.get(id)
+  if (personaState.global.trim() !== '') return personaState.global
+  return String(fallback ?? '')
+}
+
+/** 诊断用快照（不含正文，只给长度/数量，避免把大段人设塞进日志）。 */
+export function personaStateSnapshot() {
+  return {
+    globalChars: personaState.global.length,
+    sessionCount: personaState.sessions.size,
+    sessions: [...personaState.sessions.keys()].slice(0, 50),
+  }
+}
+
+// ── 技能 / 插件开关的实时投影（Phase 6）───────────────────────────
+//
+// 为什么放模块级：本模块被装载两次（preset 内的 role: guard / profile 顶层的
+// role: settings）。用户在设置页改的是 **settings 实例**的 Config，而工具门禁在
+// **guard 实例**里执行。两者是同一个 ESM 模块实例，所以把 settings 的 Config
+// 存到模块级、guard 每次执行时现读，开关才不是 UI 装饰。
+//
+// 注意：必须用 plainConfig 解 volatile 包装，直接读 config.skills 会拿到
+// `{get()}` 包装对象（见 readRole 的注释）。
+const featureState = {
+  /** 顶层 settings 实例的原始 Config（可空：guard 先装载时就是 null，按默认清单算）。 */
+  source: null,
+}
+
+/** 让 guard 实例读到设置页实例的配置（由 applySettings 写入）。 */
+export function bindFeatureConfigSource(config) {
+  featureState.source = config ?? null
+  return featureState.source
+}
+
+/** 取某类清单：配置里没有这个数组时才回落到内置默认清单。 */
+function manifestOf(cfg, kind) {
+  const raw = kind === 'plugin' ? cfg.plugins : cfg.skills
+  if (Array.isArray(raw)) return raw
+  return kind === 'plugin' ? DEFAULT_PLUGINS : DEFAULT_SKILLS
+}
+
+/**
+ * 某个技能/插件条目是否开启（纯函数，离线测试可直接调用）。
+ *
+ * 语义：
+ *   · 配置里有这个数组 → 以数组为准；条目被删掉 = 关闭（用户明确删了它）。
+ *   · 配置里没有这个数组（旧配置 / 还没落盘）→ 用内置默认清单的 enabled。
+ * @param {unknown} config 插件 Config（可含 volatile 包装）
+ * @param {string} id 条目 id，如 sk-voice / pl-guard
+ * @param {'skill'|'plugin'} [kind]
+ */
+export function itemEnabledIn(config, id, kind = 'skill') {
+  const cfg = plainConfig(config) ?? {}
+  const configured = Array.isArray(kind === 'plugin' ? cfg.plugins : cfg.skills)
+  const list = manifestOf(cfg, kind)
+  const hit = list.find((item) => item && item.id === id)
+  if (hit) return hit.enabled !== false
+  if (!configured) {
+    const fallback = (kind === 'plugin' ? DEFAULT_PLUGINS : DEFAULT_SKILLS).find((item) => item.id === id)
+    if (fallback) return fallback.enabled === true
+  }
+  return false
+}
+
+/**
+ * 当前所有已实装开关的真实状态（guard 每次执行时现算，不缓存）。
+ * @param {unknown} [config] 默认读 settings 实例的 Config；测试可注入。
+ */
+export function readFeatureFlags(config = featureState.source) {
+  return {
+    voice: itemEnabledIn(config, 'sk-voice'),
+    vision: itemEnabledIn(config, 'sk-vision'),
+    search: itemEnabledIn(config, 'sk-search'),
+    guard: itemEnabledIn(config, 'pl-guard', 'plugin'),
+    debounce: itemEnabledIn(config, 'pl-debounce', 'plugin'),
+    rateLimit: itemEnabledIn(config, 'pl-ratelimit', 'plugin'),
+  }
+}
+
+// ── 会话指令队列（模块级：设置页路由与 guard 内的语音工具共用）─────────
+//
+// 原来这套队列定义在 applySettings 里，但「发语音」工具注册在 guard 实例，
+// 同一个进程里要让桥接取到工具入队的语音任务，队列必须放在模块作用域。
+const sessionOpsQueue = new Map() // id -> { id, op, key, text, sessionId, voice, at, lease }
+let sessionOpsSeq = 0
+
+/** 清掉过期指令（5 分钟没被桥接取走就作废）。 */
+function pruneSessionOps() {
+  const now = Date.now()
+  for (const [id, op] of sessionOpsQueue) {
+    if (now - op.at > SESSION_OPS_TTL_MS) sessionOpsQueue.delete(id)
+  }
+}
+
+/**
+ * 入队一条会话指令。
+ * @param {string} op clear | delete | persona | voice
+ * @param {string} key 会话 key（voice 为空串：桥接用 sessionId 反查）
+ * @param {string} [text]
+ * @param {{sessionId?:string, voice?:string}} [extra]
+ */
+function enqueueSessionOp(op, key, text = '', extra = {}) {
+  pruneSessionOps()
+  // 同一个 key + 同一种操作只保留最新一条（连点两次不要建出两个新会话）。
+  // voice 按 sessionId + 文本去重，避免模型一次回复里重复调工具刷屏。
+  for (const [id, existing] of sessionOpsQueue) {
+    const sameTarget = op === 'voice'
+      ? existing.sessionId === extra.sessionId
+      : existing.op === op && existing.key === key
+    if (sameTarget) sessionOpsQueue.delete(id)
+  }
+  const id = `op-${Date.now().toString(36)}-${++sessionOpsSeq}`
+  sessionOpsQueue.set(id, {
+    id, op, key, text,
+    sessionId: typeof extra.sessionId === 'string' ? extra.sessionId : '',
+    voice: typeof extra.voice === 'string' ? extra.voice : '',
+    at: Date.now(), lease: 0,
+  })
+  while (sessionOpsQueue.size > SESSION_OPS_CAP) {
+    const oldest = sessionOpsQueue.keys().next().value
+    sessionOpsQueue.delete(oldest)
+  }
+  return id
+}
+
+/** 诊断用：队列长度（不含指令内容）。 */
+export function sessionOpsSnapshot() {
+  return { queued: sessionOpsQueue.size }
+}
+
 
 /**
  * 定位「当前 profile 的 node_modules」——外部插件扫描的默认目录。
@@ -1152,6 +1424,39 @@ function readJsonBody(req, { maxBytes = 8 * 1024 } = {}) {
 }
 
 /**
+ * 收敛桥接上报的单条会话数据。
+ *
+ * 桥接是自己人，但**这条路由原则上是「只收白名单字段」**：任何字段、任何长度
+ * 都按契约裁一次，防止将来桥接改动或第三方进程伪造把垃圾塞进设置页。
+ * 文本一律转成单行字符串再截断，前端 React 会转义，不做 HTML 拼接。
+ *
+ * @param {unknown} row
+ * @returns {{key:string, sessionId:string, kind:'private'|'group', qq:string,
+ *   name:string, title:string, unread:number, lastAt:number, lastText:string}|null}
+ */
+function sanitizeSessionRow(row) {
+  if (!row || typeof row !== 'object') return null
+  const text = (value, max) => (typeof value === 'string' ? value.replace(/\s+/gu, ' ').trim().slice(0, max) : '')
+  const num = (value, max) => {
+    const n = Number(value)
+    return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), max) : 0
+  }
+  const key = text(row.key, 80)
+  if (!key) return null
+  return {
+    key,
+    sessionId: text(row.sessionId, 160),
+    kind: row.kind === 'group' ? 'group' : 'private',
+    qq: text(row.qq, 40),
+    name: text(row.name, 80),
+    title: text(row.title, 120),
+    unread: num(row.unread, 9999),
+    lastAt: num(row.lastAt, 8.64e15),
+    lastText: text(row.lastText, 200),
+  }
+}
+
+/**
  * 插件入口。本插件被装载两次（见 cordis.patch.yml）：
  *   · role: 'guard'    —— 作为 qq-chat preset 的子行，只做工具门禁；
  *   · role: 'settings' —— profile 顶层行，持有 Config / 设置页 / 只读 HTTP 路由。
@@ -1175,7 +1480,7 @@ export function apply(ctx, config) {
   const role = readRole(config)
 
   if (role === 'guard') {
-    applyGuard(ctx)
+    applyGuard(ctx, config)
     return
   }
   if (role === 'settings') {
@@ -1220,6 +1525,69 @@ export function readRole(config) {
 }
 
 /**
+ * 系统提示词里「部署人设」那一段的稳定 section 名。
+ * 与 @deepseek-ai/dsh-system-prompt 的常量一致（不能 import 它：插件不依赖 DSH 包）。
+ */
+const PERSONA_PREFIX_SECTION = 'deployment:persona-prefix'
+
+/**
+ * 动态人设 section：替换 preset 里原本那条静态 `dsh-persona` 行。
+ *
+ * - section 名沿用官方常量，作用域是 preset（guard 实例的 ctx），因此遮蔽全局
+ *   默认人设，只影响 QQ 会话；
+ * - `complete: true` 保证人设是该会话**唯一**系统提示词（Harness 自述等不穿透）；
+ * - `text` 是函数：每次组装现读共享人设状态，所以「单人设保存后下一条消息生效」。
+ *
+ * 人设取不到时依次回退：单人设 → 全局人设 → config.personaDefault。
+ *
+ * @param {object} ctx guard 实例的 ctx（preset 作用域）
+ * @param {unknown} config 插件 Config 解析结果
+ */
+function applyPersonaSection(ctx, config) {
+  const cfg = plainConfig(config) ?? {}
+  const fallback = typeof cfg.personaDefault === 'string' ? cfg.personaDefault : ''
+  const register = (spCtx) => {
+    const systemPrompt = spCtx.get?.('systemPrompt') ?? spCtx.systemPrompt
+    if (!systemPrompt || typeof systemPrompt.section !== 'function') {
+      console.warn?.('[qq-guard] role=guard 找不到 systemPrompt 服务：动态人设未注册，将沿用全局层默认提示词')
+      return
+    }
+    const order = typeof systemPrompt.getSectionOrder === 'function'
+      ? systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX')
+      : 0
+    const text = (context) => personaTextForSession(context?.agent?.session?.id, fallback)
+    const effect = typeof spCtx.effect === 'function'
+      ? spCtx.effect.bind(spCtx)
+      : (fn) => fn()
+    effect(
+      () => systemPrompt.section({
+        name: PERSONA_PREFIX_SECTION,
+        order: Number.isFinite(order) ? order : 0,
+        complete: true,
+        text,
+      }),
+      'qq-guard: dynamic persona section',
+    )
+    if (typeof systemPrompt.suppressRuntimeContext === 'function') {
+      effect(
+        () => systemPrompt.suppressRuntimeContext(),
+        'qq-guard: persona suppress runtime context',
+      )
+    }
+  }
+  if (typeof ctx.inject === 'function') {
+    // 服务已就绪就直接用当前 ctx 注册（保证 section 落在 preset 作用域这一层）；
+    // 还没就绪才走 inject 等它出现。
+    let ready
+    try { ready = ctx.get?.('systemPrompt') } catch { ready = undefined }
+    if (ready && typeof ready.section === 'function') register(ctx)
+    else ctx.inject(['systemPrompt'], register)
+  } else {
+    register(ctx)
+  }
+}
+
+/**
  * 工具门禁：**只能在 preset 作用域里跑**。
  *
  * 为什么必须校验：`ctx.tools.guard` 在 plain context 上是**全局**的
@@ -1231,7 +1599,7 @@ export function readRole(config) {
  * （证据：dsh-agent-preset-registry/lib/types/index.js:326
  *   `composedPreset(ctx) { return this.generationFor(ctx)?.mount.presetId; }`）
  */
-function applyGuard(ctx) {
+function applyGuard(ctx, config) {
   const agentPresets = ctx.get?.('agentPresets')
   const presetId = agentPresets?.composedPreset?.(ctx)
 
@@ -1244,6 +1612,24 @@ function applyGuard(ctx) {
     )
     return
   }
+
+  // ── 第 0 层：动态人设 section（替代 preset 里原有的静态 dsh-persona 行）──
+  //
+  // 为什么必须动态：preset 的人设要按会话区分（单人设覆盖），静态 config 文本做不到。
+  // 为什么用 `complete: true`：preset 的人设是**唯一**系统提示词；不加的话 profile
+  // 全局层的 Harness 自述 / Agent Teams / Shell routing 会穿透进 QQ 会话，模型端出助手腔。
+  // 证据：dsh-system-prompt/lib/index.js:380-405（complete section 在瀑布后强制保留为唯一 section）。
+  //
+  // 兜底链条：单人设（HTTP 推送）> 全局人设（桥接推送）> preset 的 personaDefault。
+  // 三者都为空的极端情况下 section 文本为空串 —— 不会崩，但模型会没有身份，
+  // 所以 cordis.patch.yml 里 personaDefault 必须始终有内容。
+  applyPersonaSection(ctx, config)
+
+  // ── 第 0.5 层：语音工具（注册在 preset 作用域，不是全局）──────────
+  // 注册了就常驻 schema，开关关闭时由下面的 guard 在执行期拒绝。
+  // 为什么不动态注册/注销：配置变化没有可靠的低成本回调，频繁 register/unregister
+  // 会触发 tools/change 风暴；执行期拒绝 + 描述里写明「技能开启时可用」已经够用。
+  applyVoiceTool(ctx)
 
   // ── 第 1 层：从 schema 隐藏 ────────────────────────────────────
   // `restrict()` 会**整批原子失败**：名单里只要有一个当下未注册的名字就抛错，
@@ -1297,10 +1683,107 @@ function applyGuard(ctx) {
   ctx.tools.guard((exec) => {
     const toolName = exec?.name
     if (typeof toolName !== 'string' || toolName.length === 0) return '工具名无效，已拒绝'
+
+    // 技能开关必须在**执行期**现读：UI 关掉一个技能，模型可能还拿着旧 schema 里的工具名，
+    // 只靠 schema 隐藏兜不住；返回字符串即拒绝。
+    const flags = readFeatureFlags()
+    if (toolName === VOICE_TOOL_NAME) {
+      return flags.voice ? undefined : '「发语音」技能未开启，qq_send_voice 已拒绝'
+    }
+    if (toolName === 'web_search' || toolName === 'web_fetch') {
+      return flags.search ? undefined : '「网页搜索」技能未开启，联网工具已拒绝'
+    }
+    // 「工具门禁」总开关：关掉 = 显式放弃执行期白名单（schema 层的 restrict 仍然生效，
+    // 全局危险工具依旧被隐藏；但 agent-scope 工具将不再被这里拦住）。
+    // 这是用户明确打开的高风险开关，设置页上有红字警告。
+    if (!flags.guard) return undefined
     if (SAFE_EXACT.has(toolName)) return undefined
     if (SAFE_PREFIXES.some((prefix) => toolName.startsWith(prefix))) return undefined
     return `工具 "${toolName}" 不在 QQ 会话白名单内，已拒绝（QQ 聊天会话无本地执行能力）`
   })
+}
+
+/** 「发语音」工具名（guard 与测试共用）。 */
+export const VOICE_TOOL_NAME = 'qq_send_voice'
+/** 单条语音的文字上限：QQ 语音条约 60 秒，中文按 ~4 字/秒估。 */
+export const VOICE_MAX_CHARS = 240
+
+/**
+ * 注册「发语音」工具（Phase 6）。
+ *
+ * 工具只负责把任务入队到模块级会话指令队列；真正的合成与发送在桥接进程
+ * （它才有 NapCat 的 WS 连接）。这样插件不碰网络以外的凭据，也不引入任何 npm 依赖。
+ *
+ * @param {object} ctx guard 实例的 ctx（preset 作用域）
+ */
+function applyVoiceTool(ctx) {
+  const tools = ctx.get?.('tools') ?? ctx.tools
+  if (!tools || typeof tools.register !== 'function') {
+    console.warn?.('[qq-guard] 找不到 tools 服务：qq_send_voice 未注册')
+    return
+  }
+  const register = () => tools.register({
+    name: VOICE_TOOL_NAME,
+    description: '把一段中文文字合成语音，以 QQ 语音条发到当前聊天。'
+      + `仅在「发语音」技能开启时可用；单次最多 ${VOICE_MAX_CHARS} 字（QQ 语音条约 60 秒），`
+      + '超出请先精简。发送是异步的：工具返回「已提交」不代表已经播放。',
+    parameters: {
+      text: {
+        type: 'string',
+        required: true,
+        description: '要合成语音的正文。纯文本，不要 Markdown / emoji / 颜文字。',
+      },
+      voice: {
+        type: 'string',
+        description: '可选，覆盖设置页里的音色名（Edge 如 zh-CN-XiaoyiNeural，OpenAI 如 alloy）。',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          queued: { type: 'boolean', required: true },
+          chars: { type: 'integer', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `已提交语音合成（${Number(value?.chars) || 0} 字），桥接会在几秒内发送到 QQ。`,
+      }],
+    },
+    execute: async (args, exec) => {
+      const flags = readFeatureFlags()
+      if (!flags.voice) throw new Error('「发语音」技能未开启：请先在 QQ 桥接设置页的「技能与插件」里打开它。')
+      const text = String(args?.text ?? '').trim()
+      if (!text) throw new Error('text 不能为空')
+      const chars = [...text].length
+      if (chars > VOICE_MAX_CHARS) {
+        throw new Error(`文字过长（${chars} > ${VOICE_MAX_CHARS} 字），QQ 语音条放不下，请先精简。`)
+      }
+      const sessionId = String(exec?.agent?.id ?? '').trim()
+      if (!sessionId) throw new Error('qq_send_voice 只能在 QQ 会话内调用（拿不到 sessionId）')
+      const voice = String(args?.voice ?? '').trim()
+      const id = enqueueSessionOp('voice', '', text, {
+        sessionId,
+        ...(voice !== '' ? { voice } : {}),
+      })
+      return { queued: true, chars, id }
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: '发送 QQ 语音',
+      kind: 'other',
+      rawInput: { chars: [...String(args?.text ?? '')].length },
+    }),
+    presentResult: (_args, result) => ({
+      card: 'generic',
+      title: 'QQ 语音已入队',
+      content: result?.content,
+    }),
+  })
+  if (typeof ctx.effect === 'function') ctx.effect(register, 'qq-guard: qq_send_voice tool')
+  else register()
 }
 
 /**
@@ -1336,6 +1819,9 @@ export function plainConfig(value) {
  * 只在有 webServer 的顶层 ctx 上跑：注册只读配置路由 + 声明自管设置页。
  */
 function applySettings(ctx, config) {
+  // 把 settings 实例的 Config 暴露给 guard 实例（技能开关 / 工具门禁的实时来源）。
+  // 必须在 `webServer` 检查之前绑定：没有 webServer 的环境里 guard 也要能读到开关。
+  bindFeatureConfigSource(config)
   // 把运行时配置暴露给桥接进程（批次 4A）。
   // 桥接是独立进程，拿不到这里的内存值；它轮询这条只读路由做热更新。
   if (ctx.webServer === undefined) return
@@ -1355,10 +1841,151 @@ function applySettings(ctx, config) {
           sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
           return
         }
-        sendJson(res, 200, { ok: true, config: plainConfig(config) })
+        // personaDefault 存在 guard 子行的 config 里，顶层实例拿不到；
+        // 从自己的 patch 文件读出来合并进去，桥接才能拼出带默认人设的 prompt。
+        const cfg = plainConfig(config) ?? {}
+        sendJson(res, 200, {
+          ok: true,
+          config: {
+            ...cfg,
+            personaDefault: readGuardPersonaDefault(),
+            // Phase 6：技能/插件开关的**派生结果**。guard 与桥接共用同一份判断逻辑，
+            // 避免「UI 写着已开启、桥接按 id 算出来却是关」这类漂移。
+            features: readFeatureFlags(config),
+          },
+        })
       },
     }),
     'qq-guard: bridge runtime config route',
+  )
+
+  // ── 单人设覆盖（桥接每条消息前 POST；guard 实例注册的 section 现读）────
+  //
+  // 刻意把「写」也放在这条路由上：桥接是独立进程，没有浏览器 Cookie，
+  // 所以不校验 cookie，只拒绝跨站（sec-fetch-site: cross-site）。
+  // 内容本身没有执行能力，最坏情况只是改变 QQ 会话的人设文本。
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: PERSONA_ROUTE_PATH,
+      handler: async (req, res) => {
+        const fetchSite = req.headers['sec-fetch-site']
+        if (typeof fetchSite === 'string' && fetchSite !== 'same-origin' && fetchSite !== 'none') {
+          sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
+          return
+        }
+        if (req.method === 'GET' || req.method === 'HEAD') {
+          sendJson(res, 200, { ok: true, ...personaStateSnapshot() })
+          return
+        }
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, reason: 'method not allowed' })
+          return
+        }
+        let body
+        try {
+          body = await readJsonBody(req, { maxBytes: 64 * 1024 })
+        } catch (error) {
+          sendJson(res, error?.statusCode ?? 400, { ok: false, reason: error?.message ?? 'invalid json' })
+          return
+        }
+        const text = typeof body?.text === 'string' ? body.text : ''
+        const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
+        if (body?.mode === 'default' || sessionId === '') {
+          // 全局默认人设：桥接启动 / 设置页改动时推送。
+          setGlobalPersonaText(text)
+          sendJson(res, 200, { ok: true, scope: 'global', chars: personaStateSnapshot().globalChars })
+          return
+        }
+        setSessionPersonaText(sessionId, text)
+        sendJson(res, 200, { ok: true, scope: 'session', sessionId, chars: Math.min(text.length, PERSONA_MAX_CHARS) })
+      },
+    }),
+    'qq-guard: persona route',
+  )
+
+  // ── 会话指令队列（清空 / 删除 / 单人设）────────────────────────
+  //
+  // 为什么需要队列：桥接是独立进程，`state/sessions.json` 与 DSH 会话都是它在管，
+  // Host 直接改文件会被桥接的下一次落盘覆盖。所以 UI 只入队，桥接 2 秒轮询执行，
+  // 执行结果再回传（不追求强一致，追求「点了真的会生效且不会双开」）。
+  //
+  // 租约（LEASE_MS）：GET 取走时打租约，租约期内不再投递，避免桥接重复执行
+  // 「清空」这种非幂等操作；桥接崩了租约过期后重新投递。
+  //
+  // 队列本体在模块作用域（sessionOpsQueue）：guard 实例里的「发语音」工具
+  // 也要往同一个队列塞任务，所以不能再定义在这个闭包里。
+  const SESSION_OPS_LEASE_MS = 30_000
+  const validSessionKey = (key) => typeof key === 'string' && /^[ug]:\d{1,20}$/.test(key)
+
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: SESSION_OPS_ROUTE_PATH,
+      handler: async (req, res) => {
+        const fetchSite = req.headers['sec-fetch-site']
+        if (typeof fetchSite === 'string' && fetchSite !== 'same-origin' && fetchSite !== 'none') {
+          sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
+          return
+        }
+        if (req.method === 'GET' || req.method === 'HEAD') {
+          // 桥接来取指令：给租约，租约内不重复投递。
+          pruneSessionOps()
+          const now = Date.now()
+          const ops = []
+          for (const op of sessionOpsQueue.values()) {
+            if (op.lease && now - op.lease < SESSION_OPS_LEASE_MS) continue
+            op.lease = now
+            ops.push({
+              id: op.id, op: op.op, key: op.key,
+              ...(op.text ? { text: op.text } : {}),
+              // 语音任务没有 QQ 会话 key（由 guard 工具按 sessionId 入队），
+              // 桥接用 sessionId 反查 state.sessions；voice 可覆盖音色。
+              ...(op.sessionId ? { sessionId: op.sessionId } : {}),
+              ...(op.voice ? { voice: op.voice } : {}),
+            })
+          }
+          sendJson(res, 200, { ok: true, ops })
+          return
+        }
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, reason: 'method not allowed' })
+          return
+        }
+        let body
+        try {
+          body = await readJsonBody(req, { maxBytes: 128 * 1024 })
+        } catch (error) {
+          sendJson(res, error?.statusCode ?? 400, { ok: false, reason: error?.message ?? 'invalid json' })
+          return
+        }
+        // 桥接回执：{ results: [{ id, ok, detail }] }
+        if (Array.isArray(body?.results)) {
+          let removed = 0
+          for (const result of body.results.slice(0, 100)) {
+            const id = typeof result?.id === 'string' ? result.id : ''
+            if (id && sessionOpsQueue.delete(id)) removed++
+          }
+          sendJson(res, 200, { ok: true, removed })
+          return
+        }
+        // UI 入队：{ op, key, text? }
+        const op = typeof body?.op === 'string' ? body.op : ''
+        if (!['clear', 'delete', 'persona'].includes(op)) {
+          sendJson(res, 400, { ok: false, reason: 'unknown-op', detail: `未知操作：${op || '(空)'}` })
+          return
+        }
+        const key = typeof body?.key === 'string' ? body.key.trim() : ''
+        if (!validSessionKey(key)) {
+          sendJson(res, 400, { ok: false, reason: 'bad-key', detail: '会话 key 必须是 u:<QQ号> 或 g:<群号>' })
+          return
+        }
+        const text = typeof body?.text === 'string' ? body.text.slice(0, PERSONA_MAX_CHARS) : ''
+        const id = enqueueSessionOp(op, key, op === 'persona' ? text : '')
+        sendJson(res, 200, { ok: true, id, queued: sessionOpsQueue.size, note: '桥接 2 秒内轮询执行' })
+      },
+    }),
+    'qq-guard: session ops route',
   )
 
   // ── 真实用量统计（「数据与用量」面板）────────────────────────────
@@ -1793,7 +2420,11 @@ function applySettings(ctx, config) {
         let mapped = []
         try {
           const state = JSON.parse(readFileSync(statePath, 'utf8'))
-          mapped = Object.values(state?.sessions ?? {}).map(String)
+          // 新版桥接的 values 是对象（{ sessionId, unread, ... }），旧版是裸字符串。
+          // 两种都认，否则升级后「清理失效会话」会把所有在用的会话当孤儿归档。
+          mapped = Object.values(state?.sessions ?? {})
+            .map((value) => (typeof value === 'string' ? value : value?.sessionId))
+            .filter((id) => typeof id === 'string' && id)
         } catch { /* 没有状态文件 = 还没建过会话，映射为空 */ }
         let sessionCwd = ''
         try {
@@ -1921,6 +2552,65 @@ function applySettings(ctx, config) {
     ctx.logger?.warn?.('[qq-guard] 未注入 subprocess，NapCat 启停功能不可用（仍可查看状态）')
   }
 
+  // ── NapCat 登录二维码（qrcode.png → 浏览器）────────────────────
+  //
+  // 为什么需要：NapCat 掉登录时会把二维码打到终端，同时落一张
+  // `<napcatDir>/versions/<ver>/resources/app/napcat/cache/qrcode.png`（147×147）。
+  // ASCII 二维码在日志框里只要字体/行高差一点就扫不出来（2026-10-23 实测），
+  // 所以前端优先展示这张原图。
+  //
+  // 安全边界：只按**固定候选路径**找图（不接客户端传路径）、realpath 必须仍在
+  // NapCat 目录内、限 4MB、同源 GET、no-sniff。
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: NAPCAT_QR_ROUTE_PATH,
+      handler: (req, res) => {
+        const fetchSite = req.headers['sec-fetch-site']
+        if (typeof fetchSite === 'string' && fetchSite !== 'same-origin') {
+          sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
+          return
+        }
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          sendJson(res, 405, { ok: false, reason: 'method not allowed' })
+          return
+        }
+        const cfg = plainConfig(config) ?? {}
+        const napcatDir = cfg.napcat?.dir || ''
+        const image = findQrcodeImage(napcatDir)
+        if (image === null) {
+          sendJson(res, 404, { ok: false, reason: 'qr-not-found' })
+          return
+        }
+        if (image.size > NAPCAT_QR_MAX_BYTES) {
+          sendJson(res, 413, { ok: false, reason: 'qr-too-large', size: image.size })
+          return
+        }
+        try {
+          // realpath 二次确认：候选路径是固定的，但仍防 NapCat 目录里放符号链接逃逸。
+          const realDir = realpathSync(path.resolve(napcatDir))
+          const realFile = realpathSync(image.file)
+          if (realFile !== realDir && !realFile.startsWith(realDir + path.sep)) {
+            sendJson(res, 403, { ok: false, reason: 'qr-path-escape' })
+            return
+          }
+          const buffer = readFileSync(realFile)
+          res.writeHead(200, {
+            'content-type': 'image/png',
+            'content-length': String(buffer.length),
+            // 二维码每次刷新都会重写同名文件：绝不能缓存，否则用户扫到上一张。
+            'cache-control': 'no-store, max-age=0',
+            'x-content-type-options': 'nosniff',
+          })
+          res.end(req.method === 'HEAD' ? undefined : buffer)
+        } catch (error) {
+          sendJson(res, 500, { ok: false, reason: 'qr-read-failed', detail: error?.message ?? String(error) })
+        }
+      },
+    }),
+    'qq-guard: napcat qr route',
+  )
+
   // ── 桥接进程管理（批次 4B 补充）───────────────────────────────
   //
   // 桥接原本没有常驻机制：只能手动开终端 `node start.mjs`，窗口一关进程就没了，
@@ -2046,12 +2736,15 @@ function applySettings(ctx, config) {
         }
         // 只接受本机桥接进程上报：它没有浏览器 Cookie，所以不做 origin 校验，
         // 改为限制请求体大小 + 只收白名单字段（不允许任意写）。
+        //
+        // 64KB：除了 5 个进程级计数，现在还带一份会话列表（未读/昵称/最近消息），
+        // 100 个会话约 15~25KB，留一倍余量。超过即拒绝，绝不无限收。
         const chunks = []
         let size = 0
         let aborted = false
         req.on('data', (c) => {
           size += c.length
-          if (size > 8192) { aborted = true; try { req.destroy() } catch { /* 已断开就忽略 */ } return }
+          if (size > 65536) { aborted = true; try { req.destroy() } catch { /* 已断开就忽略 */ } return }
           chunks.push(c)
         })
         req.on('end', () => {
@@ -2074,6 +2767,11 @@ function applySettings(ctx, config) {
                 failed: Number(body?.counts?.failed) || 0,
                 denied: Number(body?.counts?.denied) || 0,
               },
+              // 会话列表：白名单字段 + 类型收敛。缺省时**不写**这个键（旧版桥接），
+              // 前端据此区分「没有数据」和「确实一个会话都没有」。
+              ...(Array.isArray(body?.sessions)
+                ? { sessions: body.sessions.slice(0, 100).map(sanitizeSessionRow).filter(Boolean) }
+                : {}),
             }
             lastStatusAt = Date.now()
             sendJson(res, 200, { ok: true })

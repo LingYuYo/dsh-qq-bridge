@@ -52,6 +52,14 @@ vm.runInContext(SOURCE, sandbox, { filename: 'client.js' })
 const textSink = []
 // 记录所有挂到 DOM 的事件处理与可交互元素，用来断言「按钮真的绑了函数」。
 const handlers = []
+/** 记录所有原生节点（tag + props），供按 aria-label / 文案做断言。 */
+const renderedNodes = []
+function textOf(node) {
+  if (node === null || node === undefined) return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(textOf).join('')
+  return textOf(node.props?.children)
+}
 function render(node, path = 'root') {
   if (node === null || node === undefined || node === false) return
   if (typeof node === 'string' || typeof node === 'number') { textSink.push(String(node)); return }
@@ -60,6 +68,7 @@ function render(node, path = 'root') {
   const children = props?.children ?? []
   if (type === React.Fragment) { children.forEach((c, i) => render(c, `${path}.frag${i}`)); return }
   if (typeof type === 'string') {
+    renderedNodes.push({ tag: type, props })
     if (props?.onClick) handlers.push({ tag: type, path, hasOnClick: typeof props.onClick === 'function' })
     children.forEach((c, i) => render(c, `${path}.${type}${i}`))
     return
@@ -168,12 +177,13 @@ for (const tab of ['status', 'sessions', 'skills', 'settings', 'usage']) {
   const joined = textSink.join('|')
   const expect = {
     status: ['今日用量概览', 'AI 排障助手', '启动桥接'],
-    sessions: ['会话管理', '单人设覆盖', '记忆提取', '单独白名单', '删除会话'],
+    // 会话管理已接真实数据：桥接未上报时渲染「等待上报」，不再有假会话。
+    sessions: ['会话管理', '等待桥接上报', '运行状态'],
     skills: ['技能（Skill）', '插件（Plugin）', '发语音', '图片理解', '网页搜索', '记忆提取',
       '防抖合并', '频率控制', '上下文压缩', '+ 添加插件', '+ 添加技能'],
     // Phase 3：引导改成按钮+弹窗，分片/打字延时合并成「运行节奏」两个大按钮。
     settings: ['运行节奏', '信息发送配置', '活跃设置', '使用引导',
-      '人设配置', '白名单管理', 'OneBot 连接', 'NapCat 进程'],
+      '人设配置', '白名单管理', '管理员 QQ 号', 'OneBot 连接', 'NapCat 进程'],
     // 用量页已全部接真实数据：假数据删除，新增「峰谷时段设置 / 单价配置 / 按会话统计」。
     usage: ['数据与用量', '按天统计', '按模型统计', '按会话统计', '单价配置', '峰谷时段设置',
       '仅在工作日生效', 'Token 消耗走势'],
@@ -181,6 +191,44 @@ for (const tab of ['status', 'sessions', 'skills', 'settings', 'usage']) {
   const missing = expect.filter((k) => !joined.includes(k))
   if (missing.length) throw new Error(`Tab「${tab}」缺少内容：${missing.join('、')}`)
   console.log(`✓ Tab「${tab}」渲染通过（文本节点 ${textSink.length}）`)
+}
+
+/* ── 会话管理：有真实上报数据时的列表 / 详情 ────────────────── */
+// SettingsPanel 的 hook 顺序：#0 useForm / #1 active / #2 guideOpen /
+// #3-#4 useBridgeProc / #5 useBridgeStatus。把 #5 预置成桥接上报的 payload。
+{
+  const LIVE = {
+    sessions: [
+      { key: 'g:123456', sessionId: 's2', kind: 'group', qq: '123456', name: '摸鱼群',
+        title: '群聊-摸鱼群(123456)', unread: 3, lastAt: Date.now(), lastText: '今天这破网', persona: '' },
+      { key: 'u:1000000001', sessionId: 's1', kind: 'private', qq: '1000000001', name: '翎羽',
+        title: '私聊-翎羽', unread: 0, lastAt: 0, lastText: '', persona: '专属人设' },
+    ],
+  }
+  const root = 'live:sessions'
+  hookStore = new Map([
+    [`${root}.BridgePanel.SettingsPanel#1`, 'sessions'],
+    [`${root}.BridgePanel.SettingsPanel#5`, LIVE],
+  ])
+  effects.length = 0; textSink.length = 0; handlers.length = 0; renderedNodes.length = 0
+  render(React.createElement(Comp, { remoteForm: form }), root)
+  const joined = textSink.join('|')
+  for (const k of ['摸鱼群', '翎羽', '群聊-摸鱼群(123456)', '3 条未读', '今天这破网', 'DSH 会话 ID',
+    '单人设覆盖', '保存人设', '恢复全局', '清空上下文', '删除会话']) {
+    if (!joined.includes(k)) throw new Error(`会话列表（真实数据）缺少「${k}」`)
+  }
+  if (joined.includes('等待桥接上报')) throw new Error('有数据时不应显示等待态')
+  // 本批解锁：按钮与文本框都必须是可用的（不再是置灰占位）
+  const textarea = renderedNodes.find((n) => n.props?.['aria-label'] === '单人设覆盖')
+  if (!textarea) throw new Error('缺少单人设输入框')
+  if (textarea.props.disabled === true) throw new Error('单人设输入框不该置灰')
+  const clearBtn = renderedNodes.find((n) => n.tag === 'button' && textOf(n).trim() === '清空上下文')
+  if (!clearBtn) throw new Error('缺少「清空上下文」按钮')
+  if (clearBtn.props.disabled === true) throw new Error('「清空上下文」按钮不该置灰')
+  const deleteBtn = renderedNodes.find((n) => n.tag === 'button' && textOf(n).trim() === '删除会话')
+  if (!deleteBtn) throw new Error('缺少「删除会话」按钮')
+  if (deleteBtn.props.disabled === true) throw new Error('「删除会话」按钮不该置灰')
+  console.log('✓ 会话管理（真实上报数据）渲染通过')
 }
 
 /* ── 交互绑定检查：页面上不能有「点了没反应」的按钮 ───────────── */
@@ -245,22 +293,8 @@ function renderSkillsWith(stateIndex, value, tag) {
   console.log('✓ 弹窗「添加技能」渲染通过')
 }
 
-/* ── 会话删除确认框 ─────────────────────────────────────────── */
-{
-  const root = 'modal:session-delete'
-  // SessionsTab 的 hook 顺序：#0 list / #1 selected / #2 allowOverride / #3 personaDraft / #4 confirmDel
-  hookStore = new Map([
-    [`${root}.BridgePanel.SettingsPanel#1`, 'sessions'],
-    [`${root}.BridgePanel.SettingsPanel.div3.div0.SessionsTab#4`, true],
-  ])
-  effects.length = 0; textSink.length = 0
-  render(React.createElement(Comp, { remoteForm: form }), root)
-  const joined = textSink.join('|')
-  for (const k of ['删除会话「', '取消']) {
-    if (!joined.includes(k)) throw new Error(`会话删除确认框缺少「${k}」`)
-  }
-  console.log('✓ 弹窗「会话删除确认」渲染通过')
-}
+/* ── 会话删除确认框已随「删除会话」功能排到下一批 ─────────────── */
+/* （本批只接真实列表与未读，按钮保持置灰；等归档 + 指令队列落地后补回用例。） */
 
 /* ── 全局设置页的两个弹窗 ───────────────────────────────────── */
 // SettingsTab hook 顺序：#0 sendOpen / #1 activeOpen

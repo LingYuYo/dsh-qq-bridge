@@ -60,14 +60,35 @@ function makeHarness({ config, services = {} } = {}) {
   return { routes }
 }
 
-function call(handler, { method = 'GET', fetchSite = 'same-origin' } = {}) {
+function call(handler, { method = 'GET', fetchSite = 'same-origin', body, raw = false } = {}) {
   return new Promise((resolve) => {
     const res = {
       status: 0,
-      writeHead(status) { this.status = status },
-      end(body) { resolve({ status: this.status, body: JSON.parse(String(body)) }) },
+      headers: {},
+      writeHead(status, headers) {
+        this.status = status
+        if (headers) this.headers = headers
+      },
+      end(bodyText) {
+        resolve({
+          status: this.status,
+          headers: this.headers,
+          body: raw ? bodyText : JSON.parse(String(bodyText)),
+        })
+      },
     }
-    const req = { method, url: '/', headers: fetchSite === undefined ? {} : { 'sec-fetch-site': fetchSite } }
+    const req = {
+      method,
+      url: '/',
+      headers: fetchSite === undefined ? {} : { 'sec-fetch-site': fetchSite },
+      // 简易可读流：有 body 时先发 data 再发 end，供 POST 解析逻辑使用。
+      on(event, fn) {
+        if (event === 'data' && body !== undefined) setImmediate(() => fn(Buffer.from(body)))
+        else if (event === 'end') setImmediate(() => fn())
+        return req
+      },
+      destroy() {},
+    }
     Promise.resolve(handler(req, res)).catch((e) => resolve({ status: 500, body: { ok: false, detail: String(e) } }))
   })
 }
@@ -341,7 +362,11 @@ function makeBridgeState({ sessionCwd, mapped, configDir }) {
   const stateDir = path.join(dir, 'state')
   fs.mkdirSync(stateDir, { recursive: true })
   fs.writeFileSync(path.join(stateDir, 'sessions.json'), JSON.stringify({
-    sessions: Object.fromEntries(mapped.map((id, i) => [`k${i}`, id])),
+    // 兼容两种 schema：旧版裸 sessionId 字符串 / 新版对象 { sessionId, unread, ... }
+    sessions: Object.fromEntries(mapped.map((entry, i) => [
+      `k${i}`,
+      typeof entry === 'string' ? entry : { sessionId: entry.sessionId, unread: entry.unread ?? 0 },
+    ])),
     generation: 1,
   }, null, 2))
   fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ dsh: { sessionCwd } }, null, 2))
@@ -376,6 +401,22 @@ await check('归档 QQ 工作区里不在映射表里的会话', async () => {
   assert.equal(r.body.archived, 2)
   assert.deepEqual(archived.sort(), ['s-orphan-1', 's-orphan-2'],
     '只归档 QQ 工作区的孤儿会话，映射内的、别的目录的、子代理的都不能动')
+})
+
+await check('映射值是对象（新版 schema）时仍算「在用」，不会被误归档', async () => {
+  const cwd = path.join(os.tmpdir(), 'QQChat-test-obj')
+  const bridgeDir = makeBridgeState({ sessionCwd: cwd, mapped: [{ sessionId: 's-keep', unread: 5 }] })
+  const archived = []
+  const services = {
+    sessionController: {
+      list: async () => ({ items: [{ sessionId: 's-keep', cwd }, { sessionId: 's-orphan', cwd }] }),
+    },
+    workspaceRegistry: { archiveSession: async (id) => { archived.push(id) } },
+  }
+  const { routes } = makeHarness({ config: { bridge: { dir: bridgeDir } }, services })
+  const r = await call(routes.get('/dsh-qq-guard/cleanup-sessions'), { method: 'POST' })
+  assert.equal(r.status, 200)
+  assert.deepEqual(archived, ['s-orphan'], '★ 新版对象映射不能被当成孤儿归档')
 })
 
 await check('映射表外的会话已不存在时 archived=0', async () => {
@@ -434,6 +475,181 @@ await check('GET cleanup-sessions → 405；跨站 → 403', async () => {
   assert.equal(g.status, 405)
   const x = await call(routes.get('/dsh-qq-guard/cleanup-sessions'), { method: 'POST', fetchSite: 'cross-site' })
   assert.equal(x.status, 403)
+})
+
+console.log('\n状态上报（会话列表）：')
+
+await check('POST /status 收会话列表：白名单字段、空 key 丢弃、上限夹紧', async () => {
+  const { routes } = makeHarness({ config: {} })
+  const payload = {
+    qqState: 'online',
+    dshOk: true,
+    counts: { received: 3 },
+    sessions: [
+      { key: 'u:1', sessionId: 's1', kind: 'private', qq: '1', name: 'A', title: '私聊-A', unread: 2, lastAt: 123, lastText: 'hi', evil: 'x' },
+      { key: '', sessionId: 's2' },
+      { key: 'g:2', kind: 'group', qq: '2', name: 'B', unread: '999999', lastText: 'x'.repeat(500) },
+    ],
+  }
+  const post = await call(routes.get('/dsh-qq-guard/status'), { method: 'POST', body: JSON.stringify(payload) })
+  assert.equal(post.status, 200)
+  const r = await call(routes.get('/dsh-qq-guard/status'))
+  assert.equal(r.body.reported, true)
+  const rows = r.body.status.sessions
+  assert.equal(rows.length, 2, '空 key 的行必须丢弃')
+  assert.equal(rows[0].unread, 2)
+  assert.equal('evil' in rows[0], false, '未知字段必须被裁掉')
+  assert.equal(rows[1].unread, 9999, '未读上限夹紧')
+  assert.equal(rows[1].lastText.length, 200, '预览截断 200 字')
+})
+
+await check('POST /status 不带 sessions 时不写 sessions 键（区分「没数据」和「空列表」）', async () => {
+  const { routes } = makeHarness({ config: {} })
+  await call(routes.get('/dsh-qq-guard/status'), {
+    method: 'POST',
+    body: JSON.stringify({ qqState: 'online', counts: {} }),
+  })
+  const r = await call(routes.get('/dsh-qq-guard/status'))
+  assert.equal('sessions' in (r.body.status ?? {}), false)
+})
+
+await check('POST /status 超过 64KB 直接 413', async () => {
+  const { routes } = makeHarness({ config: {} })
+  const huge = JSON.stringify({ counts: {}, sessions: [{ key: 'u:1', lastText: 'x'.repeat(70000) }] })
+  const r = await call(routes.get('/dsh-qq-guard/status'), { method: 'POST', body: huge })
+  assert.equal(r.status, 413)
+})
+
+console.log('\nNapCat 登录二维码：')
+
+/** 造一个带 qrcode.png 的 NapCat 目录（当前 Shell 版布局）。 */
+function makeQrNapcatDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qqg-napcat-qr-'))
+  const nested = path.join(dir, 'versions', '9.9.33-52230', 'resources', 'app', 'napcat', 'cache')
+  fs.mkdirSync(nested, { recursive: true })
+  const bytes = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex')
+  fs.writeFileSync(path.join(nested, 'qrcode.png'), bytes)
+  return { dir, bytes }
+}
+
+await check('GET /napcat-qr 返回 PNG（no-store / nosniff / 字节一致）', async () => {
+  const { dir, bytes } = makeQrNapcatDir()
+  try {
+    const { routes } = makeHarness({ config: { napcat: { dir } } })
+    const r = await call(routes.get('/dsh-qq-guard/napcat-qr'), { raw: true })
+    assert.equal(r.status, 200)
+    assert.equal(r.headers['content-type'], 'image/png')
+    assert.equal(String(r.headers['cache-control']).includes('no-store'), true)
+    assert.equal(r.headers['x-content-type-options'], 'nosniff')
+    assert.equal(Buffer.compare(Buffer.from(r.body), bytes), 0, '图片字节必须原样返回')
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+await check('没配 napcat.dir / 目录里没图 → 404', async () => {
+  const { routes } = makeHarness({ config: {} })
+  const r1 = await call(routes.get('/dsh-qq-guard/napcat-qr'))
+  assert.equal(r1.status, 404)
+  assert.equal(r1.body.reason, 'qr-not-found')
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'qqg-napcat-empty-'))
+  try {
+    const { routes: r2routes } = makeHarness({ config: { napcat: { dir: empty } } })
+    const r2 = await call(r2routes.get('/dsh-qq-guard/napcat-qr'))
+    assert.equal(r2.status, 404)
+  } finally { fs.rmSync(empty, { recursive: true, force: true }) }
+})
+
+await check('跨站 → 403；POST → 405', async () => {
+  const { dir } = makeQrNapcatDir()
+  try {
+    const { routes } = makeHarness({ config: { napcat: { dir } } })
+    const cross = await call(routes.get('/dsh-qq-guard/napcat-qr'), { fetchSite: 'cross-site' })
+    assert.equal(cross.status, 403)
+    const post = await call(routes.get('/dsh-qq-guard/napcat-qr'), { method: 'POST' })
+    assert.equal(post.status, 405)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+await check('超过 4MB 的图片拒绝（413），不往浏览器灌大文件', async () => {
+  const { dir } = makeQrNapcatDir()
+  try {
+    const nested = path.join(dir, 'versions', '9.9.33-52230', 'resources', 'app', 'napcat', 'cache', 'qrcode.png')
+    fs.writeFileSync(nested, Buffer.alloc(4 * 1024 * 1024 + 1))
+    const { routes } = makeHarness({ config: { napcat: { dir } } })
+    const r = await call(routes.get('/dsh-qq-guard/napcat-qr'))
+    assert.equal(r.status, 413)
+    assert.equal(r.body.reason, 'qr-too-large')
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+console.log('\n单人设覆盖 / 会话指令队列：')
+
+await check('POST /persona：全局与单人设分别落到共享状态', async () => {
+  const { routes } = makeHarness({ config: {} })
+  const persona = routes.get('/dsh-qq-guard/persona')
+  const globalRes = await call(persona, { method: 'POST', body: JSON.stringify({ mode: 'default', text: '全局人设' }) })
+  assert.equal(globalRes.status, 200)
+  assert.equal(globalRes.body.scope, 'global')
+  const sessionRes = await call(persona, { method: 'POST', body: JSON.stringify({ sessionId: 'g:123456', text: '群专属人设' }) })
+  assert.equal(sessionRes.status, 200)
+  assert.equal(sessionRes.body.scope, 'session')
+  const snap = await call(persona)
+  assert.equal(snap.body.globalChars, 4)
+  assert.equal(snap.body.sessionCount, 1)
+  assert.deepEqual(snap.body.sessions, ['g:123456'])
+})
+await check('persona 路由拒绝跨站；非 GET/POST 405', async () => {
+  const { routes } = makeHarness({ config: {} })
+  const cross = await call(routes.get('/dsh-qq-guard/persona'), { method: 'POST', fetchSite: 'cross-site', body: '{}' })
+  assert.equal(cross.status, 403)
+  const put = await call(routes.get('/dsh-qq-guard/persona'), { method: 'PUT' })
+  assert.equal(put.status, 405)
+})
+
+await check('session-ops：UI 入队 → 桥接 GET 拿到并加租约 → 回执后移除', async () => {
+  const { routes } = makeHarness({ config: {} })
+  const ops = routes.get('/dsh-qq-guard/session-ops')
+  const post = await call(ops, { method: 'POST', body: JSON.stringify({ op: 'clear', key: 'g:123456' }) })
+  assert.equal(post.status, 200)
+  assert.equal(post.body.ok, true)
+  assert.ok(post.body.id, '应返回指令 id')
+
+  const first = await call(ops)
+  assert.equal(first.body.ops.length, 1)
+  assert.equal(first.body.ops[0].op, 'clear')
+  assert.equal(first.body.ops[0].key, 'g:123456')
+
+  // 租约内不重复投递（清空不是幂等操作，不能被桥接执行两次）
+  const second = await call(ops)
+  assert.equal(second.body.ops.length, 0, '★ 租约内不得重复投递')
+
+  const report = await call(ops, { method: 'POST', body: JSON.stringify({ results: [{ id: first.body.ops[0].id, ok: true }] }) })
+  assert.equal(report.status, 200)
+  assert.equal(report.body.removed, 1)
+  const third = await call(ops)
+  assert.equal(third.body.ops.length, 0)
+})
+
+await check('session-ops：同 key 同操作去重；persona 带文本', async () => {
+  const { routes } = makeHarness({ config: {} })
+  const ops = routes.get('/dsh-qq-guard/session-ops')
+  await call(ops, { method: 'POST', body: JSON.stringify({ op: 'persona', key: 'u:1', text: '第一版' }) })
+  await call(ops, { method: 'POST', body: JSON.stringify({ op: 'persona', key: 'u:1', text: '第二版' }) })
+  const got = await call(ops)
+  assert.equal(got.body.ops.length, 1, '同 key + 同 op 只保留最新一条')
+  assert.equal(got.body.ops[0].text, '第二版')
+})
+
+await check('session-ops：非法 op / key → 400；跨站 → 403', async () => {
+  const { routes } = makeHarness({ config: {} })
+  const ops = routes.get('/dsh-qq-guard/session-ops')
+  const badOp = await call(ops, { method: 'POST', body: JSON.stringify({ op: 'drop-database', key: 'u:1' }) })
+  assert.equal(badOp.status, 400)
+  assert.equal(badOp.body.reason, 'unknown-op')
+  const badKey = await call(ops, { method: 'POST', body: JSON.stringify({ op: 'delete', key: '../../etc/passwd' }) })
+  assert.equal(badKey.status, 400)
+  assert.equal(badKey.body.reason, 'bad-key')
+  const cross = await call(ops, { method: 'POST', fetchSite: 'cross-site', body: JSON.stringify({ op: 'delete', key: 'u:1' }) })
+  assert.equal(cross.status, 403)
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

@@ -16,6 +16,7 @@
   "allow": {
     "private": [],
     "groups": [],
+    "admins": [],
     "deny": { "private": [], "groups": [] },
     "allowAllWhenEmpty": false
   },

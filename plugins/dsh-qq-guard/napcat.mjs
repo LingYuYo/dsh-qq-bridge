@@ -38,6 +38,99 @@ export const STOP_GRACE_MS = 5000
 const PROBE_TIMEOUT_MS = 1500
 /** NapCat 日志环形缓冲保留行数（够看「起不来」那几行）。 */
 const LOG_LINES = 120
+/** 二维码块最少连续行数：真二维码 20+ 行，零散进度条不会连续这么多。 */
+const QR_MIN_LINES = 6
+/** qrcode-terminal 的 small 模式只用到这四种字符（空格 + 三种方块）。 */
+const QR_LINE_RE = /^[ █▀▄]+$/u
+/** 登录成功标志：命中即认为二维码使命完成（面板自动收起二维码卡片）。 */
+const LOGIN_SUCCESS_RE = /登录成功|成功登录|扫码成功|二维码已扫描|账号已登录|登录已完成/iu
+/** ANSI 转义（颜色/光标）：NapCat 彩色输出里带，原样塞进日志框会变乱码方块。 */
+const ANSI_RE = /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/gu
+
+/**
+ * 去掉 ANSI 控制序列。
+ *
+ * 为什么必须做：NapCat 输出里混着颜色/光标转义（例如二维码前的状态行），
+ * 原样交给前端会显示成 `[32m` 之类的垃圾，二维码那种多行块更是全废。
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function stripAnsi(value) {
+  return String(value ?? '').replace(ANSI_RE, '')
+}
+
+/**
+ * 判断一行是不是二维码方块行（qrcode-terminal small 模式的字符集）。
+ * @param {string} line
+ * @returns {boolean}
+ */
+export function isQrLine(line) {
+  const text = String(line ?? '')
+  // 去掉行尾空白再判断：qrcode-terminal 每行左侧补了 1 格。
+  const trimmed = text.replace(/\s+$/u, '')
+  if (trimmed.length < 16) return false
+  if (!QR_LINE_RE.test(trimmed)) return false
+  return trimmed.includes('█') || trimmed.includes('▀') || trimmed.includes('▄')
+}
+
+/**
+ * 从一堆日志行里抽出二维码块（供离线测试 / 兜底用）。
+ * 连续 QR_MIN_LINES 行以上才算，取最长的一段。
+ *
+ * @param {string[]} lines
+ * @returns {{text:string, lines:number}|null}
+ */
+export function extractQrBlock(lines) {
+  const list = Array.isArray(lines) ? lines : []
+  let best = []
+  let current = []
+  const consider = () => {
+    if (current.length > best.length) best = current.slice()
+    current = []
+  }
+  for (const raw of list) {
+    const line = stripAnsi(raw).replace(/\s+$/u, '')
+    if (isQrLine(line)) current.push(line)
+    else consider()
+  }
+  consider()
+  return best.length >= QR_MIN_LINES ? { text: best.join('\n'), lines: best.length } : null
+}
+
+/**
+ * 找 NapCat 最近生成的那张登录二维码截图。
+ *
+ * 两种已知布局（NapCat Shell 版实测）：
+ *   · `<napcatDir>/versions/<ver>/resources/app/napcat/cache/qrcode.png`  ← 当前版本
+ *   · `<napcatDir>/qrcode.png`                                            ← 老版本兜底
+ * 取 mtime 最新的一个；只返回元数据，**不把绝对路径吐给前端**。
+ *
+ * @param {string} dir NapCat 安装目录
+ * @returns {{file:string, mtime:number, size:number}|null}
+ */
+export function findQrcodeImage(dir) {
+  if (!dir) return null
+  const base = path.resolve(String(dir))
+  const candidates = [path.join(base, 'qrcode.png')]
+  try {
+    const versions = path.join(base, 'versions')
+    for (const name of fs.readdirSync(versions)) {
+      candidates.push(path.join(versions, name, 'resources', 'app', 'napcat', 'cache', 'qrcode.png'))
+    }
+  } catch { /* 没有 versions 目录：用兜底路径 */ }
+  let best = null
+  for (const file of candidates) {
+    try {
+      const stat = fs.statSync(file)
+      if (!stat.isFile() || stat.size <= 0) continue
+      if (best === null || stat.mtimeMs > best.mtime) {
+        best = { file, mtime: stat.mtimeMs, size: stat.size }
+      }
+    } catch { /* 不存在就跳过 */ }
+  }
+  return best
+}
 
 /**
  * 找出真实的可执行文件。
@@ -158,14 +251,70 @@ export class NapcatManager {
      * 用户两眼一抹黑。这里 pipe 出来留最近 N 行。
      */
     this.logTail = []
+    /**
+     * 从日志里抽出来的二维码块（最后一份）。
+     *
+     * 为什么不把二维码留在 logTail 里：二维码是靠「等宽字体 + 行高 1」拼正方形
+     * 才能扫的，混在普通日志框（行高 1.5、还有别的文字）里注定被压扁。
+     * 所以遇到连续方块行时**单独收进这里**，前端用白底黑字单独渲染；
+     * 不足 QR_MIN_LINES 的零散方块会回填进 logTail，绝不吞日志。
+     */
+    this.qrText = null
+    this.qrLines = 0
+    this.qrAt = null
+    this._qrBuf = []
+    /**
+     * 登录是否已经成功（从 NapCat 日志判定）。
+     *
+     * 为什么需要它：`state` 依赖 napcat.httpUrl 的 get_status 探测；没配 HTTP API 时
+     * 登录成功了也只会是 `running-unverified`，二维码卡片会一直挂在面板上。
+     * 日志里出现「登录成功 / 扫码成功 / 二维码已扫描」就置 true，新二维码出现时置回 false。
+     */
+    this.loggedIn = false
+  }
+
+  /** 追加一行日志到环形缓冲（保留最近 LOG_LINES 行）。 */
+  _pushLogLine(text) {
+    this.logTail.push(text)
+    if (this.logTail.length > LOG_LINES) this.logTail.splice(0, this.logTail.length - LOG_LINES)
+  }
+
+  /**
+   * 收尾二维码缓冲：够长就是真二维码（存起来单独给前端），
+   * 不够长就是零散方块（回填进普通日志，避免误吞）。
+   */
+  _flushQrBuf() {
+    if (this._qrBuf.length === 0) return
+    const lines = this._qrBuf
+    this._qrBuf = []
+    if (lines.length >= QR_MIN_LINES) {
+      // 刷新二维码会再打印一份：直接覆盖旧的那份，UI 只展示最新的。
+      this.qrText = lines.join('\n')
+      this.qrLines = lines.length
+      this.qrAt = Date.now()
+      // 新二维码出现 = 还没登录成功（掉线重扫会走这里）。
+      this.loggedIn = false
+      return
+    }
+    for (const line of lines) this._pushLogLine(line)
   }
 
   /** 追加一行日志到环形缓冲（保留最近 LOG_LINES 行）。 */
   _push(line) {
-    const text = String(line ?? '').replace(/\r?\n$/, '')
+    const text = stripAnsi(String(line ?? '').replace(/\r?\n$/, ''))
     if (!text.trim()) return
-    this.logTail.push(text)
-    if (this.logTail.length > LOG_LINES) this.logTail.splice(0, this.logTail.length - LOG_LINES)
+    if (isQrLine(text)) {
+      this._qrBuf.push(text.replace(/\s+$/u, ''))
+      // 极端情况下（一直只打印方块）别让缓冲无限涨：超过 200 行当普通日志处理。
+      if (this._qrBuf.length > 200) {
+        const overflow = this._qrBuf.splice(0, this._qrBuf.length - 200)
+        for (const entry of overflow) this._pushLogLine(entry)
+      }
+      return
+    }
+    this._flushQrBuf()
+    if (LOGIN_SUCCESS_RE.test(text)) this.loggedIn = true
+    this._pushLogLine(text)
   }
 
   /**
@@ -368,6 +517,10 @@ export class NapcatManager {
   async snapshot() {
     const cfg = this._cfg()
 
+    // 二维码可能正好在「打印中」被轮询到：缓冲区够长就先收尾，避免白丢。
+    if (this._qrBuf.length >= QR_MIN_LINES) this._flushQrBuf()
+    const qrImage = findQrcodeImage(cfg.napcatDir)
+
     // ① 进程存活
     const processAlive = this.processAlive
 
@@ -405,6 +558,17 @@ export class NapcatManager {
       managed: this.handle !== null,
       // 面板「NapCat 日志」框的数据源（最近 LOG_LINES 行，stdout+stderr 混流）。
       logTail: [...this.logTail],
+      // 日志里检测到的二维码块（如果 NapCat 往终端打了二维码）。
+      qr: this.qrText === null
+        ? null
+        : { text: this.qrText, lines: this.qrLines, at: this.qrAt },
+      // 日志判定「已经登录成功」：前端据此自动收起二维码卡片（不依赖 HTTP API 探测）。
+      loggedIn: this.loggedIn === true,
+      // NapCat 自己落盘的二维码截图（147×147 PNG）。前端优先展示这张图，
+      // 比 ASCII 二维码稳得多；只给元数据，图片走 Host 的 /dsh-qq-guard/napcat-qr。
+      qrImage: qrImage === null
+        ? null
+        : { mtime: qrImage.mtime, size: qrImage.size, ageMs: Math.max(0, Date.now() - qrImage.mtime) },
     }
   }
 }

@@ -240,6 +240,10 @@ try {
     // 非法段跳过，合法段保留；全非法 → null（全天忙时兜底）
     assert.equal(parsePeakWindows('09:00-12:00, bad').length, 1)
     assert.equal(parsePeakWindows('bad, worse'), null)
+    // 分隔符归一化：中文分号 / 中文逗号 / 英文分号都按逗号处理（用户手输的常见姿势）
+    assert.equal(parsePeakWindows('09:00-12:00；14:00-18:00').length, 2, '中文分号')
+    assert.equal(parsePeakWindows('09:00-12:00，14:00-18:00').length, 2, '中文逗号')
+    assert.equal(parsePeakWindows('09:00-12:00;14:00-18:00').length, 2, '英文分号')
     assert.equal(normalizeDateKey('2026-10-01'), '2026-10-01')
     assert.equal(normalizeDateKey('2026/10/01'), '')
   })
@@ -648,6 +652,18 @@ try {
       getPersistence: () => undefined,
     })
     assert.equal(missing.statusCode, 501)
+  })
+  await check('UsageScope：sessions.json 的值升级成对象后映射仍然成立', () => {
+    const dir = makeBridge('scope-schema', {
+      mapping: {
+        'u:1000000001': 'session-legacy',
+        'g:123456': { sessionId: 'session-new', unread: 3, name: '摸鱼群' },
+      },
+    })
+    const scope = new UsageScope({ bridgeDir: dir, logger: quiet })
+    assert.equal(scope.keyOf('session-legacy'), 'u:1000000001', '旧版裸字符串仍能识别')
+    assert.equal(scope.keyOf('session-new'), 'g:123456', '新版对象取 sessionId')
+    assert.equal(scope.size(), 2)
   })
 } finally {
   // 用例自己的临时目录，跑完清掉；失败也不影响结论。

@@ -50,14 +50,18 @@ export function qqStateFromHealth(health) {
  * @param {object} [opts.health] OneBotClient.health
  * @param {object} [opts.counts] bridge.stats
  * @param {boolean} [opts.dshOk=true] 能调用本函数说明刚成功拉过 DSH 配置，链路是通的
- * @returns {{qqConnected:boolean, qqState:string, dshOk:boolean, counts:object}}
+ * @param {Array<object>} [opts.sessions] 「会话管理」用的真实列表（见 Bridge.sessionViews）
+ * @returns {{qqConnected:boolean, qqState:string, dshOk:boolean, counts:object, sessions?:Array<object>}}
  */
-export function buildBridgeStatus({ health, counts, dshOk = true } = {}) {
+export function buildBridgeStatus({ health, counts, dshOk = true, sessions } = {}) {
   const qqState = qqStateFromHealth(health)
   return {
     qqConnected: qqState === 'online',
     qqState,
     dshOk: dshOk === true,
     counts: counts && typeof counts === 'object' ? counts : {},
+    // 会话列表是设置页「会话管理」的唯一真实数据源。旧版桥接不报这个字段，
+    // Host / 前端必须把「缺省」当成「没有数据」，不能当成「空列表」覆盖掉。
+    ...(Array.isArray(sessions) ? { sessions: sessions.slice(0, 100) } : {}),
   }
 }

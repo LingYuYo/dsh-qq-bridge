@@ -401,15 +401,66 @@ export class DshClient {
   }
 
   /**
+   * 读会话当前标题（投影里的 `title` 折叠值）。会话不存在返回 null。
+   *
+   * 实测（DSH 0.2.1-rc.2，2026-10-23）`session/projections` 对 `title` 返回的是
+   * **裸字符串**（如 `"向"`）；历史版本/未来的投影 schema 可能给
+   * `{ title, messageSeqs, source }` 对象，所以两种形态都认。
+   *
+   * @param {string} sessionId
+   * @returns {Promise<string|null>} 标题；会话不存在时 null
+   */
+  async sessionTitle(sessionId) {
+    const value = await this.call('session/projections', { sessionId, keys: ['title'] })
+    if (value === null || value === undefined) return null
+    const title = value?.values?.title
+    if (typeof title === 'string') return title
+    if (typeof title?.title === 'string') return title.title
+    return ''
+  }
+
+  /**
+   * 强制重命名会话（桥接的命名规范靠它落地）。
+   *
+   * 语义（`dsh-session-title/lib/index.js:295-315` 实测）：
+   *   · 先 resolve/resume 该会话，所以**不必**保证它当前活着；
+   *   · 标题以 `source: 'user'` 追加 `session/title` 事件并持久化；
+   *   · 一旦写成 user 来源，DSH 自己的自动标题（fallback / LLM）不再覆盖它
+   *     （`onUserMessage` 里 `source.kind === 'user'` 直接 return）。
+   *
+   * @param {string} sessionId
+   * @param {string} title 规范化后的标题（空标题会被 DSH 拒绝）
+   * @returns {Promise<string>} DSH 实际接受的标题
+   */
+  async renameSession(sessionId, title) {
+    const value = await this.call('session/rename', { sessionId, title })
+    return typeof value?.title === 'string' ? value.title : String(title)
+  }
+
+  /**
    * 投递一条用户消息。
    * requestId 与 mode 在 DSH 0.2.1 上是必填项，缺一个就 gateway/input-invalid。
+   *
+   * 多模态（2026-10-23）：`content` 可以直接给 DSH 的 prompt content 数组
+   * （text / image 混排）。image part 的 wire 形态是
+   * `{ type:'image', data:<canonical base64>, mediaType:'image/png' }`，
+   * DSH 的 attachments.admitPromptContent 会落盘并换成 attachment ref。
+   * 只有当前会话模型声明支持 image 输入时才会被接受，否则报
+   * `session/attachment-invalid` + reason `MODEL_DOES_NOT_SUPPORT_IMAGES`。
+   *
+   * @param {string} sessionId
+   * @param {string} text 纯文本兜底（content 未提供时用）
+   * @param {{mode?:string, content?:Array<object>}} [opts]
    */
-  async prompt(sessionId, text, { mode = 'queue' } = {}) {
+  async prompt(sessionId, text, { mode = 'queue', content } = {}) {
+    const parts = Array.isArray(content) && content.length > 0
+      ? content
+      : [{ type: 'text', text: String(text ?? '') }]
     const value = await this.call('session/prompt', {
       sessionId,
       requestId: randomUUID(),
       mode,
-      content: [{ type: 'text', text }],
+      content: parts,
     })
     if (value?.accepted !== true) throw new Error(`session/prompt 未接受：${JSON.stringify(value)}`)
     return true
@@ -508,11 +559,11 @@ export class DshClient {
    *
    * @returns {Promise<string>} 助手回复文本（含换行）；超时抛错。
    */
-  async promptAndWait(sessionId, text, { timeoutMs = 20000, pollMs = 1500, slowHintMs = 0, onProgress } = {}) {
+  async promptAndWait(sessionId, text, { timeoutMs = 20000, pollMs = 1500, slowHintMs = 0, onProgress, content } = {}) {
     const before = await this.turnOutline(sessionId)
     const beforeTurns = before.length
     const beforeSeq = before.at(-1)?.seq ?? -1
-    await this.prompt(sessionId, text)
+    await this.prompt(sessionId, text, content ? { content } : {})
 
     const started = Date.now()
     const deadline = started + timeoutMs
@@ -571,7 +622,58 @@ export class DshClient {
     throw timeoutError
   }
 
-  async archiveSession(sessionId) {
-    return this.call('workspace/archiveSession', { sessionId })
+  /**
+   * 归档会话（只隐藏，不删历史）。
+   *
+   * `stopActivity`：会话还在跑（有活 Agent / turn）时，归档默认会被拒绝
+   * （`workspace/session-active`）。传 true 让 DSH 先停掉它的工作再归档——
+   * 「清空上下文 / 删除会话」必须带这个，否则刚聊完的会话 100% 归档失败。
+   *
+   * @param {string} sessionId
+   * @param {{stopActivity?:boolean}} [opts]
+   */
+  async archiveSession(sessionId, { stopActivity = false } = {}) {
+    return this.call('workspace/archiveSession', {
+      sessionId,
+      ...(stopActivity ? { stopActivity: true } : {}),
+    })
+  }
+
+  /**
+   * 列出所有可见会话（不 resume Agent）。
+   * 返回 items：`[{ sessionId, updatedAt, cwd?, origin?, projections?: { values: { title } } }]`
+   * —— `projections.values.title` 是当前标题（裸字符串）。
+   *
+   * 用于 `tools/rename-sessions.mjs` 的批量改名。
+   */
+  async listSessions() {
+    const value = await this.call('session/list', {})
+    return Array.isArray(value?.items) ? value.items : []
+  }
+
+  /**
+   * 把某会话的人设推给 qq-guard 插件（动态 section 现读）。
+   *
+   * 协议：POST /dsh-qq-guard/persona
+   *   { sessionId, text }        单人设（空串 = 恢复全局）
+   *   { mode:'default', text }   全局默认人设
+   */
+  async setSessionPersona({ sessionId, text, mode } = {}) {
+    const body = mode === 'default'
+      ? { mode: 'default', text: String(text ?? '') }
+      : { sessionId: String(sessionId ?? ''), text: String(text ?? '') }
+    const res = await fetch(`${this.baseUrl}/dsh-qq-guard/persona`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    })
+    const payload = await res.json().catch(() => ({}))
+    if (!res.ok || payload?.ok !== true) {
+      const error = new Error(payload?.reason ?? `HTTP ${res.status}`)
+      error.code = payload?.reason
+      throw error
+    }
+    return payload
   }
 }
