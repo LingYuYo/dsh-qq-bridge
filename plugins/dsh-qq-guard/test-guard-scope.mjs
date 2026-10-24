@@ -63,7 +63,7 @@ const check = async (name, fn) => {
  * 这个差异（见 index.js detectPresetScope），所以假 ctx 必须照着抛。
  */
 function makeCtx({ presetId, scoped = presetId !== undefined, hasWebServer = false, settingsAvailable = false, hasSubprocess = false, systemPrompt = undefined } = {}) {
-  const calls = { restrict: 0, guard: 0, guardFn: null, registeredTools: [], webRoutes: [], effects: [], inj: [], warn: [] }
+  const calls = { restrict: 0, guard: 0, guardFn: null, registeredTools: [], webRoutes: [], effects: [], inj: [], warn: [], listeners: [] }
   const ctx = {
     get(name) {
       if (name === 'agentPresets') {
@@ -72,7 +72,12 @@ function makeCtx({ presetId, scoped = presetId !== undefined, hasWebServer = fal
       if (name === 'systemPrompt') return systemPrompt
       return undefined
     },
-    on() { return () => {} },
+    // 记下注册的事件监听器：agent/pre-step 的上下文过滤与 system-prompt/assemble 的
+    // 诊断日志都要靠它验证（2026-10-24 第二轮）。
+    on(event, cb, options) {
+      calls.listeners.push({ event, fn: cb, prepend: options?.prepend === true })
+      return () => {}
+    },
     effect(fn) { calls.effects.push(fn); try { fn() } catch { /* 忽略 */ } return () => {} },
     inject(deps, fn) {
       calls.inj.push(fn)
@@ -523,6 +528,58 @@ await check('qq_send_voice：桥接回执失败 → 工具抛错（不再假装�
   mod.settleSessionOpResult(opId, { ok: false, detail: '语音发送失败（baidu，via=file）：retcode=1404' })
   await assert.rejects(() => pending, /语音发送失败/)
   mod.bindFeatureConfigSource(null)
+})
+
+console.log('\n— 宿主注入上下文过滤（人设失效 + 隐私，2026-10-24 第二轮）—')
+await check('agent/pre-step：摘掉 dsh-mnemon 注入的 USER.md/MEMORY.md 消息', async () => {
+  const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })
+  apply(ctx, Config({ role: 'guard' }))
+  const listener = calls.listeners.find((item) => item.event === 'agent/pre-step')
+  assert.ok(listener, '没有注册 agent/pre-step 监听')
+  assert.equal(listener.prepend, true, '★ 必须 prepend：mnemon 的监听器先注册在最外层，不 prepend 过滤就是白做')
+  const decision = {
+    kind: 'enter',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: '在吗' }], source: { kind: 'user' } },
+      // 真机抓到的两条：recall 快照 + instructions 引导语（source.kind 都是 dsh-mnemon）
+      { role: 'user', content: [{ type: 'text', text: 'MNEMON RUNTIME MEMORY SNAPSHOT\nContents of USER.md…' }], source: { kind: 'dsh-mnemon', form: 'recall' } },
+      { role: 'user', content: [{ type: 'text', text: '[MNEMON] Search Documents …' }], source: { kind: 'dsh-mnemon', form: 'instructions' } },
+    ],
+  }
+  const out = await listener.fn({}, async () => decision)
+  assert.equal(out.messages.length, 1, '只该留下 QQ 那头真说的话')
+  assert.equal(out.messages[0].source.kind, 'user')
+})
+await check('agent/pre-step：source.kind 变了也能靠文本标记兜底摘掉', async () => {
+  const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })
+  apply(ctx, Config({ role: 'guard' }))
+  const listener = calls.listeners.find((item) => item.event === 'agent/pre-step')
+  const decision = {
+    kind: 'enter',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: '正常一句' }], source: { kind: 'plugin' } },
+      { role: 'user', content: [{ type: 'text', text: 'prefix MNEMON RUNTIME MEMORY SNAPSHOT suffix' }], source: { kind: 'plugin' } },
+    ],
+  }
+  const out = await listener.fn({}, async () => decision)
+  assert.equal(out.messages.length, 1)
+})
+await check('agent/pre-step：没有注入消息时原样返回（不重建对象）', async () => {
+  const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })
+  apply(ctx, Config({ role: 'guard' }))
+  const listener = calls.listeners.find((item) => item.event === 'agent/pre-step')
+  const decision = { kind: 'enter', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }] }
+  const out = await listener.fn({}, async () => decision)
+  assert.equal(out, decision, '没东西可摘时应原样透传')
+})
+await check('system-prompt/assemble：debugPrompt 关闭时不打日志、仍透传 assembly', async () => {
+  const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })
+  apply(ctx, Config({ role: 'guard' }))
+  const listener = calls.listeners.find((item) => item.event === 'system-prompt/assemble')
+  assert.ok(listener, '没有注册 assemble 诊断监听')
+  const assembly = { sections: [{ name: 'deployment:persona-prefix', text: '人设' }], contexts: [], tools: [], variables: {} }
+  const out = await listener.fn(assembly, {}, async () => assembly)
+  assert.equal(out, assembly)
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
