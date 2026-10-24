@@ -239,9 +239,19 @@ function repaint() {
   return expand(React.createElement(Comp, { remoteForm: form }), 'root')
 }
 
-/** 外部插件卡片（tile 里含 compat 标签的）。 */
+/** 外部插件卡片。
+ *
+ * 注意范围：技能页里还有「技能 / 插件」两个网格，P2 起 client.js 会合并默认技能
+ * sk-image（发图片），全树抓 .qqg-tile 会把它也算进来。这里只收「外部插件」
+ * 那个 Panel 里的卡片 —— 不是放宽断言，是把查找范围对准被测区域。 */
 function extTiles(tree) {
-  return findAll(tree, (n) => n.props?.className === 'qqg-tile')
+  const panel = findViewById(tree, '外部插件')
+  return findAll(panel ?? tree, (n) => n.props?.className === 'qqg-tile')
+}
+/** 按标题找 Panel（`.qqg-panel-title` 文本匹配）。 */
+function findViewById(tree, title) {
+  return findAll(tree, (n) => n.props?.className === 'qqg-panel'
+    && textOf(findAll(n, (x) => x.props?.className === 'qqg-panel-title')[0]) === title)[0]
 }
 function tileByText(tree, text) {
   return extTiles(tree).find((t) => textOf(t).includes(text))
@@ -295,7 +305,9 @@ check('元数据行：来源格式 / 分类 / 作者 / 非标字段数', () => {
 })
 
 check('默认全关：每张卡片都是「已关闭」且开关 aria-checked=false', () => {
-  const switches = findAll(tree, (n) => n.tag === 'button' && n.props?.role === 'switch')
+  // 只数外部插件卡片里的开关（技能网格也有开关，见 extTiles 的说明）。
+  const switches = extTiles(tree)
+    .flatMap((tile) => findAll(tile, (n) => n.tag === 'button' && n.props?.role === 'switch'))
   assert(switches.length === 3, `开关数 ${switches.length}`)
   for (const sw of switches) assert(sw.props['aria-checked'] === 'false', `「${sw.props['aria-label']}」不是关`)
   assert(textOf(tree).includes('已关闭'), '没有「已关闭」文案')

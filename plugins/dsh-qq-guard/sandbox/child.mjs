@@ -205,6 +205,7 @@ function makeApi(moduleId, manifest, tools) {
 
 /** 汇总入口导出的形状（不执行任何导出函数）。 */
 function summarizeExports(mod) {
+  const hookNames = mod.hooks && typeof mod.hooks === 'object' ? Object.keys(mod.hooks) : []
   return {
     setup: typeof mod.setup === 'function',
     register: typeof mod.register === 'function',
@@ -213,12 +214,87 @@ function summarizeExports(mod) {
     dispose: typeof mod.dispose === 'function',
     promptSections: typeof mod.promptSections === 'function',
     available: typeof mod.available === 'function',
-    hooks: mod.hooks && typeof mod.hooks === 'object' ? Object.keys(mod.hooks) : [],
+    // hook 既可以是 `export const hooks = { onMessage }`，也可以直接顶层导出函数；
+    // 两种形态都要报给 Host（Host 据此决定要不要为这条 hook 发 invoke）。
+    hooks: [...new Set([
+      ...hookNames,
+      ...TOP_LEVEL_HOOK_NAMES.filter((name) => typeof mod[name] === 'function'),
+    ])],
     providers: mod.providers && typeof mod.providers === 'object' ? Object.keys(mod.providers) : [],
   }
 }
 
-/** 已加载模块缓存：重复点「测试运行」不重复执行 setup。 */
+/**
+ * 顶层导出的 hook 别名（与 `hooks` 对象的键等价）。
+ *
+ * P2 起 Host 会对每个已加载模块发 `invoke`，child 按这里的顺序找可调用函数；
+ * 找不到就回 `found:false`，不算错误。
+ */
+const TOP_LEVEL_HOOK_NAMES = ['onMessage', 'beforeContext', 'before-context', 'message']
+
+/** 每种事件允许的 hook 名（顺序即优先级，与契约 4.2 一致）。 */
+const HOOK_ALIASES = {
+  message: ['message', 'onMessage', 'beforeContext'],
+  'before-context': ['before-context', 'beforeContext', 'onMessage'],
+}
+
+/**
+ * 在模块命名空间里找某事件的 hook。
+ * @param {object} mod 模块 namespace
+ * @param {string} event 事件名
+ * @returns {Function|null}
+ */
+function resolveHook(mod, event) {
+  const hooks = mod?.hooks && typeof mod.hooks === 'object' ? mod.hooks : null
+  const names = HOOK_ALIASES[event] ?? [String(event)]
+  for (const name of names) {
+    if (hooks && typeof hooks[name] === 'function') return hooks[name]
+  }
+  for (const name of names) {
+    if (typeof mod?.[name] === 'function') return mod[name]
+  }
+  return null
+}
+
+/**
+ * 把 invoke 的返回值压成 JSON 可序列化值（循环引用 / BigInt → E_BAD_RESULT）。
+ * @param {unknown} value
+ * @returns {unknown}
+ */
+function toSerializable(value) {
+  if (value === undefined) return null
+  let json
+  try {
+    json = JSON.stringify(value)
+  } catch (error) {
+    throw new SandboxError(ERR.BAD_RESULT, `返回值不能 JSON 序列化：${error?.message ?? error}`)
+  }
+  if (json === undefined) return null
+  try { return JSON.parse(json) } catch (error) {
+    throw new SandboxError(ERR.BAD_RESULT, `返回值不能 JSON 序列化：${error?.message ?? error}`)
+  }
+}
+
+/** registerTool 收集到的声明 → 回给 Host 的工具元数据（供代理工具注册）。 */
+function summarizeTools(tools) {
+  return tools.map(({ id, def }) => ({
+    id,
+    name: String(def?.name ?? def?.id ?? id),
+    description: String(def?.description ?? ''),
+    // parameters 原样回传：既可能是 JSON Schema，也可能是作者 spec，Host 侧适配。
+    parameters: def?.parameters ?? def?.inputSchema,
+  }))
+}
+
+/**
+ * 已加载模块缓存：重复点「测试运行」/常驻重载不重复执行 setup。
+ *
+ * P2 起 value 不再只是回给 Host 的结果，还保留 `ns`（模块命名空间）、`api`
+ * 和 `tools`（registerTool 收集到的声明 + handler）：`invoke` 帧要靠它们
+ * 找到 hook / 工具并执行。
+ *
+ * @type {Map<string, {result:object, ns:object, api:object, tools:object[]}>}
+ */
 const loaded = new Map()
 
 /**
@@ -240,7 +316,7 @@ async function handleLoad(payload) {
   }
 
   const cached = loaded.get(moduleId)
-  if (cached) return { ...cached, cached: true }
+  if (cached) return { ...cached.result, cached: true }
 
   // 从 import 到 setup 结束都锁定「当前模块目录」：期间动态 import 的相对路径
   // 也必须在模块目录内，不能借 ../../src/* 摸回宿主内部模块。
@@ -291,13 +367,79 @@ async function handleLoad(payload) {
       exports: summary,
       apiCalls: api.__calls,
       toolCount: tools.length,
+      // P2：把注册的工具回给 Host（代理工具 qq_ext_<slug> 靠它建 schema）。
+      tools: summarizeTools(tools),
       durationMs: Date.now() - startedAt,
     }
-    loaded.set(moduleId, result)
+    loaded.set(moduleId, { result, ns: mod, api, tools })
     return result
   } finally {
     activeModuleDir = previousModuleDir
   }
+}
+
+/**
+ * 处理 invoke 请求（P2）。
+ *
+ * payload：`{ moduleId, kind:'hook'|'tool', name?, args?, event? }`
+ * 回包：`{ moduleId, kind, found, value, durationMs }`；找不到 hook/tool 时
+ * `found:false`（不是错误），插件自己抛错则是 `E_INVOKE`。
+ *
+ * @param {object} payload
+ * @returns {Promise<object>}
+ */
+async function handleInvoke(payload) {
+  const moduleId = String(payload?.moduleId ?? '')
+  const kind = String(payload?.kind ?? '')
+  if (!moduleId) throw new SandboxError(ERR.PROTOCOL, 'invoke 缺少 moduleId')
+  const record = loaded.get(moduleId)
+  if (!record) throw new SandboxError(ERR.NOT_LOADED, `模块没有加载过：${moduleId}`)
+  const startedAt = Date.now()
+
+  if (kind === 'hook') {
+    const eventName = String(payload?.name ?? 'message')
+    const hook = resolveHook(record.ns, eventName)
+    if (hook === null) {
+      return { moduleId, kind, found: false, value: null, durationMs: Date.now() - startedAt }
+    }
+    let value
+    try {
+      // 同插件契约：hook 是 `(event, apiLike)`。
+      value = await hook(payload?.event ?? {}, record.api)
+    } catch (error) {
+      throw new SandboxError(
+        ERR.INVOKE_FAILED,
+        `hook ${eventName} 抛出异常：${error?.message ?? error}`,
+        String(error?.stack ?? '').split('\n').slice(0, 3).join('\n'),
+      )
+    }
+    return { moduleId, kind, found: true, value: toSerializable(value), durationMs: Date.now() - startedAt }
+  }
+
+  if (kind === 'tool') {
+    const wanted = String(payload?.name ?? '')
+    const tool = record.tools.find((item) => item.id === wanted)
+      ?? record.tools.find((item) => String(item.def?.name ?? item.def?.id ?? '') === wanted)
+    if (!tool) throw new SandboxError(ERR.NOT_LOADED, `模块 ${moduleId} 没有工具：${wanted || '(空)'}`)
+    const def = tool.def
+    const handler = def?.handler ?? def?.execute ?? def?.run
+    if (typeof handler !== 'function') {
+      throw new SandboxError(ERR.NOT_LOADED, `工具 ${wanted} 没有可执行的 handler`)
+    }
+    let value
+    try {
+      value = await handler(payload?.args ?? {}, record.api)
+    } catch (error) {
+      throw new SandboxError(
+        ERR.INVOKE_FAILED,
+        `工具 ${wanted} 抛出异常：${error?.message ?? error}`,
+        String(error?.stack ?? '').split('\n').slice(0, 3).join('\n'),
+      )
+    }
+    return { moduleId, kind, found: true, value: toSerializable(value), durationMs: Date.now() - startedAt }
+  }
+
+  throw new SandboxError(ERR.PROTOCOL, `未知的 invoke kind：${kind || '(空)'}`)
 }
 
 /* ── stdin 主循环 ───────────────────────────────────────────────────── */
@@ -315,8 +457,8 @@ const decoder = createLineDecoder({
       return
     }
 
-    if (frame.type !== FRAME.LOAD) {
-      // P1 只实现 load；invoke 等留给后续阶段，明确报未实现而不是静默。
+    if (frame.type !== FRAME.LOAD && frame.type !== FRAME.INVOKE) {
+      // 其它帧（shutdown 等）留给后续阶段，明确报未实现而不是静默。
       if (frame.id !== undefined) {
         send({
           type: FRAME.ERROR, id: frame.id, ok: false,
@@ -326,7 +468,7 @@ const decoder = createLineDecoder({
       return
     }
 
-    // load 串行执行：同一时刻只处理一个（Host 侧本来也是单飞）。
+    // load / invoke 串行执行：同一时刻只处理一个（Host 侧本来也是单飞）。
     if (!initialized) {
       send({
         type: FRAME.ERROR, id: frame.id, ok: false,
@@ -335,7 +477,10 @@ const decoder = createLineDecoder({
       return
     }
 
-    void handleLoad(frame.payload).then(
+    const task = frame.type === FRAME.INVOKE
+      ? handleInvoke(frame.payload)
+      : handleLoad(frame.payload)
+    void task.then(
       (payload) => send({ type: FRAME.RESULT, id: frame.id, ok: true, payload }),
       (error) => send({
         type: FRAME.ERROR,

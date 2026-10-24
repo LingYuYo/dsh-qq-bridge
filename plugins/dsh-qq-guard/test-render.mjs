@@ -206,9 +206,11 @@ for (const tab of ['status', 'sessions', 'skills', 'settings', 'usage']) {
     ],
   }
   const root = 'live:sessions'
+  // P2 轮询隔离：会话列表的状态现在只存在于叶子组件 SessionsTab 内部（#0 = live），
+  // 面板层不再持有这份数据。
   hookStore = new Map([
     [`${root}.BridgePanel.SettingsPanel#1`, 'sessions'],
-    [`${root}.BridgePanel.SettingsPanel#5`, LIVE],
+    [`${root}.BridgePanel.SettingsPanel.div3.div0.SessionsTab#0`, LIVE],
   ])
   effects.length = 0; textSink.length = 0; handlers.length = 0; renderedNodes.length = 0
   render(React.createElement(Comp, { remoteForm: form }), root)

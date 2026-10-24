@@ -646,6 +646,22 @@ window.__ModuleLoader__.load({
 .qqg-kv b.qqg-kv-ellipsis { max-width: 62%; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; }
 .qqg-note { font-size: 11px; line-height: 1.6; color: var(--dsw-alias-label-secondary); }
+
+/* ── P2 极速：Loading / 乐观更新提示（全部纯 CSS，零第三方）────── */
+/* 转圈：耗时按钮 pending 时用，禁止用「假死」的静止文案。 */
+.qqg-spin { display: inline-block; box-sizing: border-box; width: 10px; height: 10px;
+  margin-right: 5px; vertical-align: -1px; border: 2px solid currentColor;
+  border-right-color: transparent; border-radius: 50%; opacity: .85;
+  animation: qqg-spin .7s linear infinite; }
+.qqg-spin-lg { width: 14px; height: 14px; }
+@keyframes qqg-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+/* 降低动态效果偏好下放慢但不静止（静止会被误读成卡死）。 */
+@media (prefers-reduced-motion: reduce) { .qqg-spin { animation-duration: 1.8s; } }
+/* 输入框里还有未落盘的草稿：边框变色 + title 提示，失焦即保存。 */
+.qqg-input-dirty { border-color: #b4690e; }
+/* 面板底部「正在保存…」：乐观更新在飞行中的唯一提示。 */
+.qqg-saving { display: inline-flex; align-items: center; font-size: 11.5px;
+  color: var(--dsw-alias-label-secondary); }
 `
 
     /* ══════════ 真实数据源（会话列表）══════════ */
@@ -787,6 +803,31 @@ window.__ModuleLoader__.load({
     /** 把点分路径拆成 mutate 需要的段数组。 */
     function splitPath(path) {
       return String(path).split('.')
+    }
+
+    /**
+     * 内置「发图片」技能。
+     *
+     * 对象必须与契约 3.1 / index.js 的 DEFAULT_SKILLS 逐字一致；老配置的 `skills`
+     * 数组里没有它时，面板也要显示并允许开关 —— 否则用户根本看不见这个新技能。
+     * 写回时整数组带上它（见 mergeDefaultSkills）。
+     */
+    const DEFAULT_IMAGE_SKILL = {
+      id: 'sk-image', name: '发图片', icon: 'image', tag: '内置', ver: '1.0.0', enabled: true,
+      desc: '把图片或表情包发到 QQ（网页地址或本地文件），模型可通过 qq_send_image 调用。',
+    }
+
+    /** 合并默认技能项：已有 sk-image 原样返回，没有就补在末尾（不打断老配置的排序）。 */
+    function mergeDefaultSkills(list) {
+      const rows = Array.isArray(list) ? list : []
+      if (rows.some((item) => item && item.id === DEFAULT_IMAGE_SKILL.id)) return rows
+      return [...rows, DEFAULT_IMAGE_SKILL]
+    }
+
+    /** 值相等判断（配置值都是 JSON 可序列化的纯对象/数组）。 */
+    function sameJSON(a, b) {
+      if (a === b) return true
+      try { return JSON.stringify(a) === JSON.stringify(b) } catch { return false }
     }
 
     function useForm(form) {
@@ -990,6 +1031,92 @@ window.__ModuleLoader__.load({
         disabled,
         onClick: () => onChange(!checked),
       }, h('i'))
+    }
+
+    /** 纯 CSS 转圈：耗时按钮 pending 时显示（零第三方 UI 库）。 */
+    function Spinner({ large }) {
+      return h('span', {
+        className: 'qqg-spin' + (large ? ' qqg-spin-lg' : ''),
+        'aria-hidden': true,
+      })
+    }
+
+    /**
+     * 直接绑配置的单行输入：只在失焦 / 回车时提交，击键不写盘。
+     *
+     * 为什么用「聚焦时用本地草稿、失焦回落到 props」而不是 effect 同步：
+     * 配置回读是异步的。不聚焦时直接读 props，外部写盘（浏览选目录 / 恢复默认 /
+     * 其它入口改配置）能立刻反映；聚焦时才用草稿，保证打字跟手。
+     */
+    function TextInput({ value, disabled, placeholder, type, autoComplete, className, style,
+      ariaLabel, onCommit }) {
+      const text = String(value ?? '')
+      const [state, setState] = React.useState({ focused: false, draft: text })
+      const shown = state.focused ? state.draft : text
+      const dirty = state.focused && state.draft !== text
+      const commit = () => {
+        const next = state.draft
+        setState({ focused: false, draft: next })
+        if (next !== text) onCommit(next)
+      }
+      return h('input', {
+        className: (className ?? 'qqg-input qqg-input-grow') + (dirty ? ' qqg-input-dirty' : ''),
+        style,
+        type,
+        value: shown,
+        placeholder,
+        disabled: disabled === true,
+        autoComplete,
+        'aria-label': ariaLabel,
+        title: dirty ? '有未保存改动，失焦后保存' : undefined,
+        onFocus: () => setState({ focused: true, draft: text }),
+        onChange: (e) => setState({ focused: true, draft: e.target.value }),
+        onBlur: commit,
+        onKeyDown: (e) => {
+          // 回车 = 失焦提交；真的 blur 一次，让 onBlur 统一走提交逻辑。
+          if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur() }
+        },
+      })
+    }
+
+    /** 弹窗里的文本字段：失焦 / 回车才提交（改配置但不每次击键写盘）。 */
+    function DraftTextField({ label, hint, value, placeholder, onChange, disabled }) {
+      return h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, label),
+        h(TextInput, {
+          className: 'qqg-input', style: { width: '100%' },
+          value, placeholder, disabled, ariaLabel: label, onCommit: onChange,
+        }),
+        hint ? h('span', { className: 'qqg-field-hint' }, hint) : null)
+    }
+
+    /** 弹窗里的数字字段：同上，失焦 / 回车才提交，越界值夹到 min~max。 */
+    function DraftNumField({ label, hint, value, min, max, step, onChange, disabled }) {
+      const text = String(value ?? '')
+      const [state, setState] = React.useState({ focused: false, draft: text })
+      const shown = state.focused ? state.draft : text
+      const commit = () => {
+        const n = Number(state.draft)
+        const base = Number(value)
+        const clamped = Number.isFinite(n)
+          ? Math.min(max ?? Number.MAX_SAFE_INTEGER, Math.max(min ?? Number.MIN_SAFE_INTEGER, Math.trunc(n)))
+          : base
+        setState({ focused: false, draft: String(clamped) })
+        if (clamped !== base) onChange(clamped)
+      }
+      return h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, label),
+        h('input', {
+          type: 'number', className: 'qqg-input', style: { width: '100%' },
+          value: shown, min, max, step, 'aria-label': label,
+          disabled: disabled === true,
+          title: state.focused && state.draft !== text ? '有未保存改动，失焦后保存' : undefined,
+          onFocus: () => setState({ focused: true, draft: text }),
+          onChange: (e) => setState({ focused: true, draft: e.target.value }),
+          onBlur: commit,
+          onKeyDown: (e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur() } },
+        }),
+        hint ? h('span', { className: 'qqg-field-hint' }, hint) : null)
     }
 
     function NumberField({ value, min, max, disabled, onCommit, ariaLabel }) {
@@ -1293,7 +1420,17 @@ window.__ModuleLoader__.load({
       return snap
     }
 
-    function StatusSection({ get, writable }) {
+    /**
+     * 运行状态页：轮询（状态 / 进程 / 系统事件）全部下沉到叶子组件 StatusLive。
+     *
+     * 父组件不持有任何轮询 state —— 3 秒一次的刷新只重渲染这一块，
+     * 不会带着左侧导航或其它 Tab 一起重渲染（切 Tab 的迟滞感主要来自这里）。
+     */
+    function StatusSection(props) {
+      return h(StatusLive, props)
+    }
+
+    function StatusLive({ get, writable }) {
       const live = useBridgeStatus(true)
       const [proc, refreshProc] = useBridgeProc(true)
       const sysEvents = useSystemEvents(true)
@@ -1348,19 +1485,25 @@ window.__ModuleLoader__.load({
               disabled: busy !== null || !writable || alive,
               title: alive ? '桥接已在运行' : '在后台常驻运行桥接',
               onClick: () => act('start'),
-            }, busy === 'start' ? '启动中…' : '启动桥接'),
+            }, busy === 'start'
+              ? h(React.Fragment, null, h(Spinner), '启动中…')
+              : '启动桥接'),
             h('button', {
               type: 'button', className: 'qqg-btn',
               disabled: busy !== null || !writable || !alive,
               title: alive ? '停止桥接进程' : '桥接未运行',
               onClick: () => act('stop'),
-            }, busy === 'stop' ? '停止中…' : '停止桥接'),
+            }, busy === 'stop'
+              ? h(React.Fragment, null, h(Spinner), '停止中…')
+              : '停止桥接'),
             h('button', {
               type: 'button', className: 'qqg-btn qqg-btn-danger',
               disabled: busy !== null || !writable,
               title: '彻底退出：停止并禁止自动重启',
               onClick: () => act('exit'),
-            }, busy === 'exit' ? '退出中…' : '退出桥接'))),
+            }, busy === 'exit'
+              ? h(React.Fragment, null, h(Spinner), '退出中…')
+              : '退出桥接'))),
 
         h(Field, { label: '桥接进程', desc: '插件托管的常驻进程；关闭 DSH 时会自动清理。' },
           h('div', { className: 'qqg-inline' },
@@ -1412,22 +1555,21 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'qqg-group' },
         h('div', { className: 'qqg-group-title' }, 'OneBot 连接'),
         h(Field, { label: 'WebSocket 地址', desc: 'NapCat 的正向 WS 服务端地址。' },
-          h('input', {
-            className: 'qqg-input qqg-input-grow',
+          h(TextInput, {
             value: get('onebot.wsUrl') ?? '',
             disabled: !writable,
-            'aria-label': 'WebSocket 地址',
-            onChange: (e) => write('onebot.wsUrl', e.target.value),
+            ariaLabel: 'WebSocket 地址',
+            onCommit: (v) => write('onebot.wsUrl', v),
           })),
         h(Field, { label: 'Access Token', desc: '以密码形式保存，默认不显示明文。' },
           h('div', { className: 'qqg-inline' },
-            h('input', {
+            h(TextInput, {
               className: 'qqg-input qqg-input-grow',
               type: tokenShown ? 'text' : 'password',
               value: token ?? '',
               disabled: !writable,
-              'aria-label': 'Access Token',
-              onChange: (e) => write('onebot.accessToken', e.target.value),
+              ariaLabel: 'Access Token',
+              onCommit: (v) => write('onebot.accessToken', v),
             }),
             h('button', {
               type: 'button',
@@ -1445,15 +1587,15 @@ window.__ModuleLoader__.load({
           '改动会在桥接重启后生效（WS 连接在启动时建立，不做热重连）。'))
     }
 
-    function AllowSection({ get, write, writable, form }) {
+    function AllowSection({ get, write, writable }) {
       const priv = get('allow.private')
       const groups = get('allow.groups')
       const admins = get('allow.admins')
       const allowAll = get('allow.allowAllWhenEmpty') === true
-      // 数组不能整体 set 后靠路径猜测，这里直接写整段 allow。
+      // 数组不能整体 set 后靠路径猜测，这里按 allow.<key> 逐项写；
+      // 走 write() 而不是直接 form.mutate()，才能吃到外层统一的乐观更新 / 回滚。
       const setAllow = (patch) => {
-        if (!form) return
-        form.mutate(Object.entries(patch).map(([k, v]) => ({ op: 'set', path: ['allow', k], value: v })))
+        for (const [k, v] of Object.entries(patch)) write(`allow.${k}`, v)
       }
       return h('div', { className: 'qqg-group' },
         h('div', { className: 'qqg-group-title' }, '白名单管理'),
@@ -1505,7 +1647,7 @@ window.__ModuleLoader__.load({
      * 顶部下拉 = 默认人设 + 自定义人设列表，支持新增 / 删除当前自定义人设。
      * 桥接层会根据这些字段重拼最终系统提示词（名字替换 + 附加规则追加）。
      */
-    function PersonaModal({ get, writable, form, onClose }) {
+    function PersonaModal({ get, writable, writeMany, onClose }) {
       const readPresets = () => {
         const raw = get('personaPresets')
         return Array.isArray(raw)
@@ -1556,12 +1698,13 @@ window.__ModuleLoader__.load({
         presets: prev.presets.map((item) => (item.id === prev.selected ? { ...item, name } : item)),
       }))
       const save = () => {
-        if (!form || !writable) return
+        if (!writable || typeof writeMany !== 'function') return
         // 选中的自定义人设跟着角色设定文本一起更新。
         const presets = draft.presets.map((item) => (item.id === draft.selected
           ? { ...item, text: draft.text }
           : item))
-        form.mutate([
+        // 一次 mutate 提交整组字段；writeMany 会先乐观生效，失败再整组回滚。
+        writeMany([
           { op: 'set', path: ['personaBotName'], value: draft.botName.trim() },
           { op: 'set', path: ['personaGroupName'], value: draft.groupName.trim() },
           { op: 'set', path: ['personaParticipation'], value: draft.participation },
@@ -1689,7 +1832,7 @@ window.__ModuleLoader__.load({
      * 人设概览卡片（只读）：名字 / 展示名 / 参与度 / 角色设定前两行。
      * 编辑入口统一收进弹窗，避免一大块文本框直接铺在设置页上。
      */
-    function PersonaSection({ get, write, writable, form }) {
+    function PersonaSection({ get, write, writable, writeMany }) {
       const [open, setOpen] = React.useState(false)
       const botName = String(get('personaBotName') ?? '').trim()
       const groupName = String(get('personaGroupName') ?? '').trim()
@@ -1715,7 +1858,7 @@ window.__ModuleLoader__.load({
         open
           ? h(PersonaModal, {
             key: `persona-${botName}-${participation}-${[...text].length}`,
-            get, write, writable, form,
+            get, write, writable, writeMany,
             onClose: () => setOpen(false),
           })
           : null)
@@ -1936,31 +2079,29 @@ window.__ModuleLoader__.load({
         h('option', { value: 'openai' }, 'OpenAI 兼容'))),
       openai
         ? h(Field, { label: '接口地址（baseUrl）', desc: 'OpenAI 兼容 TTS 的基础地址，末尾不要带 /audio/speech。' },
-          h('input', {
-            className: 'qqg-input qqg-input-grow',
+          h(TextInput, {
             value: String(get('voice.baseUrl') ?? ''),
             placeholder: 'https://api.openai.com/v1', disabled: !writable,
-            'aria-label': '接口地址（baseUrl）',
-            onChange: (e) => write('voice.baseUrl', e.target.value),
+            ariaLabel: '接口地址（baseUrl）',
+            onCommit: (v) => write('voice.baseUrl', v),
           }))
         : null,
       openai
         ? h(Field, { label: 'API Key', desc: '只存在本机 profile 配置里；输入框按密码显示。' },
-          h('input', {
-            type: 'password', className: 'qqg-input qqg-input-grow',
+          h(TextInput, {
+            type: 'password',
             value: String(get('voice.apiKey') ?? ''),
             placeholder: 'sk-…', disabled: !writable, autoComplete: 'off',
-            'aria-label': '语音 API Key',
-            onChange: (e) => write('voice.apiKey', e.target.value),
+            ariaLabel: '语音 API Key',
+            onCommit: (v) => write('voice.apiKey', v),
           }))
         : null,
       h(Field, { label: '音色（voice）', desc: 'Edge 用短名：zh-CN-XiaoyiNeural / zh-CN-XiaoxiaoNeural；OpenAI 用 alloy 等。' },
-        h('input', {
-          className: 'qqg-input qqg-input-grow',
+        h(TextInput, {
           value: String(get('voice.voice') ?? ''),
           placeholder: 'zh-CN-XiaoyiNeural', disabled: !writable,
-          'aria-label': '音色',
-          onChange: (e) => write('voice.voice', e.target.value),
+          ariaLabel: '音色',
+          onCommit: (v) => write('voice.voice', v),
         })),
       h('div', { className: 'qqg-hint' },
         '提示：还得到「技能与插件」里开启「发语音」，桥接才会把回复合成为语音条。'))
@@ -2202,7 +2343,9 @@ window.__ModuleLoader__.load({
               disabled: !canStart,
               title: startTitle,
               onClick: () => act('start'),
-            }, busy ? '处理中…' : '启动 NapCat'),
+            }, busy
+              ? h(React.Fragment, null, h(Spinner), '处理中…')
+              : '启动 NapCat'),
             h('button', {
               type: 'button', className: 'qqg-btn',
               disabled: !canStop,
@@ -2328,13 +2471,13 @@ window.__ModuleLoader__.load({
           h('div', { className: 'qqg-label-desc' },
             '含 NapCatWinBootMain.exe 的目录。点「浏览」直接选文件夹，不用手打路径。'),
           h('div', { className: 'qqg-dir-row' },
-            h('input', {
+            h(TextInput, {
               className: 'qqg-input qqg-dir-input',
               value: napcatDir,
               placeholder: 'C:\\Program Files\\NapCat',
               disabled: !writable,
-              'aria-label': 'NapCat 安装目录',
-              onChange: (e) => write('napcat.dir', e.target.value),
+              ariaLabel: 'NapCat 安装目录',
+              onCommit: (v) => write('napcat.dir', v),
             }),
             h('button', {
               type: 'button',
@@ -2343,20 +2486,21 @@ window.__ModuleLoader__.load({
               title: '打开系统的「选择文件夹」窗口',
               'aria-label': '浏览选择 NapCat 安装目录',
               onClick: browseDir,
-            }, picking ? '选择中…' : '浏览')),
+            }, picking
+              ? h(React.Fragment, null, h(Spinner), '选择中…')
+              : '浏览')),
           pickError ? h('div', { className: 'qqg-status qqg-status-err' }, pickError) : null,
           napcatDir.trim() === ''
             ? h('div', { className: 'qqg-status qqg-status-err' },
               '未配置安装目录，NapCat 无法启动。点「浏览」选择一个文件夹。')
             : null),
         h(Field, { label: '快速登录 QQ 号', desc: '填了就带账号启动（等同 napcat.quick.bat）；留空需手动登录。' },
-          h('input', {
-            className: 'qqg-input qqg-input-grow',
+          h(TextInput, {
             value: get('napcat.quickLoginQQ') ?? '',
             placeholder: '例如 1000000001',
             disabled: !writable,
-            'aria-label': '快速登录 QQ 号',
-            onChange: (e) => write('napcat.quickLoginQQ', e.target.value),
+            ariaLabel: '快速登录 QQ 号',
+            onCommit: (v) => write('napcat.quickLoginQQ', v),
           })),
         h('div', { className: 'qqg-hint' },
           '启动/停止操作请前往「运行状态」页。'))
@@ -2695,7 +2839,15 @@ window.__ModuleLoader__.load({
         ? SESSION_LEVEL_LABELS[n] : null
     }
 
-    function SessionsTab({ live, get }) {
+    /**
+     * 会话管理页：桥接上报的会话列表在**本组件内部**轮询。
+     *
+     * 之前列表由 SettingsPanel 轮询后当 props 传下来，于是每 3 秒整个面板
+     * （含左侧导航、其它 Tab 的空闲重渲染）都会跟着跑一遍。现在状态只落在
+     * 这一层，切 Tab 时也只挂载当前 Tab。
+     */
+    function SessionsTab({ get }) {
+      const live = useBridgeStatus(true)
       const rows = Array.isArray(live?.sessions) ? live.sessions : null
       const [selectedKey, setSelectedKey] = React.useState('')
       const [personaDraft, setPersonaDraft] = React.useState({})
@@ -2832,13 +2984,17 @@ window.__ModuleLoader__.load({
                     disabled: busy !== null || !cur.sessionId,
                     title: cur.sessionId ? '归档当前会话并新建同名会话' : '该会话还没建立 DSH 会话',
                     onClick: () => ask('clear'),
-                  }, busy === 'clear' ? '提交中…' : '清空上下文'),
+                  }, busy === 'clear'
+                    ? h(React.Fragment, null, h(Spinner), '提交中…')
+                    : '清空上下文'),
                   h('button', {
                     type: 'button', className: 'qqg-btn qqg-btn-danger',
                     disabled: busy !== null || !cur.sessionId,
                     title: cur.sessionId ? '归档该会话并删除本地映射' : '该会话还没建立 DSH 会话',
                     onClick: () => ask('delete'),
-                  }, busy === 'delete' ? '提交中…' : '删除会话')))),
+                  }, busy === 'delete'
+                    ? h(React.Fragment, null, h(Spinner), '提交中…')
+                    : '删除会话')))),
             notice
               ? h('div', { className: 'qqg-status' + (notice.kind === 'err' ? ' qqg-status-err' : '') }, notice.text)
               : null,
@@ -2881,7 +3037,9 @@ window.__ModuleLoader__.load({
                   type: 'button', className: 'qqg-btn qqg-btn-primary',
                   disabled: busy !== null || !levelDirty,
                   onClick: saveLevel,
-                }, busy === 'activity' ? '提交中…' : '保存档位'))),
+                }, busy === 'activity'
+                  ? h(React.Fragment, null, h(Spinner), '提交中…')
+                  : '保存档位'))),
             h(Panel, {
               title: '单人设覆盖',
               desc: '留空 = 沿用全局人设。保存后桥接下一条消息前推给插件，即时生效；只影响这个 QQ 会话。',
@@ -2900,7 +3058,9 @@ window.__ModuleLoader__.load({
                   type: 'button', className: 'qqg-btn qqg-btn-primary',
                   disabled: busy !== null || !personaDirty,
                   onClick: savePersona,
-                }, busy === 'persona' ? '保存中…' : '保存人设'),
+                }, busy === 'persona'
+                  ? h(React.Fragment, null, h(Spinner), '保存中…')
+                  : '保存人设'),
                 h('button', {
                   type: 'button', className: 'qqg-btn',
                   disabled: busy !== null || savedPersona === '',
@@ -2937,7 +3097,7 @@ window.__ModuleLoader__.load({
 
     /** 已真实接入桥接 / Host 的条目 id；其余只加「开发中」标签，不动配置。 */
     const IMPLEMENTED_IDS = {
-      skill: ['sk-voice', 'sk-vision', 'sk-search'],
+      skill: ['sk-voice', 'sk-vision', 'sk-search', 'sk-image'],
       plugin: ['pl-guard', 'pl-debounce', 'pl-ratelimit'],
     }
 
@@ -3528,7 +3688,9 @@ window.__ModuleLoader__.load({
     function SkillsTab({ get, write, writable, pickDirectory }) {
       // 清单本身来自配置：数组顺序 = 展示顺序，enabled = 开关。
       // 不再有前端假列表，所有改动都写回 config（写盘由 config-editor 负责）。
-      const skills = Array.isArray(get('skills')) ? get('skills') : []
+      // 老配置里可能没有 sk-image（P2 新增「发图片」）：这里补默认项，让用户能看到 / 关掉；
+      // 任何写回都基于合并后的整数组，写回去就带上它了（契约 3.1）。
+      const skills = mergeDefaultSkills(get('skills'))
       const plugins = Array.isArray(get('plugins')) ? get('plugins') : []
       const extEnabled = Array.isArray(get('externalPlugins.enabled')) ? get('externalPlugins.enabled') : []
       const extDirs = Array.isArray(get('externalPlugins.dirs')) ? get('externalPlugins.dirs') : []
@@ -3586,6 +3748,7 @@ window.__ModuleLoader__.load({
 
       /* ── 外部插件：只读扫描 Host 的目录，不改目标、不装包 ── */
       const runScan = async () => {
+        if (scanBusy) return  // 连点不再叠请求，按钮同时会被禁用
         setScanBusy(true); setScanError(null)
         try {
           const res = await fetch('/dsh-qq-guard/external-plugins', {
@@ -3787,7 +3950,11 @@ window.__ModuleLoader__.load({
             (scan?.controlled ?? 0) > 0
               ? h('span', { className: 'qqg-pill' }, `受控 ${scan.controlled}`)
               : null,
-            h('button', { type: 'button', className: 'qqg-btn', onClick: runScan }, '重新扫描')),
+            h('button', {
+              type: 'button', className: 'qqg-btn',
+              disabled: scanBusy,
+              onClick: runScan,
+            }, scanBusy ? h(React.Fragment, null, h(Spinner), '扫描中…') : '重新扫描')),
         },
         h('div', { className: 'qqg-dir-row', style: { marginBottom: 10 } },
           h('input', {
@@ -3881,7 +4048,9 @@ window.__ModuleLoader__.load({
                             ? `「${it.compat?.label ?? '未判定'}」模块 P1 不加载；等沙箱 shim（P2）`
                             : '在独立子进程里加载并执行 setup(api)',
                         onClick: () => runSandbox(it),
-                      }, sandboxRun?.phase === 'running' && sandboxRun.id === it.id ? '加载中…' : '测试运行'),
+                      }, sandboxRun?.phase === 'running' && sandboxRun.id === it.id
+                        ? h(React.Fragment, null, h(Spinner), '加载中…')
+                        : '测试运行'),
                       h('span', { className: 'qqg-status' },
                         extOn(it) ? '已启用（仅记录意图）' : '已关闭')),
                     h(Switch, {
@@ -4014,7 +4183,12 @@ window.__ModuleLoader__.load({
      * proc 由 SettingsPanel 统一轮询后传进来：按钮上的计数也要用它，
      * 弹窗自己再轮询一份就会出现两个状态源。
      */
-    function OnboardingModal({ open, get, goto, proc, refreshProc, onClose }) {
+    /**
+     * 使用引导弹窗：桥接进程状态在**弹窗内部**轮询（弹窗关着就不轮询）。
+     * 以前 proc 从面板层传进来，等于让整个面板每 3 秒跟着重渲染一次。
+     */
+    function OnboardingModal({ open, get, goto, onClose }) {
+      const [proc, refreshProc] = useBridgeProc(open === true)
       const state = guideSteps(get, proc)
       const { done, total, pct } = guideProgress(state)
       const [busy, setBusy] = React.useState(false)
@@ -4070,7 +4244,9 @@ window.__ModuleLoader__.load({
               className: 'qqg-btn' + (it.id === 'bridge' ? ' qqg-btn-primary' : ''),
               disabled: busy && it.id === 'bridge',
               onClick: it.onAction,
-            }, busy && it.id === 'bridge' ? '启动中…' : it.action)
+            }, busy && it.id === 'bridge'
+              ? h(React.Fragment, null, h(Spinner), '启动中…')
+              : it.action)
             : h('span', { className: 'qqg-pill qqg-pill-accent' },
               h(Glyph, { name: 'check', size: 11 }), '已就绪')))),
       err ? h('div', { className: 'qqg-status qqg-status-err', style: { marginTop: 10 } }, err) : null,
@@ -4171,12 +4347,12 @@ window.__ModuleLoader__.load({
             hint: '命中禁言指令词时，该会话静默一段时间不再回复。',
           }),
           muteOn ? h(React.Fragment, null,
-            h(TextField, {
+            h(DraftTextField, {
               label: '禁言指令词', value: muteWords, onChange: setWords,
-              hint: '逗号分隔，任一命中即触发。',
+              hint: '逗号分隔，任一命中即触发；失焦后保存。',
             }),
             h('div', { style: { height: 12 } }),
-            h(NumField, {
+            h(DraftNumField, {
               label: '禁言时长（秒）', value: muteSec, min: 5, max: 3600,
               onChange: (v) => set('rhythm.mute.seconds', v),
             })) : null),
@@ -4185,25 +4361,25 @@ window.__ModuleLoader__.load({
         h('div', null,
           h('div', { className: 'qqg-group-title' }, '合并与节奏'),
           h('div', { style: { marginTop: 10 } },
-            h(NumField, {
+            h(DraftNumField, {
               label: '防抖合并窗口（毫秒）', value: debounceMs, min: 0, max: 10000, step: 50,
               onChange: (v) => set('rhythm.debounceWindowMs', v),
-              hint: '同一会话连续发多条时，等这么久再一起处理。',
+              hint: '同一会话连续发多条时，等这么久再一起处理；失焦后保存。',
             }),
             h('div', { style: { height: 12 } }),
-            h(NumField, {
+            h(DraftNumField, {
               label: '批次间隔（毫秒）', value: batchMs, min: 0, max: 30000, step: 100,
               onChange: (v) => set('rhythm.batchIntervalMs', v),
               hint: '一轮回复分成多个气泡时，相邻气泡的间隔。',
             }),
             h('div', { style: { height: 12 } }),
-            h(NumField, {
+            h(DraftNumField, {
               label: '每分钟回复上限', value: perMin, min: 1, max: 120,
               onChange: (v) => set('rhythm.rateLimit.perMin', v),
               hint: '按会话独立计数，超出后丢弃。',
             }),
             h('div', { style: { height: 12 } }),
-            h(NumField, {
+            h(DraftNumField, {
               label: '允许突发条数', value: burst, min: 0, max: 30,
               onChange: (v) => set('rhythm.rateLimit.burst', v),
             }),
@@ -4364,6 +4540,7 @@ window.__ModuleLoader__.load({
           onClick: ready ? shutdown : launch,
         },
         h(Glyph, { name: ready ? 'stop' : 'play', size: 12 }),
+        starting ? h(Spinner) : null,
         buttonLabel))
     }
 
@@ -4398,8 +4575,8 @@ window.__ModuleLoader__.load({
         })))
     }
 
-    function SettingsTab({ get, write, writable, form, pickDirectory }) {
-      const common = { get, write, writable, form, pickDirectory }
+    function SettingsTab({ get, write, writeMany, writable, form, pickDirectory }) {
+      const common = { get, write, writeMany, writable, form, pickDirectory }
       const [sendOpen, setSendOpen] = React.useState(false)
       const [activeOpen, setActiveOpen] = React.useState(false)
       return h('div', { className: 'qqg-stack' },
@@ -4820,6 +4997,38 @@ window.__ModuleLoader__.load({
           })))
     }
 
+    /* ══════════ 轮询隔离：只在自己的叶子组件里 setState ══════════ */
+    /**
+     * 导航角标（有未读才渲染）：自己轮询桥接上报的会话状态。
+     * 以前这份数据提到 SettingsPanel 层，于是每 3 秒整个面板（含当前 Tab）
+     * 都要重渲染一次 —— 切 Tab 的迟滞感一半来自这里。
+     */
+    function SessionsBadge() {
+      const live = useBridgeStatus(true)
+      const unread = Array.isArray(live?.sessions)
+        ? live.sessions.filter((row) => Number(row.unread) > 0).length
+        : 0
+      if (unread <= 0) return null
+      return h('span', { className: 'qqg-nav-badge' }, unread > 99 ? '99+' : unread)
+    }
+
+    /**
+     * 左下角「使用引导」按钮：桥接进程状态在按钮内部轮询。
+     * x/3 与弹窗共用 guideSteps/guideProgress 的唯一口径，不会两处不一致。
+     */
+    function GuideNavButton({ get, onOpen }) {
+      const [proc] = useBridgeProc(true)
+      const guide = guideProgress(guideSteps(get, proc))
+      return h('button', {
+        type: 'button', className: 'qqg-nav-guide',
+        title: '三步把 QQ 桥接跑通',
+        onClick: onOpen,
+      },
+      h('span', { className: 'qqg-nav-guide-icon' }, h(Glyph, { name: 'bulb', size: 15 })),
+      h('span', { className: 'qqg-nav-guide-text' }, '使用引导'),
+      h('span', { className: 'qqg-nav-guide-done' }, `${guide.done}/${guide.total}`))
+    }
+
     function SettingsPanel(props) {
       // 两种入口来源：
       //   · plugins.bundle.config —— 框架给 form；
@@ -4830,21 +5039,119 @@ window.__ModuleLoader__.load({
       const writable = snap?.writable === true
       const [active, setActive] = React.useState('status')
       const [guideOpen, setGuideOpen] = React.useState(false)
-      // 引导按钮上的计数要包含桥接进程的真实状态，所以把轮询提到面板这一层：
-      // 弹窗与底部按钮共用同一份 proc，避免两个状态源各算各的。
-      const [guideProc, refreshGuideProc] = useBridgeProc(true)
-      // 会话管理用的真实列表（桥接上报）。同样提到面板层：导航红点与页面共用一份数据。
-      const sessionsLive = useBridgeStatus(true)
+
+      /* ── 乐观更新（P2）：点击立刻生效，写盘在后台静默进行 ──────────
+         overrides：点分路径 → 刚写入的整值。get() 优先读它，所以「拨开关 /
+         点保存」不必等 mutate 往返；写盘失败就丢掉覆盖 + 报错（回到真实值）。
+         inflight/queue：同一字段连点只保留最后一次值，不堆积请求。
+         savingCount：飞行中的写请求数，用于底部「正在保存…」的 spinner。 */
+      const [overrides, setOverrides] = React.useState({})
+      const [saveError, setSaveError] = React.useState(null)
+      const [savingCount, setSavingCount] = React.useState(0)
+      const inflight = React.useRef(new Map())
+      const queue = React.useRef(new Map())
 
       const get = (path) => {
+        const key = String(path)
+        if (Object.prototype.hasOwnProperty.call(overrides, key)) {
+          const base = getPath(value, path)
+          // 配置回读已经等于刚写的值 → 覆盖退休，别挡住之后的外部变化。
+          if (base !== undefined && sameJSON(base, overrides[key])) return base
+          return overrides[key]
+        }
         const v = getPath(value, path)
         return v === undefined ? DEFAULTS[path] : v
       }
-      const write = (path, next) => {
-        if (!form) return
-        // 嵌套字段必须按段拆成数组交给 mutate，带点字符串会落到错误的 key 上。
-        form.mutate([{ op: 'set', path: splitPath(path), value: next }])
+
+      /**
+       * 撤回某字段的覆盖，但**只在它仍等于这次写入的值时**撤。
+       * 连点场景：A 写盘还没回来用户又点了 B，覆盖表里已经是 B；
+       * A 落地后不能把 B 的乐观值一起抹掉，否则界面会闪回旧值。
+       */
+      const dropOverrideIf = (key, expected) => setOverrides((prev) => {
+        if (!Object.prototype.hasOwnProperty.call(prev, key)) return prev
+        if (!sameJSON(prev[key], expected)) return prev
+        const next = { ...prev }
+        delete next[key]
+        return next
+      })
+
+      const beginSaving = () => setSavingCount((n) => n + 1)
+      const endSaving = () => setSavingCount((n) => (n > 0 ? n - 1 : 0))
+
+      /** 单字段写入：同路径在飞行中时只记「最后一次」，落地后再补发一次。 */
+      const runOne = (key, op) => {
+        inflight.current.set(key, true)
+        beginSaving()
+        let result
+        try {
+          result = form.mutate([op])
+        } catch (error) {
+          console.error('[qq-guard] 写入抛错：', error)
+          result = false
+        }
+        const settle = (ok) => {
+          endSaving()
+          inflight.current.delete(key)
+          if (ok) setSaveError(null)
+          else setSaveError(`「${key}」保存失败，已回滚到原值`)
+          // 成功：配置已回读，覆盖可以撤；失败：必须撤（回滚）。
+          dropOverrideIf(key, op.value)
+          const queued = queue.current.get(key)
+          if (queued) { queue.current.delete(key); runOne(key, queued) }
+        }
+        Promise.resolve(result).then(
+          (ok) => settle(ok !== false),
+          (error) => { console.error('[qq-guard] 写入失败：', error); settle(false) },
+        )
+        return result
       }
+
+      const queueOp = (op) => {
+        const key = op.path.join('.')
+        if (inflight.current.has(key)) { queue.current.set(key, op); return undefined }
+        return runOne(key, op)
+      }
+
+      /** 多字段一次性提交（人设保存）：一次 mutate，失败整组回滚。 */
+      const runGroup = (ops) => {
+        beginSaving()
+        let result
+        try {
+          result = form.mutate(ops)
+        } catch (error) {
+          console.error('[qq-guard] 写入抛错：', error)
+          result = false
+        }
+        const settle = (ok) => {
+          endSaving()
+          if (ok) setSaveError(null)
+          else setSaveError('保存失败，改动已全部回滚')
+          for (const op of ops) dropOverrideIf(op.path.join('.'), op.value)
+        }
+        Promise.resolve(result).then(
+          (ok) => settle(ok !== false),
+          (error) => { console.error('[qq-guard] 写入失败：', error); settle(false) },
+        )
+        return result
+      }
+
+      /** 统一写入口：先把新值记进覆盖表（界面立刻变），再排队写盘。 */
+      const writeMany = (ops) => {
+        if (!form || !Array.isArray(ops)) return undefined
+        const list = ops.filter((op) => op && op.op === 'set' && Array.isArray(op.path))
+        if (list.length === 0) return undefined
+        setOverrides((prev) => {
+          const next = { ...prev }
+          for (const op of list) next[op.path.join('.')] = op.value
+          return next
+        })
+        setSaveError(null)
+        if (list.length === 1) return queueOp(list[0])
+        return runGroup(list)
+      }
+
+      const write = (path, next) => writeMany([{ op: 'set', path: splitPath(path), value: next }])
 
       if (!form) {
         return h('div', { className: 'qqg-card' },
@@ -4861,7 +5168,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'qqg-detail' }, '按 F12 打开 Console 可看到 [qq-guard] 前缀的完整错误。'))
       }
 
-      const common = { get, write, writable, form }
+      const common = { get, write, writeMany, writable, form }
       // 引导里的「去配置」：切到全局设置 Tab 并滚到对应卡片。
       const goto = (target) => {
         setActive('settings')
@@ -4874,8 +5181,6 @@ window.__ModuleLoader__.load({
         }, 60)
       }
 
-      // 引导按钮上的「x/3」：与弹窗共用 guideSteps/guideProgress，口径完全一致。
-      const guide = guideProgress(guideSteps(get, guideProc))
       // 启动卡的模型兜底：用配置里真实下发的 model（不是假常量）；留空 = 跟随全局默认。
       const launchModel = (() => {
         const provider = String(get('model.provider') ?? '')
@@ -4884,7 +5189,9 @@ window.__ModuleLoader__.load({
       })()
 
       let body
-      if (active === 'sessions') body = h(SessionsTab, { live: sessionsLive, get })
+      // 会话列表 / 引导计数 / 未读角标各自的轮询都在叶子组件里（见 SessionsTab /
+      // GuideNavButton / SessionsBadge），面板层不再持有任何轮询 state。
+      if (active === 'sessions') body = h(SessionsTab, { get })
       else if (active === 'skills') body = h(SkillsTab, { ...common, pickDirectory: props?.pickDirectory })
       else if (active === 'usage') body = h(UsageTab, common)
       else if (active === 'settings') body = h(SettingsTab, { ...common, pickDirectory: props?.pickDirectory })
@@ -4905,11 +5212,6 @@ window.__ModuleLoader__.load({
           h(AiAssistant))
       }
 
-      // 导航角标 = 有未读的会话数（真实数据；桥接未上报时为 0）。
-      const sessionsUnread = Array.isArray(sessionsLive?.sessions)
-        ? sessionsLive.sessions.filter((row) => Number(row.unread) > 0).length
-        : 0
-
       return h('div', { className: 'qqg-layout' },
         h('style', null, CSS),
         h('style', null, CSS2),
@@ -4928,20 +5230,11 @@ window.__ModuleLoader__.load({
             },
             h('span', { className: 'qqg-nav-icon' }, h(Glyph, { name: s.icon, size: 15 })),
             h('span', { className: 'qqg-nav-text' }, s.label),
-            s.id === 'sessions' && sessionsUnread > 0
-              ? h('span', { className: 'qqg-nav-badge' }, sessionsUnread > 99 ? '99+' : sessionsUnread)
-              : null))),
+            s.id === 'sessions' ? h(SessionsBadge) : null))),
           h('div', { className: 'qqg-nav-foot' },
             // 快捷启动卡：模型名由卡内自己从 /config + /models 读真实值；这里只传配置兜底。
             h(LaunchCard, { model: launchModel }),
-            h('button', {
-              type: 'button', className: 'qqg-nav-guide',
-              title: '三步把 QQ 桥接跑通',
-              onClick: () => setGuideOpen(true),
-            },
-            h('span', { className: 'qqg-nav-guide-icon' }, h(Glyph, { name: 'bulb', size: 15 })),
-            h('span', { className: 'qqg-nav-guide-text' }, '使用引导'),
-            h('span', { className: 'qqg-nav-guide-done' }, `${guide.done}/${guide.total}`)))),
+            h(GuideNavButton, { get, onOpen: () => setGuideOpen(true) }))),
         h('div', { className: 'qqg-content' },
           body,
           h('div', { className: 'qqg-hint qqg-hint-bottom' },
@@ -4949,15 +5242,24 @@ window.__ModuleLoader__.load({
             h('br'),
             '桥接进程每 2 秒轮询配置，通常 2 秒内生效，无需重启桥接。'),
 
+          // 乐观更新在飞行中：给一个明确的 spinner，别让人以为点击没反应。
+          savingCount > 0
+            ? h('div', { className: 'qqg-saving', role: 'status' },
+              h(Spinner), `正在保存…（${savingCount}）`)
+            : null,
+          saveError !== null
+            ? h('div', { className: 'qqg-status qqg-status-err', role: 'alert' }, saveError)
+            : null,
+
           writable ? null : h('div', { className: 'qqg-status qqg-status-err' },
             snap?.source === 'http'
               ? '只读模式：正在用 HTTP 兜底读取，改动无法保存（remote.settings 不可用）。'
               : '当前配置不可写（可能被更高优先级的配置层覆盖）。'),
         ),
         // 引导弹窗挂在最外层：从任何 Tab 点左下角按钮都能开。
+        // 弹窗内部自己轮询桥接进程状态（见 OnboardingModal），面板层不传 proc。
         h(OnboardingModal, {
           open: guideOpen, get, goto,
-          proc: guideProc, refreshProc: refreshGuideProc,
           onClose: () => setGuideOpen(false),
         }))
     }

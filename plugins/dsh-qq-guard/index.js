@@ -272,6 +272,10 @@ export function readGuardPersonaDefault(file = path.join(HERE, 'cordis.patch.yml
 const DEFAULT_SKILLS = [
   { id: 'sk-voice', name: '发语音', icon: 'send', tag: '内置', ver: '1.0.2', enabled: true,
     desc: '把回复文本合成语音，以 QQ 语音条发出；超过 60 秒自动转文字。' },
+  // P2「发图片」：模型通过 qq_send_image 把网页图片 / 本地文件发到 QQ（表情包同理）。
+  // 对象内容与 p2-contract.md §3.1 逐字一致（client.js 的合并默认值也用同一份）。
+  { id: 'sk-image', name: '发图片', icon: 'image', tag: '内置', ver: '1.0.0', enabled: true,
+    desc: '把图片或表情包发到 QQ（网页地址或本地文件），模型可通过 qq_send_image 调用。' },
   { id: 'sk-vision', name: '图片理解', icon: 'image', tag: '内置', ver: '1.3.2', enabled: true,
     desc: '识别聊天里发的截图与照片，提取文字、报错信息和界面元素。' },
   { id: 'sk-search', name: '网页搜索', icon: 'search', tag: '内置', ver: '1.0.4', enabled: true,
@@ -369,8 +373,8 @@ const SAFE_EXACT = new Set([
   'todo_write',
 ])
 
-/** 允许的前缀：DSH 的 MCP 命名空间工具。 */
-const SAFE_PREFIXES = ['mcp__']
+/** 允许的前缀：DSH 的 MCP 命名空间工具 + 外部插件代理工具（P2）。 */
+const SAFE_PREFIXES = ['mcp__', 'qq_ext_']
 
 // ── 桥接运行时配置（批次 4A）─────────────────────────────────────────────
 //
@@ -761,6 +765,18 @@ const PICK_DIR_ROUTE_PATH = '/dsh-qq-guard/pick-dir'
 const EXTERNAL_ROUTE_PATH = '/dsh-qq-guard/external-plugins'
 /** 路由路径：在独立沙箱子进程里加载一个外部插件（P1，只读测试）。 */
 const EXTERNAL_TEST_ROUTE_PATH = '/dsh-qq-guard/external-plugins/test'
+/** 路由路径：外部插件 hook（P2，桥接每条消息前调用，best-effort）。 */
+const EXTERNAL_HOOK_ROUTE_PATH = '/dsh-qq-guard/external/hook'
+/** 路由路径：外部插件常驻状态快照（P2，面板 / 排障用）。 */
+const EXTERNAL_RUNTIME_ROUTE_PATH = '/dsh-qq-guard/external/runtime'
+/** 外部插件常驻：同一份配置多久内不重复扫描/加载（hook 每条消息都会触发一次）。 */
+const EXTERNAL_RESIDENT_TTL_MS = 30_000
+/** 单个外部插件 hook 的超时（p2-contract §4.2）。 */
+const EXTERNAL_HOOK_TIMEOUT_MS = 1500
+/** 一次 hook 请求的总预算：超过就跳过剩余插件，保证桥接等得起。 */
+const EXTERNAL_HOOK_BUDGET_MS = 2000
+/** 外部工具代理执行时的默认超时（p2-contract §4.3：10s）。 */
+const EXTERNAL_TOOL_TIMEOUT_MS = 10_000
 /** 路由路径：清理 QQ 工作区里失效的会话（Phase 4）。 */
 const CLEANUP_ROUTE_PATH = '/dsh-qq-guard/cleanup-sessions'
 /** 路由路径：单人设覆盖（桥接每条消息前 POST；guard 实例只读共享内存）。 */
@@ -884,12 +900,35 @@ export function itemEnabledIn(config, id, kind = 'skill') {
 }
 
 /**
+ * 同 {@link itemEnabledIn}，但「配置里已经有数组、却缺这一项」时用传入的 fallback。
+ *
+ * 专门给 `sk-image` 用（p2-contract §3.1 兼容要求）：老用户的 `skills` 数组里
+ * 没有这一项，但新默认是**开启**——不能被当成「用户删了 = 关闭」。
+ *
+ * @param {unknown} config
+ * @param {string} id
+ * @param {boolean} fallback 数组存在但缺项时的取值
+ * @param {'skill'|'plugin'} [kind]
+ */
+export function itemEnabledOr(config, id, fallback, kind = 'skill') {
+  const cfg = plainConfig(config) ?? {}
+  const configured = Array.isArray(kind === 'plugin' ? cfg.plugins : cfg.skills)
+  const list = manifestOf(cfg, kind)
+  const hit = list.find((item) => item && item.id === id)
+  if (hit) return hit.enabled !== false
+  if (configured) return fallback === true
+  const dflt = (kind === 'plugin' ? DEFAULT_PLUGINS : DEFAULT_SKILLS).find((item) => item.id === id)
+  return dflt ? dflt.enabled === true : fallback === true
+}
+
+/**
  * 当前所有已实装开关的真实状态（guard 每次执行时现算，不缓存）。
  * @param {unknown} [config] 默认读 settings 实例的 Config；测试可注入。
  */
 export function readFeatureFlags(config = featureState.source) {
   return {
     voice: itemEnabledIn(config, 'sk-voice'),
+    image: itemEnabledOr(config, 'sk-image', true),
     vision: itemEnabledIn(config, 'sk-vision'),
     search: itemEnabledIn(config, 'sk-search'),
     guard: itemEnabledIn(config, 'pl-guard', 'plugin'),
@@ -962,21 +1001,38 @@ function pruneSessionOps() {
 
 /**
  * 入队一条会话指令。
- * @param {string} op clear | delete | persona | voice | activity
- * @param {string} key 会话 key（voice 为空串：桥接用 sessionId 反查）
+ * @param {string} op clear | delete | persona | voice | image | activity
+ * @param {string} key 会话 key（voice / image 为空串：桥接用 sessionId 反查）
  * @param {string} [text]
- * @param {{sessionId?:string, voice?:string, level?:number|null}} [extra]
+ * @param {{sessionId?:string, voice?:string, url?:string, file?:string, level?:number|null}} [extra]
  *   `level`：单群响应档位（0..3），null = 跟随全局；只有 activity 指令会带。
+ *   `url` / `file`：image 指令二选一的图片来源（P2）。
  */
 function enqueueSessionOp(op, key, text = '', extra = {}) {
   pruneSessionOps()
   // 同一个 key + 同一种操作只保留最新一条（连点两次不要建出两个新会话）。
-  // voice 按 sessionId + 文本去重，避免模型一次回复里重复调工具刷屏。
+  // voice / image 按 sessionId 去重，避免模型一次回复里重复调工具刷屏。
+  //
+  // ⚠️ 只跟**同类** op 去重（2026-10-24 终验修）：以前只比 sessionId，
+  // 于是 voice → image → image 会把前两条都删掉——voice/image 两个不同工具
+  // 互相踩，等待方要空等到 20/25s 超时才抛「桥接没回执」（错误归因 + 少发一条）。
+  // 另外**已下发（lease 非空）的 op 不撤回**：桥接已经拿走了，删除既阻止不了执行，
+  // 删了再结算反而会给在途请求报假失败。
   for (const [id, existing] of sessionOpsQueue) {
-    const sameTarget = op === 'voice'
-      ? existing.sessionId === extra.sessionId
+    if (existing.lease) continue
+    const sameTarget = (op === 'voice' || op === 'image')
+      ? existing.op === op && existing.sessionId === extra.sessionId
       : existing.op === op && existing.key === key
-    if (sameTarget) sessionOpsQueue.delete(id)
+    if (!sameTarget) continue
+    sessionOpsQueue.delete(id)
+    // voice / image 的调用方正挂在 waitForOpResult 上：被后来的一次取代时必须
+    // 结算，否则只能等超时。明确告诉它「本次未发送」，别假装成功。
+    if (op === 'voice' || op === 'image') {
+      settleOpResult(id, {
+        ok: false,
+        detail: `同一会话的同类请求已被后来的一次取代（本次未发送）：${op}`,
+      })
+    }
   }
   const id = `op-${Date.now().toString(36)}-${++sessionOpsSeq}`
   const level = (typeof extra.level === 'number' || extra.level === null) ? extra.level : undefined
@@ -984,6 +1040,8 @@ function enqueueSessionOp(op, key, text = '', extra = {}) {
     id, op, key, text,
     sessionId: typeof extra.sessionId === 'string' ? extra.sessionId : '',
     voice: typeof extra.voice === 'string' ? extra.voice : '',
+    url: typeof extra.url === 'string' ? extra.url : '',
+    file: typeof extra.file === 'string' ? extra.file : '',
     ...(level === undefined ? {} : { level }),
     at: Date.now(), lease: 0,
   })
@@ -1008,6 +1066,356 @@ export function sessionOpsSnapshot() {
  */
 export function settleSessionOpResult(id, result) {
   return settleOpResult(id, result)
+}
+
+// ── 外部插件 P2：常驻沙箱 / hook / 工具代理的跨实例共享状态 ──────────────
+//
+// settings 实例（profile 顶层）持有 webServer 与沙箱管理器，guard 实例（preset 内）
+// 要注册 `qq_ext_*` 代理工具、并在执行时调沙箱里的工具。两个实例是**同一个 ESM
+// 模块实例**，所以状态放模块级（和 personaState / featureState 同一个套路）：
+//   · manager  —— settings 实例创建的 SandboxManager（测试可注入 fake）；
+//   · loaded   —— 已加载的启用插件（id / name / moduleId / hooks / tools）；
+//   · appliers —— guard 实例登记的回调：loaded 变化时重注册代理工具。
+const externalRuntime = {
+  manager: null,
+  loaded: [],
+  updatedAt: 0,
+  /** 上一次扫描时的 enabled 签名（避免每条 hook 都重扫目录）。 */
+  signature: '',
+  /** guard 实例登记的「刷新代理工具」回调。 */
+  appliers: new Set(),
+  /** 单飞：并发的 hook / runtime 请求共用一次常驻加载。 */
+  ensuring: null,
+}
+
+/**
+ * 测试注入：替换沙箱管理器工厂（生产路径不调用）。
+ * @param {null|((options:object)=>any)} factory
+ */
+let sandboxFactoryOverride = null
+export function setSandboxFactoryForTests(factory) {
+  sandboxFactoryOverride = typeof factory === 'function' ? factory : null
+}
+
+/** 创建沙箱管理器：测试可注入 fake，生产走真 SandboxManager。 */
+function createSandboxManager(options) {
+  if (sandboxFactoryOverride !== null) return sandboxFactoryOverride(options)
+  return new SandboxManager(options)
+}
+
+/** 测试用：清空外部插件常驻状态（生产路径不调用）。 */
+export function resetExternalRuntimeForTests() {
+  externalRuntime.manager = null
+  externalRuntime.loaded = []
+  externalRuntime.updatedAt = 0
+  externalRuntime.signature = ''
+  externalRuntime.appliers.clear()
+  externalRuntime.ensuring = null
+}
+
+/**
+ * `GET /dsh-qq-guard/external/runtime` 的响应体（p2-contract §4.1）。
+ * @returns {{ok:true, resident:{state:string, pid:number|null, alive:boolean}, loaded:Array<object>, updatedAt:number}}
+ */
+export function externalRuntimeSnapshot() {
+  const manager = externalRuntime.manager
+  const alive = manager?.alive === true
+  const rawState = typeof manager?.state === 'string' ? manager.state : ''
+  // 契约只允许 ready / dead / stopped：starting 之类中间态按 stopped 报。
+  const state = alive || rawState === 'ready' ? 'ready' : (rawState === 'dead' ? 'dead' : 'stopped')
+  return {
+    ok: true,
+    resident: { state, pid: manager?.nodeInfo?.pid ?? null, alive },
+    loaded: externalRuntime.loaded.map((plugin) => ({
+      id: plugin.id,
+      name: plugin.name,
+      moduleId: plugin.moduleId,
+      hooks: [...plugin.hooks],
+      tools: plugin.tools.map((tool) => ({
+        id: tool.id,
+        name: tool.name,
+        description: tool.description,
+      })),
+    })),
+    updatedAt: externalRuntime.updatedAt,
+  }
+}
+
+/** hook 事件 → 允许的 hook 名（与 sandbox/child.mjs 的 HOOK_ALIASES 保持一致）。 */
+const EXTERNAL_HOOK_ALIASES = {
+  message: ['message', 'onMessage', 'beforeContext'],
+  'before-context': ['before-context', 'beforeContext', 'onMessage'],
+}
+
+/** 加载结果里的 hooks[] 是否覆盖该事件（用于跳过无 hook 模块的 IPC）。 */
+function externalPluginHasHook(plugin, event) {
+  const names = EXTERNAL_HOOK_ALIASES[event] ?? [event]
+  const hooks = Array.isArray(plugin?.hooks) ? plugin.hooks.map((name) => String(name)) : []
+  return names.some((name) => hooks.includes(name))
+}
+
+/** 收敛桥接发来的 hook 事件：只保留契约字段 + 长度上限。 */
+function sanitizeExternalHookEvent(body) {
+  const text = (value, max) => (typeof value === 'string' ? value.slice(0, max) : '')
+  const idOf = (value, max) => (typeof value === 'string' || typeof value === 'number'
+    ? String(value).slice(0, max)
+    : '')
+  const user = body?.user && typeof body.user === 'object'
+    ? { id: idOf(body.user.id, 40), name: text(body.user.name, 80), admin: body.user.admin === true }
+    : { id: '', name: '', admin: false }
+  const group = body?.group && typeof body.group === 'object'
+    ? { id: idOf(body.group.id, 40), name: text(body.group.name, 120) }
+    : null
+  const imageCount = Number.isFinite(Number(body?.imageCount))
+    ? Math.max(0, Math.floor(Number(body.imageCount)))
+    : 0
+  return {
+    event: String(body?.event ?? ''),
+    sessionId: text(body?.sessionId, 160),
+    key: text(body?.key, 80),
+    text: text(body?.text, 20000),
+    imageCount,
+    user,
+    group,
+  }
+}
+
+/** hook 返回值归一化：字符串 = text；对象取 text / drop / sections。 */
+function normalizeExternalHookResult(value) {
+  if (typeof value === 'string') return value === '' ? {} : { text: value.slice(0, 20000) }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const out = {}
+  if (value.drop === true) out.drop = true
+  if (typeof value.text === 'string' && value.text !== '') out.text = value.text.slice(0, 20000)
+  if (Array.isArray(value.sections)) {
+    out.sections = value.sections
+      .map((section) => (section && typeof section === 'object'
+        ? {
+          title: typeof section.title === 'string' ? section.title.slice(0, 200) : '',
+          text: typeof section.text === 'string' ? section.text.slice(0, 20000) : '',
+        }
+        : null))
+      .filter((section) => section !== null && (section.title !== '' || section.text !== ''))
+  }
+  return out
+}
+
+// ── 外部工具代理（p2-contract §4.3）───────────────────────────────────
+
+/** 代理工具名前缀：执行期白名单 SAFE_PREFIXES 也认它。 */
+export const EXTERNAL_TOOL_PREFIX = 'qq_ext_'
+/** slug 长度上限（契约 §4.3）。 */
+const EXTERNAL_TOOL_SLUG_MAX = 48
+
+/**
+ * 生成 `qq_ext_<slug>`：slug 只留 `[a-z0-9_]`，长度 ≤ 48；重名加 `_2` / `_3`。
+ * @param {string} raw 工具名 / id
+ * @param {Set<string>} used 已占用的工具名
+ */
+function externalToolProxyName(raw, used) {
+  const base = String(raw ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, EXTERNAL_TOOL_SLUG_MAX) || 'tool'
+  let name = EXTERNAL_TOOL_PREFIX + base
+  let seq = 2
+  while (used.has(name)) {
+    const suffix = `_${seq}`
+    name = EXTERNAL_TOOL_PREFIX + base.slice(0, Math.max(1, EXTERNAL_TOOL_SLUG_MAX - suffix.length)) + suffix
+    seq += 1
+  }
+  return name
+}
+
+/** 外部工具声明里的 type → 作者 spec 的 type（不支持的降级成 json）。 */
+function externalSpecType(type) {
+  if (Array.isArray(type)) return type.some((item) => String(item).toLowerCase() === 'string') ? 'string' : 'json'
+  if (typeof type !== 'string') return 'json'
+  const value = type.toLowerCase()
+  if (['string', 'number', 'integer', 'boolean', 'array', 'object'].includes(value)) return value
+  return 'json'
+}
+
+/** 单个 JSON Schema 属性 → 作者 spec 节点。 */
+function adaptJsonSchemaProperty(node, required) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return { type: 'json' }
+  const out = {}
+  if (typeof node.description === 'string' && node.description.trim() !== '') {
+    out.description = node.description.trim().slice(0, 400)
+  }
+  const enumValues = Array.isArray(node.enum)
+    ? node.enum.filter((value) => ['string', 'number', 'boolean'].includes(typeof value))
+    : []
+  if (enumValues.length > 0) {
+    out.type = 'string'
+    out.enum = enumValues.map((value) => String(value))
+  } else {
+    out.type = externalSpecType(node.type)
+  }
+  if (out.type === 'array') {
+    if (node.items) out.items = adaptJsonSchemaProperty(node.items, false)
+  } else if (out.type === 'object') {
+    out.additionalProperties = node.additionalProperties === true
+    const properties = node.properties && typeof node.properties === 'object' ? node.properties : {}
+    const nestedRequired = new Set(Array.isArray(node.required) ? node.required.map(String) : [])
+    out.properties = {}
+    for (const [key, value] of Object.entries(properties)) {
+      out.properties[key] = adaptJsonSchemaProperty(value, nestedRequired.has(key))
+    }
+  }
+  if (required) out.required = true
+  return out
+}
+
+/** 单个作者 spec 节点 → 作者 spec 节点（类型不支持的降级成 json）。 */
+function adaptAuthorSpecProperty(node) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return { type: 'json' }
+  const out = {}
+  if (typeof node.description === 'string' && node.description.trim() !== '') {
+    out.description = node.description.trim().slice(0, 400)
+  }
+  if (typeof node.title === 'string' && node.title.trim() !== '') out.title = node.title.trim().slice(0, 200)
+  if (Object.hasOwn(node, 'default')) out.default = node.default
+  if (Array.isArray(node.enum)) {
+    out.type = 'string'
+    out.enum = node.enum.map((value) => String(value))
+  } else {
+    out.type = externalSpecType(node.type)
+  }
+  if (out.type === 'array') {
+    if (node.items && typeof node.items === 'object') out.items = adaptAuthorSpecProperty(node.items)
+  } else if (out.type === 'object') {
+    out.additionalProperties = node.additionalProperties === true
+    const properties = node.properties && typeof node.properties === 'object' ? node.properties : {}
+    const nestedRequired = new Set(Array.isArray(node.required) ? node.required.map(String) : [])
+    out.properties = {}
+    for (const [key, value] of Object.entries(properties)) {
+      out.properties[key] = adaptAuthorSpecProperty(value)
+      if (nestedRequired.has(key)) out.properties[key].required = true
+    }
+  }
+  if (node.required === true) out.required = true
+  return out
+}
+
+/**
+ * 把外部工具声明的 parameters 适配成 `buildToolDefinition` 的作者 spec。
+ *
+ * 两种输入都允许（p2-contract §4.3）：
+ *   · JSON Schema：`{ type:'object', properties, required[] }`
+ *   · 作者 spec：`{ 参数名: { type, description, required } }`
+ * 支持 string / number / integer / boolean / array / object 与 enum；其它类型降级 `type:'json'`。
+ *
+ * @param {unknown} parameters
+ * @returns {Record<string, object>}
+ */
+export function adaptExternalToolParameters(parameters) {
+  if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) return {}
+  if (parameters.type === 'object'
+    && parameters.properties
+    && typeof parameters.properties === 'object'
+    && !Array.isArray(parameters.properties)) {
+    const required = new Set(Array.isArray(parameters.required) ? parameters.required.map(String) : [])
+    const out = {}
+    for (const [key, node] of Object.entries(parameters.properties)) {
+      out[key] = adaptJsonSchemaProperty(node, required.has(key))
+    }
+    return out
+  }
+  const out = {}
+  for (const [key, node] of Object.entries(parameters)) {
+    out[key] = adaptAuthorSpecProperty(node)
+  }
+  return out
+}
+
+/** 把外部工具返回值渲染成一行文本（模型侧展示用）。 */
+function formatExternalToolResult(value) {
+  if (value === null || value === undefined) return '（外部插件没有返回内容）'
+  if (typeof value === 'string') return value
+  try { return JSON.stringify(value) } catch { return String(value) }
+}
+
+/**
+ * P2：把「已启用且已加载」的外部插件工具代理注册进 preset 作用域。
+ *
+ * 注册时机：applyGuard 时先按当时的 loaded 注册一次；之后 ensureResident 重新加载
+ * 会通过模块级 `externalRuntime.appliers` 回调重试（已注册过的按 moduleId+toolId 跳过）。
+ *
+ * 已知限制（README 里写明）：cordis 没有稳定的「按名字注销工具」入口，插件被关掉后
+ * 代理工具可能残留到本次 DSH 生命周期结束；execute 里会再校验模块是否仍加载，
+ * 未加载直接抛可读错误，不会真的调到停用的插件。
+ *
+ * @param {object} ctx guard 实例的 ctx（preset 作用域）
+ */
+function applyExternalToolProxies(ctx) {
+  const tools = ctx.get?.('tools') ?? ctx.tools
+  if (!tools || typeof tools.register !== 'function') return
+  /** @type {Map<string, {moduleId:string, toolId:string}>} */
+  const registered = new Map()
+
+  const applier = () => {
+    const used = new Set(registered.keys())
+    for (const plugin of externalRuntime.loaded) {
+      for (const tool of plugin.tools) {
+        if (!tool || !tool.id) continue
+        const toolId = String(tool.id)
+        const already = [...registered.values()]
+          .some((item) => item.moduleId === plugin.moduleId && item.toolId === toolId)
+        if (already) continue
+        const proxyName = externalToolProxyName(String(tool.name || toolId), used)
+        used.add(proxyName)
+        const displayName = String(tool.name || toolId)
+        const description = `${String(tool.description ?? '').trim() || `外部插件 ${plugin.name} 提供的工具`}`
+          + `（来自外部插件 ${plugin.name}；仅在插件启用且沙箱就绪时可用）`
+        const definition = buildToolDefinition({
+          name: proxyName,
+          description: description.slice(0, 1000),
+          parameters: adaptExternalToolParameters(tool.parameters),
+          output: {
+            schema: { type: 'object', additionalProperties: true, properties: {} },
+            render: (_args, value) => [{ type: 'text', text: formatExternalToolResult(value?.result) }],
+          },
+          execute: async (args) => {
+            const manager = externalRuntime.manager
+            if (!manager || typeof manager.invoke !== 'function') {
+              throw new Error(`外部插件沙箱未就绪，${proxyName} 暂时不可用（请先在设置页确认外部插件可用）`)
+            }
+            const stillLoaded = externalRuntime.loaded
+              .some((item) => item.moduleId === plugin.moduleId)
+            if (!stillLoaded) {
+              throw new Error(`外部插件「${plugin.name}」已停用或未加载，${proxyName} 不可用`)
+            }
+            try {
+              const outcome = await manager.invoke(
+                { moduleId: plugin.moduleId, kind: 'tool', name: toolId, args: args ?? {} },
+                { timeoutMs: EXTERNAL_TOOL_TIMEOUT_MS },
+              )
+              return { result: outcome?.found === false ? null : (outcome?.value ?? null) }
+            } catch (error) {
+              throw new Error(`外部插件工具「${displayName}」执行失败：${error?.message ?? error}`)
+            }
+          },
+        })
+        try {
+          tools.register(definition)
+          registered.set(proxyName, { moduleId: plugin.moduleId, toolId })
+          console.info?.(`[qq-guard] 已注册外部插件工具代理 ${proxyName}（${plugin.id}）`)
+        } catch (error) {
+          console.warn?.(`[qq-guard] 外部工具代理注册失败（${proxyName}）：${error?.message ?? error}`)
+        }
+      }
+    }
+  }
+
+  externalRuntime.appliers.add(applier)
+  try { applier() } catch (error) {
+    console.warn?.(`[qq-guard] 外部工具代理初始化失败：${error?.message ?? error}`)
+  }
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => () => { externalRuntime.appliers.delete(applier) }, 'qq-guard: external tool proxies')
+  }
 }
 
 
@@ -2121,6 +2529,12 @@ function applyGuard(ctx, config) {
   // 会触发 tools/change 风暴；执行期拒绝 + 描述里写明「技能开启时可用」已经够用。
   applyVoiceTool(ctx)
 
+  // ── 第 0.6 层：发图片工具（P2，同样注册在 preset 作用域）──────────
+  applyImageTool(ctx)
+
+  // ── 第 0.7 层：外部插件工具代理（P2，qq_ext_<slug>，按已加载插件注册）──
+  applyExternalToolProxies(ctx)
+
   // ── 第 1 层：从 schema 隐藏 ────────────────────────────────────
   // `restrict()` 会**整批原子失败**：名单里只要有一个当下未注册的名字就抛错，
   // 整批限制都不生效。所以逐个注册，并且把"失败"记下来——不再静默吞错。
@@ -2179,6 +2593,9 @@ function applyGuard(ctx, config) {
     const flags = readFeatureFlags()
     if (toolName === VOICE_TOOL_NAME) {
       return flags.voice ? undefined : '「发语音」技能未开启，qq_send_voice 已拒绝'
+    }
+    if (toolName === IMAGE_TOOL_NAME) {
+      return flags.image ? undefined : '「发图片」技能未开启，qq_send_image 已拒绝'
     }
     if (toolName === 'web_search' || toolName === 'web_fetch') {
       return flags.search ? undefined : '「网页搜索」技能未开启，联网工具已拒绝'
@@ -2316,6 +2733,126 @@ function applyVoiceTool(ctx) {
     return registered
   }
   if (typeof ctx.effect === 'function') ctx.effect(register, 'qq-guard: qq_send_voice tool')
+  else register()
+}
+
+/** 「发图片」工具名（guard 与测试共用）。 */
+export const IMAGE_TOOL_NAME = 'qq_send_image'
+/**
+ * 等桥接回执的上限（毫秒）。
+ * 桥接要下网页图片 / 读本地文件 / base64 编码再交给 NapCat，20s 是 p2-contract §3.2 的约定。
+ */
+export const IMAGE_RECEIPT_TIMEOUT_MS = 20000
+
+/**
+ * 注册「发图片」工具（P2）。
+ *
+ * 与 qq_send_voice 同一条链路：工具只入队 `{op:'image', sessionId, url?|file?}`，
+ * 真正的下载与发送在桥接进程（它才有 NapCat 的 WS 连接），等到回执再回答模型。
+ *
+ * @param {object} ctx guard 实例的 ctx（preset 作用域）
+ */
+function applyImageTool(ctx) {
+  const tools = ctx.get?.('tools') ?? ctx.tools
+  if (!tools || typeof tools.register !== 'function') {
+    console.warn?.('[qq-guard] 找不到 tools 服务：qq_send_image 未注册')
+    return
+  }
+  const register = () => {
+    const definition = buildToolDefinition({
+      name: IMAGE_TOOL_NAME,
+      description: '把一张图片或表情包发到当前 QQ 聊天。url 与 file 二选一：'
+        + 'url 给 http/https 图片地址（NapCat 自己下载），file 给本地绝对路径 / file:// / base64://。'
+        + '两个都给时用 url。仅在「发图片」技能开启时可用；**发送失败会抛错**（桥接下载或 NapCat 拒收时），'
+        + '别假设一定成功。',
+      parameters: {
+        url: {
+          type: 'string',
+          description: '图片的 http/https 地址（与 file 二选一；两个都给时用 url）。',
+        },
+        file: {
+          type: 'string',
+          description: '本地图片：绝对路径 / file:// / base64://（与 url 二选一）。',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            queued: { type: 'boolean', required: true },
+            sent: { type: 'boolean', required: true, description: '桥接是否真的把图片发到了 QQ。' },
+            id: { type: 'string', required: true, description: '队列里的任务 id，排障用。' },
+            detail: { type: 'string', required: true, description: '桥接回执原文（成功=发送摘要，失败=原因）。' },
+          },
+        },
+        render: (_args, value) => [{
+          type: 'text',
+          text: value?.sent === true
+            ? `图片已发到 QQ：${String(value?.detail ?? '')}`
+            : `图片没有发出去：${String(value?.detail ?? '')}`,
+        }],
+      },
+      execute: async (args, exec) => {
+        const flags = readFeatureFlags()
+        if (!flags.image) throw new Error('「发图片」技能未开启：请先在 QQ 桥接设置页的「技能与插件」里打开它。')
+        if (args?.url !== undefined && typeof args.url !== 'string') throw new Error('url 必须是字符串')
+        if (args?.file !== undefined && typeof args.file !== 'string') throw new Error('file 必须是字符串')
+        const url = String(args?.url ?? '').trim()
+        const file = String(args?.file ?? '').trim()
+        // 契约：恰好给一个；两个都给用 url；都不给直接抛错（不要静默发空气）。
+        if (url === '' && file === '') {
+          throw new Error('url 与 file 必须给一个（url=http/https 图片地址，file=本地路径 / file:// / base64://）')
+        }
+        // sessionId 是桥接反查 QQ 会话的唯一凭据（同 qq_send_voice）。
+        const sessionId = String(exec?.agent?.id ?? exec?.agent?.session?.id ?? '').trim()
+        if (!sessionId) throw new Error('qq_send_image 只能在 QQ 会话内调用（拿不到 sessionId）')
+        const id = enqueueSessionOp('image', '', '', {
+          sessionId,
+          ...(url !== '' ? { url } : { file }),
+        })
+        // ★ 等桥接回执：下载失败 / NapCat 拒收时把真实原因抛给模型，别假装发出去了。
+        let receipt
+        try {
+          receipt = await waitForOpResult(id, IMAGE_RECEIPT_TIMEOUT_MS)
+        } catch (error) {
+          throw new Error(`图片没有发出去：${error?.message ?? error}`)
+        }
+        if (!receipt.ok) {
+          throw new Error(`图片发送失败：${receipt.detail || '桥接没有给出原因'}`)
+        }
+        return {
+          queued: true,
+          sent: true,
+          id,
+          detail: receipt.detail || '桥接已发送',
+        }
+      },
+      presentCall: (args) => ({
+        card: 'generic',
+        title: '发送 QQ 图片',
+        kind: 'other',
+        rawInput: {
+          ...(String(args?.url ?? '').trim() !== '' ? { url: String(args.url).trim() } : {}),
+          ...(String(args?.file ?? '').trim() !== '' ? { file: String(args.file).trim() } : {}),
+        },
+      }),
+      presentResult: (args, result) => ({
+        card: 'generic',
+        title: result?.sent === true ? 'QQ 图片已发送' : 'QQ 图片未发送',
+        content: [{
+          type: 'text',
+          text: result?.sent === true
+            ? `已发送：${String(result?.detail ?? '')}`
+            : `未发送：${String(result?.detail ?? '无原因')}`,
+        }],
+      }),
+    })
+    const registered = tools.register(definition)
+    console.info?.(`[qq-guard] qq_send_image 已注册（${voiceToolDefinitionSource()}）`)
+    return registered
+  }
+  if (typeof ctx.effect === 'function') ctx.effect(register, 'qq-guard: qq_send_image tool')
   else register()
 }
 
@@ -2520,10 +3057,13 @@ function applySettings(ctx, config) {
             ops.push({
               id: op.id, op: op.op, key: op.key,
               ...(op.text ? { text: op.text } : {}),
-              // 语音任务没有 QQ 会话 key（由 guard 工具按 sessionId 入队），
+              // 语音/图片任务没有 QQ 会话 key（由 guard 工具按 sessionId 入队），
               // 桥接用 sessionId 反查 state.sessions；voice 可覆盖音色。
               ...(op.sessionId ? { sessionId: op.sessionId } : {}),
               ...(op.voice ? { voice: op.voice } : {}),
+              // P2 图片：url / file 二选一（桥接 _applyImageOp 原样取用）。
+              ...(op.url ? { url: op.url } : {}),
+              ...(op.file ? { file: op.file } : {}),
               // 单群响应档位：null 也要下发（null = 跟随全局，是明确的语义，不是缺省）。
               ...(op.level === undefined ? {} : { level: op.level }),
             })
@@ -2786,6 +3326,9 @@ function applySettings(ctx, config) {
         entries.sort((a, b) => a.name.localeCompare(b.name))
         const controlled = entries.filter((e) => e.compat?.tier === 'controlled').length
         const invalid = entries.filter((e) => e.compat?.tier === 'invalid').length
+        // P2 常驻触发点之一：打开扫描页时顺带确保一次（配置里 enabled 非空才有动作，
+        // TTL 内不重复扫描，所以不影响这条只读路由的响应速度）。
+        void ensureResident().catch(() => {})
         sendJson(res, 200, {
           ok: true,
           dirs,
@@ -2851,15 +3394,127 @@ function applySettings(ctx, config) {
     return 502
   }
 
-  const sandbox = ctx.subprocess !== undefined
-    ? new SandboxManager({
+  const sandbox = (sandboxFactoryOverride !== null || ctx.subprocess !== undefined)
+    ? createSandboxManager({
       subprocess: ctx.subprocess,
       logger: ctx.logger ?? console,
       getRoots: readExternalRoots,
     })
     : null
   if (sandbox !== null) {
-    ctx.effect(() => () => { void sandbox.dispose() }, 'qq-guard: sandbox teardown')
+    // P2：管理器归 settings 实例所有，guard 实例通过模块级引用调 invoke。
+    // 换了实例（配置保存 → 热重载 → 新沙箱）时清空 loaded，逼下一次 ensure 重新加载。
+    if (externalRuntime.manager !== sandbox) {
+      externalRuntime.manager = sandbox
+      externalRuntime.loaded = []
+      externalRuntime.updatedAt = 0
+      externalRuntime.signature = ''
+    }
+    ctx.effect(() => () => {
+      void sandbox.dispose?.()
+      if (externalRuntime.manager === sandbox) externalRuntime.manager = null
+    }, 'qq-guard: sandbox teardown')
+  }
+
+  /**
+   * 外部插件常驻（P2 / p2-contract §4.1）。
+   *
+   * `externalPlugins.enabled` 非空时确保沙箱起来，并把每个「已启用 + 自包含 + 有入口」
+   * 的插件 load 一次；失败只记日志（连续失败熔断沿用 SandboxManager）。
+   * 同一份配置在 {@link EXTERNAL_RESIDENT_TTL_MS} 内不重复扫描（hook 每条消息都会问一次）。
+   *
+   * @returns {Promise<object>} {@link externalRuntimeSnapshot} 的结果
+   */
+  const ensureResident = async () => {
+    if (sandbox === null) return externalRuntimeSnapshot()
+    const cfg = plainConfig(config) ?? {}
+    const enabled = asStringArray(cfg.externalPlugins?.enabled)
+    if (enabled.length === 0) {
+      // 全关 = 没有常驻插件：清空快照，代理工具 execute 会据此拒绝。
+      if (externalRuntime.loaded.length > 0) {
+        externalRuntime.loaded = []
+        externalRuntime.updatedAt = Date.now()
+      }
+      externalRuntime.signature = ''
+      return externalRuntimeSnapshot()
+    }
+
+    const signature = enabled.join('\n')
+    const managerState = externalRuntime.manager?.state
+    const managerAlive = externalRuntime.manager?.alive === true || managerState === 'ready'
+    if (externalRuntime.signature === signature
+      && externalRuntime.updatedAt > 0
+      && Date.now() - externalRuntime.updatedAt < EXTERNAL_RESIDENT_TTL_MS
+      && managerAlive) {
+      return externalRuntimeSnapshot()
+    }
+    if (externalRuntime.ensuring) return externalRuntime.ensuring
+
+    externalRuntime.ensuring = (async () => {
+      const loadedPlugins = []
+      try {
+        await sandbox.ensure()
+      } catch (error) {
+        console.warn?.(`[qq-guard] 外部插件沙箱启动失败（本轮跳过加载）：${error?.message ?? error}`)
+        externalRuntime.signature = ''
+        return externalRuntimeSnapshot()
+      }
+      for (const id of enabled) {
+        const module = findExternalModule({ id })
+        if (module === null) {
+          console.warn?.(`[qq-guard] 外部插件未找到（跳过）：${id}`)
+          continue
+        }
+        if (!module.hasEntry || module.compat?.tier !== 'self-contained') {
+          console.warn?.(`[qq-guard] 外部插件不可自动加载（只允许自包含且有入口）：${module.id}`)
+          continue
+        }
+        const entryPath = path.resolve(module.dir, module.entry || 'index.js')
+        const outcome = await sandbox.testLoad({
+          id: module.id,
+          dir: module.dir,
+          entryPath,
+          format: module.format,
+        })
+        if (!outcome.ok) {
+          console.warn?.(`[qq-guard] 外部插件加载失败（${module.id}）：`
+            + `${outcome.error?.code ?? '?'} ${outcome.error?.message ?? ''}`)
+          continue
+        }
+        const result = outcome.result ?? {}
+        const hooks = Array.isArray(result.exports?.hooks)
+          ? result.exports.hooks.map((name) => String(name))
+          : []
+        const tools = Array.isArray(result.tools)
+          ? result.tools
+            .filter((tool) => tool && tool.id)
+            .map((tool) => ({
+              id: String(tool.id),
+              name: String(tool.name ?? tool.id),
+              description: String(tool.description ?? ''),
+              parameters: tool.parameters,
+            }))
+          : []
+        loadedPlugins.push({
+          id: module.id,
+          name: module.name ?? module.id,
+          moduleId: String(result.moduleId ?? module.id),
+          hooks,
+          tools,
+        })
+      }
+      externalRuntime.loaded = loadedPlugins
+      externalRuntime.signature = signature
+      externalRuntime.updatedAt = Date.now()
+      // 通知 guard 实例重注册代理工具（按 moduleId+toolId 幂等跳过已注册的）。
+      for (const applier of [...externalRuntime.appliers]) {
+        try { applier() } catch (error) {
+          console.warn?.(`[qq-guard] 外部工具代理刷新失败：${error?.message ?? error}`)
+        }
+      }
+      return externalRuntimeSnapshot()
+    })().finally(() => { externalRuntime.ensuring = null })
+    return externalRuntime.ensuring
   }
 
   ctx.effect(
@@ -2981,6 +3636,133 @@ function applySettings(ctx, config) {
       },
     }),
     'qq-guard: external plugin sandbox test route',
+  )
+
+  // ── 外部插件 hook（P2）──────────────────────────────────────────
+  //
+  // 桥接每条消息会打两次：`message`（白名单通过、入队之前）与 `before-context`
+  // （拼 prompt 之前）。**这条路由永远 best-effort**：没有沙箱 / 没有启用插件 /
+  // 插件没声明对应 hook 都返回 `{ ok:true, modules:[], latencyMs }`，插件抛错只 warn
+  // 一次，绝不把聊天主链路拖死。
+  let hooksWarned = false
+  const warnHookOnce = (message) => {
+    if (hooksWarned) return
+    hooksWarned = true
+    console.warn?.(`[qq-guard] 外部插件 hook 失败（只提示一次）：${message}`)
+  }
+
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: EXTERNAL_HOOK_ROUTE_PATH,
+      handler: async (req, res) => {
+        try {
+          const fetchSite = req.headers['sec-fetch-site']
+          if (typeof fetchSite === 'string' && fetchSite !== 'same-origin' && fetchSite !== 'none') {
+            sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
+            return
+          }
+          if (req.method !== 'POST') {
+            sendJson(res, 405, { ok: false, reason: 'method not allowed' })
+            return
+          }
+          let body
+          try {
+            body = await readJsonBody(req, { maxBytes: 64 * 1024 })
+          } catch (error) {
+            sendJson(res, error?.statusCode ?? 400, { ok: false, reason: error?.message ?? 'invalid json' })
+            return
+          }
+          const event = typeof body?.event === 'string' ? body.event : ''
+          if (EXTERNAL_HOOK_ALIASES[event] === undefined) {
+            sendJson(res, 400, {
+              ok: false,
+              reason: 'bad-event',
+              detail: `event 只支持 message / before-context，收到 ${event || '(空)'}`,
+            })
+            return
+          }
+
+          const startedAt = Date.now()
+          // 收到 hook 之前先把常驻沙箱准备好（幂等 + 单飞 + TTL；失败只记日志）。
+          try { await ensureResident() } catch { /* ensureResident 内部已兜住 */ }
+          // 预算从「沙箱已就绪」开始算（终验修）：冷启动 / 刚启用插件时 warmup 可能
+          // 吃掉全部 2s，导致本次回 modules:[]，而桥接会把「空」记 30s 负缓存 ——
+          // 表现就是「插件刚开，最长约 30s 不生效」。
+          const budgetStartedAt = Date.now()
+          const eventPayload = sanitizeExternalHookEvent(body)
+          const manager = externalRuntime.manager
+          const modules = []
+          let drop
+          let text
+          let sections
+          if (manager && typeof manager.invoke === 'function') {
+            const deadline = budgetStartedAt + EXTERNAL_HOOK_BUDGET_MS
+            for (const plugin of externalRuntime.loaded) {
+              if (!externalPluginHasHook(plugin, event)) continue
+              const remaining = deadline - Date.now()
+              if (remaining <= 0) break
+              const timeoutMs = Math.min(EXTERNAL_HOOK_TIMEOUT_MS, remaining)
+              try {
+                const outcome = await manager.invoke({
+                  moduleId: plugin.moduleId,
+                  kind: 'hook',
+                  name: event,
+                  event: eventPayload,
+                }, { timeoutMs })
+                if (outcome?.found === false) continue
+                const merged = normalizeExternalHookResult(outcome?.value)
+                modules.push(plugin.id)
+                if (merged.drop === true) drop = true
+                if (typeof merged.text === 'string' && merged.text !== '') text = merged.text
+                if (Array.isArray(merged.sections) && merged.sections.length > 0) {
+                  sections = [...(sections ?? []), ...merged.sections]
+                }
+              } catch (error) {
+                warnHookOnce(`${plugin.id}/${event}：${error?.message ?? error}`)
+              }
+            }
+          }
+          sendJson(res, 200, {
+            ok: true,
+            ...(drop === true ? { drop: true } : {}),
+            ...(typeof text === 'string' ? { text } : {}),
+            ...(sections && sections.length > 0 ? { sections } : {}),
+            modules,
+            latencyMs: Date.now() - startedAt,
+          })
+        } catch (error) {
+          // 绝不能 500：桥接把 5xx 当「hook 坏了」，虽然它会兜住，但没必要制造噪声。
+          sendJson(res, 200, { ok: false, reason: 'hook-failed', detail: error?.message ?? String(error) })
+        }
+      },
+    }),
+    'qq-guard: external hook route',
+  )
+
+  // ── 外部插件常驻快照（P2）───────────────────────────────────────
+  //
+  // 供面板 / 排障查看：沙箱是否常驻、加载了哪些插件、每个插件声明了哪些 hook / 工具。
+  // 顺带触发一次 ensureResident，保证打开面板时看到的不是「还没加载」的空快照。
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: EXTERNAL_RUNTIME_ROUTE_PATH,
+      handler: async (req, res) => {
+        const fetchSite = req.headers['sec-fetch-site']
+        if (typeof fetchSite === 'string' && fetchSite !== 'same-origin' && fetchSite !== 'none') {
+          sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
+          return
+        }
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          sendJson(res, 405, { ok: false, reason: 'method not allowed' })
+          return
+        }
+        try { await ensureResident() } catch { /* ensureResident 内部已兜住 */ }
+        sendJson(res, 200, externalRuntimeSnapshot())
+      },
+    }),
+    'qq-guard: external runtime route',
   )
 
   // ── 清理失效会话（Phase 4）───────────────────────────────────
@@ -3395,6 +4177,10 @@ function applySettings(ctx, config) {
       'qq-guard: settings page policy',
     )
   })
+
+  // P2：配置装载完成后拉一次外部插件常驻（异步，失败只记日志）。
+  // 配置保存 → DSH 热重载 → 这里再跑一次，代理工具跟着刷新（TTL 内不重复扫描）。
+  void ensureResident().catch(() => {})
 }
 
 /** 供对账脚本使用：确认名单与 DSH 真实工具名不漂移。 */

@@ -130,6 +130,46 @@ const MOD_LOOP = writeModule('loop-mod', `
 export function setup() { while (true) { /* 故意卡死，考验 Host 超时熔断 */ } }
 `)
 
+/* ── P2 invoke 夹具：hook / 工具 handler / 不可序列化 / hook 抛错 ───── */
+const MOD_INVOKE = writeModule('invoke-mod', `
+let hits = 0
+export function setup(api) {
+  api.registerTool({
+    id: 'echo',
+    name: 'echo',
+    description: '回显参数',
+    parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+    handler(args) { hits += 1; return { got: args?.text ?? null, hits } },
+  })
+}
+export const hooks = {
+  onMessage(event) { return { text: 'hooked:' + String(event?.text ?? '') } },
+}
+`)
+
+// 顶层函数形态的 hook（不在 hooks 对象里）：child 也要认。
+const MOD_TOP_HOOK = writeModule('top-hook', `
+export function setup() {}
+export function beforeContext(event) {
+  return { sections: [{ title: '外部上下文', text: 'ctx:' + String(event?.text ?? '') }] }
+}
+`)
+
+const MOD_HOOK_THROW = writeModule('hook-throw', `
+export function setup() {}
+export const hooks = { onMessage() { throw new Error('hook-boom') } }
+`)
+
+const MOD_BAD_RESULT = writeModule('bad-result', `
+export function setup(api) {
+  api.registerTool({
+    id: 'circular',
+    name: 'circular',
+    handler() { const loop = {}; loop.self = loop; return loop },
+  })
+}
+`)
+
 /* ── 跑 ─────────────────────────────────────────────────────── */
 const manager = new SandboxManager({
   subprocess: makeRealSubprocess(),
@@ -209,6 +249,87 @@ await check('process.getBuiltinModule 已被移除', async () => {
   assert.equal(outcome.ok, true, JSON.stringify(outcome.error))
 })
 
+console.log('\n— P2 invoke：hook / 工具 handler / 错误码 —')
+
+await check('load 结果带 tools[]；hooks 对象里的声明被上报', async () => {
+  const outcome = await manager.testLoad(MOD_INVOKE)
+  assert.equal(outcome.ok, true, JSON.stringify(outcome.error))
+  const tool = outcome.result.tools?.find((item) => item.id === 'invoke-mod__echo')
+  assert.ok(tool, `tools 里没有 echo：${JSON.stringify(outcome.result.tools)}`)
+  assert.equal(tool.name, 'echo')
+  assert.equal(tool.parameters?.type, 'object')
+  assert.ok(outcome.result.exports.hooks.includes('onMessage'), JSON.stringify(outcome.result.exports.hooks))
+})
+
+await check('invoke hook（hooks.onMessage）：返回值回传 value', async () => {
+  const payload = await manager.invoke({
+    moduleId: 'invoke-mod', kind: 'hook', name: 'message', event: { text: '你好' },
+  })
+  assert.equal(payload.found, true)
+  assert.equal(payload.value?.text, 'hooked:你好')
+})
+
+await check('invoke before-context：回落到顶层导出的 beforeContext 函数', async () => {
+  const loaded = await manager.testLoad(MOD_TOP_HOOK)
+  assert.equal(loaded.ok, true, JSON.stringify(loaded.error))
+  assert.ok(loaded.result.exports.hooks.includes('beforeContext'), JSON.stringify(loaded.result.exports.hooks))
+  const payload = await manager.invoke({
+    moduleId: 'top-hook', kind: 'hook', name: 'before-context', event: { text: '上下文' },
+  })
+  assert.equal(payload.found, true)
+  assert.equal(payload.value?.sections?.[0]?.title, '外部上下文')
+  assert.equal(payload.value?.sections?.[0]?.text, 'ctx:上下文')
+})
+
+await check('invoke hook：模块没声明该事件 → found:false（不是错误）', async () => {
+  const payload = await manager.invoke({
+    moduleId: 'invoke-mod', kind: 'hook', name: 'no-such-event', event: {},
+  })
+  assert.equal(payload.found, false)
+  assert.equal(payload.value, null)
+})
+
+await check('invoke tool：执行 api.registerTool 的 handler，参数透传', async () => {
+  const payload = await manager.invoke({
+    moduleId: 'invoke-mod', kind: 'tool', name: 'invoke-mod__echo', args: { text: 'hi' },
+  })
+  assert.equal(payload.found, true)
+  assert.equal(payload.value?.got, 'hi')
+  assert.equal(payload.value?.hits, 1)
+})
+
+await check('invoke tool：不存在的工具 → E_NOT_LOADED', async () => {
+  await assert.rejects(
+    () => manager.invoke({ moduleId: 'invoke-mod', kind: 'tool', name: 'nope' }),
+    (error) => error.code === ERR.NOT_LOADED,
+  )
+})
+
+await check('invoke：没加载过的模块 → E_NOT_LOADED', async () => {
+  await assert.rejects(
+    () => manager.invoke({ moduleId: 'never-loaded', kind: 'hook', name: 'message' }),
+    (error) => error.code === ERR.NOT_LOADED,
+  )
+})
+
+await check('invoke hook 自己抛错 → E_INVOKE（带原始信息）', async () => {
+  const loaded = await manager.testLoad(MOD_HOOK_THROW)
+  assert.equal(loaded.ok, true, JSON.stringify(loaded.error))
+  await assert.rejects(
+    () => manager.invoke({ moduleId: 'hook-throw', kind: 'hook', name: 'message' }),
+    (error) => error.code === ERR.INVOKE_FAILED && /hook-boom/.test(error.message),
+  )
+})
+
+await check('invoke tool 返回不可序列化值 → E_BAD_RESULT', async () => {
+  const loaded = await manager.testLoad(MOD_BAD_RESULT)
+  assert.equal(loaded.ok, true, JSON.stringify(loaded.error))
+  await assert.rejects(
+    () => manager.invoke({ moduleId: 'bad-result', kind: 'tool', name: 'bad-result__circular' }),
+    (error) => error.code === ERR.BAD_RESULT,
+  )
+})
+
 await check('死循环：Host 超时杀进程 → E_TIMEOUT', async () => {
   const outcome = await manager.testLoad(MOD_LOOP)
   assert.equal(outcome.ok, false)
@@ -218,6 +339,13 @@ await check('死循环：Host 超时杀进程 → E_TIMEOUT', async () => {
 await check('超时杀进程后能重新拉起并加载成功', async () => {
   const outcome = await manager.testLoad(MOD_OK)
   assert.equal(outcome.ok, true, JSON.stringify(outcome.error))
+})
+
+await check('沙箱重启后模块缓存清空：旧模块 invoke → E_NOT_LOADED（防调到上一个进程的残留）', async () => {
+  await assert.rejects(
+    () => manager.invoke({ moduleId: 'invoke-mod', kind: 'hook', name: 'message' }),
+    (error) => error.code === ERR.NOT_LOADED,
+  )
 })
 
 await manager.dispose()

@@ -591,6 +591,20 @@ node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔�
   发送会失败，失败原因经回执回到模型（provider / 体积 / via / retcode 都在 detail 里）。
 - 技能关闭时工具执行期直接拒绝（guard 层）。
 
+### 发图片 / 表情包（sk-image，P2）
+
+- guard 实例在 preset 作用域注册 `qq_send_image` 工具（`url` / `file` 二选一），
+  执行时只把任务入队（`sessionId + url/file`），跟 `qq_send_voice` 一样**等桥接回执**
+  （20s 上限）：成功回 `{queued, sent, id, detail}`，失败直接抛，detail 是可读原因。
+- 桥接轮询到 `op:'image'` 后：按 `sessionId` 反查 QQ 会话 key → `features.image` 门禁 →
+  `send_group_msg` / `send_private_msg` 发 `[{ type:'image', data:{ file } }]`。
+  `file` 原样交给 NapCat：http(s) URL 由它自己下载，`base64://` / `file:///` / 绝对路径同样原样传。
+- **图片不参与文本分片、不碰换行**；群聊发图**不带 @**（图片不需要 @ 人也看得见）。
+- 成功 detail 例：`已发送图片（via=url，retcode=0）`；失败 detail 带 `via` + `retcode`/`status`。
+- 找回会话失败（刚 delete / 重建）时 detail 会提示「让用户先发条 QQ 消息」。
+- 开关：设置页「技能与插件 → 发图片」；老配置里没有 `sk-image` 时按**默认开启**兼容
+  （`normalizeFeatures` 缺 `image` 也是 true），关闭时工具执行期直接拒绝。
+
 ### 网页搜索（sk-search）
 
 - 开启：guard 执行期放行 `web_search` / `web_fetch`（DSH 原生联网工具）；
@@ -611,6 +625,45 @@ node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔�
   但 agent-scope 工具不再被 guard 拦）。设置页有高风险提示，默认开启。
 - `pl-debounce` 关闭：不再攒防抖窗口，消息立即投递。
 - `pl-ratelimit` 关闭：不做每会话每分钟限频。
+
+## 外部插件 hook（P2，2026-10-24）
+
+设置页「外部插件」里 `externalPlugins.enabled` 非空时，桥接会在两个时机 POST
+`${dsh.baseUrl}/dsh-qq-guard/external/hook`（Host 的常驻沙箱去调插件）：
+
+| event | 时机 | 能做什么 |
+|---|---|---|
+| `message` | 通过白名单后、入队/防抖之前 | `text` 改写本轮正文；`drop:true` 直接丢弃（计 `stats.skipped`，记一条 info） |
+| `before-context` | `_processBatch` 拼好 prompt、真正投递之前 | `text` 替换本轮正文；`sections:[{title,text}]` 按顺序拼成 `\n\n[外部上下文：<title>]\n<text>` 追加到正文**之后**（不动人设） |
+
+设计取舍：
+
+- **best-effort**：HTTP 失败 / 超时（2.5s）/ `ok:false` 一律只 warn（连续失败只提示一次），
+  聊天照常，绝不因为外部插件丢消息；
+- **两条 HTTP 上限**：`externalPlugins.enabled` 为空时一条都不发；路由回 `modules:[]`
+  后该事件 30 秒内不再请求（按事件分开缓存，`message` 没有 hook 不影响 `before-context`）；
+- 桥接**不做工具代理**：`qq_ext_*` 由 Host 在 preset 作用域自行注册。
+
+## 桥接性能（P2，2026-10-24）
+
+目标：无效网络请求清零、慢操作不阻塞主链路。全部是内存态，重启即清。
+
+- **模型 / 人设去重**：`_applyModel` 按 `sessionId|provider/model|effort|fallbacks` 签名，
+  `_applyPersona` 按 `sessionId + 人设正文 + 是否管理员` 签名；同签名直接跳过 POST。
+  设置页改配置 / 新建会话自然换签名；保存单人设时清对应缓存立即重推。失败不写签名 → 下条消息重试。
+- **会话存在性缓存**：`ensureSession` 的 `sessionExists` **正结果**缓存 30 秒
+  （负结果不缓存，失效要立刻重建）；重建 / clear / delete 清对应 sessionId。
+- **图片 ingress 预取**：收到消息立刻后台下载（最多并发 2、LRU 32、TTL 60s），
+  `_loadImageParts` 复用同一个 in-flight Promise，不重复下载、不阻塞入队；
+  失败按 TTL 缓存并在组装 prompt 时 warn 跳过。
+- **voice / image op detached**：`session-ops` 轮询器里 `voice`（TTS 合成 + 上传）与
+  `image`（下载 / 转码 / 上传）都不再串行阻塞 `clear` / `delete` / `persona`；
+  两者完成后回执照常单独回传（Host 按 id 消费，`DETACHED_OPS` 定义在 session-ops.mjs）。
+- 统计计数（`bridge.stats`，测试与排障用）：`modelPushes` / `personaPushes` /
+  `sessionChecks` / `skippedRequests`（被去重或缓存省掉的请求数）/ `hookCalls` /
+  `hookDrops` / `hookSkipped`。
+- 红线不变：换行 / 分片逻辑（`splitBubbles` / `_buildSegments`）一行没动；
+  `promptAndWait` 轮询节奏也没动。
 
 ## 运行
 
@@ -670,19 +723,22 @@ value = v1.<base64url(JSON{version,authority,issuedAt,expiresAt})>.<base64url(HM
 ## 自测
 
 ```bash
-node test-offline.mjs   # 主回归
+node test-offline.mjs   # 主回归（含 P2：发图片 / 外部 hook / 性能去重）
+node test-tts.mjs       # TTS 通路 + voice op detail + voice detached 不阻塞
 node test-timeout.mjs   # 等待超时：默认 20s / 超时必 session/cancel / 错误码 TIMEOUT
 ```
 
 覆盖回复审计、消息解析（array / 字符串 / 混合段）、长文本分片、分气泡（强边界 / 语义切 /
 原子块 / 分级延时）、群聊 @ 回复、DSH 设置热同步、白名单热读、人设写入、DSH 端口自动跟随、
-客户端接口面、**纯 WS 在线探测四态（批次 5）**、**单实例锁（批次 5）**，并串跑插件侧回归：
+客户端接口面、**纯 WS 在线探测四态（批次 5）**、**单实例锁（批次 5）**、
+**P2 发图片 / 外部插件 hook / 请求去重与图片预取**，并串跑插件侧回归：
 `plugins/dsh-qq-guard/test-guard-scope.mjs`（防全局锁死）、
 `plugins/dsh-qq-guard/test-settings-data.mjs`（设置页数据通路）、
 `plugins/dsh-qq-guard/test-napcat.mjs`（NapCat 进程管理）、
 `plugins/dsh-qq-guard/test-autostart.mjs`（autoStart / 单实例 / 崩溃重启上限）、
 `test-persona.mjs`（人设写入不丢插件）。
-**不连 QQ、不启 NapCat、不碰 DSH 会话。** 当前基线：`92 通过 / 0 失败`。
+**不连 QQ、不启 NapCat、不碰 DSH 会话。** 当前基线（2026-10-24 P2）：`195 通过 / 0 失败`
+（bridge 五个测试文件：195 / 16 / 31 / 13 / 6，全绿）。
 
 ## 排障
 

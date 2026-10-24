@@ -9,7 +9,7 @@
  *
  * 帧类型：
  *   child → host  ready / log / event / result / error
- *   host → child  init / load / invoke(预留) / shutdown(预留)
+ *   host → child  init / load / invoke / shutdown(预留)
  *
  * @module qq-guard/sandbox/protocol
  */
@@ -31,6 +31,7 @@ export const FRAME = {
   ERROR: 'error',
   INIT: 'init',
   LOAD: 'load',
+  INVOKE: 'invoke',
 }
 
 export const ERR = {
@@ -50,6 +51,12 @@ export const ERR = {
   BAD_EXPORTS: 'E_BAD_EXPORTS',
   NOT_SELF_CONTAINED: 'E_NOT_SELF_CONTAINED',
   UNSUPPORTED_API: 'E_UNSUPPORTED_API',
+  /** invoke：目标模块没加载过 / 没声明这个 hook / 没有这个工具。 */
+  NOT_LOADED: 'E_NOT_LOADED',
+  /** invoke：插件自己抛错。 */
+  INVOKE_FAILED: 'E_INVOKE',
+  /** invoke：返回值不能 JSON 序列化（协议要求 JSON 可序列化）。 */
+  BAD_RESULT: 'E_BAD_RESULT',
 }
 
 /** 沙箱内的可预期错误：带稳定错误码，Host/UI 只认 code，不解析 message。 */

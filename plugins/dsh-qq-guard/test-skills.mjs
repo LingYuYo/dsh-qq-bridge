@@ -548,17 +548,30 @@ check('语音合成：默认 Edge 隐藏 baseUrl / Key，切到 openai 后可写
   tree = renderTab()
   const input = (label) => findAll(tree, (n) => n.tag === 'input'
     && n.props?.['aria-label'] === label)[0]
-  const baseUrl = input('接口地址（baseUrl）')
-  if (!baseUrl) throw new Error('openai 模式缺少 baseUrl')
-  baseUrl.props.onChange({ target: { value: 'https://api.openai.com/v1' } })
-  eq(VALUE.voice.baseUrl, 'https://api.openai.com/v1', '写回 voice.baseUrl')
+  // P2：文本输入改成「失焦才保存」，所以要先 onChange 更新草稿、重渲染拿到新闭包，
+  // 再 onBlur 提交。击键阶段绝不能写盘。
+  const commitText = (label, value) => {
+    let node = input(label)
+    if (!node) throw new Error(`缺少「${label}」`)
+    node.props.onChange({ target: { value } })
+    tree = renderTab()
+    input(label).props.onBlur()
+    tree = renderTab()
+  }
+  // P2：击键阶段只改草稿，绝不写盘；失焦才提交。
+  input('接口地址（baseUrl）').props.onChange({ target: { value: 'https://api.openai.com/v1' } })
+  eq(VALUE.voice.baseUrl, '', '击键阶段不该写盘（应等 onBlur）')
+  tree = renderTab()
+  input('接口地址（baseUrl）').props.onBlur()
+  eq(VALUE.voice.baseUrl, 'https://api.openai.com/v1', '失焦后写回 voice.baseUrl')
+  tree = renderTab()
   const apiKey = input('语音 API Key')
   if (!apiKey) throw new Error('openai 模式缺少 API Key')
   eq(apiKey.props.type, 'password', 'API Key 应为密码框')
-  apiKey.props.onChange({ target: { value: 'sk-test' } })
-  eq(VALUE.voice.apiKey, 'sk-test', '写回 voice.apiKey')
-  input('音色').props.onChange({ target: { value: 'alloy' } })
-  eq(VALUE.voice.voice, 'alloy', '写回 voice.voice')
+  commitText('语音 API Key', 'sk-test')
+  eq(VALUE.voice.apiKey, 'sk-test', '失焦后写回 voice.apiKey')
+  commitText('音色', 'alloy')
+  eq(VALUE.voice.voice, 'alloy', '失焦后写回 voice.voice')
 })
 
 check('技能卡片：已实装显示「已接入」，其余显示「开发中」', () => {
@@ -588,6 +601,60 @@ check('技能卡片：已实装显示「已接入」，其余显示「开发中�
   if (hasOkClass('记忆提取')) throw new Error('「开发中」标签不该带 qqg-pill-ok')
 })
 
+/* ── P2：默认技能 sk-image（发图片）的合并与写回 ───────────── */
+console.log('\nP2 · 默认技能「发图片」（sk-image）：')
+
+/** 取某个标题的卡片节点。 */
+function tileOf(tree, name) {
+  return findAll(tree, (n) => n.props?.className === 'qqg-tile')
+    .find((t) => textOf(findAll(t, (x) => x.props?.className === 'qqg-tile-name')[0]) === name)
+}
+
+check('老配置里没有 sk-image → 面板补出「发图片」且默认启用', () => {
+  VALUE.skills = CONFIG_CATALOG.skills.map((x) => ({ ...x }))  // 夹具里不含 sk-image
+  const tree = resetSkills()
+  if (!tileNames(tree).includes('发图片')) throw new Error('没有合并默认技能「发图片」')
+  const tile = tileOf(tree, '发图片')
+  const sw = findAll(tile, (n) => n.tag === 'button' && n.props?.role === 'switch')[0]
+  if (!sw) throw new Error('「发图片」卡片没有开关')
+  eq(sw.props['aria-checked'], 'true', '默认项应默认启用')
+  // 它是 P2 实装的技能，标签应为「已接入」。
+  const pill = findAll(tile, (n) => typeof n.props?.className === 'string'
+    && n.props.className.split(' ').includes('qqg-pill'))[0]
+  eq(textOf(pill), '已接入', 'sk-image 应标为已接入')
+})
+
+check('切「发图片」开关 → 写回整数组（含 sk-image，enabled=false）', () => {
+  VALUE.skills = CONFIG_CATALOG.skills.map((x) => ({ ...x }))
+  let tree = resetSkills()
+  const tile = tileOf(tree, '发图片')
+  const sw = findAll(tile, (n) => n.tag === 'button' && n.props?.role === 'switch')[0]
+  sw.props.onClick()
+  // 写回后重渲染：状态行跟着配置走。
+  // （「乐观更新在写盘前就生效」由 test-shell-ui 的 overrides 用例覆盖——这里的假
+  //  form.mutate 是同步写值，所以本用例只能证明写回内容正确，不能证明乐观时序。）
+  tree = renderSkills()
+  const after = findAll(tileOf(tree, '发图片'), (n) => n.props?.className === 'qqg-status')[0]
+  if (!textOf(after).includes('已停用')) throw new Error(`开关没立刻生效：${textOf(after)}`)
+  const written = VALUE.skills
+  const sk = written.find((x) => x.id === 'sk-image')
+  if (!sk) throw new Error('写回的数组里没有 sk-image（老配置点一下就丢了默认项）')
+  eq(sk.enabled, false, '写回的 sk-image.enabled')
+  eq(written.length, CONFIG_CATALOG.skills.length + 1, '写回的是合并后的整数组')
+})
+
+check('配置里已有 sk-image → 不重复追加', () => {
+  VALUE.skills = [
+    ...CONFIG_CATALOG.skills.map((x) => ({ ...x })),
+    { id: 'sk-image', name: '发图片', icon: 'image', tag: '内置', ver: '1.0.0', enabled: false, desc: '已有条目' },
+  ]
+  const tree = resetSkills()
+  const count = tileNames(tree).filter((n) => n === '发图片').length
+  eq(count, 1, '「发图片」出现了多张')
+  const sw = findAll(tileOf(tree, '发图片'), (n) => n.tag === 'button' && n.props?.role === 'switch')[0]
+  eq(sw.props['aria-checked'], 'false', '应沿用配置里的 enabled=false')
+})
+
 check('活跃设置：禁言开关写回 rhythm.mute.enabled', () => {
   let tree = resetTab('settings')
   findAll(tree, (n) => n.props?.className === 'qqg-bigbtn')[1].props.onClick()
@@ -598,14 +665,17 @@ check('活跃设置：禁言开关写回 rhythm.mute.enabled', () => {
   if (VALUE.rhythm.mute.enabled !== false) throw new Error('没写回配置，实际 ' + VALUE.rhythm.mute.enabled)
 })
 
-check('活跃设置：防抖窗口写回 rhythm.debounceWindowMs', () => {
+check('活跃设置：防抖窗口失焦后写回 rhythm.debounceWindowMs（击键不写盘）', () => {
   let tree = resetTab('settings')
   findAll(tree, (n) => n.props?.className === 'qqg-bigbtn')[1].props.onClick()
   tree = renderTab()
-  const input = findAll(tree, (n) => n.tag === 'input' && n.props?.['aria-label'] === '防抖合并窗口（毫秒）')[0]
-  if (!input) throw new Error('找不到防抖窗口输入框')
-  input.props.onChange({ target: { value: '1200' } })
-  if (VALUE.rhythm.debounceWindowMs !== 1200) throw new Error('没写回配置，实际 ' + VALUE.rhythm.debounceWindowMs)
+  const input = () => findAll(tree, (n) => n.tag === 'input' && n.props?.['aria-label'] === '防抖合并窗口（毫秒）')[0]
+  if (!input()) throw new Error('找不到防抖窗口输入框')
+  input().props.onChange({ target: { value: '1200' } })
+  if (VALUE.rhythm.debounceWindowMs !== 800) throw new Error('击键阶段不该写盘，实际 ' + VALUE.rhythm.debounceWindowMs)
+  tree = renderTab()
+  input().props.onBlur()
+  if (VALUE.rhythm.debounceWindowMs !== 1200) throw new Error('失焦后没写回配置，实际 ' + VALUE.rhythm.debounceWindowMs)
 })
 
 check('Esc 关闭弹窗（模拟 keydown）', () => {

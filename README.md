@@ -12,9 +12,24 @@ QQ ──► NapCat (OneBot v11 正向 WS) ──► qq-bridge ──► DSH Web
 
 ## 版本演进
 
-当前版本：**v0.4.0**（正式版，2026-10-24）
+当前版本：**v0.5.0**（2026-10-24）
 
-**本版做了什么**：把 QQ 桥接从「能跑但一堆静默失效」推到「人设、语音、搜索三条主链路都真机打通」。
+**本版做了什么**：四项 P2 收口 —— 发图片、外部插件真实生效、桥接性能、UI 手感。
+
+- **发图片 / 表情包**：新增 `qq_send_image` 工具（官方 `defineTool` 编译参数，`url` / `file` 二选一），
+  桥接用 OneBot `image` 段发送并**等回执**再回答模型（下载/拒收的失败原因原样抛给模型）。
+  设置页「技能与插件」新增 `sk-image`（老配置里没有也显示，默认开），系统提示词同步引导模型使用。
+- **外部插件真实生效（P2）**：启用「自包含」外部插件后沙箱进程常驻；桥接收消息时把
+  `message` / `before-context` 事件转发进沙箱执行插件 hook（可改写文本、丢弃消息、追加外部上下文）；
+  插件 `registerTool()` 注册的工具自动代理成 `qq_ext_<slug>` 暴露给 QQ 会话（沙箱单飞 + 10s 超时）。
+  失败一律 best-effort，不影响聊天；`GET /dsh-qq-guard/external/runtime` 可看常驻状态 / 已加载 hook 与工具。
+- **桥接性能**：模型路由 / 人设下发按签名去重（配置没变不再每条消息 POST）、会话存在性正结果缓存 30s、
+  图片 ingress 后台预取（并发 2 / LRU 32 / TTL 60s，复用 in-flight Promise）、TTS 语音指令脱离主串行链。
+- **UI 手感**：开关与保存改为**乐观更新**（点击立刻生效，写盘失败回滚并报错）、输入框改失焦 / 回车保存、
+  2–3 秒轮询全部下沉到叶子组件（切 Tab / 轮询不再带着整个面板重渲染）、耗时按钮加纯 CSS spinner。
+- **回归**：离线自测扩到 260+ 条（新增发图 / hook / 性能 / 乐观更新断言），全绿。
+
+上一版（v0.4.0，正式版，2026-10-24）：把 QQ 桥接从「能跑但一堆静默失效」推到「人设、语音、搜索三条主链路都真机打通」。
 
 - **人设真的生效了（两轮才查到底）**：
   - 第一轮的 P0 —— guard 的 preset 作用域判定用错 API，`applyGuard()` 第一步就 return，
@@ -99,15 +114,16 @@ plugins/dsh-qq-guard/     DSH 插件（Host + 浏览器半身）
   ├─ bridge-runner.mjs    桥接进程管理（autoStart / 单实例 / 崩溃重启上限）
   ├─ sandbox/             外部插件沙箱执行链路
   │   ├─ protocol.mjs     Host ↔ 子进程的 NDJSON 协议（零依赖、两侧共用）
-  │   ├─ manager.mjs      Host 侧：拉起子进程 / 超时 / 熔断 / 对外只暴露 testLoad
+  │   ├─ manager.mjs      Host 侧：拉起子进程 / 超时 / 熔断 / testLoad + invoke
   │   └─ child.mjs        子进程入口：--permission + registerHooks 拦危险内置模块
   └─ test-*.mjs           离线回归（假 ctx / 假 subprocess，不真起进程）
 
 qq-bridge/                独立桥接进程（零 npm 依赖）
   ├─ start.mjs            入口：读配置 → 起桥接 → 打印状态
-  ├─ src/onebot.mjs       OneBot v11 正向 WS 客户端
+  ├─ src/onebot.mjs       OneBot v11 正向 WS 客户端（文本分片 / 语音 / 图片）
   ├─ src/dsh.mjs          DSH Web API 客户端（离线铸会话 Cookie）
-  ├─ src/bridge.mjs       主逻辑：白名单 / 串行投递 / 回复审计
+  ├─ src/bridge.mjs       主逻辑：白名单 / 串行投递 / 回复审计 / 图片预取
+  ├─ src/external-hooks.mjs  外部插件 hook 客户端（message / before-context，best-effort）
   ├─ src/runtime-config.mjs  从插件轮询热配置
   └─ test-offline.mjs     离线自测（不连 QQ、不启 NapCat、不碰 DSH 会话）
 ```
@@ -123,8 +139,8 @@ qq-bridge/                独立桥接进程（零 npm 依赖）
    - `tools.guard`：执行期白名单兜底，任何不在白名单内的调用一律拒绝。
    - **必须装在 preset 子行**：顶层 `tools.guard` 是全局的，会把浏览器里的正常会话一起锁死。这个坑在代码注释里写了来龙去脉。
 2. **设置页**（`role: settings`，装在 profile 顶层）：分片节奏、气泡长度、群聊 @ 位置、标点处理、白名单、人设、外部插件、NapCat / 桥接进程管理。
-3. **HTTP 路由**：`/dsh-qq-guard/config`（桥接轮询热更新）、`/dsh-qq-guard/status`（状态上报）、`/dsh-qq-guard/napcat`、`/dsh-qq-guard/bridge`、`/dsh-qq-guard/external-plugins/test`（沙箱冒烟测试）。
-4. **沙箱**：外部插件一律在独立子进程里加载执行，绝不 import 进 DSH 主进程。
+3. **HTTP 路由**：`/dsh-qq-guard/config`（桥接轮询热更新）、`/dsh-qq-guard/status`（状态上报）、`/dsh-qq-guard/napcat`、`/dsh-qq-guard/bridge`、`/dsh-qq-guard/external-plugins/test`（沙箱冒烟测试）、`/dsh-qq-guard/external/hook`（桥接转发的插件 hook，best-effort）、`/dsh-qq-guard/external/runtime`（常驻沙箱快照）。
+4. **沙箱**：外部插件一律在独立子进程里加载执行，绝不 import 进 DSH 主进程。P2 起启用的自包含插件会**常驻**，hook 调用与 `registerTool()` 的工具执行都只在子进程内发生（单飞 + 超时熔断）。
 
 ### `qq-bridge`
 
@@ -132,6 +148,9 @@ qq-bridge/                独立桥接进程（零 npm 依赖）
 - 鉴权不靠抓日志：从 `~/.dsh/.credentials.yaml` 里持久化的 `client-connection/browser-session` 签名密钥**离线铸造**会话 Cookie。权限等同浏览器会话，所以**白名单不是可选项**。
 - 安全边界：白名单（fail-closed）+ 回复审计（本机路径 / 凭据特征 / `sk-` Key / 桥接令牌 → 整条不发）+ 同会话串行投递。
 - 单实例锁：两个桥接同时连 NapCat 同一条 WS 会重复收消息，所以抢锁失败直接让位。
+- **发图片 / 表情包**：`qq_send_image` 入队 → 桥接用 OneBot `image` 段发送（http(s) URL 由 NapCat 下载，也接受 `base64://` / `file:///` / 绝对路径），**等回执**才算成功，失败原因回给模型。
+- **外部插件 hook**：`message` / `before-context` 事件转发给 Host 常驻沙箱执行（可改写文本 / 丢弃消息 / 追加外部上下文），HTTP 失败或超时一律按原样放行。
+- **性能**：模型路由与人设下发按签名去重、会话存在性正结果缓存 30s、图片 ingress 预取（并发 2 / LRU 32 / TTL 60s）不阻塞主队列、语音指令脱离主串行链。
 
 ## 安装
 
@@ -170,18 +189,20 @@ node qq-bridge/start.mjs             # 正式启动
 node qq-bridge/test-offline.mjs
 ```
 
-覆盖回复审计、消息解析（array / 字符串 / 混合段）、长文本分片、分气泡、群聊 @、热配置同步、白名单热读、人设写入、DSH 端口自动跟随、在线探测四态、单实例锁，并串跑插件侧回归（门禁作用域 / 设置页数据通路 / NapCat 进程管理 / autoStart / 沙箱协议与子进程 / 外部插件扫描与卡片）。
+覆盖回复审计、消息解析（array / 字符串 / 混合段）、长文本分片、分气泡、群聊 @、热配置同步、白名单热读、人设写入、DSH 端口自动跟随、在线探测四态、单实例锁、图片发送、外部插件 hook、模型/人设去重与图片预取，并串跑插件侧回归（门禁作用域 / 设置页数据通路 / NapCat 进程管理 / autoStart / 沙箱协议与子进程 / 外部插件扫描与卡片 / 发图片工具 / 外部 hook 与工具代理）。
 
 不连 QQ、不启 NapCat、不碰 DSH 会话。插件侧用例需要 `@deepseek-ai/schemastery`，用 `QQG_SCHEMASTERY` 指向它的 `lib/index.mjs`（不设就自动探测 `node_modules`）。
 
 ## 已知限制
 
-- 图片理解与 TTS 发语音已接（WIP，见上面 Known Issues）；表情等仍以 `[表情]` 占位符形式进入文本。
+- 图片 / 表情包**发送**已实装（`qq_send_image`）；接收侧表情等仍以 `[表情]` 占位符进入文本。
 - 不把 `ask_user_question` 与工具审批转发到 QQ。
 - 未实现 `/reset` 等斜杠命令。
 - 人设改动只对**新建** QQ 会话生效，已有会话保留原人设与上下文。
 - NapCat 安装目录**必须显式配置**（`napcat.dir`），仓库不含任何机器相关默认值。
-- **外部插件目前只对「自包含」模块开放测试执行**，受控模块需 P2 阶段提供 shim 才能加载。
+- **外部插件只允许「自包含」模块常驻 / 执行**，受控模块仍需 shim 才能加载。工具代理在 DSH 生命周期内没有可靠的注销入口：停用插件后 `qq_ext_*` 可能残留在工具清单里（执行时会校验加载状态并拒绝）。
+- **外部插件 hook 是 best-effort**：沙箱没起 / 插件没声明对应 hook / 超时，都按原样继续，不保证执行；单插件 1.5s、整体 2s 预算。
+- **沙箱是单进程串行的**：某个插件的 hook / tool 死循环会把后续 invoke 一起拖到超时，直到熔断（5 分钟）或重启沙箱才恢复。
 - **沙箱不提供网络能力**：子进程没有 `net` / `http` / `fetch` 的放行，外部插件不能联网。
 
 ## 参考项目与致谢

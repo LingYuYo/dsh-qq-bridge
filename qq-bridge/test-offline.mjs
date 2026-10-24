@@ -16,8 +16,9 @@ import {
 import { planRenames } from './src/rename-plan.mjs'
 import {
   OneBotClient, parseMessage, splitText, splitBubbles, charCount, typingDelayFor,
-  normalizeTypingCharTiers, normalizeTypingMsTiers, extractImages,
+  normalizeTypingCharTiers, normalizeTypingMsTiers, extractImages, imageFileVia,
 } from './src/onebot.mjs'
+import { ExternalHooksClient } from './src/external-hooks.mjs'
 import { buildSsml, synthesizeOpenAI } from './src/tts.mjs'
 import { discoverDshBaseUrl, listLocalListeningPorts, DSH_BASE_HOST } from './src/dsh.mjs'
 import { pickHotConfig, applyHotConfig, startConfigPolling, CONFIG_ROUTE_PATH } from './src/runtime-config.mjs'
@@ -30,6 +31,7 @@ const check = async (name, fn) => {
   try { await fn(); console.log(`  ✓ ${name}`); pass++ }
   catch (e) { console.log(`  ✗ ${name}\n      ${e.message}`); fail++ }
 }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 console.log('— 回复审计（命中即整条拦下）—')
 await check('干净文本放行', () => assert.equal(auditReply('你好呀，今天天气不错').ok, true))
@@ -1005,7 +1007,7 @@ function makeBridge({ rhythm, dsh: dshCfg, stateFile, allow, personaDefault } = 
     renameSession: async (sid, title) => { calls.renamed.push({ sid, title }); return title },
     sessionTitle: async () => null,
     setSessionPersona: async (payload) => { calls.personas.push(payload); return { ok: true } },
-    promptAndWait: async (sid, text) => { calls.prompts.push({ sid, text }); return calls.reply },
+    promptAndWait: async (sid, text, opts) => { calls.prompts.push({ sid, text, opts }); return calls.reply },
   }
   // NapCat 侧：真实 Bridge 会调 get_group_info / get_stranger_info 取名字。
   b.qq.call = async (action, params) => {
@@ -1670,17 +1672,26 @@ await check('字数档位：非法/倒挂的边界被归一化成单调递增', 
 await check('features：Host 下发的派生值优先；缺字段按默认补', () => {
   assert.deepEqual(normalizeFeatures({ vision: false, search: false }), {
     voice: true, vision: false, search: false, guard: true, debounce: true, rateLimit: true,
+    image: true,
   })
   assert.equal(featuresFromManifests({ skills: [{ id: 'sk-vision', enabled: false }] }).vision, false)
   assert.equal(featuresFromManifests({ skills: [] }).vision, false, '清单里没有 = 关闭')
   assert.equal(featuresFromManifests({}).vision, true, '清单缺失 = 默认开启')
+  // P2 兼容（契约 3.1）：老配置的 skills 里没有 sk-image → 按新默认开启；
+  // 明确写了 sk-image 且 enabled:false 才算关闭。
+  assert.equal(featuresFromManifests({ skills: [{ id: 'sk-voice', enabled: true }] }).image, true,
+    '老配置没有 sk-image 时按默认开启')
+  assert.equal(featuresFromManifests({ skills: [{ id: 'sk-image', enabled: false }] }).image, false)
 })
 await check('能力说明只包含开启的技能', () => {
-  const lines = capabilityLines({ vision: false, search: true, voice: false })
+  const lines = capabilityLines({ vision: false, search: true, voice: false, image: false })
   const text = lines.join('\n')
   assert.ok(text.includes('web_search'))
   assert.ok(!text.includes('图片'))
   assert.ok(!text.includes('qq_send_voice'))
+  assert.ok(!text.includes('qq_send_image'), '「发图片」关掉时不能出现能力说明')
+  const withImage = capabilityLines({ vision: false, search: false, voice: false, image: true }).join('\n')
+  assert.ok(withImage.includes('qq_send_image'), '开启时必须有发图片的能力说明')
 })
 await check('人设：技能能力段追加在参与度之后、模型行之前', () => {
   const probe = new Bridge({
@@ -1810,6 +1821,7 @@ await check('热配置白名单包含 Phase 6 字段（skills/features/voice/字
     features: { vision: false },
     voice: { provider: 'edge' },
     typingDelayCharTiers: { shortMax: 12 },
+    externalPlugins: { enabled: ['demo.ext'] },
     wsUrl: 'ws://evil',
   })
   assert.equal(hot.features.vision, false)
@@ -1817,6 +1829,454 @@ await check('热配置白名单包含 Phase 6 字段（skills/features/voice/字
   assert.equal(hot.typingDelayCharTiers.shortMax, 12)
   assert.equal(hot.skills[0].id, 'sk-vision')
   assert.equal('wsUrl' in hot, false)
+  // P2：外部插件启用清单要热同步给桥接（否则 hook 永远不发）。
+  assert.equal(hot.externalPlugins.enabled[0], 'demo.ext')
+})
+
+console.log('\n— P2：发图片（qq_send_image 桥接侧）—')
+
+/** 假 NapCat：只记 call，不联网。 */
+function makeImageClient() {
+  const client = new OneBotClient({
+    wsUrl: 'ws://127.0.0.1:1', accessToken: 't', logger: { info() {}, warn() {}, error() {} },
+  })
+  const sent = []
+  client.call = async (action, params) => {
+    sent.push({ action, params })
+    return { status: 'ok', retcode: 0, data: { message_id: 7 } }
+  }
+  return { client, sent }
+}
+
+await check('sendImage：私聊用 send_private_msg，消息段只有 image，file 原样', async () => {
+  const { client, sent } = makeImageClient()
+  const r = await client.sendImage('private', '1000000001', 'https://example.invalid/a.png')
+  assert.equal(r.ok, true)
+  assert.equal(r.via, 'url')
+  assert.equal(r.retcode, 0)
+  assert.equal(r.status, 'ok')
+  assert.deepEqual(r.messageIds, ['7'])
+  assert.equal(sent[0].action, 'send_private_msg')
+  assert.equal(sent[0].params.user_id, 1000000001)
+  assert.deepEqual(sent[0].params.message,
+    [{ type: 'image', data: { file: 'https://example.invalid/a.png' } }])
+})
+await check('sendImage：群聊用 send_group_msg，默认不带 @', async () => {
+  const { client, sent } = makeImageClient()
+  const r = await client.sendImage('group', '123456', 'base64://QUJD', { atUserId: undefined })
+  assert.equal(r.ok, true)
+  assert.equal(r.via, 'base64')
+  assert.equal(sent[0].action, 'send_group_msg')
+  assert.equal(sent[0].params.group_id, 123456)
+  assert.deepEqual(sent[0].params.message,
+    [{ type: 'image', data: { file: 'base64://QUJD' } }], '群聊图片不带 at 段')
+})
+await check('imageFileVia：url / base64 / 本地路径分类', () => {
+  assert.equal(imageFileVia('https://x/y.png'), 'url')
+  assert.equal(imageFileVia('HTTP://x/y.png'), 'url')
+  assert.equal(imageFileVia('base64://QUJD'), 'base64')
+  assert.equal(imageFileVia('file:///C:/a.png'), 'file')
+  assert.equal(imageFileVia('C:\\pics\\a.png'), 'file')
+  assert.equal(imageFileVia(''), '')
+})
+await check('sendImage：retcode 非 0 → ok=false 带 retcode/status/via，不抛', async () => {
+  const { client } = makeImageClient()
+  client.call = async () => ({ status: 'failed', retcode: 1200, data: null })
+  const r = await client.sendImage('private', '1000000001', 'file:///C:/a.png')
+  assert.equal(r.ok, false)
+  assert.equal(r.via, 'file')
+  assert.equal(r.retcode, 1200)
+  assert.equal(r.status, 'failed')
+  assert.deepEqual(r.messageIds, [])
+  assert.match(r.error, /retcode=1200/)
+})
+await check('sendImage：传输层异常也永不抛（status=exception）', async () => {
+  const { client } = makeImageClient()
+  client.call = async () => { throw new Error('WebSocket 未连接') }
+  const r = await client.sendImage('group', '123456', 'https://example.invalid/a.png')
+  assert.equal(r.ok, false)
+  assert.equal(r.status, 'exception')
+  assert.equal(r.retcode, null)
+  assert.match(r.error, /WebSocket 未连接/)
+})
+await check('sendImage：非法目标 / 空地址在本地拦下，不打 NapCat', async () => {
+  const { client, sent } = makeImageClient()
+  assert.equal((await client.sendImage('private', '0', 'https://x/y.png')).ok, false)
+  assert.equal((await client.sendImage('private', 'abc', 'https://x/y.png')).ok, false)
+  assert.equal((await client.sendImage('group', '123456', '   ')).ok, false)
+  assert.equal(sent.length, 0)
+})
+
+/** 造一个已映射两个会话、sendImage 打桩的 Bridge。 */
+function imageBridge({ features } = {}) {
+  const { b, calls } = makeBridge()
+  b.live.features = normalizeFeatures({ ...(features ?? {}) })
+  b.state.sessions['u:1000000001'] = normalizeSessionEntry('u:1000000001', { sessionId: 's1', qq: '1000000001' })
+  b.state.sessions['g:123456'] = normalizeSessionEntry('g:123456', { sessionId: 's2', qq: '123456' })
+  const sentImages = []
+  b.qq.sendImage = async (kind, target, file, opts) => {
+    sentImages.push({ kind, target, file, opts })
+    return { ok: true, messageIds: ['9'], retcode: 0, status: 'ok', via: imageFileVia(file) }
+  }
+  return { b, sentImages }
+}
+
+await check('image op：私聊成功 → sendImage(private) 且 detail 含 via/retcode', async () => {
+  const { b, sentImages } = imageBridge()
+  const r = await b.applySessionOp({ op: 'image', sessionId: 's1', url: 'https://example.invalid/a.png' })
+  assert.equal(r.ok, true)
+  assert.equal(r.action, 'image')
+  assert.equal(r.sent, true)
+  assert.equal(r.via, 'url')
+  assert.equal(r.retcode, 0)
+  assert.match(r.detail, /已发送图片（via=url，retcode=0）/)
+  assert.equal(sentImages[0].kind, 'private')
+  assert.equal(sentImages[0].target, '1000000001')
+  assert.equal(sentImages[0].file, 'https://example.invalid/a.png')
+  assert.equal(sentImages[0].opts.atUserId, undefined, '私聊不带 @')
+  assert.equal(b.stats.images, 1)
+})
+await check('image op：群聊成功且**不带 @**（atUserId=undefined）', async () => {
+  const { b, sentImages } = imageBridge()
+  const r = await b.applySessionOp({ op: 'image', sessionId: 's2', file: 'C:\\pics\\a.png' })
+  assert.equal(r.ok, true)
+  assert.equal(r.via, 'file')
+  assert.equal(sentImages[0].kind, 'group')
+  assert.equal(sentImages[0].target, '123456')
+  assert.equal(sentImages[0].opts.atUserId, undefined, '契约 3.3：群聊图片不带 @')
+})
+await check('image op：技能关闭 → 拒绝且不调 sendImage', async () => {
+  const { b, sentImages } = imageBridge({ features: { image: false } })
+  const r = await b.applySessionOp({ op: 'image', sessionId: 's1', url: 'https://x/y.png' })
+  assert.equal(r.ok, false)
+  assert.equal(r.error, 'image-disabled')
+  assert.match(r.detail, /设置页/)
+  assert.equal(sentImages.length, 0)
+})
+await check('image op：sessionId 没有映射 → no-session，且不污染 state', async () => {
+  const { b } = imageBridge()
+  const before = JSON.stringify(b.state.sessions)
+  const r = await b.applySessionOp({ op: 'image', sessionId: 'nope', url: 'https://x/y.png' })
+  assert.equal(r.ok, false)
+  assert.equal(r.error, 'no-session')
+  assert.match(r.detail, /先发条 QQ 消息/)
+  assert.equal(JSON.stringify(b.state.sessions), before, 'image op 不该创建空 key 的垃圾行')
+})
+await check('image op：url 和 file 都没给 → empty-image', async () => {
+  const { b } = imageBridge()
+  const r = await b.applySessionOp({ op: 'image', sessionId: 's1' })
+  assert.equal(r.ok, false)
+  assert.equal(r.error, 'empty-image')
+})
+await check('image op：发送失败 → detail 带 via/retcode，字段原样透出', async () => {
+  const { b } = imageBridge()
+  b.qq.sendImage = async () => ({
+    ok: false, messageIds: [], error: 'retcode=1200 status=failed', retcode: 1200, status: 'failed', via: 'url',
+  })
+  const r = await b.applySessionOp({ op: 'image', sessionId: 's1', url: 'https://x/y.png' })
+  assert.equal(r.ok, false)
+  assert.equal(r.stage, 'send')
+  assert.match(r.detail, /图片发送失败（via=url）/)
+  assert.match(r.detail, /retcode=1200/)
+  assert.equal(r.detail, r.error)
+  assert.equal(r.retcode, 1200)
+  assert.equal(r.status, 'failed')
+  assert.equal(r.via, 'url')
+  assert.equal(b.stats.images, 0)
+})
+
+console.log('\n— P2：外部插件 hook（message / before-context）—')
+
+/** 造一个「已启用外部插件」且 hook 打桩的 Bridge。 */
+function hookedBridge(invoke) {
+  const { b, calls } = makeBridge({ rhythm: { debounceWindowMs: 0 } })
+  b.live.externalPlugins = { enabled: ['demo.ext'] }
+  b.hooks = { invoke: async (event, payload) => invoke(event, payload) }
+  return { b, calls }
+}
+
+await check('hook message：改写文本后再入队（入队前生效）', async () => {
+  const seen = []
+  const { b, calls } = hookedBridge((event, payload) => {
+    seen.push({ event, payload: { ...payload } })
+    return event === 'message'
+      ? { ok: true, text: '改写后的文本', modules: ['demo.ext'] }
+      : { ok: true, modules: ['demo.ext'] }
+  })
+  await b.handleMessage(privMsg('原始文本', 'p2-1'))
+  assert.equal(calls.prompts.length, 1)
+  assert.equal(calls.prompts[0].text, '改写后的文本')
+  const msgEvent = seen.find((s) => s.event === 'message')
+  assert.equal(msgEvent.payload.key, 'u:1000000001')
+  assert.equal(msgEvent.payload.text, '原始文本')
+  assert.equal(msgEvent.payload.imageCount, 0)
+  assert.equal(msgEvent.payload.user.id, '1000000001')
+  assert.equal(msgEvent.payload.user.admin, false)
+  assert.equal(msgEvent.payload.group, null)
+  assert.ok(b.stats.hookCalls >= 1)
+})
+await check('hook message：drop → 不入队、计 skipped、记 info', async () => {
+  const logs = []
+  const { b, calls } = hookedBridge(() => ({ ok: true, drop: true, modules: ['demo.ext'] }))
+  b.logger = { info: (m) => logs.push(String(m)), warn() {}, error() {} }
+  await b.handleMessage(privMsg('刷屏广告', 'p2-2'))
+  assert.equal(calls.prompts.length, 0)
+  assert.equal(b.stats.skipped, 1)
+  assert.equal(b.stats.hookDrops, 1)
+  assert.ok(logs.some((line) => line.includes('丢弃')), `缺 info 日志：${JSON.stringify(logs)}`)
+})
+await check('hook 失败/抛错 → 原样放行，聊天不中断', async () => {
+  const { b, calls } = hookedBridge(() => { throw new Error('hook down') })
+  await b.handleMessage(privMsg('还是正常聊', 'p2-3'))
+  assert.equal(calls.prompts.length, 1)
+  assert.equal(calls.prompts[0].text, '还是正常聊')
+})
+await check('hook 返回 ok:false → 原样放行', async () => {
+  const { b, calls } = hookedBridge(() => ({ ok: false, modules: [], error: 'HTTP 500' }))
+  await b.handleMessage(privMsg('照常', 'p2-4'))
+  assert.equal(calls.prompts[0].text, '照常')
+})
+await check('hook before-context：text 替换正文 + sections 按序追加到正文之后', async () => {
+  const { b, calls } = hookedBridge((event) => (event === 'before-context'
+    ? {
+      ok: true, modules: ['demo.ext'], text: '替换后的正文',
+      sections: [
+        { title: '记忆', text: '用户喜欢短句' },
+        { title: '天气', text: '今天晴' },
+        { title: '空段', text: '   ' },
+      ],
+    }
+    : { ok: true, modules: ['demo.ext'] }))
+  await b.handleMessage(privMsg('原始', 'p2-5'))
+  assert.equal(calls.prompts.length, 1)
+  assert.equal(calls.prompts[0].text,
+    '替换后的正文\n\n[外部上下文：记忆]\n用户喜欢短句\n\n[外部上下文：天气]\n今天晴')
+})
+await check('hook before-context：只给 sections 时追加在原文之后（不替换）', async () => {
+  const { b, calls } = hookedBridge((event) => (event === 'before-context'
+    ? { ok: true, modules: ['demo.ext'], sections: [{ title: '笔记', text: '甲' }] }
+    : { ok: true, modules: ['demo.ext'] }))
+  await b.handleMessage(privMsg('原文', 'p2-6'))
+  assert.equal(calls.prompts[0].text, '原文\n\n[外部上下文：笔记]\n甲')
+})
+await check('没有启用外部插件 → 一条 hook 都不发', async () => {
+  const { b } = makeBridge({ rhythm: { debounceWindowMs: 0 } })
+  let called = 0
+  b.hooks = { invoke: async () => { called++; return { ok: true, modules: [] } } }
+  await b.handleMessage(privMsg('没人启用插件', 'p2-7'))
+  assert.equal(called, 0, '★ externalPlugins.enabled 为空时不该发 hook')
+  assert.equal(b.stats.hookSkipped, 2, 'message + before-context 各跳过一次')
+  assert.equal(b.stats.hookCalls, 0)
+})
+await check('hook 客户端：modules 空 → 30s 负缓存（按事件分开）', async () => {
+  let calls = 0
+  const client = new ExternalHooksClient({
+    getBaseUrl: () => 'http://127.0.0.1:1',
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls++
+      return { ok: true, json: async () => ({ ok: true, modules: [], latencyMs: 1 }) }
+    },
+  })
+  const first = await client.invoke('message', { text: 'a' })
+  assert.equal(first.ok, true)
+  assert.equal(calls, 1)
+  const second = await client.invoke('message', { text: 'b' })
+  assert.equal(calls, 1, '★ 负缓存窗口内不该再请求')
+  assert.equal(second.skipped, 'no-module-cache')
+  await client.invoke('before-context', { text: 'c' })
+  assert.equal(calls, 2, '负缓存按事件分开：另一个事件仍会请求')
+})
+await check('hook 客户端：有模块生效不建负缓存；失败只 warn 一次且不缓存', async () => {
+  let calls = 0
+  const warns = []
+  const client = new ExternalHooksClient({
+    getBaseUrl: () => 'http://127.0.0.1:1',
+    logger: { warn: (m) => warns.push(String(m)) },
+    fetchImpl: async () => {
+      calls++
+      if (calls === 1) throw new Error('ECONNREFUSED')
+      if (calls === 2) return { ok: false, status: 500, json: async () => ({}) }
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true, modules: ['m1'], text: '外部改写', sections: [{ title: 't', text: 'v' }],
+        }),
+      }
+    },
+  })
+  assert.equal((await client.invoke('message', { text: 'a' })).ok, false)
+  assert.equal((await client.invoke('message', { text: 'b' })).ok, false)
+  assert.equal(warns.length, 1, `连续失败只 warn 一次，实际 ${warns.length}`)
+  const ok = await client.invoke('message', { text: 'c' })
+  assert.equal(ok.ok, true)
+  assert.equal(ok.text, '外部改写')
+  assert.deepEqual(ok.sections, [{ title: 't', text: 'v' }])
+  assert.equal(calls, 3, '失败不进负缓存，下次还会试')
+  await client.invoke('message', { text: 'd' })
+  assert.equal(calls, 4, '有模块生效时不建负缓存')
+})
+
+console.log('\n— P2：性能（去重 / 缓存 / 预取）—')
+
+await check('_applyModel：同签名不重复 POST，换模型自然重发', async () => {
+  const { b } = makeBridge({ rhythm: { debounceWindowMs: 0 } })
+  let pushes = 0
+  b.dsh.setSessionModel = async ({ provider, model }) => { pushes++; return { model: `${provider}/${model}` } }
+  b.live.model = { provider: 'p', model: 'm1' }
+  await b.handleMessage(privMsg('第一条', 'pm-1'))
+  await b.handleMessage(privMsg('第二条', 'pm-2'))
+  assert.equal(pushes, 1, `★ 同签名只该推一次，实际 ${pushes}`)
+  assert.equal(b.stats.modelPushes, 1)
+  assert.ok(b.stats.skippedRequests >= 1)
+  b.live.model = { provider: 'p', model: 'm2' }
+  await b.handleMessage(privMsg('第三条', 'pm-3'))
+  assert.equal(pushes, 2, '★ 设置页换模型后必须重发')
+})
+await check('_applyPersona：同签名不重复 POST；身份变化/保存人设才重发', async () => {
+  const { b } = makeBridge({
+    rhythm: { debounceWindowMs: 0 },
+    allow: { admins: ['1000000001'] },
+    personaDefault: '默认人设',
+  })
+  const pushes = []
+  b.dsh.setSessionPersona = async (payload) => { pushes.push(payload) }
+  await b.handleMessage(privMsg('管理员一', 'pp-1'))
+  await b.handleMessage(privMsg('管理员二', 'pp-2'))
+  assert.equal(pushes.length, 1, `★ 同签名只该推一次，实际 ${pushes.length}`)
+  assert.equal(b.stats.personaPushes, 1)
+  // 非管理员在群里 @ 桥接：正文相同但追加了权限提示，签名变了 → 必须重发。
+  const nonAdmin = { ...groupMsg('群友说话', { at: true, id: 'pp-3' }), userId: '1000000002' }
+  await b.handleMessage(nonAdmin)
+  assert.equal(pushes.length, 2, '★ 非管理员要重推（人设末尾多了权限提示）')
+  assert.ok(String(pushes.at(-1).text).endsWith(ADMIN_GUARD_NOTE))
+  // 设置页保存单人设：清缓存后立即重推。
+  await b.applySessionOp({ op: 'persona', key: 'u:1000000001', text: '新人设' })
+  assert.equal(pushes.length, 3, '保存单人设应立即推送')
+  await b.handleMessage(privMsg('管理员三', 'pp-4'))
+  assert.equal(pushes.length, 3, '相同人设的下一条消息不该再推')
+})
+await check('ensureSession：sessionExists 正结果缓存 30s，过期后重查', async () => {
+  const { b } = makeBridge({ rhythm: { debounceWindowMs: 0 } })
+  b.state.sessions['u:1000000001'] = normalizeSessionEntry('u:1000000001', { sessionId: 's1', qq: '1000000001' })
+  let checks = 0
+  b.dsh.sessionExists = async () => { checks++; return true }
+  await b.handleMessage(privMsg('一', 'sc-1'))
+  await b.handleMessage(privMsg('二', 'sc-2'))
+  assert.equal(checks, 1, `★ 30s 内只该查一次，实际 ${checks}`)
+  assert.equal(b.stats.sessionChecks, 1)
+  assert.ok(b.stats.skippedRequests >= 1)
+  // 模拟 30s 后缓存过期：必须重新确认，不能永远假存在。
+  b._sessionExistsCache.set('s1', 0)
+  await b.handleMessage(privMsg('三', 'sc-3'))
+  assert.equal(checks, 2, '缓存过期后应重新查')
+})
+await check('图片预取：ingress 立即后台下载，处理时复用（不重复下载、不阻塞入队）', async () => {
+  const { b, calls } = makeBridge({ rhythm: { debounceWindowMs: 120 } })
+  b._modelSupportsImages = async () => true
+  let downloads = 0
+  b._downloadImage = async () => {
+    downloads++
+    await sleep(40)
+    return { base64: 'QUJD', mediaType: 'image/png' }
+  }
+  const msg = { ...privMsg('看图', 'pf-1'), images: [{ url: 'https://example.invalid/pf.png' }] }
+  const started = Date.now()
+  await b.handleMessage(msg)
+  const elapsed = Date.now() - started
+  assert.ok(elapsed < 100, `★ handleMessage 不该等图片下载（${elapsed}ms）`)
+  assert.equal(downloads, 1, '★ ingress 收到消息就该开始预取')
+  await sleep(320)
+  assert.equal(calls.prompts.length, 1)
+  assert.equal(downloads, 1, '★ 处理时复用预取的同一个 Promise，不重复下载')
+  const content = calls.prompts[0].opts?.content ?? []
+  assert.ok(content.some((part) => part.type === 'image'), '图片应作为 image part 交给模型')
+})
+await check('图片预取：并发 ≤ 2，LRU ≤ 32，TTL 过期会重新下载', async () => {
+  const { b } = makeBridge()
+  let active = 0
+  let maxActive = 0
+  let downloads = 0
+  b._downloadImage = async () => {
+    downloads++
+    active++
+    maxActive = Math.max(maxActive, active)
+    await sleep(15)
+    active--
+    return { base64: 'QUJD', mediaType: 'image/png' }
+  }
+  const images = Array.from({ length: 4 }, (_, i) => ({ url: `https://example.invalid/c${i}.png` }))
+  b._prefetchImages(images)
+  await sleep(250)
+  assert.equal(downloads, 4, `4 张图都应预取，实际 ${downloads}`)
+  assert.equal(maxActive, 2, `★ 预取并发上限应为 2，实际 ${maxActive}`)
+  // 缓存命中：同一批再取不产生新下载。
+  await b._loadImageParts(images)
+  assert.equal(downloads, 4, '缓存命中不该重复下载')
+  // LRU 上限 32。
+  let loads = 0
+  b._downloadImage = async () => { loads++; return { base64: 'QUJD', mediaType: 'image/png' } }
+  for (let i = 0; i < 40; i++) await b._loadImageRef(`https://example.invalid/l${i}.png`)
+  assert.ok(b._imageCache.size <= 32, `★ LRU 上限应为 32，实际 ${b._imageCache.size}`)
+  // TTL：过期条目必须重新下载。
+  b._imageCache.set('https://example.invalid/c0.png',
+    { at: Date.now() - 61_000, promise: Promise.resolve({ ok: true, value: { base64: 'x', mediaType: 'image/png' } }) })
+  const before = loads
+  await b._loadImageRef('https://example.invalid/c0.png')
+  assert.equal(loads, before + 1, '★ TTL 过期后必须重新下载')
+})
+
+console.log('\n— P2：session-ops 慢 op detached（image 不阻塞同批其它 op）—')
+await check('同一批 [image, clear]：image 后台执行、clear 回执先到，image 回执照常到达', async () => {
+  const { startSessionOpsPolling, DETACHED_OPS } = await import('./src/session-ops.mjs')
+  assert.equal(DETACHED_OPS.has('voice'), true)
+  assert.equal(DETACHED_OPS.has('image'), true, '★ image 也必须是 detached op')
+  let delivered = false
+  const posted = []
+  let imageStarts = 0
+  const fakeFetch = async (url, init = {}) => {
+    if ((init.method ?? 'GET') === 'GET') {
+      if (delivered) return { ok: true, json: async () => ({ ok: true, ops: [] }) }
+      delivered = true
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          ops: [
+            { id: 'op-i', op: 'image', sessionId: 's1', url: 'https://example.invalid/a.png' },
+            { id: 'op-c', op: 'clear', key: 'u:1000000001' },
+          ],
+        }),
+      }
+    }
+    posted.push(JSON.parse(init.body))
+    return { ok: true, json: async () => ({ ok: true }) }
+  }
+  const applySessionOp = async (op) => {
+    if (op.op === 'image') {
+      imageStarts++
+      await sleep(150)
+      return { ok: true, action: 'image', key: 'u:1000000001', detail: '已发送图片（via=url，retcode=0）' }
+    }
+    return { ok: true, action: 'clear', key: op.key }
+  }
+  const stop = startSessionOpsPolling({
+    baseUrl: 'http://127.0.0.1:1',
+    bridge: { applySessionOp },
+    logger: { info() {}, warn() {} },
+    pollMs: 10,
+    fetchImpl: fakeFetch,
+  })
+  await sleep(60)
+  assert.equal(posted.length, 1, `★ clear 回执应先到（image 还在跑）：${JSON.stringify(posted)}`)
+  assert.deepEqual(posted[0].results.map((r) => r.id), ['op-c'])
+  assert.equal(imageStarts, 1, 'image 应已开始执行（detached）')
+  await sleep(240)
+  stop()
+  const receipt = posted.flatMap((p) => p.results).find((r) => r.id === 'op-i')
+  assert.ok(receipt, `★ image 回执丢了：${JSON.stringify(posted)}`)
+  assert.equal(receipt.ok, true)
+  assert.match(receipt.detail, /已发送图片/)
 })
 
 console.log('\n— 单群活跃系数 + 人设重推修复（qq-bridge 独立测试文件）—')

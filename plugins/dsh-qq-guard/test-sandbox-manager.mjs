@@ -71,10 +71,17 @@ function makeFakeSubprocess(behavior = 'reply') {
           if (!line.trim()) continue
           const parsed = JSON.parse(line)
           if (parsed.type === FRAME.INIT) { initFrames.push(parsed); continue }
-          if (parsed.type !== FRAME.LOAD) continue
+          if (parsed.type !== FRAME.LOAD && parsed.type !== FRAME.INVOKE) continue
           if (behavior === 'timeout') continue
           if (behavior === 'exit') {
             setTimeout(() => handle.settleWith({ exitCode: 1, signal: null }), 5)
+            continue
+          }
+          if (behavior === 'invoke-error' && parsed.type === FRAME.INVOKE) {
+            setTimeout(() => stdout.write(frame({
+              type: FRAME.ERROR, id: parsed.id, ok: false,
+              error: { code: ERR.INVOKE_FAILED, message: '插件自己抛错了' },
+            })), 5)
             continue
           }
           const delay = behavior === 'reply-slow' ? 200 : 5
@@ -83,12 +90,28 @@ function makeFakeSubprocess(behavior = 'reply') {
               type: FRAME.RESULT,
               id: parsed.id,
               ok: true,
-              payload: {
-                moduleId: parsed.payload.moduleId,
-                exports: { setup: true, hooks: ['onMessage'] },
-                apiCalls: ['log'],
-                durationMs: 2,
-              },
+              payload: parsed.type === FRAME.INVOKE
+                // P2：invoke 回包（child 的形状）
+                ? {
+                  moduleId: parsed.payload?.moduleId,
+                  kind: parsed.payload?.kind,
+                  found: true,
+                  value: { echo: parsed.payload?.args ?? null },
+                  durationMs: 1,
+                }
+                : {
+                  moduleId: parsed.payload.moduleId,
+                  exports: { setup: true, hooks: ['onMessage'] },
+                  apiCalls: ['log'],
+                  // P2：load 结果带 tools[]（代理工具靠它建 schema）
+                  tools: [{
+                    id: `${parsed.payload.moduleId}__echo`,
+                    name: 'echo',
+                    description: '回显',
+                    parameters: { type: 'object', properties: { text: { type: 'string' } } },
+                  }],
+                  durationMs: 2,
+                },
             }))
           }, delay)
         }
@@ -219,6 +242,86 @@ await check('老 Node（无 registerHooks）→ 拒绝使用并杀进程', async
   assert.equal(outcome.ok, false)
   assert.equal(outcome.error.code, ERR.NO_NODE, JSON.stringify(outcome.error))
   assert.ok(/registerHooks/.test(outcome.error.message), outcome.error.message)
+  await manager.dispose()
+})
+
+await check('load 结果透传 tools[]（P2：代理工具注册靠它）', async () => {
+  const sub = makeFakeSubprocess('reply')
+  const manager = makeManager(sub)
+  const outcome = await manager.testLoad(MODULE)
+  assert.equal(outcome.ok, true, JSON.stringify(outcome))
+  const tools = outcome.result.tools
+  assert.ok(Array.isArray(tools) && tools.length === 1, JSON.stringify(tools))
+  assert.equal(tools[0].id, 'ok-mod__echo')
+  assert.equal(tools[0].name, 'echo')
+  assert.equal(tools[0].parameters.type, 'object')
+  await manager.dispose()
+})
+
+await check('invoke：返回 child 回包（found/value）', async () => {
+  const sub = makeFakeSubprocess('reply')
+  const manager = makeManager(sub)
+  await manager.testLoad(MODULE)
+  const payload = await manager.invoke({ moduleId: 'ok-mod', kind: 'hook', name: 'message', event: { text: 'hi' } })
+  assert.equal(payload.found, true)
+  assert.deepEqual(payload.value, { echo: null })
+  const toolResult = await manager.invoke({ moduleId: 'ok-mod', kind: 'tool', name: 'ok-mod__echo', args: { text: 'hi' } })
+  assert.deepEqual(toolResult.value, { echo: { text: 'hi' } })
+  await manager.dispose()
+})
+
+await check('invoke：单飞，第二个请求 E_BUSY', async () => {
+  const sub = makeFakeSubprocess('reply-slow')
+  const manager = makeManager(sub, { requestTimeoutMs: 1000 })
+  await manager.testLoad(MODULE)
+  const first = manager.invoke({ moduleId: 'ok-mod', kind: 'hook', name: 'message' })
+  await new Promise((r) => setTimeout(r, 30))
+  await assert.rejects(
+    () => manager.invoke({ moduleId: 'ok-mod', kind: 'hook', name: 'message' }),
+    (error) => error.code === ERR.BUSY,
+  )
+  const out = await first
+  assert.equal(out.found, true)
+  await manager.dispose()
+})
+
+await check('invoke：超时 → E_TIMEOUT 并杀进程', async () => {
+  const sub = makeFakeSubprocess('timeout')
+  const manager = makeManager(sub, { requestTimeoutMs: 120 })
+  await manager.ensure()
+  await assert.rejects(
+    () => manager.invoke({ moduleId: 'ok-mod', kind: 'tool', name: 'x' }, { timeoutMs: 120 }),
+    (error) => error.code === ERR.TIMEOUT,
+  )
+  assert.equal(sub.spawned[0].terminated, true, '超时后必须 terminate')
+  await manager.dispose()
+})
+
+await check('invoke：插件抛错 → 原样抛 E_INVOKE', async () => {
+  const sub = makeFakeSubprocess('invoke-error')
+  const manager = makeManager(sub)
+  await manager.testLoad(MODULE)
+  await assert.rejects(
+    () => manager.invoke({ moduleId: 'ok-mod', kind: 'hook', name: 'message' }),
+    (error) => error.code === ERR.INVOKE_FAILED && /插件自己抛错/.test(error.message),
+  )
+  await manager.dispose()
+})
+
+await check('invoke：连续失败触发熔断 → E_CIRCUIT_OPEN', async () => {
+  const sub = makeFakeSubprocess('invoke-error')
+  const manager = makeManager(sub, { maxFailures: 2 })
+  await manager.testLoad(MODULE)
+  for (let i = 0; i < 2; i++) {
+    await assert.rejects(
+      () => manager.invoke({ moduleId: 'ok-mod', kind: 'hook', name: 'message' }),
+      (error) => error.code === ERR.INVOKE_FAILED,
+    )
+  }
+  await assert.rejects(
+    () => manager.invoke({ moduleId: 'ok-mod', kind: 'hook', name: 'message' }),
+    (error) => error.code === ERR.CIRCUIT_OPEN,
+  )
   await manager.dispose()
 })
 

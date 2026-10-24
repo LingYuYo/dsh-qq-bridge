@@ -127,8 +127,14 @@ const VALUE = {
 const form = {
   getSnapshot: () => ({ status: 'ready', value: VALUE, writable: true, source: 'remote' }),
   subscribe: () => () => {},
-  mutate: async () => true,
+  // 记录每次写盘（ops 数组）并支持模拟失败：乐观更新 / 回滚用例要用。
+  mutate: async (ops) => {
+    MUTATIONS.push(ops)
+    return MUTATE_FAIL !== true
+  },
 }
+let MUTATE_FAIL = false
+const MUTATIONS = []
 
 let registered = {}
 const ctx = {
@@ -154,6 +160,15 @@ function renderSettings() {
 }
 function resetSettings() {
   hookStore = new Map([['root:SettingsPanel#1', 'settings']])
+  return renderSettings()
+}
+/** 渲染指定 Tab（用于运行状态页的 pending / spinner 用例）。 */
+function resetTab(tab) {
+  hookStore = new Map([['root:SettingsPanel#1', tab]])
+  return renderSettings()
+}
+/** 保留 state 重渲染（等价于真 React 的 setState 后重渲染）。 */
+function renderTab() {
   return renderSettings()
 }
 
@@ -295,6 +310,94 @@ check('冷却时间可改：输入 3600000 并在失焦后提交', () => {
   tree = renderSettings()
   const value = byLabel(memoryPanel(tree), '整理冷却时间（毫秒）')[0].props.value
   assert(String(value) === '3600000', `提交后应为 3600000，实际 ${value}`)
+})
+
+/* ── 3. P2 极速：乐观更新 / 失焦保存 / 轮询隔离 / Loading ──────── */
+console.log('\nP2 极速（乐观更新 / 失焦保存 / 轮询隔离 / Loading）：')
+
+const spinNodes = (tree) => findAll(tree, (n) => typeof n.props?.className === 'string'
+  && n.props.className.split(/\s+/).includes('qqg-spin'))
+
+check('乐观更新：点开关后当场重渲染就是新状态（不等写盘回读）', () => {
+  MUTATIONS.length = 0
+  MUTATE_FAIL = false
+  let tree = resetTab('settings')
+  const sw = () => byLabel(tree, 'DSH 启动时自动拉起桥接进程')[0]
+  assert(sw().props['aria-checked'] === 'false', '初值应为关')
+  sw().props.onClick()
+  // 关键：这里**没有 await**，且假 mutate 不会改 VALUE。
+  // 界面要是在这一步还是关的，说明仍是「等回读」的旧实现。
+  tree = renderTab()
+  assert(sw().props['aria-checked'] === 'true', '点击后界面没有立刻变（不是乐观更新）')
+  assert(MUTATIONS.length === 1, `应当已静默发一次 mutate，实际 ${MUTATIONS.length}`)
+  assert(MUTATIONS[0][0].path.join('.') === 'bridge.autoStart', '写错路径')
+  assert(byClass(tree, 'qqg-saving').length === 1, '飞行中应显示「正在保存…」')
+})
+
+await checkAsync('乐观更新失败：回滚原值 + 红字错误提示', async () => {
+  MUTATIONS.length = 0
+  MUTATE_FAIL = true
+  let tree = resetTab('settings')
+  const sw = () => byLabel(tree, 'DSH 启动时自动拉起桥接进程')[0]
+  sw().props.onClick()
+  tree = renderTab()
+  assert(sw().props['aria-checked'] === 'true', '点击后应先乐观置为开')
+  await new Promise((r) => setTimeout(r, 0))
+  tree = renderTab()
+  assert(sw().props['aria-checked'] === 'false', '写盘失败后必须回滚成关闭')
+  const err = byClass(tree, 'qqg-status-err').map(textOf).join('|')
+  assert(err.includes('保存失败'), `缺少失败提示，实际：${err.slice(0, 120)}`)
+  MUTATE_FAIL = false
+})
+
+check('文本输入：击键不写盘，失焦才 mutate（OneBot WebSocket 地址）', () => {
+  MUTATIONS.length = 0
+  MUTATE_FAIL = false
+  let tree = resetTab('settings')
+  const input = () => byLabel(tree, 'WebSocket 地址')[0]
+  input().props.onChange({ target: { value: 'ws://127.0.0.1:9777' } })
+  assert(MUTATIONS.length === 0, '击键阶段不该写盘（会每敲一个字刷一次配置）')
+  tree = renderTab()
+  assert(input().props.value === 'ws://127.0.0.1:9777', '打字期间输入框应显示草稿')
+  input().props.onBlur()
+  assert(MUTATIONS.length === 1, '失焦后应写一次')
+  assert(MUTATIONS[0][0].path.join('.') === 'onebot.wsUrl', '写错路径')
+})
+
+/* 轮询隔离：静态检查（结构约束，树级别测不出「父级是否持有 state」） */
+function fnBody(name) {
+  const start = SOURCE.indexOf(`function ${name}(`)
+  if (start < 0) throw new Error(`找不到函数 ${name}`)
+  const next = SOURCE.indexOf('\n    function ', start + 10)
+  return SOURCE.slice(start, next > 0 ? next : undefined)
+}
+check('轮询隔离：SettingsPanel 不持有任何轮询 state', () => {
+  const body = fnBody('SettingsPanel')
+  for (const hook of ['useBridgeStatus(', 'useBridgeProc(', 'useSystemEvents(']) {
+    assert(!body.includes(hook), `SettingsPanel 里还有 ${hook}：每次轮询都会把整个面板带着重渲染`)
+  }
+})
+check('轮询隔离：状态/日志/进程数据只在叶子组件里 setState', () => {
+  assert(fnBody('SessionsBadge').includes('useBridgeStatus(true)'), 'SessionsBadge 应自己轮询会话未读')
+  assert(fnBody('GuideNavButton').includes('useBridgeProc(true)'), 'GuideNavButton 应自己轮询桥接进程')
+  assert(fnBody('StatusLive').includes('useBridgeStatus(true)'), 'StatusLive 应自己轮询运行状态')
+  assert(fnBody('SessionsTab').includes('useBridgeStatus(true)'), 'SessionsTab 应自己轮询会话列表')
+  assert(fnBody('OnboardingModal').includes('useBridgeProc('), 'OnboardingModal 应自己轮询进程状态')
+})
+
+await checkAsync('Loading：耗时按钮 pending 时出现纯 CSS spinner + 按钮禁用', async () => {
+  assert(SOURCE.includes('@keyframes qqg-spin'), '缺少 spinner 的 CSS 动画')
+  assert(SOURCE.includes('.qqg-spin {'), '缺少 .qqg-spin 样式')
+  let tree = resetTab('status')
+  const startBtn = findAll(tree, (n) => n.tag === 'button' && textOf(n).includes('启动桥接'))[0]
+  assert(startBtn, '运行状态页找不到「启动桥接」')
+  const pending = startBtn.props.onClick()
+  tree = renderTab()
+  const busyBtn = findAll(tree, (n) => n.tag === 'button' && textOf(n).includes('启动中'))[0]
+  assert(busyBtn, '点击后没有进入「启动中…」态')
+  assert(busyBtn.props.disabled === true, 'pending 时按钮必须禁用（防重复点击）')
+  assert(spinNodes(busyBtn).length === 1, 'pending 按钮里没有 .qqg-spin')
+  await pending
 })
 
 console.log(`\n结果：${pass} 通过 / ${process.exitCode ? 1 : 0} 失败`)

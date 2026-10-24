@@ -5,7 +5,8 @@
  *   · 用 `ctx.subprocess` 拉起独立的 Node 子进程（绝不 import 外部代码进 DSH）；
  *   · 给子进程加 `--permission` / `--allow-fs-read` / `--disallow-code-generation-from-strings`；
  *   · 管理 NDJSON 请求/响应、5 秒超时、进程崩溃与熔断；
- *   · 对外只暴露一个动作：`testLoad(moduleInfo)`。
+ *   · 对外动作：`testLoad(moduleInfo)`（加载并执行 setup）与
+ *     `invoke(payload, opts)`（P2：调已加载模块的 hook / 工具）。
  *
  * 进程模型：全局共享一个沙箱进程，子进程内按 `moduleId` 缓存已加载模块。
  * 一个模块超时/崩溃会连累同一个进程里的其它模块（它们本来也还没执行 hook），
@@ -35,6 +36,8 @@ const CHILD_ENTRY = path.join(HERE, 'child.mjs')
 export const MAX_CONSECUTIVE_FAILURES = 5
 /** 熔断冷却时间（对齐侦察报告 §12.6）。 */
 export const BREAKER_COOLDOWN_MS = 5 * 60_000
+/** invoke 的默认超时：hook 由调用方传 1500ms，工具代理传 10s，这里只是兜底。 */
+export const DEFAULT_INVOKE_TIMEOUT_MS = 5000
 const STDERR_TAIL_LINES = 40
 const LOG_TAIL_LINES = 50
 
@@ -355,6 +358,48 @@ export class SandboxManager {
   }
 
   /**
+   * P2：调用一个已加载模块的 hook / 工具（单飞 + 超时 + 熔断沿用）。
+   *
+   * 与 testLoad 的差别：失败**直接抛** SandboxError（调用方是 hook 路由 / 工具代理，
+   * 需要拿到可读错误），成功时返回子进程的 invoke 回包：
+   * `{ moduleId, kind, found, value, durationMs }`。
+   *
+   * @param {{moduleId:string, kind:'hook'|'tool', name?:string, args?:object, event?:object}} payload
+   * @param {{timeoutMs?:number}} [options]
+   * @returns {Promise<object>}
+   */
+  async invoke(payload, { timeoutMs = DEFAULT_INVOKE_TIMEOUT_MS } = {}) {
+    const moduleId = String(payload?.moduleId ?? '')
+    if (!moduleId) throw new SandboxError(ERR.PROTOCOL, 'invoke 缺少 moduleId')
+    const until = this.breakerUntil.get(moduleId) ?? 0
+    if (Date.now() < until) {
+      throw new SandboxError(
+        ERR.CIRCUIT_OPEN,
+        `该插件连续失败已熔断，约 ${Math.ceil((until - Date.now()) / 1000)}s 后重试`,
+      )
+    }
+    try {
+      const result = await this.request(FRAME.INVOKE, payload, { timeoutMs })
+      this.failures.delete(moduleId)
+      this.breakerUntil.delete(moduleId)
+      return result
+    } catch (error) {
+      this._noteFailure(moduleId)
+      throw error
+    }
+  }
+
+  /** 记一次失败，达到阈值就熔断（testLoad / invoke 共用）。 */
+  _noteFailure(moduleId) {
+    const fails = (this.failures.get(moduleId) ?? 0) + 1
+    this.failures.set(moduleId, fails)
+    if (fails >= this.maxFailures) {
+      this.breakerUntil.set(moduleId, Date.now() + this.breakerCooldownMs)
+      this.failures.set(moduleId, 0)
+    }
+  }
+
+  /**
    * P1 唯一对外动作：加载模块并执行 setup/register。
    *
    * @param {{id:string, dir:string, entryPath:string, format?:string}} moduleInfo
@@ -395,12 +440,7 @@ export class SandboxManager {
         },
       }
     } catch (error) {
-      const fails = (this.failures.get(moduleId) ?? 0) + 1
-      this.failures.set(moduleId, fails)
-      if (fails >= this.maxFailures) {
-        this.breakerUntil.set(moduleId, Date.now() + this.breakerCooldownMs)
-        this.failures.set(moduleId, 0)
-      }
+      this._noteFailure(moduleId)
       return {
         ok: false,
         error: {

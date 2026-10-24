@@ -54,6 +54,9 @@ const HOT_KEYS = [
   // 模型配置（无痕热切换 + 失败降级）：设置页改完，下一条消息就按新配置下发。
   'model',
   'modelFallbacks',
+  // 外部插件启用清单（P2）：桥接据此决定要不要发 hook 请求——
+  // 没人启用时一条 HTTP 都不发（见 bridge._externalPluginsEnabled）。
+  'externalPlugins',
   // 高级参数（排障/调优）：全部允许热改，改完下一条消息生效。
   'replyTimeoutMs',
   'modelWatchdogMs',

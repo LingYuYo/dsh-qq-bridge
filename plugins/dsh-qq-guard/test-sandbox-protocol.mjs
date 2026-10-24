@@ -97,6 +97,14 @@ check('FRAME 常量稳定（Host/child 共用）', () => {
   assert.equal(FRAME.LOAD, 'load')
   assert.equal(FRAME.RESULT, 'result')
   assert.equal(FRAME.READY, 'ready')
+  // P2：invoke 帧（Host → child 调 hook / 工具）
+  assert.equal(FRAME.INVOKE, 'invoke')
+})
+
+check('P2 invoke 错误码稳定（Host 只认 code）', () => {
+  assert.equal(ERR.NOT_LOADED, 'E_NOT_LOADED')
+  assert.equal(ERR.INVOKE_FAILED, 'E_INVOKE')
+  assert.equal(ERR.BAD_RESULT, 'E_BAD_RESULT')
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail.length} 失败`)

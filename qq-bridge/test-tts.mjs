@@ -478,5 +478,82 @@ await check('成功回执也带 detail（Host 可回给模型「已发出」的�
   })
 })
 
+console.log('\n— session-ops：voice detached，不阻塞其它 op（P2）—')
+await check('voice 慢执行不阻塞同批 clear 回执，voice 回执照常回传', async () => {
+  let delivered = false
+  const posted = []
+  let voiceStarts = 0
+  const fakeFetch = async (url, init = {}) => {
+    if ((init.method ?? 'GET') === 'GET') {
+      if (delivered) return { ok: true, json: async () => ({ ok: true, ops: [] }) }
+      delivered = true
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          ops: [
+            { id: 'op-v', op: 'voice', sessionId: 's1', text: '你好' },
+            { id: 'op-c', op: 'clear', key: 'u:1000000001' },
+          ],
+        }),
+      }
+    }
+    posted.push({ at: Date.now(), results: JSON.parse(init.body).results })
+    return { ok: true, json: async () => ({ ok: true }) }
+  }
+  const applySessionOp = async (op) => {
+    if (op.op === 'voice') {
+      voiceStarts++
+      await sleep(150)
+      return { ok: true, detail: '已发送语音（baidu，8KB，via=base64，retcode=0）' }
+    }
+    return { ok: true }
+  }
+  const stop = startSessionOpsPolling({
+    baseUrl: 'http://127.0.0.1:1',
+    bridge: { applySessionOp },
+    logger: quietLogger,
+    pollMs: 10,
+    fetchImpl: fakeFetch,
+  })
+  await sleep(60)
+  assert.equal(posted.length, 1, `★ clear 回执应先到（voice 还在跑）：${JSON.stringify(posted)}`)
+  assert.deepEqual(posted[0].results.map((r) => r.id), ['op-c'])
+  assert.equal(voiceStarts, 1, 'voice 应已开始执行（detached）')
+  await sleep(240)
+  stop()
+  assert.ok(posted.length >= 2, '★ voice 回执照常回传')
+  const voiceReceipt = posted.flatMap((p) => p.results).find((r) => r.id === 'op-v')
+  assert.ok(voiceReceipt, `voice 回执丢了：${JSON.stringify(posted)}`)
+  assert.equal(voiceReceipt.ok, true)
+  assert.match(voiceReceipt.detail, /已发送语音/)
+})
+await check('voice 后台抛错 → 仍回执 ok=false + 可读 detail', async () => {
+  let delivered = false
+  const posted = []
+  const fakeFetch = async (url, init = {}) => {
+    if ((init.method ?? 'GET') === 'GET') {
+      if (delivered) return { ok: true, json: async () => ({ ok: true, ops: [] }) }
+      delivered = true
+      return { ok: true, json: async () => ({ ok: true, ops: [{ id: 'op-v2', op: 'voice', sessionId: 's1', text: 'x' }] }) }
+    }
+    posted.push(JSON.parse(init.body))
+    return { ok: true, json: async () => ({ ok: true }) }
+  }
+  const stop = startSessionOpsPolling({
+    baseUrl: 'http://127.0.0.1:1',
+    bridge: { applySessionOp: async () => { throw new Error('tts boom') } },
+    logger: quietLogger,
+    pollMs: 10,
+    fetchImpl: fakeFetch,
+  })
+  await sleep(60)
+  stop()
+  const receipt = posted.flatMap((p) => p.results).find((r) => r.id === 'op-v2')
+  assert.ok(receipt, `voice 失败回执丢了：${JSON.stringify(posted)}`)
+  assert.equal(receipt.ok, false)
+  assert.match(receipt.detail, /tts boom/)
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 process.exit(fail === 0 ? 0 : 1)

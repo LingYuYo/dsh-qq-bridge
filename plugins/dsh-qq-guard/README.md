@@ -14,6 +14,50 @@ DSH 插件：给 QQ 聊天会话装一道**执行期工具门禁**，并提供 Q
 > ⑤ 网页搜索补上 DeepSeek API Key 的配置入口；另含单群独立响应档位、技能配置真实弹窗。
 > 细节见文末两轮「修复记录」。
 
+## P2（v0.5.0）：发图片 / 外部插件真实生效 / 性能与 UI 极速
+
+**① 发图片 / 表情包（`qq_send_image`）**
+
+- 工具注册在 `qq-chat` preset 作用域（与 `qq_send_voice` 同一套 `buildToolDefinition`，优先官方 `defineTool`），
+  参数 `url` / `file` 二选一：`url` 是 http(s) 图片地址（NapCat 自己下载），`file` 是本地绝对路径 / `file://` / `base64://`。
+- execute 只入队 `{op:'image', sessionId, url?|file?}`，**等桥接回执**（20s 上限）再回答模型；下载失败 / NapCat 拒收会把可读原因抛给模型。
+- 设置页「技能与插件」新增 `sk-image`（发图片，默认开）。老配置的 `skills` 数组里没有它时也显示、也按开启处理，写回时整数组带上。
+- 桥接在系统提示词里追加使用引导；发送走 OneBot `image` 段，群聊不带 @，与文本分片完全解耦。
+
+**② 外部插件真实生效（P2）**
+
+- **沙箱常驻**：`externalPlugins.enabled` 非空时，`applySettings` / 扫描路由 / hook 请求前都会 `ensureResident()`——
+  拉起沙箱并把每个「已启用 + 自包含 + 有入口」的插件 load 一次（同一签名 30s TTL、单飞；失败沿用熔断）。
+- **Hook 桥接**：新增 `POST /dsh-qq-guard/external/hook`。桥接在收到 QQ 消息后（白名单通过、入队前）发 `message`，
+  在拼 prompt 前发 `before-context`；插件可返回 `{ drop }` / `{ text }` / `{ sections:[{title,text}] }`。
+  单插件 1.5s、整体 2s 预算，任何失败都按原样放行（best-effort，不影响聊天）。
+- **工具代理**：插件通过 `api.registerTool()` 注册的工具，会以 `qq_ext_<slug>`（defineTool 包裹，参数 JSON Schema 自动适配）
+  注册进 QQ 会话；执行时转发到沙箱 `invoke`（单飞 + 10s 超时 + 熔断）。执行期白名单已放行 `qq_ext_` 前缀。
+- **诊断路由**：`GET /dsh-qq-guard/external/runtime` 返回常驻沙箱 state/pid 与每个已加载插件的 hooks / tools 清单。
+- **已知限制**：cordis 没有按名字注销工具的稳定入口，插件停用后 `qq_ext_*` 可能残留在本次 DSH 生命周期的工具清单里
+  （execute 会校验插件仍加载，否则拒绝）；受控模块仍不支持加载。沙箱是**单进程串行**的：某个插件的 hook / tool
+  死循环会把后续 invoke 一起拖到超时，直到熔断（5 分钟）或重启沙箱才恢复；hook 预算从沙箱就绪后开始算，
+  但冷启动本身可能吃掉一次 hook（失败按原样放行，桥接侧对「无模块」有 30s 负缓存）。
+
+**③ 桥接性能（配合 qq-bridge 侧改动）**
+
+- 模型路由 / 人设下发按签名去重：配置没变时不再每条消息都 POST `/dsh-qq-guard/model`、`/dsh-qq-guard/persona`。
+- `sessionExists` 正结果缓存 30s（重建 / clear / delete 时失效），少一次每条消息的 `session/projections` 往返。
+- 图片在 ingress 阶段后台预取（并发 2、LRU 32、TTL 60s），复用 in-flight Promise；语音指令脱离会话指令轮询的串行链。
+- 新增可断言计数（`modelPushes` / `personaPushes` / `sessionChecks` / `skippedRequests` / `hookCalls`）供测试与排障。
+
+**④ 设置页手感（UI 极速）**
+
+- **乐观更新**：开关与保存点击后立刻改本地 UI（`overrides` 覆盖表），再后台静默 `settings.mutate`；
+  失败撤覆盖回滚并显示 `.qqg-status-err`。同一字段连点只保留最后一次值，不堆请求。
+- **输入框失焦保存**：OneBot / 语音 / NapCat 等直绑输入框改为「聚焦草稿 + 失焦/回车提交」，击键不再写盘；有未保存草稿时边框变色提示。
+- **轮询隔离**：状态 / 日志 / 进程 / 会话未读的 2–3s 轮询全部下沉到叶子组件（`StatusLive` / `SessionsBadge` / `GuideNavButton` / `SessionsTab`），
+  主面板与其它 Tab 不再随轮询重渲染。
+- **Loading**：新增纯 CSS `.qqg-spin`（含 `prefers-reduced-motion`），用于启停桥接 / NapCat、浏览目录、测试运行、重新扫描、会话提交等耗时按钮，pending 时禁用防重复点击。
+
+> 本节的离线回归：`test-image-tool.mjs`（21）、`test-external-hooks.mjs`（17）、sandbox 三件套（+19）、
+> bridge `test-offline`（195）、`test-tts`（31）、UI `test-shell-ui`（14）/ `test-skills`（33，新增 sk-image 与 onBlur 断言）。
+
 ## 为什么需要它
 
 DSH 的 `agentPreset` **不隔断全局工具**。2026-10-20 实测：profile 里全局挂载的 bundle（dsh-ops / dsh-mnemon / agent-team）会把工具**穿透**进每个会话 —— 一个 `minimal` preset 的会话实际拿到 **35 个工具**，含 `ops_bash`、`pwsh`、`spawn_teammate`；而且 `minimal` 在 Windows 上还**启用**了 `terminal-pwsh` / `persistent-pwsh`。

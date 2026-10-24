@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url'
 import { OneBotClient, normalizeTypingCharTiers, normalizeTypingMsTiers } from './onebot.mjs'
 import { DshClient } from './dsh.mjs'
 import { synthesize, TTS_MAX_CHARS, DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER } from './tts.mjs'
+import { ExternalHooksClient } from './external-hooks.mjs'
 
 /**
  * 非管理员说话时追加到人设末尾的安全提示。
@@ -146,6 +147,14 @@ const IMAGE_MAX_BYTES = 8 * 1024 * 1024
 /** 一条消息最多处理几张图：群聊刷图时不至于把一轮请求撑爆。 */
 const IMAGE_MAX_COUNT = 4
 const IMAGE_FETCH_TIMEOUT_MS = 8_000
+/** 图片预取缓存 TTL（P2）：60 秒内同一地址不重复下载。 */
+const IMAGE_CACHE_TTL_MS = 60_000
+/** 预取缓存上限（LRU）：群聊刷图时不至于无限占内存。 */
+const IMAGE_CACHE_MAX = 32
+/** 预取并发上限：不要为了几张图把网络打满。 */
+const IMAGE_PREFETCH_CONCURRENCY = 2
+/** 会话存在性正结果缓存时长（P2）：30 秒内不重复查。 */
+const SESSION_EXISTS_TTL_MS = 30_000
 
 /**
  * 技能/插件开关的默认值（与插件 Config 的 DEFAULT_SKILLS / DEFAULT_PLUGINS 对齐）。
@@ -153,6 +162,8 @@ const IMAGE_FETCH_TIMEOUT_MS = 8_000
  */
 export const DEFAULT_FEATURES = Object.freeze({
   voice: true, vision: true, search: true, guard: true, debounce: true, rateLimit: true,
+  // P2「发图片」（sk-image）：老配置里没有这个技能时按默认开启（契约 3.1）。
+  image: true,
 })
 
 /** 归一化 features：缺字段按默认值补，非布尔忽略。 */
@@ -166,6 +177,7 @@ export function normalizeFeatures(source) {
     guard: bool(raw.guard, DEFAULT_FEATURES.guard),
     debounce: bool(raw.debounce, DEFAULT_FEATURES.debounce),
     rateLimit: bool(raw.rateLimit, DEFAULT_FEATURES.rateLimit),
+    image: bool(raw.image, DEFAULT_FEATURES.image),
   }
 }
 
@@ -183,6 +195,11 @@ export function featuresFromManifests({ skills, plugins } = {}) {
     guard: pick(plugins, 'pl-guard', DEFAULT_FEATURES.guard),
     debounce: pick(plugins, 'pl-debounce', DEFAULT_FEATURES.debounce),
     rateLimit: pick(plugins, 'pl-ratelimit', DEFAULT_FEATURES.rateLimit),
+    // 老配置的 skills 里没有 sk-image（升级前保存的清单）：按新默认开启，不把功能关死。
+    // 只有清单里**明确有** sk-image 时才看它的 enabled（契约 3.1 的兼容规则）。
+    image: !Array.isArray(skills) || !skills.some((item) => item && item.id === 'sk-image')
+      ? DEFAULT_FEATURES.image
+      : pick(skills, 'sk-image', DEFAULT_FEATURES.image),
   })
 }
 
@@ -193,6 +210,7 @@ export function capabilityLines(features) {
   if (f.vision) lines.push('对方发来的图片会以图像形式直接提供给你，你可以看图回答；没收到图像时不要编造图片内容。')
   if (f.search) lines.push('需要查实时信息时，可以调用 web_search / web_fetch 联网检索，再把结果用自己的话说。')
   if (f.voice) lines.push('如果一句话适合用语音说，可以调用 qq_send_voice 把它变成 QQ 语音条发出去。')
+  if (f.image) lines.push('想发图片或表情包时，可以调用 qq_send_image，用 url（http/https 图片地址）或 file（本地绝对路径 / file:// / base64://）二选一。')
   return lines
 }
 
@@ -482,6 +500,15 @@ export class Bridge {
       },
     }
     this.dsh = new DshClient({ baseUrl: config.dsh.baseUrl, logger: this.logger })
+    // 外部插件 hook 客户端（P2）：best-effort，没装插件 / DSH 不可达都不影响聊天。
+    // 没人启用外部插件时一条 HTTP 都不发（见 _externalPluginsEnabled）。
+    this.hooks = new ExternalHooksClient({
+      getBaseUrl: () => this.dsh?.baseUrl || this.config?.dsh?.baseUrl || '',
+      getCookie: () => {
+        try { return this.dsh?.ensureCookie?.() ?? '' } catch { return '' }
+      },
+      logger: this.logger,
+    })
     // 语音合成入口（测试可替换）：只在执行「voice」会话指令时调用。
     this.tts = { synthesize: (text, voiceConfig) => synthesize(text, voiceConfig) }
     // 多模态能力探测缓存：模型是否声明支持图片输入（60 秒一次，失败不阻塞聊天）。
@@ -493,14 +520,27 @@ export class Bridge {
     })
     // 用 live 里的当前值覆盖客户端的默认值（构造完再同步一次，热更新走同一路径）。
     this._applyLiveToClient()
+    // 性能缓存（P2）：都是内存态，不落盘。
+    this._modelSignatures = new Map()    // sessionId -> 上次成功下发的模型签名
+    this._personaSignatures = new Map()  // sessionId -> 上次成功下发的人设签名
+    this._sessionExistsCache = new Map() // sessionId -> 正结果过期时间戳（ms）
+    this._imageCache = new Map()         // 图片地址 -> { at, promise }（LRU + TTL）
+    this._imagePrefetchQueue = []        // 待预取的图片地址（并发限 IMAGE_PREFETCH_CONCURRENCY）
+    this._imagePrefetchPending = new Set()
+    this._imagePrefetchActive = 0
     this.stats = {
       received: 0, replied: 0, blocked: 0, denied: 0, failed: 0,
       // 节奏相关（Phase 4），供设置页排障：跳过/静音中/被限频。
       skipped: 0, muted: 0, rateLimited: 0,
       // 管理员指令拦截（非管理员发 `/` 开头指令）。
       commandsBlocked: 0,
-      // 语音发送成功数（Phase 6）。
-      voices: 0,
+      // 语音 / 图片发送成功数（Phase 6 / P2）。
+      voices: 0, images: 0,
+      // 性能计数（P2），测试与排障断言用：
+      // 真正发出的请求数 vs 被缓存/去重省掉的请求数。
+      modelPushes: 0, personaPushes: 0, sessionChecks: 0, skippedRequests: 0,
+      // 外部插件 hook：实际生效次数 / 因 drop 丢弃的消息数 / 没人启用时的跳过次数。
+      hookCalls: 0, hookDrops: 0, hookSkipped: 0,
     }
   }
 
@@ -828,8 +868,17 @@ export class Bridge {
       || this._globalPersona
       || this.buildPersonaPrompt()
     const text = admin || base === '' ? base : `${base}\n\n${ADMIN_GUARD_NOTE}`
+    // 同签名不重复 POST（P2）：人设没变就不该每条消息都推一次。
+    // 签名含 sessionId + 人设正文 + 是否管理员；设置页改人设 / 单人设保存会清缓存（见 applySessionOp）。
+    const signature = `${sessionId}|${admin ? 'admin' : 'guest'}|${text}`
+    if (this._personaSignatures.get(sessionId) === signature) {
+      this.stats.skippedRequests++
+      return
+    }
     try {
       await this.dsh.setSessionPersona({ sessionId, text })
+      this._personaSignatures.set(sessionId, signature)
+      this.stats.personaPushes++
       this._personaWarned = false
     } catch (error) {
       if (!this._personaWarned) {
@@ -898,17 +947,51 @@ export class Bridge {
     return rows.slice(0, SESSION_VIEW_CAP)
   }
 
+  /**
+   * 会话是否在 DSH 侧仍存在（正结果缓存 30 秒，P2）。
+   *
+   * 为什么缓存正结果：每条消息都会走 ensureSession，而一个会话一旦确认存在，
+   * 30 秒内几乎不可能凭空消失；缓存掉重复的 session/projections 调用能省一次往返。
+   * **负结果不缓存**：失效要立刻重建，不能因为缓存多等半分钟。
+   * 重建 / clear / delete 时由 {@link _forgetSessionCaches} 让对应 sessionId 失效。
+   *
+   * @param {string} sessionId
+   * @returns {Promise<boolean>}
+   */
+  async _sessionExists(sessionId) {
+    const id = String(sessionId ?? '').trim()
+    if (!id) return false
+    if ((this._sessionExistsCache.get(id) ?? 0) > Date.now()) {
+      this.stats.skippedRequests++
+      return true
+    }
+    const exists = await this.dsh.sessionExists(id)
+    this.stats.sessionChecks++
+    if (exists) this._sessionExistsCache.set(id, Date.now() + SESSION_EXISTS_TTL_MS)
+    return exists
+  }
+
+  /** 会话被替换 / 删除时清掉按 sessionId 的缓存（防止 Map 随重建无限增长）。 */
+  _forgetSessionCaches(sessionId) {
+    const id = String(sessionId ?? '').trim()
+    if (!id) return
+    this._modelSignatures?.delete(id)
+    this._personaSignatures?.delete(id)
+    this._sessionExistsCache?.delete(id)
+  }
+
   /** 取或建该 QQ 会话对应的 DSH 会话。 */
   async ensureSession(key, msg) {
     const entry = this._entryOf(key)
     if (entry.sessionId) {
-      if (await this.dsh.sessionExists(entry.sessionId)) {
+      if (await this._sessionExists(entry.sessionId)) {
         // 接管已有会话：标题可能还是旧版留下的（比如 LLM 生成的「向」），顺手对齐。
         await this._ensureSessionTitle(key, msg)
         return entry.sessionId
       }
       this.logger.warn?.(`会话 ${key} 在 DSH 侧已不存在，重建`)
       const staleId = entry.sessionId
+      this._forgetSessionCaches(staleId)
       entry.sessionId = ''
       entry.title = ''
       this.state.rebuilds = (Number(this.state.rebuilds) || 0) + 1
@@ -957,8 +1040,17 @@ export class Bridge {
         .filter((item) => item && typeof item.provider === 'string' && typeof item.model === 'string')
         .slice(0, 4)
       : []
+    // 同签名不重复 POST（P2）：设置页改模型 / 新建会话都会自然换签名。
+    // 失败不写签名 → 下一条消息还会重试（插件没装时不会永久放弃）。
+    const signature = JSON.stringify([sessionId, provider, model, reasoningEffort, fallbacks])
+    if (this._modelSignatures.get(sessionId) === signature) {
+      this.stats.skippedRequests++
+      return
+    }
     try {
       const entry = await this.dsh.setSessionModel({ sessionId, provider, model, reasoningEffort, fallbacks })
+      this._modelSignatures.set(sessionId, signature)
+      this.stats.modelPushes++
       this._modelRouteWarned = false
       const want = provider && model ? `${provider}/${model}` : '跟随全局默认'
       if (this._lastAppliedModel !== `${want}|${entry?.model ?? ''}`) {
@@ -1065,13 +1157,15 @@ export class Bridge {
   async applySessionOp(op) {
     const key = String(op?.key ?? '')
     const action = String(op?.op ?? '')
-    // voice 任务由 guard 工具按 sessionId 入队（没有 QQ 会话 key），
+    // voice / image 任务由 guard 工具按 sessionId 入队（没有 QQ 会话 key），
     // 不能走 _entryOf('')，否则会在 state.sessions 里留下一个空 key 的垃圾行。
-    const entry = action === 'voice' ? null : this._entryOf(key)
+    const entry = (action === 'voice' || action === 'image') ? null : this._entryOf(key)
 
     if (action === 'persona') {
       entry.persona = String(op?.text ?? '').slice(0, 20000)
       this._saveState()
+      // 明确保存了人设：清掉同签名缓存，下一条消息必须真的重推一次。
+      this._personaSignatures.delete(entry.sessionId)
       if (entry.sessionId) await this._applyPersona(key, entry.sessionId, true)
       return { ok: true, action: 'persona', key }
     }
@@ -1094,6 +1188,7 @@ export class Bridge {
     if (action === 'clear') {
       const oldId = entry.sessionId
       if (!oldId) return { ok: false, error: 'no-session', action: 'clear', key }
+      this._forgetSessionCaches(oldId)
       let archived = false
       try {
         await this.dsh.archiveSession(oldId, { stopActivity: true })
@@ -1120,6 +1215,7 @@ export class Bridge {
 
     if (action === 'delete') {
       const oldId = entry.sessionId
+      this._forgetSessionCaches(oldId)
       let archived = false
       if (oldId) {
         try {
@@ -1140,6 +1236,11 @@ export class Bridge {
     // 真正的合成与发送在这里做（桥接才有 NapCat 连接）。
     if (action === 'voice') {
       return await this._applyVoiceOp(op, entry)
+    }
+
+    // 「发图片」技能（P2）：guard 里的 qq_send_image 只负责入队，真正的图片发送在这里做。
+    if (action === 'image') {
+      return await this._applyImageOp(op)
     }
 
     return { ok: false, error: 'unknown-op', action }
@@ -1284,6 +1385,175 @@ export class Bridge {
     }
   }
 
+  /**
+   * 执行一条发图片任务：按 sessionId 反查 QQ 会话 → `sendImage`（image 段）。
+   *
+   * 失败语义与 voice op 对齐：不抛错（session-ops 轮询器需要回执），但**必须把可读
+   * 原因放进 `error` 和 `detail`**——Host 侧 `qq_send_image` 是「等回执再返回」，
+   * 模型能不能看到失败原因全靠这两个字段：
+   *   · `error`：一句话可读原因（短码：no-session / image-disabled / empty-image / no-qq）
+   *   · `detail`：同义（session-ops 优先取它）
+   *   · `stage`：'send'（NapCat 发送失败）
+   *   · `retcode` / `status` / `via`：NapCat 原始码，排障用
+   *
+   * 群聊**不带 @**（契约 3.3）：图片不需要 @ 人也看得见，@ 反而刷屏。
+   *
+   * @param {{sessionId?:string, url?:string, file?:string}} op
+   * @returns {Promise<{ok:boolean, action:'image', key?:string, sessionId?:string,
+   *   error?:string, detail?:string, stage?:string, via?:string,
+   *   retcode?:number|null, status?:string, sent?:boolean}>}
+   */
+  async _applyImageOp(op) {
+    const sessionId = String(op?.sessionId ?? '').trim()
+    const key = Object.keys(this.state.sessions ?? {})
+      .find((candidate) => this.state.sessions[candidate]?.sessionId === sessionId)
+    if (!key) {
+      return {
+        ok: false, error: 'no-session', action: 'image', sessionId,
+        detail: `桥接找不到这个 DSH 会话（sessionId=${sessionId || '(空)'}）对应的 QQ 会话：`
+          + '可能刚被删除或重建。让用户先发条 QQ 消息后重试。',
+      }
+    }
+    if (!this._features().image) {
+      return {
+        ok: false, error: 'image-disabled', action: 'image', key,
+        detail: '「发图片」技能当前是关闭的：请先在设置页「技能与插件」里打开，再重试。',
+      }
+    }
+    // guard 契约：url / file 二选一，都给时 url 优先（见 p2-contract 3.2）。
+    const source = String(op?.url ?? '').trim() || String(op?.file ?? '').trim()
+    if (!source) {
+      return {
+        ok: false, error: 'empty-image', action: 'image', key,
+        detail: '要发送的图片地址是空的（url 和 file 都没给）',
+      }
+    }
+    const { kind, qq } = parseSessionKey(key)
+    const target = String(qq || this.state.sessions[key]?.qq || '').trim()
+    if (!target) {
+      return {
+        ok: false, error: 'no-qq', action: 'image', key,
+        detail: `会话 ${key} 没有可用的 QQ 号/群号，无法发图片`,
+      }
+    }
+
+    const sent = await this.qq.sendImage(kind, target, source, { atUserId: undefined })
+    const via = sent?.via ?? ''
+    if (sent?.ok === false) {
+      const detail = `图片发送失败（via=${via || 'file'}）：${sent.error ?? '未知原因'}`
+      this.logger.warn?.(`${detail}｜会话 ${key}`)
+      return {
+        ok: false, action: 'image', key, stage: 'send',
+        error: detail, detail,
+        retcode: sent.retcode ?? null,
+        status: sent.status ?? '',
+        via,
+      }
+    }
+    const retcode = sent?.retcode ?? null
+    const detail = `已发送图片（via=${via || 'file'}${retcode === null ? '' : `，retcode=${retcode}`}）`
+    this.stats.images++
+    this.logger.info?.(`已发送图片 ${key}（via=${via || 'file'}${retcode === null ? '' : `，retcode=${retcode}`}）`)
+    return {
+      ok: true, action: 'image', key, sent: true,
+      via, retcode, status: sent?.status ?? '', detail,
+    }
+  }
+
+  /**
+   * 是否可能有外部插件生效：`externalPlugins.enabled` 非空才发 hook 请求。
+   *
+   * 契约 4.4 明确「不新增开关」——就用 Host 设置页已有的「启用外部插件」清单，
+   * 没人启用时一条 HTTP 都不发（省掉每条消息一次本地往返）。
+   * @returns {boolean}
+   */
+  _externalPluginsEnabled() {
+    const hot = this.live?.externalPlugins
+    const list = Array.isArray(hot?.enabled)
+      ? hot.enabled
+      : (Array.isArray(this.config?.externalPlugins?.enabled) ? this.config.externalPlugins.enabled : [])
+    return list.some((item) => typeof item === 'string' && item.trim() !== '')
+  }
+
+  /** hook 请求里的发送者信息（不查 NapCat：拿不到名字就留空，不为 hook 多打接口）。 */
+  _hookUserOf(msg, key) {
+    const entry = this.state.sessions?.[key]
+    return {
+      id: String(msg?.userId ?? ''),
+      name: String(msg?.senderName ?? entry?.name ?? '').trim(),
+      admin: this.isAdmin(msg),
+    }
+  }
+
+  /** hook 请求里的群信息；私聊为 null。 */
+  _hookGroupOf(msg, key) {
+    if (msg?.kind !== 'group') return null
+    const entry = this.state.sessions?.[key]
+    return { id: String(msg?.groupId ?? ''), name: String(entry?.name ?? '').trim() }
+  }
+
+  /**
+   * message 事件 hook：返回 `{ drop, text? }`（text 有值 = 替换后的正文）。
+   * best-effort：没人启用 / HTTP 失败 / 超时 → 原样放行，聊天绝不被它卡死。
+   */
+  async _runMessageHook(msg, key, text, images) {
+    if (!this.hooks || !this._externalPluginsEnabled()) {
+      this.stats.hookSkipped++
+      return { drop: false }
+    }
+    const result = await this.hooks.invoke('message', {
+      event: 'message',
+      sessionId: String(this.state.sessions?.[key]?.sessionId ?? ''),
+      key,
+      text,
+      imageCount: Array.isArray(images) ? images.length : 0,
+      user: this._hookUserOf(msg, key),
+      group: this._hookGroupOf(msg, key),
+    }).catch((error) => ({ ok: false, error }))
+    if (result?.skipped) {
+      this.stats.skippedRequests++
+      return { drop: false }
+    }
+    if (!result?.ok) return { drop: false }
+    this.stats.hookCalls++
+    if (result.drop === true) {
+      this.stats.hookDrops++
+      return { drop: true }
+    }
+    const next = typeof result.text === 'string' && result.text.trim() !== '' ? result.text : undefined
+    return { drop: false, ...(next !== undefined ? { text: next } : {}) }
+  }
+
+  /**
+   * before-context 事件 hook：返回 `{ text, sections }`（text 空 = 不替换）。
+   * 失败一律返回空（调用方按原上下文继续）。
+   */
+  async _runContextHook({ sessionId, key, text, imageCount, msg }) {
+    if (!this.hooks || !this._externalPluginsEnabled()) {
+      this.stats.hookSkipped++
+      return { text: '', sections: [] }
+    }
+    const result = await this.hooks.invoke('before-context', {
+      event: 'before-context',
+      sessionId: String(sessionId ?? ''),
+      key,
+      text,
+      imageCount,
+      user: this._hookUserOf(msg, key),
+      group: this._hookGroupOf(msg, key),
+    }).catch((error) => ({ ok: false, error }))
+    if (result?.skipped) {
+      this.stats.skippedRequests++
+      return { text: '', sections: [] }
+    }
+    if (!result?.ok) return { text: '', sections: [] }
+    this.stats.hookCalls++
+    return {
+      text: typeof result.text === 'string' ? result.text : '',
+      sections: Array.isArray(result.sections) ? result.sections : [],
+    }
+  }
+
   async handleMessage(msg) {
     this.stats.received++
     if (!this.isAllowed(msg)) {
@@ -1292,9 +1562,20 @@ export class Bridge {
       return
     }
     const key = this.keyOf(msg)
-    const text = (msg.text ?? '').trim()
+    let text = (msg.text ?? '').trim()
     // 图片段（2026-10-23）：纯图片消息也要能进模型，不再因为 text 为空直接丢弃。
     const images = Array.isArray(msg.images) ? msg.images : []
+    // 图片预取（P2）：消息一进来就在后台开始下载，不阻塞后面的判定 / 入队。
+    this._prefetchImages(images)
+    // 外部插件 hook（P2）：message 事件。可在入队前改写文本或直接 drop；
+    // best-effort，失败/超时一律按原样放行（见 external-hooks.mjs）。
+    const hook = await this._runMessageHook(msg, key, text, images)
+    if (hook.drop) {
+      this.stats.skipped++
+      this.logger.info?.(`外部插件丢弃了这条消息（${key}）：${text.slice(0, 40)}`)
+      return
+    }
+    if (hook.text !== undefined) text = hook.text
     // 未读：通过白名单的消息一律计数（包括后面被档位/静音/限频拦掉的），
     // 只有真的把回复发出去才清零。空文本（纯图片/表情）也计数——那也是消息。
     this._noteIncoming(key, text || (images.length > 0 ? '[图片]' : ''))
@@ -1405,7 +1686,27 @@ export class Bridge {
         // 多模态（2026-10-23）：图片只在「图片理解」开启且模型声明支持时随消息带上；
         // 否则退回纯文本 + 一句诚实说明（绝不让模型假装看见了图）。
         const built = await this._buildPromptContent(text, images)
-        const promptText = built.fallbackText || text
+        let promptText = built.fallbackText || text
+        // 外部插件 hook（P2）：prompt 之前的 before-context。可替换本轮正文、按顺序
+        // 追加「外部上下文」小节到正文之后；**不改人设**（人设走 setSessionPersona）。
+        // best-effort：失败/超时按原上下文继续，绝不影响本轮回复。
+        const hookCtx = await this._runContextHook({
+          sessionId, key, text: promptText,
+          imageCount: Array.isArray(images) ? images.length : 0,
+          msg,
+        })
+        if (hookCtx.text.trim() !== '' || hookCtx.sections.length > 0) {
+          const replaced = hookCtx.text.trim() !== '' ? hookCtx.text : promptText
+          const sections = hookCtx.sections
+            .filter((item) => item && typeof item === 'object' && String(item.text ?? '').trim() !== '')
+            .map((item) => `[外部上下文：${String(item.title ?? '').trim()}]\n${String(item.text).trim()}`)
+          promptText = sections.length > 0 ? `${replaced}\n\n${sections.join('\n\n')}` : replaced
+          // 多模态时 DSH 用 content 数组，正文替换/追加必须同步进第一个 text 段。
+          if (built.images > 0 && Array.isArray(built.content) && built.content[0]?.type === 'text') {
+            built.content[0] = { type: 'text', text: promptText }
+          }
+          built.fallbackText = promptText
+        }
         const promptOpts = {
           // 优先级：设置页热改的 replyTimeoutMs > config.json > 20s 默认。
           // 20s：主模型卡住时不要拖着 QQ 用户等 3 分钟。
@@ -1519,6 +1820,92 @@ export class Bridge {
     }
   }
 
+  /**
+   * 图片 ingress 预取（P2）：消息一进来就在后台开始下载。
+   *
+   * 只是「提前开始」：真正组装 prompt 时（{@link _loadImageParts}）复用的是同一批
+   * Promise（见 {@link _loadImageRef} 的 in-flight 复用），不会重复下载；
+   * 失败也只 warn，不影响主队列。最多并发 {@link IMAGE_PREFETCH_CONCURRENCY} 张。
+   * 「图片理解」关掉时没人会用到这些图，直接跳过（别白耗流量）。
+   *
+   * @param {Array<{url?:string, file?:string}>} images
+   */
+  _prefetchImages(images = []) {
+    if (!Array.isArray(images) || images.length === 0) return
+    if (!this._features().vision) return
+    const seen = new Set()
+    for (const image of images.slice(0, IMAGE_MAX_COUNT)) {
+      const ref = String(image?.url || image?.file || '').trim()
+      if (!ref || seen.has(ref)) continue
+      seen.add(ref)
+      if (this._hasFreshImage(ref)) continue
+      if (this._imagePrefetchPending.has(ref)) continue
+      this._imagePrefetchPending.add(ref)
+      this._imagePrefetchQueue.push(ref)
+    }
+    this._pumpImagePrefetch()
+  }
+
+  /** 按并发上限把预取队列推起来（不 await：纯后台）。 */
+  _pumpImagePrefetch() {
+    while (this._imagePrefetchActive < IMAGE_PREFETCH_CONCURRENCY && this._imagePrefetchQueue.length > 0) {
+      const ref = this._imagePrefetchQueue.shift()
+      this._imagePrefetchPending.delete(ref)
+      if (this._hasFreshImage(ref)) continue
+      this._imagePrefetchActive++
+      // _loadImageRef 永不 reject，不会留下未处理的 rejection 把进程带走。
+      this._loadImageRef(ref).then(() => {
+        this._imagePrefetchActive--
+        this._pumpImagePrefetch()
+      })
+    }
+  }
+
+  /** 该地址是否命中「还新鲜」的缓存（含正在下载的 in-flight）。 */
+  _hasFreshImage(ref, now = Date.now()) {
+    const hit = this._imageCache.get(ref)
+    if (!hit) return false
+    if (now - hit.at >= IMAGE_CACHE_TTL_MS) {
+      this._imageCache.delete(ref)
+      return false
+    }
+    return true
+  }
+
+  /**
+   * 取一张图的下载结果（LRU + TTL 缓存 + in-flight 复用，P2）。
+   *
+   * 返回值**永不 reject**，统一是 `{ ok:true, value }` / `{ ok:false, error }`：
+   * 预取是 fire-and-forget，留下未处理的 rejection 会直接把进程带走。
+   * 失败结果也缓存到 TTL（60s），避免同一条坏链接被反复重试。
+   *
+   * @param {string} ref 图片地址（http(s) / data: / base64:// / file:// / 绝对路径）
+   * @returns {Promise<{ok:boolean, value?:{base64:string, mediaType:string}, error?:any}>}
+   */
+  _loadImageRef(ref) {
+    const now = Date.now()
+    const hit = this._imageCache.get(ref)
+    if (hit && now - hit.at < IMAGE_CACHE_TTL_MS) {
+      // 触碰一下 LRU 顺序（Map 按插入顺序迭代，删了再插 = 移到队尾）。
+      this._imageCache.delete(ref)
+      this._imageCache.set(ref, hit)
+      return hit.promise
+    }
+    if (hit) this._imageCache.delete(ref)
+    const promise = this._downloadImage(ref).then(
+      (value) => ({ ok: true, value }),
+      (error) => ({ ok: false, error }),
+    )
+    this._imageCache.set(ref, { at: now, promise })
+    // LRU 上限：超了就丢最久没被用到的（Map 的第一个键）。
+    while (this._imageCache.size > IMAGE_CACHE_MAX) {
+      const oldest = this._imageCache.keys().next().value
+      if (oldest === undefined) break
+      this._imageCache.delete(oldest)
+    }
+    return promise
+  }
+
   /** 下载并转成 DSH prompt 需要的 image part；失败的单张跳过。 */
   async _loadImageParts(images) {
     const parts = []
@@ -1527,11 +1914,12 @@ export class Bridge {
       const ref = String(image?.url || image?.file || '').trim()
       if (!ref || seen.has(ref)) continue
       seen.add(ref)
-      try {
-        const loaded = await this._downloadImage(ref)
-        if (loaded) parts.push({ type: 'image', data: loaded.base64, mediaType: loaded.mediaType })
-      } catch (error) {
-        this.logger.warn?.(`图片下载失败（跳过）：${error?.message ?? error}`)
+      // 与 ingress 预取共用同一个 Promise：预取过的这里不重复下载。
+      const result = await this._loadImageRef(ref)
+      if (result?.ok && result.value) {
+        parts.push({ type: 'image', data: result.value.base64, mediaType: result.value.mediaType })
+      } else if (result && result.ok === false) {
+        this.logger.warn?.(`图片下载失败（跳过）：${result.error?.message ?? result.error}`)
       }
     }
     return parts

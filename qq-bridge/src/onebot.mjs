@@ -545,6 +545,20 @@ export function splitBubbles(text, opts = {}) {
   return out.filter((x) => x.length > 0)
 }
 
+/**
+ * 图片地址分类（只用于回执里的 `via`，不影响实际发送）：
+ * http(s) → `url`；`base64://` → `base64`；其余（file:/// 绝对路径）→ `file`。
+ * @param {string} file
+ * @returns {'url'|'file'|'base64'|''}
+ */
+export function imageFileVia(file) {
+  const ref = String(file ?? '').trim()
+  if (!ref) return ''
+  if (/^https?:\/\//i.test(ref)) return 'url'
+  if (/^base64:\/\//i.test(ref)) return 'base64'
+  return 'file'
+}
+
 export class OneBotClient {
   /**
    * @param {object} opts
@@ -769,6 +783,65 @@ export class OneBotClient {
     // 总开关兜底：即使调用方传了 atUserId，groupAtReply=false 也一律不带 @。
     const at = this.groupAtReply ? opts : { ...opts, atUserId: undefined }
     return await this._sendText('group', groupId, text, at)
+  }
+
+  /**
+   * 发一张图片 / 表情包（image 段，P2「发图片」技能）。
+   *
+   * `file` **原样**交给 NapCat：http(s) URL 由它自己下载；`base64://` / `file:///` /
+   * 绝对路径也原样传（各版本接受度不一致，由调用方决定给哪种）。
+   * 与文本发送完全解耦：不分片、不碰换行（图片没有换行语义）。
+   *
+   * 永不抛：传输层异常也转成 `{ok:false, status:'exception'}`，由上层写进 op 的
+   * detail（模型能看到失败原因，而不是以为发出去了）。
+   *
+   * @param {'private'|'group'} kind
+   * @param {string|number} targetId QQ 号 / 群号
+   * @param {string} file 图片地址（url / file:/// / base64:// / 绝对路径）
+   * @param {{atUserId?:string}} [opts] 群聊可带 @（发图片默认不 @，见 _applyImageOp）
+   * @returns {Promise<{ok:boolean, messageIds:string[], error?:string,
+   *   retcode:number|null, status:string, via:'url'|'file'|'base64'|''}>}
+   */
+  async sendImage(kind, targetId, file, { atUserId } = {}) {
+    const id = String(targetId ?? '').trim()
+    const ref = String(file ?? '').trim()
+    const via = imageFileVia(ref)
+    if (!/^\d+$/.test(id) || id === '0') {
+      return {
+        ok: false, messageIds: [],
+        error: `${kind === 'private' ? 'user_id' : 'group_id'} 必须是正整数：${targetId}`,
+        retcode: null, status: '', via,
+      }
+    }
+    if (!ref) return { ok: false, messageIds: [], error: '图片内容为空', retcode: null, status: '', via }
+    const message = []
+    // 群聊 + 明确给了 atUserId 才带 @；桥接的 image op 固定不传（契约：群聊不带 @）。
+    if (kind === 'group' && atUserId !== undefined && atUserId !== null
+      && /^\d+$/.test(String(atUserId).trim())) {
+      message.push({ type: 'at', data: { qq: String(atUserId).trim() } })
+      message.push({ type: 'text', data: { text: ' ' } })
+    }
+    message.push({ type: 'image', data: { file: ref } })
+    const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg'
+    const params = kind === 'private' ? { user_id: Number(id), message } : { group_id: Number(id), message }
+    try {
+      const res = await this.call(action, params)
+      const ok = res?.status === 'ok' && Number(res?.retcode) === 0
+      const mid = res?.data?.message_id
+      return {
+        ok,
+        messageIds: ok && mid !== undefined && mid !== null ? [String(mid)] : [],
+        retcode: Number.isFinite(Number(res?.retcode)) ? Number(res.retcode) : null,
+        status: String(res?.status ?? ''),
+        via,
+        ...(ok ? {} : { error: `retcode=${res?.retcode} status=${res?.status}` }),
+      }
+    } catch (error) {
+      return {
+        ok: false, messageIds: [], error: error?.message ?? String(error),
+        retcode: null, status: 'exception', via,
+      }
+    }
   }
 
   /**

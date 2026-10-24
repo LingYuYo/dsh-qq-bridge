@@ -255,6 +255,9 @@ await check('role=settings 有 webServer → 注册全部设置面路由，且�
     '/dsh-qq-guard/external-plugins',
     // P1：外部插件沙箱加载测试
     '/dsh-qq-guard/external-plugins/test',
+    // P2：外部插件 hook（桥接每条消息前调用）+ 常驻快照
+    '/dsh-qq-guard/external/hook',
+    '/dsh-qq-guard/external/runtime',
     '/dsh-qq-guard/napcat',
     // NapCat 登录二维码截图（qrcode.png → 浏览器）
     '/dsh-qq-guard/napcat-qr',
@@ -268,7 +271,7 @@ await check('role=settings 有 webServer → 注册全部设置面路由，且�
     // 真实用量统计（数据与用量面板）+ 历史回填
     '/dsh-qq-guard/usage',
     '/dsh-qq-guard/usage/backfill',
-  ], `路由应为 13 条，实际 ${JSON.stringify(paths)}`)
+  ], `路由应为 15 条，实际 ${JSON.stringify(paths)}`)
   assert.ok(calls.webRoutes.every((r) => r.kind === 'exact'))
 })
 await check('role=settings 无 webServer → 安全跳过', () => {
@@ -432,7 +435,7 @@ await check('readFeatureFlags：把开关聚合成桥接/guard 共用的布尔',
   const cfg = Config({ role: 'settings' })
   const flags = mod.readFeatureFlags(cfg)
   assert.deepEqual(flags, {
-    voice: true, vision: true, search: true, guard: true, debounce: true, rateLimit: true,
+    voice: true, image: true, vision: true, search: true, guard: true, debounce: true, rateLimit: true,
   })
 })
 await check('guard：网页搜索开启 → web_search 放行；关闭 → 执行期拒绝', () => {

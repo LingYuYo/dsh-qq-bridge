@@ -181,11 +181,13 @@ function resetSkills(formOverride) {
   return render(formOverride)
 }
 
-/** 从头渲染 sessions Tab，并预置桥接上报的会话列表（SettingsPanel 的 #5 是 live）。 */
+/** 从头渲染 sessions Tab，并预置桥接上报的会话列表。
+ *  会话列表的轮询状态现在只存在于叶子组件 SessionsTab 内部（`#0` = live），
+ *  面板层不再持有它（P2 轮询隔离）。 */
 function resetSessions(live, formOverride) {
   hookStore = new Map([
     ['root:SettingsPanel#1', 'sessions'],
-    ['root:SettingsPanel#5', live],
+    ['root.div3.div0:SessionsTab#0', live],
   ])
   return render(formOverride)
 }
