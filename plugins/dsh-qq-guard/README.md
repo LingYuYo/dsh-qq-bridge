@@ -4,6 +4,11 @@ DSH 插件：给 QQ 聊天会话装一道**执行期工具门禁**，并提供 Q
 
 配套的桥接进程在 [`../../qq-bridge/`](../../qq-bridge/)，两个要一起用。
 
+> **2026-10-24 修了一组真机 P0**：guard 在 preset 内的作用域判定写错，导致人设 section /
+> `qq_send_voice` / restrict / 执行期白名单**四件事全部静默跳过**（QQ 会话当时既没有系统人设、
+> 也没有执行期门禁）。根因、修法和验证见文末「2026-10-24 修复记录」；同一批还修了
+> 人设每 2 秒重复推送、`web_search` 未挂载、单群独立响应档位、技能配置弹窗。
+
 ## 为什么需要它
 
 DSH 的 `agentPreset` **不隔断全局工具**。2026-10-20 实测：profile 里全局挂载的 bundle（dsh-ops / dsh-mnemon / agent-team）会把工具**穿透**进每个会话 —— 一个 `minimal` preset 的会话实际拿到 **35 个工具**，含 `ops_bash`、`pwsh`、`spawn_teammate`；而且 `minimal` 在 Windows 上还**启用**了 `terminal-pwsh` / `persistent-pwsh`。
@@ -32,6 +37,28 @@ DSH 的 `agentPreset` **不隔断全局工具**。2026-10-20 实测：profile �
 
 两个 role 是同一份代码、不同实例。`role` 未声明会走兼容分支（等于旧行为），所以**别删这个字段**。
 
+### 「我是不是在 preset 里」必须这么判（2026-10-24 P0 的教训）
+
+`role: guard` 这个实例启动时第一件事就是确认自己装在哪：装错到 profile 顶层会让全局锁死，
+**判错成「不在 preset」**则会让下面四件事全部静默跳过（人设 section / `qq_send_voice` /
+restrict / 执行期白名单）—— 2026-10-24 就是这么炸的。
+
+```js
+// ❌ 旧写法：preset 子行恒返回 undefined
+agentPresets.composedPreset(ctx) === undefined → return
+
+// ✅ 现在：detectPresetScope() 两层取或
+//   ① composedPreset(ctx) 有非空字符串        → 在 preset 内（agent ctx 场景）
+//   ② tools.restrict 探针抛到「名字未知」      → scope 校验已过，在 preset 内
+//   其它一切情况（含意外异常）                 → 当作不在 preset，拒绝装载（fail-closed）
+```
+
+为什么 ① 单独不够：`composedPreset()` → `generationFor(ctx)` 找的是 **`scopeOf(ctx)` 的父
+scope**，而 preset 子行 ctx 的作用域**就是** generation 本身（没有父），所以恒 undefined；
+它只对已 `bindScopeParent` 的 `agent.ctx` 成立。探针为什么无副作用：`restrict()` 先校验
+scope 再校验工具名，两条 throw 路径都在 `layers.effect()` 之前。
+回归用例见 `test-preset-scope.mjs`（真宿主）与 `test-guard-scope.mjs`（假 ctx）。
+
 ### restrict 必须重扫
 
 第一版只在 `apply()` 里跑一遍 `tools.restrict()` 并 `catch {}` 静默吞错，结果**部分失效**。原因是 `restrict()` 对当下未注册的名字会抛错（`restrict() names unknown global tool …`），而 preset 子树装载时那些工具还没注册。
@@ -45,8 +72,8 @@ profile 顶层实例持有配置，投影到「设置 → QQ 桥接」。左侧�
 | Tab | 内容 | 数据来源 |
 | --- | --- | --- |
 | 运行状态 | 桥接状态 / 启停 / 日志、NapCat 进程状态与启停、**NapCat 日志折叠框**、**登录二维码卡片（图片优先 / ASCII 兜底）**、**系统底层事件折叠面板**、今日用量概览卡、AI 排障助手输入框 | 状态与启停走真实路由；**今日用量卡读真实 `/usage`**；二维码直接读 NapCat 落盘的 `qrcode.png`；AI 框为 **Mock 壳** |
-| 会话管理 | 左会话列表（昵称 / 群名、未读红点、最近一条消息预览）+ 右详情（DSH 映射与标题、单人设覆盖、清空上下文、删除会话） | **全部真实**：列表来自桥接上报；清空/删除/单人设走 Host 指令队列 + 桥接 2 秒轮询 |
-| 技能与插件 | Skill / Plugin / 外部插件 三组卡片，外部插件带兼容标签与 `[测试运行]`，含版本号、齿轮、垃圾桶、拖拽手柄、上下移 | **全部真实配置读写**；沙箱测试走真实 Host 路由 |
+| 会话管理 | 左会话列表（昵称 / 群名、未读红点、最近一条消息预览）+ 右详情（DSH 映射与标题、**单群响应档位**、单人设覆盖、清空上下文、删除会话） | **全部真实**：列表来自桥接上报；清空/删除/单人设/档位走 Host 指令队列 + 桥接 2 秒轮询 |
+| 技能与插件 | Skill / Plugin / 外部插件 三组卡片，外部插件带兼容标签与 `[测试运行]`，含版本号、齿轮、垃圾桶、拖拽手柄、上下移 | **全部真实配置读写**（齿轮弹窗按卡片 id 映射到真实 Config 路径）；沙箱测试走真实 Host 路由 |
 | 全局设置 | 运行节奏（两个大按钮 → 信息发送配置 / 活跃设置 弹窗）、**模型配置（无痕热切换 + 备用模型）**、**高级参数（折叠）**、人设概览卡（编辑收进弹窗）、白名单、OneBot、NapCat | **全部真实配置读写** |
 | 数据与用量 | 近 7 天柱状图 + Token 面积图，按天 / 按模型 / 按会话三张表，外加**峰谷时段设置**与**忙/闲两套单价配置卡** | **全部真实 `/usage` 数据**（5 秒轮询），成本按事件时刻分峰谷计价 |
 
@@ -151,6 +178,25 @@ profile 顶层实例持有配置，投影到「设置 → QQ 桥接」。左侧�
 `openai`（baseUrl + apiKey），音色默认 `zh-CN-XiaoyiNeural`。合成在桥接进程里做，
 插件只写配置 + 入队；NapCat 负责 mp3 → QQ 语音的转码，失败会写日志、不影响聊天。
 
+### 2026-10-24：齿轮弹窗接真实 Config（不再是「暂无可配置项」）
+
+以前的设置弹窗读的是卡片上的假 `settings` 数组，所以点进去永远是空的。现在按**卡片 id**
+直接映射到真实 Config 路径，读写都走 `get(path)` / `write(path, value)`：
+
+| 卡片 | 字段（＝Config 路径） |
+| --- | --- |
+| 发语音 `sk-voice` | `voice.provider`（edge / openai）、`voice.voice`（音色，候选随后端切换：Edge 4 个 `zh-CN-*Neural`，OpenAI `alloy/echo/fable/onyx/nova/shimmer`）、`voice.apiKey`（密码框，`role('secret')` 不回显、**留空 = 不改**）、`voice.baseUrl`（仅 openai 时出现） |
+| 防抖合并 `pl-debounce` | `rhythm.debounceWindowMs`（0–10000ms，步进 100） |
+| 频率控制 `pl-ratelimit` | `rhythm.rateLimit.perMin`（1–120）、`.burst`（0–30）、`.silent`（开关） |
+| 其余未实装条目 | **不给假表单**：弹窗直接写「开发中」+ 具体原因（例如「定时提醒还没实装，桥接侧没有对应实现」），齿轮仍可点开看解释 |
+| 已接入但无可调项 | 例如 `sk-vision` / `sk-search` / `pl-guard`：显示「无可调配置」+ 说明 |
+| 不认识的 id（外部插件 / 自定义条目） | 兜底文案「该条目还没有对应的桥接实现」，不崩、不空弹窗 |
+
+- 「恢复默认」写回 `index.js` 里 Config 的默认值，**但不会清空已保存的 `voice.apiKey`**
+  （一键清 Key 是不可逆伤害，弹窗里有说明）。
+- `writable=false`（只读配置源）时所有控件与按钮禁用，且点击直接 return，不写盘。
+- 保存时逐字段比对，只写真正变化的键；secret 只在输入非空时写。
+
 ### Phase 4：清理失效会话
 
 `POST /dsh-qq-guard/cleanup-sessions` 对账并归档：
@@ -254,10 +300,15 @@ NapCat 的**启停按钮和进程状态只在「运行状态」页**（紧接「
 
 ```
 桥接进程（唯一知道 QQ 会话 ↔ DSH 会话映射的地方）
-  → POST /dsh-qq-guard/status { ..., sessions: [{key, sessionId, kind, qq, name, title, unread, lastAt, lastText}] }
+  → POST /dsh-qq-guard/status { ..., sessions: [{key, sessionId, kind, qq, name, title,
+      unread, lastAt, lastText, persona, activityLevel}] }
   → Host 白名单收敛（sanitizeSessionRow，最多 100 条，body 上限 64KB）
   → 前端 useBridgeStatus 3 秒轮询 → 列表 / 详情 / 导航红点
 ```
+
+⚠️ `sanitizeSessionRow()` 是**白名单**：桥接上报了、这里没写，前端就永远读到 `undefined`
+（2026-10-24 就是这么丢了 `activityLevel` 与 `persona`，单群档位和单人设回填全显示不出来）。
+新增上报字段必须同时改它，并且有测试盯着（`test-guard-scope.mjs` 里三个用例）。
 
 - **列表**：昵称或群名、私聊/群聊、未读数、相对时间、最后一条消息预览；按最近活动倒序。
 - **详情**：`u:<QQ>` / `g:<群号>` key、DSH 会话 ID、已对齐的 DSH 标题、最近活动、最近消息。
@@ -267,6 +318,22 @@ NapCat 的**启停按钮和进程状态只在「运行状态」页**（紧接「
 - **单人设 / 清空 / 删除**已解锁（见下文两节）。
 
 桥接侧的命名与状态维护见 `qq-bridge/README.md` 的「会话标题与未读」一节。
+
+### 单群独立响应档位（2026-10-24）
+
+响应档位原来是**全局一个值**（`rhythm.activityLevel`），对一个安静群设 0 档会把所有群一起静音。
+现在每个群可以单独覆盖：
+
+- 落盘：`qq-bridge/state/sessions.json` 每条会话多一个 `activityLevel`
+  —— `null` = **跟随全局**，`0..3` = 该群独立档位。**私聊不受影响**（永远回）。
+- 指令：设置页提交 `{op:'activity', key:'g:<群号>', level: 0|1|2|3|null}`，
+  走同一套会话指令队列（Host 队列 → 桥接 2 秒轮询）。非法 level 直接 400 `bad-level`，不静默改写。
+- 判定：桥接 `_activityLevelFor(key)` 先读单群、再回退全局；`shouldRespond` 的第三参
+  `key` 是可选的（老调用不受影响），命中日志会打印**实际生效**的档位。
+- 「先配置、后聊天」也能用：key 还没有会话时 `_entryOf` 会建占位记录，重启后不会因为
+  「空壳会话」被清理规则丢掉。
+- UI：会话详情右侧「响应档位」卡，`null` 显示「跟随全局（当前 N 档）」；
+  覆盖生效时详情头部多一个「单群档位 N 档」标签。
 
 ### 单人设覆盖（动态 persona section）
 
@@ -287,7 +354,7 @@ NapCat 的**启停按钮和进程状态只在「运行状态」页**（紧接「
 ### 会话指令队列（清空 / 删除 / 单人设保存）
 
 ```
-UI POST /dsh-qq-guard/session-ops {op, key, text?}
+UI POST /dsh-qq-guard/session-ops {op, key, text?, level?}
   → Host 内存队列（同 key+op 去重，50 条上限，5 分钟 TTL）
   → 桥接每 2 秒 GET 同一路由（Host 给 30s 租约，防重复执行非幂等操作）
   → 桥接执行 → POST {results:[...]} → Host 移除
@@ -298,6 +365,8 @@ UI POST /dsh-qq-guard/session-ops {op, key, text?}
 - `delete`：归档旧会话（同样 stopActivity）+ 从 `sessions.json` 删除映射；归档失败仍删映射，
   否则 UI 上「删不掉」。
 - `persona`：写 `sessions.json` 的 `persona` 字段并立即推送；空串 = 恢复全局。
+- `activity`：写 `sessions.json` 的 `activityLevel`（`0..3` 或 `null`=跟随全局），见上一节。
+  取值校验在 Host 侧（非法返回 400 `bad-level`），桥接侧再按契约归一化一次。
 - UI：两个按钮二次确认，提交后显示「已提交，桥接会在 2 秒内执行」，列表随 3 秒轮询更新。
 
 ### 管理员权限（`allow.admins`）
@@ -494,14 +563,16 @@ QQ 会话切模型，**不能**走 `session/selectModel` —— 它会顺带 `ag
 ## 自测
 
 ```bash
-node test-guard-scope.mjs     # 门禁作用域（防全局锁死）
+node test-guard-scope.mjs     # 门禁作用域（防全局锁死）+ preset 作用域判定（32 例）
+node test-preset-scope.mjs    # 真宿主：preset 内必须生效 / 顶层必须拒绝（31 例，缺 DSH 包时 SKIP）
 node test-model-override.mjs  # 模型无痕热切换 + 降级链 + 静默看门狗 + 系统事件 + 目录 join（假 ctx，23 例）
 node test-settings-data.mjs   # 设置页数据通路（remote / HTTP 兜底 / 错误可见）
 node test-napcat.mjs          # NapCat 进程管理（假 subprocess，不真起进程）
 node test-status-napcat.mjs   # 运行状态页的 NapCat 面板（启停路由 / 状态刷新 / 设置页只留输入框）
 node test-autostart.mjs       # autoStart / 单实例 / 崩溃重启上限
-node test-render.mjs          # 五个 Tab + 七个弹窗的渲染冒烟（假 React）
-node test-usage-stats.mjs     # 用量拦截 / 去重 / 多段峰谷 / 工作日节假日 / 规则变化重建 / 回填幂等 / 两条路由（18 例）
+node test-render.mjs          # 五个 Tab + 八个弹窗的渲染冒烟（假 React）
+node test-tile-config.mjs     # 技能/插件配置弹窗接真实 Config（字段集 / 保存路径 / 开发中 / 只读禁用，17 例）
+node test-usage-stats.mjs     # 用量拦截 / 去重 / 多段峰谷 / 工作日节假日 / 规则变化重建 / 回填幂等 / 两条路由（19 例）
 node test-usage-ui.mjs        # 用量页真实数据接线（轮询 / 图表 / 三表 / 多段峰谷 / 工作日开关 / 单价写回，11 例）
 node test-skills.mjs          # 技能页交互逻辑（拖拽排序 / 上下移 / 增删 / 弹窗 / Esc / autoStart 开关）
 node test-persona-ui.mjs      # 人设概览卡 + 设置弹窗（名字/展示名/参与度/三块文本/人设增删）
@@ -516,65 +587,103 @@ node test-sandbox-manager.mjs  # 沙箱管理器（假 subprocess：ready / 超�
 node test-sandbox-child.mjs    # 真 node 子进程（setup / fs 拦截 / 越界引用 / 死循环超时）
 node test-sandbox-route.mjs    # POST /external-plugins/test 路由（同源 / 路径注入 / 受控拒绝）
 node verify-layout.mjs        # 布局几何（左导航底部按钮沉底、输入框不溢出、遮罩铺满、弹窗居中）
-node render-preview.mjs       # 生成 preview/*.html 静态版式（含弹窗与深色版）
+node render-preview.mjs       # 生成 preview/*.html 静态版式（含弹窗与深色版；弹窗页带关键文案断言）
 ```
 
-全部离线，用假 ctx / 假 subprocess / 假 React。`test-guard-scope.mjs` 与 `test-autostart.mjs` 需要 `@deepseek-ai/schemastery`：用 `QQG_SCHEMASTERY` 指向它的 `lib/index.mjs`，不设就自动探测 `node_modules`。
+全部离线，用假 ctx / 假 subprocess / 假 React。`test-guard-scope.mjs` 与 `test-autostart.mjs` 需要
+`@deepseek-ai/schemastery`：用 `QQG_SCHEMASTERY` 指向它的 `lib/index.mjs`（**要给绝对路径**），
+不设就自动探测 `node_modules`。
 
-`qq-bridge/test-offline.mjs` 会串跑这四组。
+`test-preset-scope.mjs` 需要真正的 DSH 包（`@deepseek-ai/cordis` / `dsh-tools` / `dsh-system-prompt`
+/ `dsh-agent-preset-registry`）：用 `QQG_DSH_MODULES` 指向一个含这些包的 `node_modules`
+（例如从 `app.asar` 抽出来的那份），**没设或找不到就打 SKIP 并 exit 0**，不会把离线套件弄红。
+它是唯一一条「真宿主 + 真实 mountPreset」的用例 —— 2026-10-24 那个 P0 只有它能拦住，
+把判定退回旧写法会红 13 条。
 
-## 待修复（2026-10-24 真机测试记录）
+`qq-bridge/test-offline.mjs` 会串跑这四组；桥接侧另有 `test-activity.mjs` / `test-persona.mjs` / `test-timeout.mjs`。
 
-> 今天只记录，不修。下列都是真机现场证据，明天开新会话从这里继续。
+2026-10-24 基线：guard 23 个文件全绿（`test-guard-scope` 32 例、`test-preset-scope` 31 例【联机】），
+桥接 `test-offline.mjs` 167 例 0 失败。
 
-### 1. 人设没进系统提示：单人设保存「失效」+ 被全局 Harness / 记忆提示覆盖（P0）
+## 2026-10-24 修复记录（真机 Bug 清单 → 已修）
 
-- **现象**：设置页保存单人设后，QQ 会话回复仍是助手腔；模型侧提示里出现
-  `You are an AI agent powered by DeepSeek Harness`、`Agent Teams is available in this session`、
-  `MNEMON RUNTIME MEMORY PROTOCOL`。
-- **实测**（2026-10-24 00:15，某个 QQ 群会话）：该会话最近一条 `system/message`
-  长度 10595，内容是**全局 Harness 系统提示**，不是 guard `deployment:persona-prefix`
-  的 complete section。
-- **结论**：guard 的动态人设 section 这次没有生效。`applyPersonaSection` 注册失败时
-  只 `console.warn`，日志里没浮出来；restrict 正常（全局危险工具被隐藏）说明
-  `applyGuard` 确实继续执行了，问题在 section 注册本身。
-- **排查方向**：`ctx.get('systemPrompt')` 是否可用 / `ctx.inject(['systemPrompt'])` 是否触发 /
-  `getSectionOrder('DEPLOYMENT_PERSONA_PREFIX')` 是否在新版本抛错 /
-  `section({ complete: true })` 语义是否变了。先看 DSH 控制台有没有
-  `[qq-guard] role=guard 找不到 systemPrompt 服务` 这类 warn。
-- 单人设保存链路（UI → session-ops → bridge state → plugin personaState）有离线单测，
-  但**没有 section 承载，保存了也看不见效果**；两者要一起验证，别只盯着保存按钮。
+> 原文是当天的「只记录不修」现场记录，下面保留症状 + **事后确认的根因**，方便下次复发时对照。
 
-### 2. 人设每 2 秒被重复推送（日志刷屏 + 可能盖掉单人设）
+### 0. 真正的根因：guard 在 preset 里根本没跑起来（P0，一次解释完 1/3/4）
 
-- **现象**：桥接日志每 2 秒一条「全局人设已推送（设置页人设变化，6701 字）」。
-- **根因**：`qq-bridge/src/runtime-config.mjs` 里 `const r = onPersona?.(...)`，而
-  `start.mjs` 的 `onPersona` 是 `() => { void pushGlobalPersona(...) }`，返回 undefined
-  → `lastPersonaSignature` 永远不更新 → 每轮轮询都当成「变了」再推一次。
-- **修法**：让 `onPersona` 返回 `{ ok: boolean }`，或把签名更新移到推送成功之后。
-- **影响**：日志被刷没（TTS 报错被挤出 40 行 `logTail`，排障困难）；持续把全局人设
-  推给插件，也可能让单人设的状态更乱。
+- **现象**：三条独立症状同时出现 —— ① 人设 section 没生效（system/message 是全局 Harness
+  提示词，10595 字）；② 工具清单里没有 `qq_send_voice`；③ 连 `ops_glob` /
+  `load_workspace_dependencies` 这种**本该被 restrict 藏掉的全局层工具**也还在。
+- **根因**：`applyGuard()` 第一行的「我是不是装在 preset 里」判定写成了
+  `agentPresets.composedPreset(ctx) === undefined → 直接 return`。而
+  `composedPreset()` → `generationFor(ctx)` 取的是 **`scopeOf(ctx)` 的父 scope** 去查
+  generation 表；preset **子行自身**的 ctx 作用域**就是**那个 generation（没有父），
+  于是恒返回 `undefined`。它只对「已经 `bindScopeParent` 到 generation 的 `agent.ctx`」成立。
+- **后果**：`applyGuard` 在第一步就 return，人设 section / `qq_send_voice` / restrict /
+  执行期白名单**四件事全都没做** —— 也就是说当时 QQ 会话**既没有系统人设、也没有执行期门禁**。
+- **修法**：新增 `detectPresetScope(ctx)`，两层判定取或：
+  ① `composedPreset(ctx)` 返回非空字符串（agent ctx，保留兼容）；
+  ② `tools.restrict({deny:['__dsh_qq_guard_scope_probe__']})` 探针 —— 无 scope 会先抛
+  `requires a scoped context`（此时还没做任何变更），抛到「名字未知」就说明 scope 校验已通过。
+  **兜底方向 fail-closed**：只有拿到正向证据才挂 guard；其它任何意外一律当作「不在 preset」，
+  因为「误判成顶层」只是 QQ 会话失去门禁（日志可见），「误判成 preset」则是全局 guard
+  把浏览器会话全锁死 —— 后者正是 2026-10-20 那次事故。
+- **验证**：`test-preset-scope.mjs`（真宿主 + 真实 `mountPreset`）：修复后
+  `assemble()` 只剩 `deployment:persona-prefix` 一段、`tools.schemas(presetScope)` 里出现
+  `qq_send_voice`、deny 名单里的全局工具被隐藏、全局视角一段没少；顶层装载仍然被拒绝。
+  把判定换回旧写法 → 该文件红 7 条。
 
-### 3. 发语音失败（工具不可见 + 发送链路未验证）（P1）
+### 1. 人设没进系统提示（P0）→ 根因见上，已修
 
-- **现象**：真机让它发语音，模型回复「没有语音通道」，发送报错。
-- **实测**：QQ 会话最近两次 `request/header`（23:55 / 23:58）的工具列表都是 35 个，
-  **没有 `qq_send_voice`**，也没有 `web_search`。工具根本没进模型可见清单，
-  模型当然说没有通道。
-- **头号嫌疑**：`index.js` 的 `applyVoiceTool` 绕过 `@deepseek-ai/dsh-tools` 的 `defineTool`，
-  直接把参数 spec 当 `parameters` 传给 `ctx.tools.register`；registry 需要的是 JSON Schema
-  （root `type: "object"` + `properties` + `required[]`）。参考 `dsh-tool-todo/lib/index.js`，
-  所有工具都经 `defineTool`。
-- **次嫌疑**（等工具可见后才遇到）：NapCat 的 `record` 段 `base64://` + mp3 可能不被当前
-  版本接受，需要 silk；要落盘 mp3 用 `file://` 实测，并看 `sendVoice` 返回的 retcode。
-- **修复顺序**：① 让 `qq_send_voice` 出现在 header 工具列表；② 再验证合成与发送，
-  日志里的 `已发送语音 …` / `语音发送失败 … retcode` 是判据。
+- 单人设保存链路（UI → session-ops → bridge state → plugin personaState）本来就是通的，
+  缺的是 section 承载：guard 不跑，`applyPersonaSection` 自然不执行。
+- 现在 section 正常注册（`complete: true`，`text` 是函数每次组装现读），
+  兜底链 单人设 > 全局人设 > `personaDefault`；`suppressRuntimeContext()` 也会关掉
+  运行时上下文注入，避免 Harness 自述 / Agent Teams / MNEMON 段落穿透进 QQ 会话。
 
-### 4. 网页搜索同样没接上（P2）
+### 2. 人设每 2 秒被重复推送 → 已修（根因比记录多一层）
 
-- `web_search` 不在 QQ 会话工具列表里，技能开着也调不到。
-- 需要确认 `@deepseek-ai/dsh-tool-web` 是否 agent-scope 注册、qq-chat preset 要不要显式加一行；
-  只改 guard 的放行名单不够。
+- 记录里只写了 `onPersona` 返回 `undefined`；实际还有一层：`runtime-config.mjs` 里
+  `const r = onPersona?.(...)` **没有 `await`**，异步回调拿到的是 Promise，`r?.ok` 同样恒假。
+- 修法：`start.mjs` 的 `pushGlobalPersona` 改 async、返回 `{ok, action, detail}`，
+  并在内部按正文签名去重（内容没变返回 `unchanged`，不重复写插件）；
+  `onPersona` 返回 Promise，`runtime-config.mjs` 补 `await`；
+  `r === undefined` 按契约违例 warn **一次**并推进签名（不再每 2 秒静默重推）。
+- 「全局人设已推送」日志现在只在启动（config 兜底 + 首次同步校准）和真正变化时出现。
+
+### 3. 发语音失败（P1）→ 已修（工具可见性）
+
+- 头号嫌疑成立：`parameters` 之前是手写的「属性名 → spec」裸对象，没有根 `type: "object"`，
+  交给 registry 后模型侧 schema 非法（注册成功但进不了 `request/header` 的工具清单）。
+- 现在改用官方 `defineTool()` 编译（`@deepseek-ai/dsh-tools`），
+  `parameters` / `output.schema` 都是合法 JSON Schema；`output.schema` 补上了 `id` 字段，
+  避免「返回值和声明的 schema 不一致」。
+- ⚠️ 插件装载在 profile 的 `node_modules` 里，**生产环境能否解析到 `@deepseek-ai/dsh-tools`
+  取决于宿主的模块解析**；拿不到时用 `index.js` 里的 `localDefineTool` 兜底（编译规则逐条对齐
+  `dsh-tools/lib/types/schema.js`，产出同构），启动日志会打印用了哪条路径
+  （`qq_send_voice 已注册（official-defineTool|local-fallback）`）。
+- **次嫌疑仍未验证**：NapCat `record` 段对 `base64://` + mp3 的兼容性、是否必须 silk、
+  落盘 mp3 用 `file://` 是否更稳。判据是桥接日志里的 `已发送语音 …` / `语音发送失败 … retcode`，
+  这条要在真机上再看一次。
+
+### 4. 网页搜索没接上（P2）→ 已修（是没挂载，不是白名单）
+
+- 根因：`@deepseek-ai/dsh-tool-web` 是 agent 侧插件，`qq-chat` preset 里**没有这一行**，
+  所以 QQ 会话的工具面里根本没有 `web_search`。guard 的白名单（`features.search`）只是第二道。
+- 修法：`cordis.patch.yml` 的 `qq-chat` preset 加 `- id: tool-web / name: '@deepseek-ai/dsh-tool-web'`；
+  `ctx.web` 与搜索/抓取后端都在 profile 顶层装着，preset 子行继承即可，不用再装后端。
+- 技能页「网页搜索」关掉后，guard 会在**执行期**拒绝 `web_search` / `web_fetch`（schema 常驻）。
+- ⚠️ **离线只能验到「同名全局工具不会被误伤 / 不会溢出全局」**（真宿主 harness 里没有
+  `dsh-web` / `dsh-tool-web`）。`web_search` 真的出现在 QQ 会话 schema 里，需要在真 profile
+  重启 DSH 后开一条 QQ 会话看 `request/header` —— 这是下一次真机验收的第一条。
+
+### 5. 顺手修掉的两个静默 bug
+
+- **`sanitizeSessionRow()` 白名单漏字段**：Host 收敛桥接上报时只留了 10 个字段，
+  `activityLevel` 与 `persona` 被裁掉 → 单群档位保存了也看不出效果、单人设回填永远空。
+  现在两个都补上（`null` 原样保留，不走 `num()`），并有 3 条测试盯着。
+- **`render-preview.mjs` 的 hook 序号漂移**：三张弹窗预览一直渲染成「添加技能」。
+  已对齐 `useState` 顺序，并给 `emit()` 加了关键文案断言，下次再漂会直接报错而不是默默出空弹窗。
 
 ## 许可
 

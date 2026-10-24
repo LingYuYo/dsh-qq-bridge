@@ -204,8 +204,19 @@ function pageOf(tab, title) {
 html,body{height:100%} #app{height:100%;display:flex}</style></head>
 <body><div id="app">${body}</div></body></html>`
 }
-function emit(name, tab, title) {
+/**
+ * 写出一张预览页（含深色版）。
+ *
+ * `expect` 是这张页必须出现的关键文案 —— 弹窗预览靠预置 hook 序号打开，
+ * 而 index 会随组件里 useState 的增减漂移（2026-10-24 就漂过一次：三张弹窗
+ * 预览全变成了「添加技能」）。这里炸掉比默默写出一张空弹窗好。
+ */
+function emit(name, tab, title, expect) {
   const page = pageOf(tab, title)
+  const missing = (expect ?? []).filter((k) => !page.includes(k))
+  if (missing.length) {
+    throw new Error(`预览「${name}」缺少内容：${missing.join('、')}（弹窗的 hook 序号可能又漂了）`)
+  }
   writeFileSync(`${OUT}/${name}.html`, page)
   writeFileSync(`${OUT}/${name}-dark.html`, page.replace('<body>', '<body data-ds-dark-theme>'))
   console.log('wrote', `${name}.html`, `${(page.length / 1024).toFixed(0)}KB`)
@@ -222,33 +233,51 @@ for (const tab of TABS) {
 // qqg-content 下的第一个子节点位置固定为 `r.div3.div0`。
 const TAB_POS = 'r.div3.div0'
 
+// 齿轮弹窗按条目 id 映射真实 Config 字段（client.js 的 TILE_FIELDS），
+// 所以 fixture 的 id 必须是真实目录里的 id，否则只会渲染「开发中」兜底。
 const TEST_SKILL = {
-  id: 'sk-test', icon: 'send', name: '发语音', ver: '1.0.2', tag: '内置', enabled: true,
+  id: 'sk-voice', icon: 'send', name: '发语音', ver: '1.0.2', tag: '内置', enabled: true,
   desc: '把回复文本合成语音，以 QQ 语音条发出；超过 60 秒自动转文字。',
   author: 'qq-guard', updated: '2026-10-12',
-  settings: [
-    { key: 'a', label: '语音引擎', type: 'select', value: 'sherpa-onnx', options: ['sherpa-onnx', '系统 TTS'] },
-    { key: 'b', label: '单条最长（秒）', type: 'number', value: 60, min: 5, max: 300 },
-    { key: 'c', label: '语速倍率', type: 'number', value: 1.0, min: 0.5, max: 2.0, step: 0.1 },
-  ],
   notes: ['语音条在部分 QQ 版本会被压缩，超长句子建议先切片。'],
 }
 const TEST_PLUGIN = {
-  id: 'pl-test', icon: 'activity', name: '防抖合并', ver: '1.4.0', tag: '本地', enabled: true,
+  id: 'pl-debounce', icon: 'activity', name: '防抖合并', ver: '1.4.0', tag: '本地', enabled: true,
   desc: '群聊里连续多条短消息先攒一窗口再一次性回复。',
-  author: 'qq-guard', updated: '2026-10-19', settings: [], notes: [],
+  author: 'qq-guard', updated: '2026-10-19', notes: [],
+}
+// 未实装条目：预览一下「开发中」兜底长什么样（应该没有任何表单控件）。
+const TEST_DEV_SKILL = {
+  id: 'sk-memory', icon: 'memory', name: '记忆提取', ver: '1.2.0', tag: '内置', enabled: true,
+  desc: '从会话里抽取长期事实（偏好、身份、约定），写进记忆空间供后续召回。',
+  author: 'qq-guard', updated: '2026-10-10', notes: [],
 }
 
+// SkillsTab 的 useState 顺序：#0 settingsTarget / #1 deleteTarget / #2 addKind
+// （后面还有 drag / dirDraft / scan…，新增 state 请加在它们之后，别插到前面）。
 const MODALS = [
-  { name: 'modal-tile-settings', tab: 'skills', idx: 2, value: { kind: 'skill', item: TEST_SKILL }, title: '技能设置' },
-  { name: 'modal-tile-delete', tab: 'skills', idx: 3, value: { kind: 'plugin', item: TEST_PLUGIN }, title: '删除确认' },
-  { name: 'modal-tile-add', tab: 'skills', idx: 4, value: 'skill', title: '添加技能' },
+  {
+    name: 'modal-tile-settings', tab: 'skills', idx: 0, value: { kind: 'skill', item: TEST_SKILL },
+    title: '技能设置', expect: ['语音后端', '音色', '恢复默认', '保存'],
+  },
+  {
+    name: 'modal-tile-dev', tab: 'skills', idx: 0, value: { kind: 'skill', item: TEST_DEV_SKILL },
+    title: '技能设置（开发中）', expect: ['开发中', '关闭'],
+  },
+  {
+    name: 'modal-tile-delete', tab: 'skills', idx: 1, value: { kind: 'plugin', item: TEST_PLUGIN },
+    title: '删除确认', expect: ['删除「防抖合并」'],
+  },
+  {
+    name: 'modal-tile-add', tab: 'skills', idx: 2, value: 'skill',
+    title: '添加技能', expect: ['添加技能', '本地文件'],
+  },
   // 会话删除确认框已随「删除会话」功能排到下一批，本批只接真实列表与未读。
   // 引导弹窗已挪到左侧导航底部，开关是 SettingsPanel 的 #2（guideOpen），不在 SettingsTab 里。
-  { name: 'modal-guide', tab: 'settings', panelHook: 2, value: true, title: '使用引导' },
+  { name: 'modal-guide', tab: 'settings', panelHook: 2, value: true, title: '使用引导', expect: ['使用引导'] },
   // SettingsTab：分片/打字延时已合并成两个大按钮，弹窗开关是 #0 sendOpen / #1 activeOpen。
-  { name: 'modal-send', tab: 'settings', idx: 0, value: true, title: '信息发送配置' },
-  { name: 'modal-active', tab: 'settings', idx: 1, value: true, title: '活跃设置' },
+  { name: 'modal-send', tab: 'settings', idx: 0, value: true, title: '信息发送配置', expect: ['信息发送配置'] },
+  { name: 'modal-active', tab: 'settings', idx: 1, value: true, title: '活跃设置', expect: ['活跃设置', '响应档位'] },
 ]
 const TAB_COMP = { skills: 'SkillsTab', sessions: 'SessionsTab', settings: 'SettingsTab' }
 for (const m of MODALS) {
@@ -256,6 +285,6 @@ for (const m of MODALS) {
   if (m.panelHook !== undefined) store.set(`r:SettingsPanel#${m.panelHook}`, m.value)
   else store.set(`${TAB_POS}:${TAB_COMP[m.tab]}#${m.idx}`, m.value)
   hookStore = store
-  emit(m.name, m.tab, m.title)
+  emit(m.name, m.tab, m.title, m.expect)
 }
 

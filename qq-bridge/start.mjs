@@ -100,11 +100,27 @@ logger.info('桥接已启动，等待 QQ 消息。按 Ctrl+C 退出。')
 //   ① 启动时 `bridge.live` 还没有 DSH 设置页下发的 `model`（轮询要 2 秒后才有），
 //      先用 config.json 的 `dsh.provider/model` 兜底 —— 至少有身份行；
 //   ② 首次同步成功后必须**再推一次校准**，否则设置页里配的模型和身份行会不一致。
+//
+// ⚠️ 必须**返回执行结果** `{ ok, action, detail }`（可以是 Promise）：
+//    runtime-config 靠它判断推送是否成功，据此推进 lastPersonaSignature。
+//    旧实现写成 `() => { void pushGlobalPersona(...) }`，返回值恒为 undefined →
+//    runtime-config 里 `r?.ok` 永远假、签名永不更新 → **每 2 秒重复推送一次**
+//    （README【待修复 2】）。
+/** 上次真正推给插件的人设正文；内容没变就不重复写（轮询每 2 秒一次）。 */
+let pushedPersonaSignature
 const pushGlobalPersona = async (label) => {
   const text = bridge.buildPersonaPrompt()
+  if (pushedPersonaSignature === text) {
+    return { ok: true, action: 'unchanged', detail: '人设内容未变，跳过重复推送' }
+  }
   const ok = await bridge.setGlobalPersona(text)
-  if (ok) logger.info(`全局人设已推送（${label}，${text.length} 字）`)
-  return ok
+  if (!ok) {
+    return { ok: false, action: 'failed', detail: 'setSessionPersona 调用失败（详见上方 warn）' }
+  }
+  pushedPersonaSignature = text
+  // 日志减噪：只有真正变化（含启动首次）才打，不再每 2 秒刷一条。
+  logger.info(`全局人设已推送（${label}，${text.length} 字）`)
+  return { ok: true, action: 'pushed', detail: `${text.length} 字` }
 }
 await pushGlobalPersona('含底层模型路由')
 
@@ -123,7 +139,9 @@ const stopPolling = startConfigPolling({
     }
   },
   // 人设变化 → 重拼最终系统提示词（名字/参与度/附加规则/覆盖/模型身份），推给插件。
-  onPersona: () => { void pushGlobalPersona('设置页人设变化') },
+  // 返回 pushGlobalPersona 的结果对象（异步）—— 不能写成 `() => { void ... }`，
+  // 否则 runtime-config 拿不到 ok，签名不更新就会每 2 秒重推。见上方 pushGlobalPersona 的说明。
+  onPersona: () => pushGlobalPersona('设置页人设变化'),
   // 顺带把运行状态回推给 DSH 设置页的「运行状态」分类（批次 4A）。
   // 批次 5：**不再用 `qq.connected`（WS 建连瞬间恒 false，且不等于账号在线）**，
   // 改由 health.online 推导四态（online/offline/unverified/disconnected）。

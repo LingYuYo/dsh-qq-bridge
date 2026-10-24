@@ -246,9 +246,9 @@ for (const tab of ['status', 'sessions', 'skills', 'settings', 'usage']) {
 // 弹窗的开关是 SkillsTab 里的 useState（#2 settingsTarget / #3 deleteTarget / #4 addKind），
 // 直接把初始值灌进 hookStore 就能渲染出弹窗本身。
 const TEST_SKILL = {
-  id: 'sk-test', icon: 'send', name: '发语音', ver: '1.0.2', tag: '内置', enabled: true,
+  // 齿轮弹窗按条目 id 映射真实 Config 字段（TILE_FIELDS），所以这里用真实 id。
+  id: 'sk-voice', icon: 'send', name: '发语音', ver: '1.0.2', tag: '内置', enabled: true,
   desc: '把回复文本合成语音。', author: 'qq-guard', updated: '2026-10-12',
-  settings: [{ key: 'a', label: '语音引擎', type: 'select', value: 'x', options: ['x', 'y'] }],
   notes: ['测试用条目。'],
 }
 const TEST_PLUGIN = {
@@ -271,7 +271,7 @@ function renderSkillsWith(stateIndex, value, tag) {
 
 {
   const joined = renderSkillsWith(0, { kind: 'skill', item: TEST_SKILL }, 'tile-settings')
-  for (const k of ['设置', '说明', '恢复默认', '保存', '语音引擎']) {
+  for (const k of ['设置', '说明', '恢复默认', '保存', '语音后端', '音色']) {
     if (!joined.includes(k)) throw new Error(`技能设置弹窗缺少「${k}」`)
   }
   console.log('✓ 弹窗「技能设置」渲染通过')

@@ -300,6 +300,7 @@ UI → POST /dsh-qq-guard/session-ops {op,key,text?}   （Host 队列，30s 租�
   → 重新对齐标题 → 未读清零；归档失败也继续建。
 - `delete`：归档旧会话（同样 stopActivity）+ 删除本地映射；归档失败仍删映射。
 - `persona`：写 `sessions.json` 的 `persona` 并立即推送。
+- `activity`：写 `sessions.json` 的 `activityLevel`（`0..3` 或 `null`=跟随全局），见「单群独立响应档位」。
 - 轮询器在 `src/session-ops.mjs`，失败只记一次 warn，不影响聊天。
 
 ### 批量修正历史标题
@@ -396,6 +397,7 @@ node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔�
   - `2`：在 1 档基础上，未命中关键词时按 `rhythm.randomChance`（默认 0.15）随机回；
   - `3`：群里所有消息都回。
   @ 的判定看 OneBot 消息段里的 `at.qq` 是否等于桥接登录号；拿不到登录号时「有 at 段就算被叫」。
+  **单个群可以覆盖这个档位**（2026-10-24）：见下节。
 - **debounceWindowMs**：同一会话（`u:<QQ号>` / `g:<群号>`）窗口内的连续消息用换行拼接成
   一次 prompt，窗口内没有新消息才投递。串行队列（`queues.run`）语义不变，仍然绝不并发。
   入站合并只影响**发给模型**的文本，与「模型原生换行不合并」的发送红线无关。
@@ -403,6 +405,23 @@ node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔�
   的回复。超限时 `silent=true` 静默丢弃，`false` 则回一句「慢一点」提示（提示不计入回复数）。
 - **mute**：文本命中 `words` 任一词就把该会话静音 `seconds` 秒（内存态，重启清空）。
   禁言指令本身不回复，静音期内所有消息都不回。
+
+### 单群独立响应档位（2026-10-24）
+
+全局 `rhythm.activityLevel` 是**默认值**，每个群可以单独覆盖：
+
+- 字段：`state/sessions.json` 里每条会话多一个 `activityLevel`
+  —— `null`（或省略）= 跟随全局，`0..3` = 该群独立档位。`normalizeSessionEntry` 负责归一化，
+  脏值（非数字 / 越界）一律退回 `null`，宁可跟随全局也不要被脏数据静音。
+- 生效：`Bridge._activityLevelFor(key)` 单群 > 全局；`shouldRespond(msg, text, key?)`
+  的 `key` 可选（老调用自动 `keyOf(msg)`），跳过日志里会打印**实际生效**的档位。
+- 写入：设置页发 `{op:'activity', key, level}`（Host 队列 → 桥接 2 秒轮询），
+  `applySessionOp` 落盘并返回 `{ok:true, action:'activity', key, activityLevel}`；
+  非法 level 返回 `{ok:false, error:'bad-level'}`，不静默改成「跟随全局」。
+- **先配置、后聊天**也成立：key 还没建会话时 `_entryOf` 建占位记录；
+  `_loadState` 的空壳清理规则对「只配了档位」的 key 放行，否则重启一次设置就丢了。
+- 上报：`sessionViews()` 的行里带 `activityLevel`，Host 的 `sanitizeSessionRow()` 白名单也要放行它
+  （它曾经把这个字段裁掉，导致 UI 永远显示「跟随全局」）。
 
 ### 会话失效自动归档
 
@@ -431,10 +450,15 @@ node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔�
     "title": "私聊-翎羽",
     "lastAt": 1792471261621,
     "lastText": "小鱼下午好",
-    "nameAt": 1792471261621
+    "nameAt": 1792471261621,
+    "activityLevel": null,
+    "persona": ""
   }
 }
 ```
+
+`activityLevel`：单群响应档位，`null` = 跟随全局 `rhythm.activityLevel`（见「单群独立响应档位」）。
+`persona`：单人设覆盖，空串 = 沿用全局人设。
 
 **强制命名**（`Bridge._ensureSessionTitle`）：
 

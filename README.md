@@ -12,7 +12,31 @@ QQ ──► NapCat (OneBot v11 正向 WS) ──► qq-bridge ──► DSH Web
 
 ## 版本演进
 
-当前版本：**v0.3.0-alpha**
+当前版本：**v0.3.1-alpha**
+
+本版（2026-10-24，真机 Bug 修复 + 配置体验）：
+
+- **P0：guard 在 preset 内整体失活** —— 「我是不是装在 preset 里」的判定用错了 API
+  （`composedPreset()` 对 preset 子行的 ctx 恒返回 `undefined`，只对 `agent.ctx` 有效），
+  于是 `applyGuard()` 第一步就 return，**人设 section / `qq_send_voice` / restrict /
+  执行期白名单四件事全部静默跳过**。真机后果：QQ 会话的 system 提示是全局 Harness 自述
+  （助手腔），且**当时没有任何执行期门禁**。现在改成 `composedPreset` + `restrict` 作用域探针
+  两层判定、兜底 fail-closed；新增唯一一条「真宿主」回归测试 `test-preset-scope.mjs`。
+- **发语音 `qq_send_voice` 进 schema**：改用官方 `defineTool()` 编译参数（合法 JSON Schema），
+  之前手写的裸参数 spec 让工具注册了却进不了模型侧工具列表。
+- **`web_search` 接入**：`qq-chat` preset 漏了 `@deepseek-ai/dsh-tool-web` 这一行，
+  不是白名单问题；已补挂载，技能开关仍由 guard 执行期控制。
+- **人设重复推送**：`onPersona` 返回值契约 + 缺 `await` 两层问题一起修，
+  「全局人设已推送」不再每 2 秒刷屏（正文签名去重，只在真变化时推）。
+- **单群独立响应档位**：每个群可在「会话管理」右侧单独配 0–3 档，落盘 `sessions.json`
+  的 `activityLevel`（`null` = 跟随全局），私聊不受影响。
+- **技能与插件齿轮弹窗接真实 Config**：发语音（后端 / 音色 / API Key / baseUrl）、
+  防抖（窗口）、频控（每分钟上限 / 突发 / 静默）都能在卡片里直接改；
+  未实装条目明确标「开发中」+ 原因，不再假装有表单。
+- **顺手修的静默 bug**：Host 的 `sanitizeSessionRow()` 白名单漏了 `activityLevel` / `persona`
+  （上报了也被裁掉，UI 永远读不到）；`render-preview.mjs` 的 hook 序号漂移导致三张弹窗预览是空壳。
+
+上一版（v0.3.0-alpha）：
 
 本次新增（WIP）：
 
@@ -43,12 +67,17 @@ QQ ──► NapCat (OneBot v11 正向 WS) ──► qq-bridge ──► DSH Web
 
 ## 已知问题 (Known Issues)
 
-> 2026-10-24 真机测试记录，明天开新会话继续修。详细排查方向见
-> [`plugins/dsh-qq-guard/README.md`](plugins/dsh-qq-guard/README.md) 的「待修复」一节。
+> 2026-10-24 的四个真机 Bug **已全部修复**，根因与验证见
+> [`plugins/dsh-qq-guard/README.md`](plugins/dsh-qq-guard/README.md) 的「2026-10-24 修复记录」一节。
+> 下面保留现状待办，都是「离线验不到、必须真机跑一次」的项目。
 
-- **单人设注入被底层系统提示词覆盖，且每 2 秒重复推送**：QQ 会话的 `system/message` 实测整段是全局 Harness 提示（含 Agent Teams / MNEMON），guard 的 persona section 没生效；桥接日志同时每 2 秒刷一条「全局人设已推送」。
-- **发语音 `qq_send_voice` 工具未注册进 schema**：工具注册时未使用 `@deepseek-ai/dsh-tools` 的 `defineTool`，参数 schema 形态不对，模型侧工具列表里看不到它。
-- **`web_search` 工具放行名单未生效**：QQ 会话工具列表里没有 `web_search`，技能开着也调不到；只改 guard 放行名单不够，需确认工具本身是否注册进了该 preset 作用域。
+- **TTS 发送链路未在真机复验**：工具已经能进 schema，但 NapCat `record` 段对
+  `base64://` + mp3 的兼容性（是否必须 silk、落盘 mp3 用 `file://` 是否更稳）还没实测。
+  判据是桥接日志里的 `已发送语音 …` / `语音发送失败 … retcode`。
+- **`web_search` 需要在真 profile 确认**：preset 行已补，离线只能验到「不会误伤同名全局工具」；
+  重启 DSH 后开一条 QQ 会话看 `request/header` 是否出现 `web_search`。
+- **活着跑着的桥接进程要重启一次**：`onPersona` / 单群档位都是桥接侧改动，进程不重启还是旧逻辑
+  （设置页改完能落盘，但旧进程不认新字段）。
 
 ## 仓库结构
 

@@ -1819,5 +1819,16 @@ await check('热配置白名单包含 Phase 6 字段（skills/features/voice/字
   assert.equal('wsUrl' in hot, false)
 })
 
+console.log('\n— 单群活跃系数 + 人设重推修复（qq-bridge 独立测试文件）—')
+await check('qq-bridge 单群活跃系数回归全绿', async () => {
+  const { execFileSync } = await import('node:child_process')
+  const path = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+  const here = path.dirname(fileURLToPath(import.meta.url))
+  const script = path.resolve(here, 'test-activity.mjs')
+  const out = execFileSync(process.execPath, [script], { encoding: 'utf8', env: pluginTestEnv })
+  assert.match(out, /结果：\d+ 通过 \/ 0 失败/, `单群活跃系数回归未全绿：\n${out}`)
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 process.exit(fail === 0 ? 0 : 1)

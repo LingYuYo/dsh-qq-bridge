@@ -157,6 +157,9 @@ export function applyHotConfig(target, hot) {
  * @param {string} [opts.cookie] DSH 会话 Cookie（路由不强制鉴权，但带上更稳）
  * @param {object} opts.liveConfig 会被原地更新的配置对象
  * @param {Function} [opts.onSync] 每次成功同步后调用（用于把值刷进客户端实例）
+ * @param {Function} [opts.onPersona] 人设字段变化时调用，**必须返回（或 resolve 出）**
+ *   `{ ok, action, detail }`：本模块靠 ok 推进签名，返回 undefined 会按契约违例处理。
+ * @param {Function} [opts.getStatus] 返回要回推给 Host 的运行状态快照（缺省则跳过上报）
  * @param {number} [opts.pollMs=2000]
  * @param {number} [opts.timeoutMs=1500]
  * @param {{info?:Function,warn?:Function,error?:Function}} [opts.logger]
@@ -177,6 +180,8 @@ export function startConfigPolling({
   let syncedOnce = false
   // 上次写入 preset 的人设签名：避免每 2 秒重复写盘。
   let lastPersonaSignature = undefined
+  // onPersona 契约违例只告警一次，避免每 2 秒刷屏（见下方 r === undefined 分支）。
+  let personaContractWarned = false
   // 状态上报失败只告警一次，避免每 2 秒刷屏。
   let statusReportWarned = false
   let statusReportedOnce = false
@@ -205,21 +210,37 @@ export function startConfigPolling({
       try { onSync?.(changed) } catch (error) {
         log.warn?.(`应用热配置失败：${error?.message ?? error}`)
       }
-      // 人设变了 → 写回 profile 的 preset 覆盖（只对新建会话生效）。
-      // 首次同步只**记录**当前值，不写盘（避免每次启动都改 profile）。
+      // 人设变了 → 重拼最终系统提示词（名字/参与度/附加规则/覆盖/模型身份），推给插件。
+      // 首次同步只**记录**当前值，不推送（避免每次启动都白推一次）。
       try {
         const signature = personaSignature(hot)
         if (lastPersonaSignature === undefined) {
           lastPersonaSignature = signature
         } else if (signature !== lastPersonaSignature) {
-          const r = onPersona?.(hot, { previous: lastPersonaSignature })
-          if (r?.ok) {
+          // ⚠️ 必须 await：onPersona 允许是异步的（start.mjs 的推送就是 async）。
+          // 不 await 时拿到的是 Promise，`r?.ok` 恒假 → 签名永不更新 → 每 2 秒重复推送。
+          const r = await onPersona?.(hot, { previous: lastPersonaSignature })
+          if (r === undefined) {
+            // 契约违例：onPersona 必须返回（或 resolve 出）{ ok, action, detail }。
+            // 旧 start.mjs 写的是 `() => { void pushGlobalPersona(...) }`，返回 undefined，
+            // 于是每 2 秒重复推一次人设（README【待修复 2】）。
+            // 这里 warn 一次并推进签名：不再静默无限重试，等下次人设真的变化再推。
+            if (!personaContractWarned) {
+              personaContractWarned = true
+              log.warn?.('人设推送回调未返回结果（契约要求 { ok, action, detail }）：'
+                + '本次按已生效处理，下次人设变化才重推')
+            }
             lastPersonaSignature = signature
-            log.info(r.action === 'removed-override'
-              ? '人设已恢复默认（删除 preset 覆盖）'
-              : '人设已写入 preset 覆盖（对新建 QQ 会话生效）')
-          } else if (r) {
-            log.warn?.(`写人设失败（${r.action}）：${r.detail ?? ''}`)
+          } else if (r?.ok) {
+            lastPersonaSignature = signature
+            // unchanged = 内容其实没变（例如改的字段被「系统提示词覆盖」吃掉）：不推送、不打日志。
+            if (r.action !== 'unchanged') {
+              log.info(r.action === 'removed-override'
+                ? '人设已恢复默认（删除 preset 覆盖）'
+                : `人设已推送到 guard 动态 section（${r.detail || '下一条消息生效'}）`)
+            }
+          } else {
+            log.warn?.(`写人设失败（${r?.action}）：${r?.detail ?? ''}`)
           }
         }
       } catch (error) {

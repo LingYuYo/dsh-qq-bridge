@@ -263,6 +263,22 @@ export function parseSessionKey(key) {
 }
 
 /**
+ * 单群活跃系数归一化。
+ *
+ * 语义（与设置页约定）：`null` = 跟随全局 `rhythm.activityLevel`；`0..3` = 该群独立档位。
+ * 省略 / 空串 / 非数字一律归一成 `null`（宁可跟随全局，也不要被脏数据静音）。
+ *
+ * @param {unknown} value
+ * @returns {number|null}
+ */
+function normalizeActivityLevel(value) {
+  if (value === null || value === undefined || value === '') return null
+  const n = Number(value)
+  if (!Number.isFinite(n)) return null
+  return Math.min(3, Math.max(0, Math.floor(n)))
+}
+
+/**
  * 把 state.sessions 里的一条记录统一成对象形态。
  *
  * 兼容旧版：v0.2 及之前的值是**裸 sessionId 字符串**（例如
@@ -272,7 +288,7 @@ export function parseSessionKey(key) {
  * @param {string} key
  * @param {unknown} raw
  * @returns {{sessionId:string, unread:number, kind:string, qq:string, name:string,
- *   title:string, lastAt:number, lastText:string, nameAt:number}}
+ *   title:string, lastAt:number, lastText:string, nameAt:number, activityLevel:number|null}}
  */
 export function normalizeSessionEntry(key, raw) {
   const parsed = parseSessionKey(key)
@@ -295,6 +311,8 @@ export function normalizeSessionEntry(key, raw) {
     nameAt: Number.isFinite(nameAt) && nameAt > 0 ? nameAt : 0,
     // 单人设：空串 = 沿用全局人设（由插件 slot 兜底）。
     persona: typeof value.persona === 'string' ? value.persona : '',
+    // 单群活跃系数（0..3）：null = 跟随全局 rhythm.activityLevel，数字 = 该群独立档位。
+    activityLevel: normalizeActivityLevel(value.activityLevel),
   }
 }
 
@@ -586,6 +604,24 @@ export class Bridge {
   }
 
   /**
+   * 该会话**实际生效**的活跃档位：单群独立档位 > 全局 rhythm.activityLevel。
+   *
+   * 单群档位存在 `state.sessions[key].activityLevel`（null = 跟随全局）。
+   * 每次现读，设置页改完下一条消息就生效，不需要重启、不需要重建会话。
+   *
+   * @param {string} [key] 会话 key（u:<QQ号> / g:<群号>）；缺省或无记录时回退全局
+   * @returns {number} 0..3
+   */
+  _activityLevelFor(key) {
+    const fallback = this._rhythm().activityLevel
+    if (!key) return fallback
+    const entry = this.state?.sessions?.[key]
+    if (!entry || typeof entry !== 'object') return fallback
+    const level = normalizeActivityLevel(entry.activityLevel)
+    return level === null ? fallback : level
+  }
+
+  /**
    * 现读技能/插件开关。
    *
    * 优先级：热配置的 `features`（Host 按设置页算好的派生值）> config.json 里的
@@ -616,7 +652,8 @@ export class Bridge {
       for (const [key, raw] of Object.entries(rawSessions)) {
         const entry = normalizeSessionEntry(key, raw)
         // 空壳（没有映射也没有未读）不保留，避免一次次重建后留下垃圾行。
-        if (!entry.sessionId && entry.unread === 0) continue
+        // 例外：配过单群活跃系数的 key 必须保留，否则桥接重启后设置就丢了。
+        if (!entry.sessionId && entry.unread === 0 && entry.activityLevel === null) continue
         sessions[key] = entry
       }
       return {
@@ -834,7 +871,8 @@ export class Bridge {
    *
    * 只读、纯数据（不含任何凭据）；按最近活动倒序，最多 {@link SESSION_VIEW_CAP} 条。
    * @returns {Array<{key:string, sessionId:string, kind:string, qq:string,
-   *   name:string, title:string, unread:number, lastAt:number, lastText:string}>}
+   *   name:string, title:string, unread:number, lastAt:number, lastText:string,
+   *   persona:string, activityLevel:number|null}>}
    */
   sessionViews() {
     const rows = []
@@ -852,6 +890,8 @@ export class Bridge {
         lastText: entry.lastText,
         // 单人设文本：设置页直接用它在详情里回填输入框。
         persona: entry.persona,
+        // 单群活跃系数：null = 跟随全局；设置页用它回填档位选择器。
+        activityLevel: entry.activityLevel,
       })
     }
     rows.sort((left, right) => (right.lastAt || 0) - (left.lastAt || 0))
@@ -1010,6 +1050,7 @@ export class Bridge {
    * 执行一条来自设置页 UI 的会话指令（由 session-ops 轮询器取出后调用）。
    *
    * - `persona`：保存单人设并立即推给插件（下一条消息前还会再推一次）；
+   * - `activity`：保存单群活跃系数（`level` 为 0..3，`null` = 跟随全局 rhythm）；
    * - `clear`  ：归档旧会话（**带 stopActivity**，刚聊完的会话才不会归档失败），
    *              在同一工作区建新会话、改回规范标题、清空未读；
    * - `delete` ：归档旧会话并从本地映射里删掉；下次有人发消息会重新建。
@@ -1017,8 +1058,9 @@ export class Bridge {
    * 归档失败不阻塞语义：clear 仍建新会话（旧会话留成孤儿，由清理路由兜底）；
    * delete 仍删映射（否则用户点了「删除」页面永远不消失）。
    *
-   * @param {{op:string, key:string, text?:string}} op
-   * @returns {Promise<{ok:boolean, action?:string, error?:string, sessionId?:string, archived?:boolean}>}
+   * @param {{op:string, key:string, text?:string, level?:number|null}} op
+   * @returns {Promise<{ok:boolean, action?:string, error?:string, sessionId?:string,
+   *   archived?:boolean, activityLevel?:number|null}>}
    */
   async applySessionOp(op) {
     const key = String(op?.key ?? '')
@@ -1032,6 +1074,21 @@ export class Bridge {
       this._saveState()
       if (entry.sessionId) await this._applyPersona(key, entry.sessionId, true)
       return { ok: true, action: 'persona', key }
+    }
+
+    // 单群独立活跃系数（0..3 / null=跟随全局）：只改 state，判定链每次现读。
+    // key 还没建会话时 _entryOf 会先建一条占位记录 —— 设置页可以先配置、后聊天。
+    if (action === 'activity') {
+      const raw = op?.level
+      const level = normalizeActivityLevel(raw)
+      // 明确给了值但既不是 null 也不是数字：报错让 UI 看得见，不静默改成「跟随全局」。
+      if (level === null && raw !== null && raw !== undefined && raw !== '') {
+        return { ok: false, error: 'bad-level', action: 'activity', key }
+      }
+      entry.activityLevel = level
+      this._saveState()
+      this.logger.info?.(`会话 ${key} 活跃系数 → ${level === null ? '跟随全局' : `${level} 档`}`)
+      return { ok: true, action: 'activity', key, activityLevel: level }
     }
 
     if (action === 'clear') {
@@ -1172,9 +1229,9 @@ export class Bridge {
     }
     // 3) 响应档位（activityLevel）：判否时**不回复、不建会话**，避免白建一堆会话。
     //    管理员指令是显式操作，不受档位限制（否则群里没 @ 就永远执行不了）。
-    if (!isCommand && !this.shouldRespond(msg, text)) {
+    if (!isCommand && !this.shouldRespond(msg, text, key)) {
       this.stats.skipped++
-      this.logger.info?.(`会话 ${key} 未达响应档位（activityLevel=${this._rhythm().activityLevel}），跳过`)
+      this.logger.info?.(`会话 ${key} 未达响应档位（activityLevel=${this._activityLevelFor(key)}），跳过`)
       return
     }
     // 4) 同会话防抖合并：窗口内没有新消息才真正投递（见 _enqueue）。
@@ -1509,13 +1566,23 @@ export class Bridge {
    *   1 档              → 命中关键词才回（词表见 rhythm.keywords / 默认 DEFAULT_ACTIVITY_KEYWORDS）
    *   2 档              → 关键词之外，再按 randomChance（默认 0.15）随机回
    *   3 档              → 全回
+   *
+   * 档位来源：单群独立档位（state.sessions[key].activityLevel）优先，
+   * 该群没配（null）时回退全局 rhythm.activityLevel —— 见 {@link _activityLevelFor}。
+   *
+   * @param {object} msg
+   * @param {string} text
+   * @param {string} [key] 会话 key；缺省时从 msg 自行推导（兼容旧调用方）
    */
-  shouldRespond(msg, text) {
+  shouldRespond(msg, text, key) {
     const rhythm = this._rhythm()
     if (msg.kind === 'private') return true
     if (msg.kind !== 'group') return false
     if (this.isMentioned(msg)) return true
-    const level = rhythm.activityLevel
+    const sessionKey = key === undefined || key === null || key === ''
+      ? this.keyOf(msg)
+      : String(key)
+    const level = this._activityLevelFor(sessionKey)
     if (level <= 0) return false
     if (matchActivityKeyword(text, rhythm.keywords)) return true
     if (level === 1) return false

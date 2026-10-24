@@ -52,8 +52,17 @@ const check = async (name, fn) => {
   catch (e) { console.log(`  ✗ ${name}\n      ${e.message}`); fail++ }
 }
 
-/** 造一个假的 ctx，记录所有注册行为。 */
-function makeCtx({ presetId, hasWebServer = false, settingsAvailable = false, hasSubprocess = false, systemPrompt = undefined } = {}) {
+/** 造一个假的 ctx，记录所有注册行为。
+ *
+ * `scoped` 模拟「这个 ctx 是否处在 dsh-scope 的作用域里」：
+ *   · preset 子行 / agent.ctx → 有 scope；
+ *   · profile 顶层行 → 没有 scope。
+ * 真实 DSH 的 `tools.restrict()` 第一行就检查 scope：无 scope 抛
+ * "requires a scoped context"，有 scope 才继续校验工具名（假名字 →
+ * "names unknown global tool"）。guard 的「我到底在不在 preset 里」判定就靠
+ * 这个差异（见 index.js detectPresetScope），所以假 ctx 必须照着抛。
+ */
+function makeCtx({ presetId, scoped = presetId !== undefined, hasWebServer = false, settingsAvailable = false, hasSubprocess = false, systemPrompt = undefined } = {}) {
   const calls = { restrict: 0, guard: 0, guardFn: null, registeredTools: [], webRoutes: [], effects: [], inj: [], warn: [] }
   const ctx = {
     get(name) {
@@ -77,7 +86,19 @@ function makeCtx({ presetId, hasWebServer = false, settingsAvailable = false, ha
       } else if (settingsAvailable) fn(makeSettingsCtx(calls))
     },
     tools: {
-      restrict() { calls.restrict++ },
+      restrict(filter) {
+        // 与 @deepseek-ai/dsh-tools 的真实顺序一致：先 scope、后工具名。
+        if (!scoped) {
+          throw new Error('tools.restrict() requires a scoped context (agent.ctx): a context-global restriction would mask every agent')
+        }
+        const names = [...(filter?.allow ?? []), ...(filter?.deny ?? [])]
+        const unknown = names.filter((n) => n.startsWith('__'))
+        if (unknown.length > 0) {
+          throw new Error(`tools.restrict() names unknown global tool${unknown.length > 1 ? 's' : ''} ${unknown.map((n) => `"${n}"`).join(', ')}`)
+        }
+        calls.restrict++
+        return () => {}
+      },
       guard(fn) { calls.guard++; calls.guardFn = fn },
       register(definition) { calls.registeredTools.push(definition); return () => {} },
     },
@@ -185,6 +206,25 @@ await check('preset 内 ctx（composedPreset=qq-chat）+ role=guard → 正常�
   assert.equal(calls.guard, 1, '应注册 1 个 guard')
   assert.equal(calls.webRoutes.length, 0, '不该注册路由')
 })
+// ★ 2026-10-24 P0 回归：真机上 preset 子行的 composedPreset() **恒为 undefined**
+//   （generationFor 找的是 scopeOf(ctx) 的父 scope，而子行 ctx 的作用域就是 generation
+//   本身），旧实现据此判定「不在 preset」直接 return，人设/语音工具/restrict 全没跑。
+//   新判定用 restrict 的 scoped 错误区分，所以这条必须挂载成功。
+await check('preset 子行（composedPreset=undefined 但 ctx 有 scope）→ 仍然挂载（P0 回归）', () => {
+  const { ctx, calls } = makeCtx({ presetId: undefined, scoped: true })
+  apply(ctx, Config({ role: 'guard' }))
+  assert.equal(calls.guard, 1, '★ 有 scope 就是 preset 内，必须挂 guard')
+  assert.ok(calls.restrict > 0, '人设/语音工具不该被这层判定拦下')
+  const tool = calls.registeredTools.find((t) => t.name === 'qq_send_voice')
+  assert.ok(tool, '★ 真机症状之一：qq_send_voice 没注册上来')
+})
+await check('无 scope 且 composedPreset=undefined → 仍拒绝（顶层事故防线不放松）', () => {
+  const { ctx, calls } = makeCtx({ presetId: undefined, scoped: false })
+  apply(ctx, Config({ role: 'guard' }))
+  assert.equal(calls.guard, 0, '顶层依然不许挂')
+  assert.equal(calls.restrict, 0)
+  assert.equal(calls.registeredTools.length, 0, '顶层也不该注册 qq_send_voice')
+})
 
 console.log('\n— 分派：role=settings 只做设置面 —')
 await check('role=settings 有 webServer → 注册全部设置面路由，且不挂 guard', () => {
@@ -271,6 +311,55 @@ await check('跨站请求被拒（sec-fetch-site）', async () => {
   const res = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
   route.handler({ method: 'GET', headers: { 'sec-fetch-site': 'cross-site' } }, res)
   assert.equal(res.status, 403)
+})
+
+console.log('\n— 会话上报字段白名单（漏字段 = 设置页静默失效）—')
+await check('sanitizeSessionRow：activityLevel 保留 0 与 null 的区别', () => {
+  const { sanitizeSessionRow } = mod
+  const zero = sanitizeSessionRow({ key: 'g:1', activityLevel: 0 })
+  assert.equal(zero.activityLevel, 0, '0 档（仅艾特）必须能上报')
+  const three = sanitizeSessionRow({ key: 'g:1', activityLevel: 3 })
+  assert.equal(three.activityLevel, 3)
+  const follow = sanitizeSessionRow({ key: 'g:1', activityLevel: null })
+  assert.equal(follow.activityLevel, null, 'null = 跟随全局，不能退化成 0')
+  assert.equal(sanitizeSessionRow({ key: 'g:1' }).activityLevel, null, '缺省也是 null')
+  assert.equal(sanitizeSessionRow({ key: 'g:1', activityLevel: 9 }).activityLevel, null, '越界按未配置')
+  assert.equal(sanitizeSessionRow({ key: 'g:1', activityLevel: 1.5 }).activityLevel, null, '非整数拒绝')
+})
+await check('sanitizeSessionRow：persona 原样保留换行且截断', () => {
+  const { sanitizeSessionRow } = mod
+  const row = sanitizeSessionRow({ key: 'u:1', persona: '第一行\n第二行' })
+  assert.equal(row.persona, '第一行\n第二行', '单人设回填不能被压成单行')
+  assert.equal(sanitizeSessionRow({ key: 'u:1' }).persona, '')
+  assert.equal(sanitizeSessionRow({ key: 'u:1', persona: 'x'.repeat(30000) }).persona.length, 20000)
+})
+await check('POST /status 会话行带 activityLevel（端到端不丢）', async () => {
+  const { ctx, calls } = makeCtx({ presetId: undefined, hasWebServer: true, settingsAvailable: true })
+  apply(ctx, Config({ role: 'settings' }))
+  const route = calls.webRoutes.find((r) => r.path === '/dsh-qq-guard/status')
+  assert.ok(route, '没有注册 status 路由')
+  const payload = JSON.stringify({
+    qqState: 'online',
+    sessions: [{ key: 'g:123456', kind: 'group', qq: '123456', activityLevel: 2, persona: '单人设' }],
+  })
+  const req = {
+    method: 'POST', headers: {},
+    on(evt, fn) {
+      if (evt === 'data') fn(Buffer.from(payload))
+      if (evt === 'end') fn()
+    },
+  }
+  const res = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+  route.handler(req, res)
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(res.status, 200)
+  const getRes = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+  route.handler({ method: 'GET', headers: {} }, getRes)
+  const parsed = JSON.parse(getRes.body)
+  const row = parsed.status.sessions.find((s) => s.key === 'g:123456')
+  assert.ok(row, 'status 里应有这条会话')
+  assert.equal(row.activityLevel, 2, '★ 档位必须在 Host 侧存活')
+  assert.equal(row.persona, '单人设', '★ 单人设回填也要存活')
 })
 
 console.log('\n— 动态人设 section（替代 preset 里的静态 persona 行）—')
@@ -363,7 +452,17 @@ await check('qq_send_voice 注册在 preset 作用域（guard 实例自己注册
   const tool = calls.registeredTools.find((t) => t.name === 'qq_send_voice')
   assert.ok(tool, '没有注册 qq_send_voice')
   assert.equal(typeof tool.execute, 'function')
-  assert.ok(tool.parameters.text, '参数里应有 text')
+  // ★ 2026-10-24 修复：parameters 必须是**合法 JSON Schema**（根 type:"object" + properties），
+  //   不能再是手写的「属性名 → spec」裸对象 —— 那样模型侧 schema 没有根 type，
+  //   工具虽然注册了却不会出现在 request/header 的工具清单里。
+  assert.equal(tool.parameters?.type, 'object', 'parameters 根必须是 object')
+  assert.ok(tool.parameters.properties?.text, '参数里应有 text')
+  assert.deepEqual(tool.parameters.required, ['text'], 'text 应为必填')
+  assert.equal(tool.parameters.properties.text.type, 'string')
+  // output.schema 同理必须可被 assertSupportedJsonSchema 接受。
+  assert.equal(tool.output?.schema?.type, 'object')
+  assert.equal(tool.output.schema.additionalProperties, false)
+  assert.equal(typeof tool.output.render, 'function')
 })
 await check('qq_send_voice：技能关闭 → 执行抛错且不入队', async () => {
   mod.bindFeatureConfigSource(Config({

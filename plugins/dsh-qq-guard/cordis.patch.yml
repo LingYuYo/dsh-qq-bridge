@@ -23,6 +23,20 @@
             name: '@deepseek-ai/dsh-tool-todo'
             config:
               allowParallelInProgress: true
+          # ── 联网工具：web_search / web_fetch（README 待修复 4）──────
+          #
+          # 为什么缺了它 web_search 就调不到：`dsh-tool-web` 是**agent 侧**插件，
+          # 只把它装在 profile 顶层（cordis.yml 里的 tool-web 行）给的是「标准」那类
+          # preset 的工具面；本 preset 不在它的作用域链上，于是 QQ 会话的
+          # request/header 里根本没有 web_search —— 不是白名单问题，是没挂载。
+          #
+          # 依赖是现成的：`ctx.web`（dsh-web）与搜索/抓取后端都在 profile 顶层装着，
+          # preset 子行只要声明这一行就能拿到服务（服务继承，不需要再装后端）。
+          #
+          # 开关不在这里：技能页「网页搜索」关掉后，guard 会在**执行期**拒绝
+          # web_search / web_fetch（见 index.js 的 flags.search 分支）。
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
           # ── 安全硬边界：隐藏危险工具 + 执行期白名单拒绝 ──────────
           - id: qq-guard
             name: '@local/dsh-qq-guard'

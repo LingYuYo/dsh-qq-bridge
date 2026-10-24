@@ -757,6 +757,12 @@ window.__ModuleLoader__.load({
       'voice.baseUrl': '',
       'voice.apiKey': '',
       'voice.voice': 'zh-CN-XiaoyiNeural',
+      // 运行节奏默认值：「活跃设置」弹窗与技能卡片弹窗共用这组字段，口径必须一致。
+      'rhythm.activityLevel': 1,
+      'rhythm.debounceWindowMs': 800,
+      'rhythm.rateLimit.perMin': 12,
+      'rhythm.rateLimit.burst': 3,
+      'rhythm.rateLimit.silent': true,
     }
 
     /** 按点分路径取值（'typingDelay.enabled' → value.typingDelay.enabled）。 */
@@ -2495,36 +2501,41 @@ window.__ModuleLoader__.load({
     }
 
     /** 单行输入框表单字段。 */
-    function TextField({ label, hint, value, placeholder, onChange }) {
+    function TextField({ label, hint, value, placeholder, onChange, disabled }) {
       return h('label', { className: 'qqg-field' },
         h('span', { className: 'qqg-field-label' }, label),
         h('input', {
           className: 'qqg-input', style: { width: '100%' }, value,
           placeholder, 'aria-label': label,
+          disabled: disabled === true,
           onChange: (e) => onChange(e.target.value),
         }),
         hint ? h('span', { className: 'qqg-field-hint' }, hint) : null)
     }
 
-    /** 下拉选择字段。 */
-    function SelectField({ label, hint, value, options, onChange }) {
+    /** 下拉选择字段。options 支持字符串，也支持 { value, label }（要展示中文名时用后者）。 */
+    function SelectField({ label, hint, value, options, onChange, disabled }) {
+      const opts = (Array.isArray(options) ? options : []).map((o) => (
+        typeof o === 'string' ? { value: o, label: o } : { value: String(o.value), label: String(o.label ?? o.value) }))
       return h('label', { className: 'qqg-field' },
         h('span', { className: 'qqg-field-label' }, label),
         h('select', {
           className: 'qqg-input', style: { width: '100%' }, value,
           'aria-label': label,
+          disabled: disabled === true,
           onChange: (e) => onChange(e.target.value),
-        }, options.map((o) => h('option', { key: o, value: o }, o))),
+        }, opts.map((o) => h('option', { key: o.value, value: o.value }, o.label))),
         hint ? h('span', { className: 'qqg-field-hint' }, hint) : null)
     }
 
     /** 数字字段。 */
-    function NumField({ label, hint, value, min, max, step, onChange }) {
+    function NumField({ label, hint, value, min, max, step, onChange, disabled }) {
       return h('label', { className: 'qqg-field' },
         h('span', { className: 'qqg-field-label' }, label),
         h('input', {
           type: 'number', className: 'qqg-input', style: { width: '100%' },
           value, min, max, step, 'aria-label': label,
+          disabled: disabled === true,
           onChange: (e) => {
             const n = Number(e.target.value)
             onChange(Number.isFinite(n) ? n : value)
@@ -2541,23 +2552,6 @@ window.__ModuleLoader__.load({
           hint ? h('div', { className: 'qqg-label-desc' }, hint) : null),
         h('div', { className: 'qqg-control' },
           h(Switch, { checked: value === true, ariaLabel: label, onChange, disabled })))
-    }
-
-    /** 按 settings 描述数组渲染一组字段（技能 / 插件设置弹窗共用）。 */
-    function SettingsFields({ fields, values, onChange }) {
-      return h(React.Fragment, null, fields.map((f) => {
-        const v = values[f.key] ?? f.value
-        const set = (next) => onChange(f.key, next)
-        if (f.type === 'switch') return h(SwitchField, { key: f.key, label: f.label, hint: f.hint, value: v, onChange: set })
-        if (f.type === 'select') return h(SelectField, { key: f.key, label: f.label, hint: f.hint, value: v, options: f.options, onChange: set })
-        if (f.type === 'number') {
-          return h(NumField, {
-            key: f.key, label: f.label, hint: f.hint, value: v,
-            min: f.min, max: f.max, step: f.step, onChange: set,
-          })
-        }
-        return h(TextField, { key: f.key, label: f.label, hint: f.hint, value: v, onChange: set })
-      }))
     }
 
 
@@ -2663,7 +2657,7 @@ window.__ModuleLoader__.load({
      */
     /**
      * 提交一条会话指令（入 Host 队列，桥接 2 秒内轮询执行）。
-     * @param {{op:'persona'|'clear'|'delete', key:string, text?:string}} body
+     * @param {{op:'persona'|'clear'|'delete'|'activity', key:string, text?:string, level?:number|null}} body
      */
     async function postSessionOp(body) {
       const res = await fetch('/dsh-qq-guard/session-ops', {
@@ -2679,10 +2673,25 @@ window.__ModuleLoader__.load({
       return payload
     }
 
-    function SessionsTab({ live }) {
+    /**
+     * 单群档位的下拉文案。0 档在群聊语境里是「仅艾特与私聊」（私聊本身永远回）。
+     * 与「活跃设置」里的 ACTIVITY_LEVELS 同语义，只是 0 档文案更贴近单群场景。
+     */
+    const SESSION_LEVEL_LABELS = ['仅艾特与私聊', '+关键词', '+随机', '全响应']
+
+    /** 档位数字 → 文案；越界 / 非数字返回 null，由调用方兜底。 */
+    function sessionLevelLabel(level) {
+      const n = Number(level)
+      return Number.isInteger(n) && n >= 0 && n < SESSION_LEVEL_LABELS.length
+        ? SESSION_LEVEL_LABELS[n] : null
+    }
+
+    function SessionsTab({ live, get }) {
       const rows = Array.isArray(live?.sessions) ? live.sessions : null
       const [selectedKey, setSelectedKey] = React.useState('')
       const [personaDraft, setPersonaDraft] = React.useState({})
+      // 单群档位草稿：按会话 key 存，提交成功前不覆盖桥接上报的真实值。
+      const [levelDraft, setLevelDraft] = React.useState({})
       const [busy, setBusy] = React.useState(null)
       const [notice, setNotice] = React.useState(null)
       const [confirm, setConfirm] = React.useState(null)
@@ -2691,6 +2700,16 @@ window.__ModuleLoader__.load({
       const draftPersona = cur === null ? '' : String(personaDraft[cur.key] ?? cur.persona ?? '')
       const savedPersona = cur === null ? '' : String(cur.persona ?? '')
       const personaDirty = draftPersona !== savedPersona
+      // 全局档位：从真实配置读（缺值时按 Config 默认 1 档兜底）。
+      const globalLevelRaw = Number(get?.('rhythm.activityLevel'))
+      const globalLevel = Number.isInteger(globalLevelRaw) && globalLevelRaw >= 0
+        && globalLevelRaw < SESSION_LEVEL_LABELS.length ? globalLevelRaw : 1
+      // savedLevel：桥接上报的该会话覆盖值，null = 跟随全局。
+      const savedLevel = cur === null || cur.activityLevel === null || cur.activityLevel === undefined
+        ? null : Number(cur.activityLevel)
+      const draftLevel = cur !== null && Object.prototype.hasOwnProperty.call(levelDraft, cur.key)
+        ? levelDraft[cur.key] : savedLevel
+      const levelDirty = draftLevel !== savedLevel
 
       if (rows === null) {
         return h('div', { className: 'qqg-stack' },
@@ -2743,6 +2762,11 @@ window.__ModuleLoader__.load({
         setPersonaDraft((map) => ({ ...map, [cur.key]: '' }))
         return submit({ op: 'persona', key: cur.key, text: '' }, '恢复全局人设')
       }
+      /** 保存单群档位：level=null 表示清掉覆盖、回退全局。 */
+      const saveLevel = () => {
+        if (cur === null) return undefined
+        return submit({ op: 'activity', key: cur.key, level: draftLevel }, '单群响应档位')
+      }
       const ask = (op) => setConfirm({ op, key: cur.key, name: displayName(cur) })
 
       return h('div', { className: 'qqg-stack' },
@@ -2783,6 +2807,13 @@ window.__ModuleLoader__.load({
                     h('span', { className: 'qqg-mono' }, cur.qq),
                     h('span', { className: 'qqg-pill' }, kindLabel(cur)),
                     cur.persona ? h('span', { className: 'qqg-pill qqg-pill-accent' }, '单人设') : null,
+                    // 只在桥接确认该会话有独立档位时才显示，避免「跟随全局」被误读成覆盖。
+                    savedLevel !== null
+                      ? h('span', {
+                        className: 'qqg-pill qqg-pill-accent',
+                        title: '该会话覆盖了全局响应档位',
+                      }, '单群档位 ' + savedLevel + ' 档')
+                      : null,
                     cur.unread > 0
                       ? h('span', { className: 'qqg-pill qqg-pill-accent' }, cur.unread + ' 条未读')
                       : h('span', { className: 'qqg-pill' }, '已读'))),
@@ -2810,6 +2841,38 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'qqg-kv' }, h('span', null, 'DSH 标题'),
                   h('b', { className: 'qqg-kv-ellipsis' }, cur.title || '（待对齐）')),
                 h('div', { className: 'qqg-kv' }, h('span', null, '最近活动'), h('b', null, sessionTime(cur.lastAt))))),
+            h(Panel, {
+              title: '响应档位',
+              desc: '单群覆盖全局档位：保存后桥接在下一条消息前读新值。留空/选「跟随全局」= 清掉覆盖。',
+              right: h('span', { className: 'qqg-pill' + (savedLevel === null ? '' : ' qqg-pill-accent') },
+                savedLevel === null ? '跟随全局' : '单群 ' + savedLevel + ' 档'),
+            },
+              h('div', { className: 'qqg-field' },
+                h('span', { className: 'qqg-field-label' }, '该会话的档位'),
+                h('select', {
+                  className: 'qqg-input', style: { width: '100%' },
+                  value: draftLevel === null ? '' : String(draftLevel),
+                  disabled: busy !== null,
+                  'aria-label': '单群响应档位',
+                  onChange: (e) => {
+                    const raw = e.target.value
+                    setLevelDraft((map) => ({ ...map, [cur.key]: raw === '' ? null : Number(raw) }))
+                  },
+                },
+                h('option', { value: '' }, '跟随全局（当前 ' + globalLevel + ' 档）'),
+                SESSION_LEVEL_LABELS.map((label, level) => h('option', {
+                  key: level, value: String(level),
+                }, level + ' · ' + label))),
+                h('span', { className: 'qqg-field-hint' },
+                  draftLevel === null
+                    ? '全局现在是 ' + globalLevel + ' 档（' + (sessionLevelLabel(globalLevel) ?? '未知') + '）。'
+                    : '覆盖为 ' + draftLevel + ' 档（' + (sessionLevelLabel(draftLevel) ?? '未知') + '），只影响这个会话。')),
+              h('div', { className: 'qqg-textarea-actions' },
+                h('button', {
+                  type: 'button', className: 'qqg-btn qqg-btn-primary',
+                  disabled: busy !== null || !levelDirty,
+                  onClick: saveLevel,
+                }, busy === 'activity' ? '提交中…' : '保存档位'))),
             h(Panel, {
               title: '单人设覆盖',
               desc: '留空 = 沿用全局人设。保存后桥接下一条消息前推给插件，即时生效；只影响这个 QQ 会话。',
@@ -2869,13 +2932,100 @@ window.__ModuleLoader__.load({
       plugin: ['pl-guard', 'pl-debounce', 'pl-ratelimit'],
     }
 
-    /* ══════════ Tab 3 · 技能与插件（Mock）══════════ */
+    /* ── 技能 / 插件弹窗：真实配置字段表 ─────────────────────── */
+    /**
+     * 音色候选：必须和桥接侧调语音合成时用的取值一致。
+     * Edge 走微软朗读接口，用 zh-CN-*Neural 这种完整名；OpenAI 兼容接口用 alloy 这类短名。
+     */
+    const VOICE_OPTIONS = {
+      edge: [
+        { value: 'zh-CN-XiaoyiNeural', label: '晓伊 · 女声（默认）' },
+        { value: 'zh-CN-XiaoxiaoNeural', label: '晓晓 · 女声' },
+        { value: 'zh-CN-YunxiNeural', label: '云希 · 男声' },
+        { value: 'zh-CN-YunyangNeural', label: '云扬 · 男声（播报）' },
+      ],
+      openai: ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']
+        .map((name) => ({ value: name, label: name })),
+    }
+
+    /**
+     * 卡片 id → 弹窗字段。每项都直接对应一条 Config 路径（path），
+     * 弹窗只通过 get(path) / write(path, value) 读写真实配置，不留任何前端假数据。
+     *   · type：select / number / switch / secret（密码框，不回显明文）/ text
+     *   · options 可以是数组，也可以是 (valueOf) => 数组（候选随其它字段变化）
+     *   · when(valueOf) 返回 false 时该字段不渲染、也不参与保存
+     */
+    const TILE_FIELDS = {
+      'sk-voice': [
+        {
+          path: 'voice.provider', type: 'select', label: '语音后端',
+          options: [
+            { value: 'edge', label: 'Edge TTS（免 Key）' },
+            { value: 'openai', label: 'OpenAI 兼容（需 baseUrl + Key）' },
+          ],
+          hint: 'edge 走微软朗读接口，开箱可用；openai 走任意 OpenAI 兼容的 /v1/audio/speech。',
+        },
+        {
+          path: 'voice.voice', type: 'select', label: '音色',
+          // 音色候选跟着后端走：切后端时会自动落到该后端的第一项。
+          options: (valueOf) => VOICE_OPTIONS[valueOf('voice.provider')] ?? VOICE_OPTIONS.edge,
+          hint: '音色名对不上后端时合成会失败，换完后端建议重新选一次。',
+        },
+        {
+          path: 'voice.apiKey', type: 'secret', label: 'API Key',
+          when: (valueOf) => valueOf('voice.provider') === 'openai',
+          hint: '仅 OpenAI 兼容后端需要；以密码形式保存，不回显明文。',
+          placeholder: 'sk-…',
+        },
+        {
+          path: 'voice.baseUrl', type: 'text', label: '接口地址 baseUrl',
+          when: (valueOf) => valueOf('voice.provider') === 'openai',
+          hint: '例如 https://api.openai.com/v1（不要带后面的 /audio/speech）。',
+          placeholder: 'https://api.openai.com/v1',
+        },
+      ],
+      'pl-debounce': [
+        {
+          path: 'rhythm.debounceWindowMs', type: 'number', label: '防抖合并窗口（毫秒）',
+          min: 0, max: 10000, step: 100,
+          hint: '同一会话的连续消息在这个窗口内合并成一次处理；0 = 不合并。',
+        },
+      ],
+      'pl-ratelimit': [
+        {
+          path: 'rhythm.rateLimit.perMin', type: 'number', label: '每会话每分钟上限',
+          min: 1, max: 120, step: 1,
+          hint: '超出后按「超限静默」决定是否回提示。',
+        },
+        {
+          path: 'rhythm.rateLimit.burst', type: 'number', label: '允许突发条数',
+          min: 0, max: 30, step: 1,
+          hint: '短时间内的额外额度；0 = 严格按每分钟上限。',
+        },
+        {
+          path: 'rhythm.rateLimit.silent', type: 'switch', label: '超限静默',
+          hint: '开启后超限直接丢弃，不回复提示。',
+        },
+      ],
+    }
+
+    /** 未实装条目的「开发中」原因：齿轮可点，但只说明状态，不摆假表单。 */
+    const TILE_DEV_REASON = {
+      'sk-memory': '记忆提取走 DSH 的记忆面，本插件没有可写的开关。',
+      'sk-remind': '定时提醒还没实装，桥接侧没有对应实现。',
+      'sk-weather': '天气查询还是实验条目，接口和触发词都没定。',
+      'pl-compact': '上下文压缩由 DSH 会话内部完成，桥接侧没有可调参数。',
+      'pl-persona': '人设改在「运行状态」页的「人设配置」里，这里不再做第二份。',
+      'pl-archive': '日志归档还没实装。',
+    }
+
+    /* ══════════ Tab 3 · 技能与插件 ══════════ */
     /**
      * 一张卡片：图标 + 名字 + 版本 + 描述 + 开关，右侧工具区（齿轮 / 垃圾桶 / 拖拽手柄）。
      * 原生 HTML5 拖拽：卡片本身 draggable，手柄只是视觉提示（按住卡片任意位置都能拖）。
      * 上下箭头是拖拽的降级方案，键盘用户也能排序。
      */
-    function MockTile({ item, index, total, implemented, onToggle, onSettings, onDelete, onMove,
+    function Tile({ item, index, total, implemented, onToggle, onSettings, onDelete, onMove,
       dragging, dragOver, onDragStart, onDragEnd, onDragOver, onDrop }) {
       const cls = ['qqg-tile']
       if (dragging) cls.push('qqg-tile-dragging')
@@ -2931,44 +3081,172 @@ window.__ModuleLoader__.load({
         })))
     }
 
-    /** 技能 / 插件设置弹窗：左表单，右说明。 */
-    function TileSettingsModal({ target, onClose }) {
+    /**
+     * 技能 / 插件设置弹窗（真实配置版）：左表单，右说明。
+     *
+     * 字段按卡片 id 从 TILE_FIELDS 取，读写全部走 get(path) / write(path, value)；
+     * 写盘后桥接 2 秒内热更新。没有字段的条目给明确状态（已接入无可调项 / 开发中），
+     * 绝不摆一张「保存了也不生效」的假表单 —— 未知 id（外挂 / 自定义条目）也走这条兜底。
+     */
+    function TileSettingsModal({ target, get, write, writable, onClose }) {
       const item = target?.item
-      const [values, setValues] = React.useState({})
-      // 每次换目标重新灌一遍初值，避免上一个卡片的设置串到下一个。
-      React.useEffect(() => { setValues({}) }, [target?.item?.id])
+      const id = item?.id
+      const impl = target ? (IMPLEMENTED_IDS[target.kind] ?? []).includes(id) : false
+      const fields = (id ? TILE_FIELDS[id] : null) ?? []
+      const [draft, setDraft] = React.useState({})
+      // 每次换目标清空草稿，避免上一个卡片的输入串到下一个。
+      React.useEffect(() => { setDraft({}) }, [id])
       if (!item) return null
-      const fields = item.settings ?? []
+
+      const has = (path) => Object.prototype.hasOwnProperty.call(draft, path)
+      const valueOf = (path) => (has(path) ? draft[path] : get(path))
+      const setField = (path, value) => setDraft((prev) => {
+        const next = { ...prev, [path]: value }
+        // 切后端时把音色拉回该后端的第一项，避免存下对方不认的音色名。
+        if (path === 'voice.provider') {
+          const allowed = (VOICE_OPTIONS[value] ?? []).map((o) => o.value)
+          if (!allowed.includes(next['voice.voice'] ?? get('voice.voice'))) next['voice.voice'] = allowed[0]
+        }
+        return next
+      })
+      const visible = (field) => (typeof field.when === 'function' ? field.when(valueOf) === true : true)
+
+      const control = (field) => {
+        const value = valueOf(field.path)
+        if (field.type === 'switch') {
+          return h(SwitchField, {
+            key: field.path, label: field.label, hint: field.hint,
+            value: value === true, disabled: !writable,
+            onChange: (next) => setField(field.path, next),
+          })
+        }
+        if (field.type === 'select') {
+          const options = typeof field.options === 'function' ? field.options(valueOf) : field.options
+          return h(SelectField, {
+            key: field.path, label: field.label, hint: field.hint,
+            value: value ?? '', options, disabled: !writable,
+            onChange: (next) => setField(field.path, next),
+          })
+        }
+        if (field.type === 'number') {
+          return h(NumField, {
+            key: field.path, label: field.label, hint: field.hint,
+            value: value ?? 0, min: field.min, max: field.max, step: field.step,
+            disabled: !writable,
+            onChange: (next) => setField(field.path, next),
+          })
+        }
+        if (field.type === 'secret') {
+          // role('secret')：配置里的明文一律不回显，输入框里只有用户这次新敲的字符。
+          const stored = String(get(field.path) ?? '')
+          return h('label', { key: field.path, className: 'qqg-field' },
+            h('span', { className: 'qqg-field-label' }, field.label),
+            h('input', {
+              type: 'password', className: 'qqg-input', style: { width: '100%' },
+              value: has(field.path) ? String(draft[field.path]) : '',
+              placeholder: stored ? '已保存（留空 = 不修改）' : (field.placeholder ?? ''),
+              disabled: !writable, 'aria-label': field.label,
+              onChange: (e) => setField(field.path, e.target.value),
+            }),
+            h('span', { className: 'qqg-field-hint' },
+              (stored ? '当前已保存一个 Key；' : '当前还没有配置 Key；') + (field.hint ?? '')),
+            h('span', { className: 'qqg-field-hint' }, '留空 = 不修改已保存的值。'))
+        }
+        return h(TextField, {
+          key: field.path, label: field.label, hint: field.hint,
+          value: String(value ?? ''), placeholder: field.placeholder,
+          disabled: !writable,
+          onChange: (next) => setField(field.path, next),
+        })
+      }
+
+      /** 保存：只写改动过的字段；secret 留空则不写（不清掉已保存的 Key）。 */
+      const save = () => {
+        if (!writable) return
+        for (const field of fields) {
+          if (!visible(field)) continue
+          if (field.type === 'secret') {
+            const typed = has(field.path) ? String(draft[field.path]).trim() : ''
+            if (typed !== '') write(field.path, typed)
+            continue
+          }
+          const next = valueOf(field.path)
+          if (next === get(field.path)) continue
+          write(field.path, next)
+        }
+        onClose()
+      }
+
+      /**
+       * 恢复默认：写回 index.js Config 里的 default 值（就地写盘，和「活跃设置」弹窗一致）。
+       * 例外：secret 字段（API Key）不动 —— 它取不到明文，清掉就等于把用户的 Key 弄丢了。
+       */
+      const resetDefaults = () => {
+        if (!writable) return
+        const next = {}
+        for (const field of fields) {
+          if (field.type === 'secret') continue
+          if (!Object.prototype.hasOwnProperty.call(DEFAULTS, field.path)) continue
+          next[field.path] = DEFAULTS[field.path]
+          write(field.path, DEFAULTS[field.path])
+        }
+        setDraft(next)
+      }
+
+      const configurable = fields.length > 0
+      const hasSecret = fields.some((field) => field.type === 'secret')
+      const devReason = TILE_DEV_REASON[id] ?? '该条目还没有对应的桥接实现，暂时没有可配置项。'
+
       return h(Modal, {
         open: true,
-        title: `${item.name} · 设置`,
-        desc: `v${item.ver} · ${item.tag} · 最后更新 ${item.updated}`,
+        title: (item.name ?? id ?? '条目') + ' · 设置',
+        desc: 'v' + (item.ver ?? '0.0.0') + ' · ' + (item.tag ?? '未分类')
+          + (item.updated ? ' · 最后更新 ' + item.updated : ''),
         onClose,
-        footer: [
-          h('button', { key: 'r', type: 'button', className: 'qqg-btn', onClick: () => setValues({}) }, '恢复默认'),
-          h('button', { key: 'c', type: 'button', className: 'qqg-btn', onClick: onClose }, '取消'),
-          h('button', {
-            key: 's', type: 'button', className: 'qqg-btn qqg-btn-primary',
-            onClick: () => { onClose() },
-          }, '保存'),
-        ],
+        footer: configurable
+          ? [
+            h('button', {
+              key: 'r', type: 'button', className: 'qqg-btn',
+              disabled: !writable, onClick: resetDefaults,
+            }, '恢复默认'),
+            h('button', { key: 'c', type: 'button', className: 'qqg-btn', onClick: onClose }, '取消'),
+            h('button', {
+              key: 's', type: 'button', className: 'qqg-btn qqg-btn-primary',
+              disabled: !writable, onClick: save,
+            }, '保存'),
+          ]
+          : [h('button', { key: 'c', type: 'button', className: 'qqg-btn', onClick: onClose }, '关闭')],
       },
       h('div', { className: 'qqg-setgrid' },
         h('div', null,
-          fields.length
-            ? h(SettingsFields, { fields, values, onChange: (k, v) => setValues((m) => ({ ...m, [k]: v })) })
-            : h('div', { className: 'qqg-hint' }, '该条目暂无可配置项。')),
+          configurable
+            ? h(React.Fragment, null,
+              writable ? null : h('div', {
+                className: 'qqg-status qqg-status-err', style: { marginBottom: 10 },
+              }, '当前配置不可写，下面的值只能看不能改。'),
+              fields.filter(visible).map(control))
+            : h(React.Fragment, null,
+              h('span', { className: 'qqg-pill' }, impl ? '无可调配置' : '开发中'),
+              h('div', { className: 'qqg-hint', style: { marginTop: 8 } },
+                impl
+                  ? '这个条目已经接入桥接，但参数写死在实现里，没有可编辑的配置项。'
+                  : devReason))),
         h('div', { className: 'qqg-setdesc' },
           h('div', { className: 'qqg-setdesc-title' }, '说明'),
-          h('div', { className: 'qqg-setdesc-text' }, item.desc),
-          h('div', { className: 'qqg-kv' }, h('span', null, '作者'), h('b', null, item.author)),
-          h('div', { className: 'qqg-kv' }, h('span', null, '版本'), h('b', null, 'v' + item.ver)),
-          h('div', { className: 'qqg-kv' }, h('span', null, '分类'), h('b', null, item.tag)),
+          h('div', { className: 'qqg-setdesc-text' }, item.desc ?? ''),
+          item.author ? h('div', { className: 'qqg-kv' }, h('span', null, '作者'), h('b', null, item.author)) : null,
+          h('div', { className: 'qqg-kv' }, h('span', null, '版本'), h('b', null, 'v' + (item.ver ?? '0.0.0'))),
+          h('div', { className: 'qqg-kv' }, h('span', null, '分类'), h('b', null, item.tag ?? '未分类')),
           (item.notes ?? []).length
             ? h('ul', { className: 'qqg-setdesc-list' },
               item.notes.map((n, i) => h('li', { key: i }, n)))
             : null,
-          h('div', { className: 'qqg-field-hint' }, 'Mock 阶段：保存只关弹窗，不写任何配置。'))))
+          h('div', { className: 'qqg-field-hint' },
+            configurable
+              ? '写入 profile 配置，桥接 2 秒内热生效。'
+                + (hasSecret ? '「恢复默认」不会清掉已保存的 Key。' : '')
+              : (impl ? '参数写死在桥接侧，改了也不会生效，所以这里不提供编辑。'
+                : '还没实装，先不摆假表单。')))))
     }
 
     /** 添加技能 / 添加插件弹窗（输入框 + 本地文件选择占位）。 */
@@ -3311,7 +3589,7 @@ window.__ModuleLoader__.load({
       const renderGrid = (kind, list) => h('div', { className: 'qqg-grid' },
         list.length === 0
           ? h('div', { className: 'qqg-hint' }, '清单为空。可以点右上角添加，或在配置文件里编辑。')
-          : list.map((it, i) => h(MockTile, {
+          : list.map((it, i) => h(Tile, {
             key: it.id, item: it, index: i, total: list.length,
             implemented: (IMPLEMENTED_IDS[kind] ?? []).includes(it.id),
             onToggle: flip(kind),
@@ -3568,6 +3846,7 @@ window.__ModuleLoader__.load({
 
         h(TileSettingsModal, {
           target: settingsTarget,
+          get, write, writable,
           onClose: () => setSettingsTarget(null),
         }),
 
@@ -4533,7 +4812,7 @@ window.__ModuleLoader__.load({
       })()
 
       let body
-      if (active === 'sessions') body = h(SessionsTab, { live: sessionsLive })
+      if (active === 'sessions') body = h(SessionsTab, { live: sessionsLive, get })
       else if (active === 'skills') body = h(SkillsTab, { ...common, pickDirectory: props?.pickDirectory })
       else if (active === 'usage') body = h(UsageTab, common)
       else if (active === 'settings') body = h(SettingsTab, { ...common, pickDirectory: props?.pickDirectory })

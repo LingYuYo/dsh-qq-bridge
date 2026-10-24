@@ -98,6 +98,129 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+/**
+ * 官方 `defineTool`（@deepseek-ai/dsh-tools）。
+ *
+ * 为什么必须用它：`ctx.tools.register()` 期望的是 **registry-ready definition**：
+ *   `parameters` 是编译好的原始 JSON Schema（根 `type:"object"` + `properties` + `required[]`），
+ *   `output.schema` 也要过 `assertSupportedJsonSchema`。
+ * 直接把手写的「参数 spec 对象」当 parameters 传进去，模型侧拿到的 schema 没有根 type，
+ * 工具虽然能注册但不会出现在 request/header 的工具清单里（2026-10-24 真机：
+ * 35 个工具里没有 qq_send_voice）。
+ * `defineTool()` 负责把 author spec 编译成合法 JSON Schema，并把 execute 包上严格参数校验。
+ *
+ * 为什么用**动态导入 + 兜底**而不是静态 import：
+ *   · 宿主运行时 `@deepseek-ai/dsh-tools` 是能从 DSH 自己的模块图解析到的（同生态插件都这么干）；
+ *   · 但本仓库的离线自测（test-*.mjs）是纯 Node 跑的，那里没有 DSH 的 node_modules，
+ *     静态 import 会直接 ERR_MODULE_NOT_FOUND 把整套测试带崩。
+ *   ⇒ 能拿到就用官方的；拿不到（离线/单测）就用下面 `localDefineTool()` 编出**同构**定义，
+ *     两条路径产出的 parameters **语义一致**（同样的 type / properties / required / enum；
+ *     对象键序不保证相同，所以别拿 JSON.stringify 直接比字符串），
+ *     行为差别只有「参数校验的严格程度」。
+ */
+let officialDefineTool
+try {
+  const mod = await import('@deepseek-ai/dsh-tools')
+  if (typeof mod?.defineTool === 'function') officialDefineTool = mod.defineTool
+} catch {
+  // 离线环境（纯 node 跑自测）会走到这里，属于预期，不报错不警告。
+  officialDefineTool = undefined
+}
+
+/**
+ * 本地兜底：按 `defineTool()` 的编译规则把 author spec 投影成原始 JSON Schema。
+ *
+ * 规则抄自 dsh-tools/lib/types/schema.js：
+ *   · `parameters` 是「属性名 → value schema」的隐式对象，根节点编译成
+ *     `{ type:'object', properties }`（**不加 additionalProperties**，与官方一致）；
+ *   · 属性节点里的 `required: true` 会被抽出来汇总成根的 `required[]`，节点本身不再带 required；
+ *   · object 节点必须显式给 `additionalProperties`；
+ *   · 其余只支持 description / title / default / examples 这些注解键。
+ *
+ * @param {string} path 报错用的位置前缀
+ * @param {Record<string, object>} spec 属性表
+ * @returns {{type:'object', properties:Record<string,object>, required?:string[]}}
+ */
+function compileParameterMap(path, spec) {
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+    throw new TypeError(`${path} 必须是「属性名 → value schema」的对象`)
+  }
+  const properties = {}
+  const required = []
+  for (const [key, node] of Object.entries(spec)) {
+    const compiled = compileValueSchema(`${path}.${key}`, node)
+    if (node?.required === true) required.push(key)
+    properties[key] = compiled
+  }
+  return required.length > 0 ? { type: 'object', properties, required } : { type: 'object', properties }
+}
+
+/** 单个 value schema 节点 → 原始 JSON Schema。 */
+function compileValueSchema(path, node) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) {
+    throw new TypeError(`${path} 必须是 value schema 对象`)
+  }
+  const out = {}
+  for (const key of ['description', 'title', 'default', 'examples']) {
+    if (Object.hasOwn(node, key)) out[key] = node[key]
+  }
+  const type = Object.hasOwn(node, 'type') ? node.type : undefined
+  if (Array.isArray(node.oneOf)) {
+    out.oneOf = node.oneOf.map((branch, i) => compileValueSchema(`${path}.oneOf[${i}]`, branch))
+    return out
+  }
+  out.type = type
+  if (type === 'json') delete out.type
+  if (type === 'object') {
+    out.additionalProperties = node.additionalProperties === true
+    if (node.properties) Object.assign(out, compileParameterMap(`${path}.properties`, node.properties))
+  } else if (type === 'array') {
+    if (node.items) out.items = compileValueSchema(`${path}.items`, node.items)
+  } else if (Array.isArray(node.enum)) {
+    out.enum = [...node.enum]
+  }
+  return out
+}
+
+/**
+ * 定义一个模型侧工具：有官方 `defineTool` 就用它，没有就用本地同构编译。
+ *
+ * @param {{name:string, description:string, parameters:object, output:object, execute:Function,
+ *   presentCall?:Function, presentResult?:Function}} options
+ * @returns {object} registry-ready definition
+ */
+function buildToolDefinition(options) {
+  if (typeof officialDefineTool === 'function') return officialDefineTool(options)
+  const parameters = compileParameterMap('parameters', options.parameters)
+  const definition = {
+    name: options.name,
+    description: options.description,
+    parameters,
+    output: {
+      schema: compileValueSchema('output.schema', options.output.schema),
+      render: (args, value) => options.output.render(args, value),
+    },
+    async execute(args, exec) {
+      // 官方 defineTool 会在这里做完整 JSON Schema 校验；离线兜底只拦住最常见的两种错法，
+      // 真正的内容校验（空文本 / 超长 / 技能开关）下面 execute 里还会再做一次。
+      if (!args || typeof args !== 'object' || Array.isArray(args)) {
+        throw new Error('invalid arguments: 参数必须是对象')
+      }
+      return options.execute(args, exec)
+    },
+  }
+  if (typeof options.presentCall === 'function') definition.presentCall = (args) => options.presentCall(args)
+  if (typeof options.presentResult === 'function') {
+    definition.presentResult = (args, result) => options.presentResult(args, result)
+  }
+  return definition
+}
+
+/** 本进程里 qq_send_voice 是用官方 defineTool 还是本地兜底编出来的（自检/日志用）。 */
+export function voiceToolDefinitionSource() {
+  return typeof officialDefineTool === 'function' ? 'official-defineTool' : 'local-fallback'
+}
+
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
 /**
@@ -766,10 +889,11 @@ function pruneSessionOps() {
 
 /**
  * 入队一条会话指令。
- * @param {string} op clear | delete | persona | voice
+ * @param {string} op clear | delete | persona | voice | activity
  * @param {string} key 会话 key（voice 为空串：桥接用 sessionId 反查）
  * @param {string} [text]
- * @param {{sessionId?:string, voice?:string}} [extra]
+ * @param {{sessionId?:string, voice?:string, level?:number|null}} [extra]
+ *   `level`：单群响应档位（0..3），null = 跟随全局；只有 activity 指令会带。
  */
 function enqueueSessionOp(op, key, text = '', extra = {}) {
   pruneSessionOps()
@@ -782,10 +906,12 @@ function enqueueSessionOp(op, key, text = '', extra = {}) {
     if (sameTarget) sessionOpsQueue.delete(id)
   }
   const id = `op-${Date.now().toString(36)}-${++sessionOpsSeq}`
+  const level = (typeof extra.level === 'number' || extra.level === null) ? extra.level : undefined
   sessionOpsQueue.set(id, {
     id, op, key, text,
     sessionId: typeof extra.sessionId === 'string' ? extra.sessionId : '',
     voice: typeof extra.voice === 'string' ? extra.voice : '',
+    ...(level === undefined ? {} : { level }),
     at: Date.now(), lease: 0,
   })
   while (sessionOpsQueue.size > SESSION_OPS_CAP) {
@@ -1430,9 +1556,14 @@ function readJsonBody(req, { maxBytes = 8 * 1024 } = {}) {
  * 都按契约裁一次，防止将来桥接改动或第三方进程伪造把垃圾塞进设置页。
  * 文本一律转成单行字符串再截断，前端 React 会转义，不做 HTML 拼接。
  *
+ * ⚠️ 白名单漏字段的后果是**静默的**：桥接上报了但这里裁掉，设置页永远读到 undefined。
+ * 2026-10-24 就踩过一次（activityLevel / persona 都被裁掉，单群档位与单人设回填全失效），
+ * 所以新增上报字段时必须同步改这里，并有测试盯着。
+ *
  * @param {unknown} row
  * @returns {{key:string, sessionId:string, kind:'private'|'group', qq:string,
- *   name:string, title:string, unread:number, lastAt:number, lastText:string}|null}
+ *   name:string, title:string, unread:number, lastAt:number, lastText:string,
+ *   persona:string, activityLevel:number|null}|null}
  */
 function sanitizeSessionRow(row) {
   if (!row || typeof row !== 'object') return null
@@ -1453,7 +1584,27 @@ function sanitizeSessionRow(row) {
     unread: num(row.unread, 9999),
     lastAt: num(row.lastAt, 8.64e15),
     lastText: text(row.lastText, 200),
+    // 单人设回填（会话详情里的输入框要显示已保存的值）。多行不能压成单行，
+    // 只裁掉首尾空白与长度，换行原样保留。
+    persona: textPreservingLines(row.persona, 20000),
+    // 单群响应档位：**null = 跟随全局**，是一个有意义的取值，必须原样保留；
+    // 绝不能走上面的 num()（它会把 0 和 null 都压成 0，"仅艾特"和"跟随全局"就分不清了）。
+    activityLevel: normalizeActivityLevelInput(row.activityLevel),
   }
+}
+
+/** 多行文本按原样保留（只 trim + 截断），用于人设这类正文。 */
+function textPreservingLines(value, max) {
+  return typeof value === 'string' ? value.slice(0, max) : ''
+}
+
+/** 单群响应档位归一化：0..3 的整数，其余（含 null/undefined/NaN）一律 null。 */
+function normalizeActivityLevelInput(value) {
+  if (value === null || value === undefined) return null
+  const n = Number(value)
+  if (!Number.isFinite(n)) return null
+  if (!Number.isInteger(n) || n < 0 || n > 3) return null
+  return n
 }
 
 /**
@@ -1588,30 +1739,113 @@ function applyPersonaSection(ctx, config) {
 }
 
 /**
+ * 探测「本实例是不是在 preset 作用域里」用的假工具名（DSH 里不可能存在）。
+ * 用不存在名字探测是**无副作用**的：`restrict()` 先校验 scope、再校验名字，
+ * 两条 throw 路径都发生在 `layers.effect()` 之前，不会留下任何限制。
+ */
+const SCOPE_PROBE_TOOL = '__dsh_qq_guard_scope_probe__'
+
+/**
+ * 判定当前 ctx 是否装在 **agent preset** 作用域里（决定要不要挂 guard）。
+ *
+ * ⚠️ 2026-10-24 的 P0 事故就出在这个判定上：旧实现只看
+ * `agentPresets.composedPreset(ctx)`，结果在 preset 自己的子行里**永远**拿到 undefined。
+ *
+ * 为什么：`composedPreset(ctx)` → `generationFor(ctx)`（dsh-agent-preset-registry/lib/index.js）
+ * 的实现是「取 `scopeOf(ctx)` 的**父** scope，去 generations 表里查」。
+ * preset 的生成作用域是 `createScope(owner, key)` 造出来的，key **没有 parent**；
+ * preset 子行（我们这条 guard）的 ctx 作用域**就是这个 generation 本身**，
+ * 所以父 scope 一定查不到 → `composedPreset()` 恒返回 undefined。
+ * 它只对「已经 bindScopeParent 到 generation 的 agent.ctx」成立。
+ *
+ * ⇒ 旧判定把「在 preset 内」误判成「在顶层」，applyGuard 第一步就 return，
+ *    后面三层（人设 section / qq_send_voice / restrict）**全部没跑**。
+ *    真机症状：system/message 是全局 Harness 提示词、工具清单里没有 qq_send_voice、
+ *    连本该被藏的 ops_glob / load_workspace_dependencies 都还在。
+ *
+ * 现在的判据（两层取或，任一成立即认定「在 preset 内」）：
+ *   ① `composedPreset(ctx)` 返回非空字符串 —— agent ctx 场景，保留兼容；
+ *   ② ctx 处于 **scoped** 上下文。DSH 里只有两类 scoped ctx：agent.ctx 与
+ *      preset 生成作用域；profile 顶层的行装载在**无 scope** 的 ctx 上。
+ *      探针用 `tools.restrict()`：它第一行就 `scopeOf(this.ctx)`，
+ *      无 scope 时抛 "requires a scoped context"；有 scope 才继续校验工具名。
+ *
+ * ⚠️ 兜底方向是 **fail-closed**：只有拿得到「正向证据」（composedPreset 有值 /
+ *    restrict 已过 scope 校验）才允许挂 guard；其它任何意外（DSH 改错误文案、
+ *    版本升级、代理异常）一律当作「不在 preset」拒绝装载。理由：误判成顶层只是
+ *    QQ 会话失去门禁（日志可见、可立刻修），误判成 preset 却是全局 guard
+ *    把所有浏览器会话锁死 —— 后者正是 2026-10-20 那次事故。
+ *
+ * @param {object} ctx 插件实例 ctx（preset 子行或 profile 顶层行）
+ * @returns {{inPreset:boolean, via:string, presetId?:string, reason?:string}}
+ */
+function detectPresetScope(ctx) {
+  let presetId
+  try { presetId = ctx.get?.('agentPresets')?.composedPreset?.(ctx) } catch { presetId = undefined }
+  if (typeof presetId === 'string' && presetId !== '') {
+    return { inPreset: true, via: 'composedPreset', presetId }
+  }
+
+  const tools = ctx.get?.('tools') ?? ctx.tools
+  if (!tools || typeof tools.restrict !== 'function') {
+    return { inPreset: false, via: 'none', reason: 'tools 服务不可用，无法判定作用域' }
+  }
+  try {
+    const undo = tools.restrict({ deny: [SCOPE_PROBE_TOOL] })
+    // 理论上到不了这里（假名字不可能被接受）。真发生了就立刻撤销，绝不留脏限制。
+    try { undo?.() } catch { /* 撤销失败也没关系：名字本身不存在 */ }
+    return { inPreset: true, via: 'restrict-probe(accepted)' }
+  } catch (error) {
+    const message = String(error?.message ?? error)
+    if (message.includes('requires a scoped context')) {
+      // 无 scope = profile 顶层：坚决不挂 guard，否则全局锁死。
+      return { inPreset: false, via: 'restrict-probe', reason: message }
+    }
+    // **只有正向证据才放行**：走到名字校验说明 scope 校验已通过。
+    // （这两句文案来自 @deepseek-ai/dsh-tools 的 restrict()：先 scope、再 run_code、
+    //   最后 unknown names / no-op。我们传了 deny，所以 no-op 那句实际不会出现，
+    //   留着只是为了让「未来 restrict 改成先校验 filter 形状」时不会误判。）
+    if (message.includes('names unknown global tool')
+      || message.includes('restrict({}) is a no-op')) {
+      return { inPreset: true, via: 'restrict-probe' }
+    }
+    // 其它任何异常（DSH 改文案 / 代理差异 / 版本升级）都**不当作证据**：
+    //   · 误判成 top-level → guard 不装，QQ 会话失去门禁（危险，但日志里看得见，可立刻修）；
+    //   · 误判成 preset    → 全局 tools.guard 把所有浏览器会话锁死（2026-10-20 事故，用户自己都进不来）。
+    // 两害相权，宁可 fail-closed 到「不装」，并把原始 message 带进 warn 里方便定位。
+    return { inPreset: false, via: 'restrict-probe', reason: message }
+  }
+}
+
+/**
  * 工具门禁：**只能在 preset 作用域里跑**。
  *
  * 为什么必须校验：`ctx.tools.guard` 在 plain context 上是**全局**的
  * （Service 契约："a plain-context guard applies globally"），挂到 profile 顶层
  * 会把浏览器会话一起锁死——2026-10-20 就是这么炸的。
  *
- * 判定依据：`agentPresets.composedPreset(ctx)` 返回 ctx 所属的 preset id，
- * 顶层 ctx 没有 generation → 返回 undefined。
- * （证据：dsh-agent-preset-registry/lib/types/index.js:326
- *   `composedPreset(ctx) { return this.generationFor(ctx)?.mount.presetId; }`）
+ * 判定见 {@link detectPresetScope}（不要再用 composedPreset 单独下结论）。
+ *
+ * @param {object} ctx 插件实例 ctx
+ * @param {unknown} config 插件 Config
  */
 function applyGuard(ctx, config) {
-  const agentPresets = ctx.get?.('agentPresets')
-  const presetId = agentPresets?.composedPreset?.(ctx)
+  const detected = detectPresetScope(ctx)
 
-  if (presetId === undefined) {
+  if (!detected.inPreset) {
     // 顶层 / 非 preset 作用域：坚决不挂 guard。
     console.warn?.(
-      '[qq-guard] role=guard 但当前不在任何 agent preset 作用域内（composedPreset 返回 undefined）；'
+      '[qq-guard] role=guard 但当前不在任何 agent preset 作用域内'
+      + `（检测方式 ${detected.via}：${detected.reason ?? '无 scope'}）；`
       + '已拒绝装载 tools.guard，避免它全局生效锁死整个 profile。'
       + '请把这条行放到 preset 的 plugins[] 子级里。',
     )
     return
   }
+  console.info?.(
+    `[qq-guard] role=guard 作用域判定通过（${detected.via}`
+    + `${detected.presetId ? `, preset=${detected.presetId}` : ''}），开始装配人设/语音工具/工具门禁`,
+  )
 
   // ── 第 0 层：动态人设 section（替代 preset 里原有的静态 dsh-persona 行）──
   //
@@ -1722,7 +1956,8 @@ function applyVoiceTool(ctx) {
     console.warn?.('[qq-guard] 找不到 tools 服务：qq_send_voice 未注册')
     return
   }
-  const register = () => tools.register({
+  const register = () => {
+    const definition = buildToolDefinition({
     name: VOICE_TOOL_NAME,
     description: '把一段中文文字合成语音，以 QQ 语音条发到当前聊天。'
       + `仅在「发语音」技能开启时可用；单次最多 ${VOICE_MAX_CHARS} 字（QQ 语音条约 60 秒），`
@@ -1745,6 +1980,7 @@ function applyVoiceTool(ctx) {
         properties: {
           queued: { type: 'boolean', required: true },
           chars: { type: 'integer', required: true },
+          id: { type: 'string', required: true, description: '队列里的任务 id，排障用。' },
         },
       },
       render: (_args, value) => [{
@@ -1757,11 +1993,16 @@ function applyVoiceTool(ctx) {
       if (!flags.voice) throw new Error('「发语音」技能未开启：请先在 QQ 桥接设置页的「技能与插件」里打开它。')
       const text = String(args?.text ?? '').trim()
       if (!text) throw new Error('text 不能为空')
+      // 官方 defineTool 已经校验过类型；离线兜底只做了对象校验，这里补一道。
+      if (args?.voice !== undefined && typeof args.voice !== 'string') throw new Error('voice 必须是字符串')
       const chars = [...text].length
       if (chars > VOICE_MAX_CHARS) {
         throw new Error(`文字过长（${chars} > ${VOICE_MAX_CHARS} 字），QQ 语音条放不下，请先精简。`)
       }
-      const sessionId = String(exec?.agent?.id ?? '').trim()
+      // sessionId 是桥接反查 QQ 会话的唯一凭据。DSH 里 `agent.id` 与 `agent.session.id`
+      // 是同一个「共享 agent/session id」（dsh-agent 的 enter() 会校验两者相等），
+      // 所以优先取 agent.id、拿不到再退到 session.id。
+      const sessionId = String(exec?.agent?.id ?? exec?.agent?.session?.id ?? '').trim()
       if (!sessionId) throw new Error('qq_send_voice 只能在 QQ 会话内调用（拿不到 sessionId）')
       const voice = String(args?.voice ?? '').trim()
       const id = enqueueSessionOp('voice', '', text, {
@@ -1779,9 +2020,16 @@ function applyVoiceTool(ctx) {
     presentResult: (_args, result) => ({
       card: 'generic',
       title: 'QQ 语音已入队',
-      content: result?.content,
+      content: [{
+        type: 'text',
+        text: `已入队 ${Number(result?.chars) || 0} 字，任务 ${String(result?.id ?? '') || '(无 id)'}。`,
+      }],
     }),
-  })
+    })
+    const registered = tools.register(definition)
+    console.info?.(`[qq-guard] qq_send_voice 已注册（${voiceToolDefinitionSource()}）`)
+    return registered
+  }
   if (typeof ctx.effect === 'function') ctx.effect(register, 'qq-guard: qq_send_voice tool')
   else register()
 }
@@ -1943,6 +2191,8 @@ function applySettings(ctx, config) {
               // 桥接用 sessionId 反查 state.sessions；voice 可覆盖音色。
               ...(op.sessionId ? { sessionId: op.sessionId } : {}),
               ...(op.voice ? { voice: op.voice } : {}),
+              // 单群响应档位：null 也要下发（null = 跟随全局，是明确的语义，不是缺省）。
+              ...(op.level === undefined ? {} : { level: op.level }),
             })
           }
           sendJson(res, 200, { ok: true, ops })
@@ -1969,9 +2219,9 @@ function applySettings(ctx, config) {
           sendJson(res, 200, { ok: true, removed })
           return
         }
-        // UI 入队：{ op, key, text? }
+        // UI 入队：{ op, key, text?, level? }
         const op = typeof body?.op === 'string' ? body.op : ''
-        if (!['clear', 'delete', 'persona'].includes(op)) {
+        if (!['clear', 'delete', 'persona', 'activity'].includes(op)) {
           sendJson(res, 400, { ok: false, reason: 'unknown-op', detail: `未知操作：${op || '(空)'}` })
           return
         }
@@ -1980,8 +2230,23 @@ function applySettings(ctx, config) {
           sendJson(res, 400, { ok: false, reason: 'bad-key', detail: '会话 key 必须是 u:<QQ号> 或 g:<群号>' })
           return
         }
+        // 单群响应档位：0..3 的整数，或 null = 跟随全局。
+        let level
+        if (op === 'activity') {
+          const raw = body?.level
+          if (raw === null || raw === undefined) level = null
+          else if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 0 && raw <= 3) level = raw
+          else {
+            sendJson(res, 400, { ok: false, reason: 'bad-level', detail: 'level 必须是 0~3 的整数或 null' })
+            return
+          }
+        }
         const text = typeof body?.text === 'string' ? body.text.slice(0, PERSONA_MAX_CHARS) : ''
-        const id = enqueueSessionOp(op, key, op === 'persona' ? text : '')
+        const id = enqueueSessionOp(
+          op, key,
+          op === 'persona' ? text : '',
+          op === 'activity' ? { level } : {},
+        )
         sendJson(res, 200, { ok: true, id, queued: sessionOpsQueue.size, note: '桥接 2 秒内轮询执行' })
       },
     }),
@@ -2797,4 +3062,6 @@ function applySettings(ctx, config) {
 /** 供对账脚本使用：确认名单与 DSH 真实工具名不漂移。 */
 export const DENIED_TOOL_NAMES = Object.freeze([...DENY_TOOLS])
 export const SAFE_TOOL_NAMES = Object.freeze([...SAFE_EXACT])
+/** 会话行白名单收敛（导出仅为测试：漏字段是静默 bug，必须有断言盯着）。 */
+export { sanitizeSessionRow }
 export { Config }
