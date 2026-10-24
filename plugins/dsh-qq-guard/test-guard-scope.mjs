@@ -536,7 +536,6 @@ await check('agent/pre-step：摘掉 dsh-mnemon 注入的 USER.md/MEMORY.md 消�
   apply(ctx, Config({ role: 'guard' }))
   const listener = calls.listeners.find((item) => item.event === 'agent/pre-step')
   assert.ok(listener, '没有注册 agent/pre-step 监听')
-  assert.equal(listener.prepend, true, '★ 必须 prepend：mnemon 的监听器先注册在最外层，不 prepend 过滤就是白做')
   const decision = {
     kind: 'enter',
     messages: [
@@ -549,6 +548,27 @@ await check('agent/pre-step：摘掉 dsh-mnemon 注入的 USER.md/MEMORY.md 消�
   const out = await listener.fn({}, async () => decision)
   assert.equal(out.messages.length, 1, '只该留下 QQ 那头真说的话')
   assert.equal(out.messages[0].source.kind, 'user')
+})
+await check('★ agent/created → 在该 agent ctx 上 prepend 挂过滤（否则 mnemon 会追加在过滤之后）', async () => {
+  const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })
+  apply(ctx, Config({ role: 'guard' }))
+  const created = calls.listeners.find((item) => item.event === 'agent/created')
+  assert.ok(created, '没有监听 agent/created，就没法挂到 agent 自己的 ctx 上')
+  const agentListeners = []
+  const agentCtx = {
+    on(event, fn, options) { agentListeners.push({ event, fn, prepend: options?.prepend === true }); return () => {} },
+  }
+  created.fn({ agent: { ctx: agentCtx } })
+  // 微任务之后才挂（要排在 mnemon 的同步注册之后）
+  assert.equal(agentListeners.length, 0, '不能同步挂：那样又会被 mnemon 的 unshift 压在下面')
+  await new Promise((resolve) => queueMicrotask(resolve))
+  const scoped = agentListeners.find((item) => item.event === 'agent/pre-step')
+  assert.ok(scoped, 'agent ctx 上应有 agent/pre-step 过滤')
+  assert.equal(scoped.prepend, true, '★ 这里必须 prepend：要成为最外层，next() 回来才看得到 mnemon 追加的快照')
+  // 同一个 agent 反复触发 agent/created 不能重复挂
+  created.fn({ agent: { ctx: agentCtx } })
+  await new Promise((resolve) => queueMicrotask(resolve))
+  assert.equal(agentListeners.length, 1, '不该重复注册')
 })
 await check('agent/pre-step：source.kind 变了也能靠文本标记兜底摘掉', async () => {
   const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })

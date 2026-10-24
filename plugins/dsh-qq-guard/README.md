@@ -4,14 +4,15 @@ DSH 插件：给 QQ 聊天会话装一道**执行期工具门禁**，并提供 Q
 
 配套的桥接进程在 [`../../qq-bridge/`](../../qq-bridge/)，两个要一起用。
 
-> **2026-10-24 修了一组真机 P0**：guard 在 preset 内的作用域判定写错，导致人设 section /
-> `qq_send_voice` / restrict / 执行期白名单**四件事全部静默跳过**（QQ 会话当时既没有系统人设、
-> 也没有执行期门禁）。根因、修法和验证见文末「2026-10-24 修复记录」；同一批还修了
-> 人设每 2 秒重复推送、`web_search` 未挂载、单群独立响应档位、技能配置弹窗。
->
-> **同日晚第二轮真机复测**又查出三件事（见文末「第二轮」）：人设被宿主注入的
-> USER.md/MEMORY.md 当 user 消息盖掉（已摘掉，顺带堵了隐私口子）、微软 Edge 朗读接口 403
-> （TTS 换 baidu 免 Key 通路 + 失败必回模型）、`web_search` 缺 DeepSeek API Key（齿轮弹窗可填）。
+> **v0.4.0（2026-10-24 正式版）** 一整天三轮真机修复的收口：
+> ① guard 在 preset 内整体失活（作用域判定用错 API）→ 修好并加了「真宿主」回归测试；
+> ② 人设被宿主注入的 USER.md/MEMORY.md 当 user 消息盖掉 → 在 agent 创建后挂过滤摘掉
+>    （**顺带堵了隐私口子**：群友对话原本能让模型读到主人的长期记忆）；
+> ③ 微软 Edge 朗读接口 403 → TTS 换 baidu 免 Key 通路，且**真机已打通**
+>    （`已发送语音（baidu，96KB，via=base64，retcode=0）`）；
+> ④ `qq_send_voice` 改成等桥接回执，失败直接抛错给模型（以前「入队即成功」）；
+> ⑤ 网页搜索补上 DeepSeek API Key 的配置入口；另含单群独立响应档位、技能配置真实弹窗。
+> 细节见文末两轮「修复记录」。
 
 ## 为什么需要它
 
@@ -568,7 +569,7 @@ QQ 会话切模型，**不能**走 `session/selectModel` —— 它会顺带 `ag
 ## 自测
 
 ```bash
-node test-guard-scope.mjs     # 门禁作用域（防全局锁死）+ preset 作用域判定（32 例）
+node test-guard-scope.mjs     # 门禁作用域 + preset 判定 + 上下文过滤 + 语音回执（38 例）
 node test-preset-scope.mjs    # 真宿主：preset 内必须生效 / 顶层必须拒绝（31 例，缺 DSH 包时 SKIP）
 node test-model-override.mjs  # 模型无痕热切换 + 降级链 + 静默看门狗 + 系统事件 + 目录 join（假 ctx，23 例）
 node test-settings-data.mjs   # 设置页数据通路（remote / HTTP 兜底 / 错误可见）
@@ -611,7 +612,7 @@ node render-preview.mjs       # 生成 preview/*.html 静态版式（含弹窗�
 
 `qq-bridge/test-offline.mjs` 会串跑这四组；桥接侧另有 `test-activity.mjs` / `test-tts.mjs` / `test-persona.mjs` / `test-timeout.mjs`。
 
-2026-10-24 基线（第二轮）：guard 24 个文件 + 桥接 5 个文件全绿 —— `test-guard-scope` 33、
+2026-10-24 基线（第二轮）：guard 24 个文件 + 桥接 5 个文件全绿 —— `test-guard-scope` 38、
 `test-preset-scope` 31【联机】、`test-tile-config` 17、`test-web-config` 9、`test-offline` 168、`test-tts` 29。
 
 ## 2026-10-24 修复记录（真机 Bug 清单 → 已修）
@@ -718,11 +719,19 @@ node render-preview.mjs       # 生成 preview/*.html 静态版式（含弹窗�
   把 USER.md / MEMORY.md 快照当普通 user 消息插进每一步。对模型来说**user 消息比系统人设更硬**，
   我们的人设就被整段无视了。`suppressRuntimeContext()` 管不了它（那是 system-prompt 的
   context 面，而这是 pre-step 的消息面）。
-- **修法**：`applyContextFilter(ctx)` —— guard 在 preset 作用域挂 `agent/pre-step` 监听（`{prepend:true}`），
-  调完 `next()` 后按 `source.kind === 'dsh-mnemon'`（外加文本标记兜底）把这些消息摘掉。
-  `prepend` 是必须的：mnemon 的监听器在 profile 顶层先注册、处在最外层，不 prepend 我们就在内层，
-  `next()` 回来时快照还没被追加进去，过滤等于白做。
-  顺带解决**隐私问题**：QQ 群友的对话不该带着主人的长期记忆（本轮之前模型能直接读到 USER.md）。
+- **修法**：`applyContextFilter(ctx)` —— 调完 `next()` 后按 `source.kind === 'dsh-mnemon'`
+  （外加文本标记兜底）把这些消息摘掉。**难点全在监听器的注册时机**：
+  - cordis 瀑布里「数组第一个」= 最外层（最先拿控制权、最后拿返回值），`prepend` 是 unshift；
+  - `next()` 之后才追加消息的插件（mnemon 就是这样）只有让我们「站在它外面」才摘得掉；
+  - mnemon 在 **agent 创建事件**里对 `agent.ctx` 做 `prepend` → 它占据最外层；
+  - 我们如果在 preset 装载时注册（早于 agent 创建），无论 prepend 还是 push，都会被 mnemon
+    的 unshift 顶到里面去 → **静默失效**（第一版就是这样：真机新会话里 MNEMON 照样出现 3 次）；
+  - 正确做法：监听 `agent/created`，在这个 agent 自己的 ctx 上用 `queueMicrotask` +
+    `{prepend:true}` 再挂一次 —— 落在 mnemon 的同步注册之后，unshift 后就是最外层。
+- **这条顺序陷阱有专门的证据**（真 cordis 跑的三种注册方式对照）：
+  装载时 prepend → 泄漏；装载时 push → **同样泄漏**；agent 创建后 prepend → 干净。
+  仓库里 `test-guard-scope.mjs` 用断言把「agent/created 之后必须 prepend 挂到 agent ctx」锁死了。
+- 顺带解决**隐私问题**：QQ 群友的对话不该带着主人的长期记忆（本轮之前模型能直接读到 USER.md）。
 - **诊断开关**：Config `debugPrompt = true`（或环境变量 `QQG_PROMPT_DEBUG=1`）会打印
   `[Persona Debug] session=… sections=[名字:字数] contexts=[…] personaHead="…"`，
   只在内容变化时打，用来确认「组装出来的到底有没有人设」。
@@ -747,6 +756,9 @@ node render-preview.mjs       # 生成 preview/*.html 静态版式（含弹窗�
     25s 拿不到回执照样抛错。detail 带 provider / 体积 / via / retcode，够模型跟用户解释。
   - NapCat `record` 段：`base64://` 失败会自动落盘 `state/voice-<ts>.mp3` 用 `file://` 重发一次，
     两次都失败保留文件并带回两次 retcode。
+- **真机已验证（2026-10-24 16:5x，新会话）**：
+  模型调用 `qq_send_voice` → 工具回执 `语音已发到 QQ（49 字）：已发送语音（baidu，96KB，via=base64，retcode=0）`
+  → QQ 收到语音条。也就是**合成、回执、NapCat 转码三段全通了**（`retcode=0`，走的 base64 没降级）。
 
 ### 3. 网页搜索：不是白名单，是缺 DeepSeek API Key；web_fetch 是个别站点被墙
 

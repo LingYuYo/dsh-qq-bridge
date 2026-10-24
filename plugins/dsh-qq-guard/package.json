@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-qq-guard",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "private": true,
   "description": "QQ 聊天会话的安全硬边界，以及 QQ 桥接的运行时参数设置页（分片节奏 / 群聊 @ / 标点处理）。",
   "type": "module",

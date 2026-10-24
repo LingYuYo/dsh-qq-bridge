@@ -1940,19 +1940,33 @@ function isInjectedContextMessage(message) {
 /**
  * 从 QQ 会话的每一步里摘掉宿主注入的运行时上下文（人设失效 + 隐私）。
  *
- * 为什么用 `agent/pre-step` 且必须 `{ prepend: true }`：
- *   cordis 瀑布「先注册的在最外层，外层返回值最终生效」。mnemon 的监听器在
- *   profile 顶层**先**注册，所以它是外层、我们默认是内层 —— 内层拿到 next() 时
- *   mnemon 还没把快照追加进去，过滤等于白做。prepend 之后我们变最外层，
- *   `next()` 回来时消息已经齐了，这时候再摘，最终结果一定干净。
+ * ⚠️ **顺序是这件事的全部难点，2026-10-24 第一版就栽在这里（prepend 的时机搞反了）。**
  *
- * 作用域：本函数只在 `role: guard` 的 preset 实例里调用，监听器带该 preset 的 scope
- * 标记，只会收到 qq-chat 会话的事件，浏览器会话一条都不碰。
+ * cordis 瀑布语义：监听器数组按顺序调用，**第一个最外层**（最先拿控制权、最后拿返回值）。
+ * `prepend` = unshift（更外层），不 prepend = push（更内层）。
+ * `next()` 的返回值会从内层往外层层传递，所以「谁能摘掉 mnemon 追加的消息」取决于
+ * 我们是在 mnemon **外面**还是**里面**：
+ *   · 我们更内层 → 我们先过滤（此时还没有 mnemon 的消息），返回后 mnemon 才追加 → 白做；
+ *   · 我们更外层 → 我们先调 next()，mnemon 追加完才把结果交回来 → 这时候摘才有效。
+ *
+ * 实测的注册时机（这是关键）：
+ *   · mnemon 在 **agent 创建事件里** 对 `agent.ctx` 做 `on(..., {prepend:true})`
+ *     —— 它把自己插到最外层；
+ *   · 我们的 guard 在 **preset 装载时** 注册（preset 是懒装载的，比 agent 早），
+ *     所以无论是否 prepend，注册完都会在 mnemon 之后被 mnemon 的 unshift 顶到里面去。
+ *     第一版就是这样静默失效的：真机新会话里 MNEMON 快照照旧出现 3 次。
+ *
+ * ⇒ 正确做法：**等 agent 创建完之后**，在这个 agent 自己的 ctx 上 `{prepend:true}` 再挂一个
+ *    —— 用 `queueMicrotask` 保证落在 mnemon 的同步注册之后，unshift 之后我们就在最外层。
+ *    同时保留 preset 作用域上的那个监听做兜底（它现在是内层，通常摘不到东西，但没坏处）。
+ *
+ * 作用域：监听器带 preset 的 scope 标记，只会收到 qq-chat 的 agent，浏览器会话一条都不碰。
  *
  * @param {object} ctx guard 实例 ctx（preset 作用域）
  */
 function applyContextFilter(ctx) {
-  ctx.on('agent/pre-step', async (payload, next) => {
+  /** 真正的过滤器：next() 回来之后再摘。 */
+  const filter = async (payload, next) => {
     const decision = await next()
     if (decision === undefined || decision === null || decision.kind === 'reject') return decision
     const messages = Array.isArray(decision.messages) ? decision.messages : []
@@ -1962,7 +1976,28 @@ function applyContextFilter(ctx) {
     if (dropped === 0) return decision
     console.info?.(`[qq-guard] 已摘掉 ${dropped} 条宿主注入上下文（运行时记忆不会进 QQ 会话）`)
     return { ...decision, messages: kept }
-  }, { prepend: true })
+  }
+
+  // 兜底：preset 作用域一层（懒装载时可能比 mnemon 更内层，通常摘不到，但不会有害）。
+  ctx.on('agent/pre-step', filter)
+
+  // 主力：每个 qq-chat agent 创建后，在它自己的 ctx 上用 prepend 挂到最外层。
+  const seen = new WeakSet()
+  ctx.on('agent/created', (payload) => {
+    const agentCtx = payload?.agent?.ctx
+    if (!agentCtx || typeof agentCtx.on !== 'function') return
+    if (seen.has(agentCtx)) return
+    seen.add(agentCtx)
+    // 微任务：确保排在 mnemon 同步注册（以及任何后续同步注册）之后，
+    // unshift 才是真正的「最外层」。改成同步会在某些装载顺序下再次失效。
+    queueMicrotask(() => {
+      try {
+        agentCtx.on('agent/pre-step', filter, { prepend: true })
+      } catch (error) {
+        console.warn?.(`[qq-guard] 给 agent 挂上下文过滤失败（人设可能被记忆盖掉）：${error?.message ?? error}`)
+      }
+    })
+  })
 }
 
 /**
