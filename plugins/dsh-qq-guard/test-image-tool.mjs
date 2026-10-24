@@ -191,6 +191,19 @@ await check('导出常量与契约一致（IMAGE_TOOL_NAME / IMAGE_RECEIPT_TIMEO
   assert.equal(mod.IMAGE_RECEIPT_TIMEOUT_MS, 20000)
 })
 
+await check('工具能力版本 TOOL_CAPABILITY_EPOCH 有值且能从 /config 下发给桥接', async () => {
+  assert.equal(typeof mod.TOOL_CAPABILITY_EPOCH, 'string')
+  assert.match(mod.TOOL_CAPABILITY_EPOCH, /^v\d/, '格式应是 v 开头的版本串')
+  const routeHarness = makeHarness()
+  const route = routeHarness.settings.calls.routes.get('/dsh-qq-guard/config')
+  assert.ok(route, '设置实例没有注册 /dsh-qq-guard/config 路由')
+  const res = await callRoute(route)
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.equal(res.body?.config?.toolEpoch, mod.TOOL_CAPABILITY_EPOCH,
+    '★ 桥接靠这个字段判断旧会话要不要重建（否则老会话永远拿不到新工具）')
+  assert.equal(res.body?.config?.features?.image, true, '默认配置下 features.image 必须是 true')
+})
+
 await check('DEFAULT_SKILLS 里有 sk-image，且与契约逐字一致', () => {
   const defaults = mod.plainConfig(mod.Config({ role: 'settings' })).skills
   const image = defaults.find((item) => item.id === 'sk-image')

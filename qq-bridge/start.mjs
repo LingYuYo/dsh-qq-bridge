@@ -8,7 +8,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Bridge } from './src/bridge.mjs'
 import { DshClient } from './src/dsh.mjs'
-import { startConfigPolling } from './src/runtime-config.mjs'
+import { startConfigPolling, syncConfigOnce } from './src/runtime-config.mjs'
 import { startSessionOpsPolling } from './src/session-ops.mjs'
 import { buildBridgeStatus } from './src/status.mjs'
 import { acquireInstanceLock } from './src/instance-lock.mjs'
@@ -86,6 +86,15 @@ if (!lock.ok) {
 process.on('exit', () => lock.release())
 
 const bridge = new Bridge({ config, logger })
+// ★ 启动时同步拉一次热配置（v0.5.1）：第一条 QQ 消息可能早于 2s 轮询的第一轮，
+//   而 toolEpoch / features 决定「旧会话要不要重建上下文」。晚一拍，重启后的
+//   第一条消息仍会落在旧工具基线上（真机踩过：第一句又说「没有发图工具」）。
+try {
+  const early = await syncConfigOnce({ baseUrl: config.dsh.baseUrl, liveConfig: bridge.live, logger })
+  if (early.ok && early.changed.length > 0) {
+    logger.info(`启动时已同步 DSH 配置：${early.changed.join('、')}`)
+  }
+} catch { /* syncConfigOnce 内部已兜住，这里只防御 */ }
 await bridge.start()
 logger.info('桥接已启动，等待 QQ 消息。按 Ctrl+C 退出。')
 

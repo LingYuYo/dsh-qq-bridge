@@ -57,6 +57,9 @@ const HOT_KEYS = [
   // 外部插件启用清单（P2）：桥接据此决定要不要发 hook 请求——
   // 没人启用时一条 HTTP 都不发（见 bridge._externalPluginsEnabled）。
   'externalPlugins',
+  // 工具能力版本（v0.5.1）：Host 发布新模型工具时递增；桥接据此判断
+  // 旧 QQ 会话的 DSH 上下文要不要重建一次（新工具进基线）。
+  'toolEpoch',
   // 高级参数（排障/调优）：全部允许热改，改完下一条消息生效。
   'replyTimeoutMs',
   'modelWatchdogMs',
@@ -87,6 +90,10 @@ const PERSONA_KEYS = [
   // 模型路由会注入人设（【底层模型】一行），所以它也是人设签名的一部分：
   // 设置页换模型时必须触发一次重写，否则模型身份会落后于实际请求。
   'model',
+  // 技能开关会改变【能力】段（qq_send_voice / qq_send_image / web_search 的说明）。
+  // 不把 features 算进签名的话，用户在设置页刚打开「发图片」，人设里那行引导
+  // 要等下一次别的变动才会更新（v0.5.1 修）。
+  'features',
 ]
 
 /**
@@ -150,6 +157,43 @@ export function applyHotConfig(target, hot) {
     changed.push(key)
   }
   return changed
+}
+
+/**
+ * 启动时**同步拉一次**热配置（v0.5.1）。
+ *
+ * 为什么需要：桥接启动后的第一条 QQ 消息可能早于 2 秒轮询的第一轮。
+ * 而 `toolEpoch` 决定「旧会话要不要重建上下文」——晚一拍就会让第一条消息
+ * 仍落在旧工具基线上（真机踩过：重启后第一条消息依然说「没有发图工具」）。
+ * 启动时拉一次，bridge.live 从 t0 起就有完整的 features / toolEpoch。
+ *
+ * 失败不阻塞启动：DSH 没起 / 插件没装就继续用 config.json。
+ *
+ * @param {object} opts
+ * @param {string} opts.baseUrl
+ * @param {string} [opts.cookie]
+ * @param {object} opts.liveConfig 会被原地更新的配置对象
+ * @param {number} [opts.timeoutMs=1500]
+ * @param {object} [opts.logger]
+ * @returns {Promise<{ok:boolean, changed:string[], error?:string}>}
+ */
+export async function syncConfigOnce({ baseUrl, cookie, liveConfig, timeoutMs = DEFAULT_TIMEOUT_MS, logger } = {}) {
+  const base = String(baseUrl ?? '').replace(/\/+$/, '')
+  if (!base) return { ok: false, changed: [], error: '缺少 baseUrl' }
+  try {
+    const headers = { accept: 'application/json' }
+    if (cookie) headers.cookie = cookie
+    const res = await fetch(`${base}${CONFIG_ROUTE_PATH}`, { headers, signal: AbortSignal.timeout(timeoutMs) })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const body = await res.json()
+    if (body?.ok !== true || !body.config) throw new Error('响应格式不符')
+    const hot = pickHotConfig(body.config)
+    const changed = applyHotConfig(liveConfig, hot)
+    return { ok: true, changed }
+  } catch (error) {
+    logger?.warn?.(`启动时同步 DSH 配置失败（继续用 config.json，2 秒轮询会重试）：${error?.message ?? error}`)
+    return { ok: false, changed: [], error: error?.message ?? String(error) }
+  }
 }
 
 /**

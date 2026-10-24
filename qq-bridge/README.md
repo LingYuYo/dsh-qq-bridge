@@ -665,6 +665,24 @@ node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔�
 - 红线不变：换行 / 分片逻辑（`splitBubbles` / `_buildSegments`）一行没动；
   `promptAndWait` 轮询节奏也没动。
 
+## 工具能力升级：旧会话自动重建上下文（v0.5.1）
+
+**症状**：v0.5.0 后，**已有的 QQ 会话**里模型坚持说「没有发图工具」。
+
+**根因**：DSH 会话把**首次 `request/header`** 冻成工具基线，之后新增工具只以 `tool-addition`
+增量下发；`opencode-go/deepseek` 路由上模型拿不到增量声明。重启 DSH 不会重建基线
+（它跟会话历史一起持久化），只有新建会话（清空上下文）才有效。
+
+**桥接的处理**：
+
+- Host `/config` 下发 `toolEpoch`（发布新工具时递增，当前 `v0.5.1-2026-10-24-qq_send_image`）。
+- `state/sessions.json` 每条会话记 `toolEpoch`；`ensureSession` 发现不一致 →
+  **归档旧会话 + 重建上下文一次**（不删历史，`stats.capabilityRefreshes++`），新工具进基线。
+- `start.mjs` 启动时 `syncConfigOnce()` 先同步拉一次热配置，重启后的第一条消息就能触发重建。
+- 新建 / 清空上下文的会话立即写入当前 epoch，不会反复重建。
+- 关掉自动重建：`config.json` 加 `{ "capability": { "autoRefreshOnUpgrade": false } }`
+  （之后需要自己在设置页「清空上下文」一次）。
+
 ## 运行
 
 ```bash
@@ -737,8 +755,8 @@ node test-timeout.mjs   # 等待超时：默认 20s / 超时必 session/cancel /
 `plugins/dsh-qq-guard/test-napcat.mjs`（NapCat 进程管理）、
 `plugins/dsh-qq-guard/test-autostart.mjs`（autoStart / 单实例 / 崩溃重启上限）、
 `test-persona.mjs`（人设写入不丢插件）。
-**不连 QQ、不启 NapCat、不碰 DSH 会话。** 当前基线（2026-10-24 P2）：`195 通过 / 0 失败`
-（bridge 五个测试文件：195 / 16 / 31 / 13 / 6，全绿）。
+**不连 QQ、不启 NapCat、不碰 DSH 会话。** 当前基线（2026-10-24 v0.5.1）：`204 通过 / 0 失败`
+（bridge 五个测试文件：204 / 16 / 31 / 13 / 6，全绿）。
 
 ## 排障
 

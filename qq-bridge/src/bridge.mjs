@@ -207,10 +207,19 @@ export function featuresFromManifests({ skills, plugins } = {}) {
 export function capabilityLines(features) {
   const f = normalizeFeatures(features)
   const lines = []
+  // 权威块（v0.5.1 真机教训）：旧会话/自定义人设里可能写着「这里没有发语音/发图工具」，
+  // 模型会拿它当事实拒绝调用。这一段显式声明优先级，压掉那些过时说法。
+  if (f.voice || f.image) {
+    lines.push('【工具可用性（以本段为准）】以下工具现在确实可用；'
+      + '如果你的人设或之前的对话里说过「没有发语音/发图的工具」，那是旧设定，别再照它回答。')
+  }
   if (f.vision) lines.push('对方发来的图片会以图像形式直接提供给你，你可以看图回答；没收到图像时不要编造图片内容。')
   if (f.search) lines.push('需要查实时信息时，可以调用 web_search / web_fetch 联网检索，再把结果用自己的话说。')
   if (f.voice) lines.push('如果一句话适合用语音说，可以调用 qq_send_voice 把它变成 QQ 语音条发出去。')
-  if (f.image) lines.push('想发图片或表情包时，可以调用 qq_send_image，用 url（http/https 图片地址）或 file（本地绝对路径 / file:// / base64://）二选一。')
+  if (f.image) {
+    lines.push('想发图片或表情包时，可以调用 qq_send_image，用 url（http/https 图片地址）或 file（本地绝对路径 / file:// / base64://）二选一。'
+      + '对方要图/表情包时直接调用它；没有可用的图片地址就如实说「给我个图片链接」或「我这儿没有图」，不要回答「没有发图工具」。')
+  }
   return lines
 }
 
@@ -331,6 +340,8 @@ export function normalizeSessionEntry(key, raw) {
     persona: typeof value.persona === 'string' ? value.persona : '',
     // 单群活跃系数（0..3）：null = 跟随全局 rhythm.activityLevel，数字 = 该群独立档位。
     activityLevel: normalizeActivityLevel(value.activityLevel),
+    // 建这条会话时的工具能力版本（v0.5.1）：空串 = 旧版本建的，下次消息会触发一次上下文重建。
+    toolEpoch: typeof value.toolEpoch === 'string' ? value.toolEpoch : '',
   }
 }
 
@@ -498,6 +509,9 @@ export class Bridge {
         wsUrl: config.onebot?.wsUrl ?? '',
         accessToken: config.onebot?.accessToken ?? '',
       },
+      // 工具能力版本（v0.5.1）：Host 的 /config 下发。
+      // 与 state.sessions[key].toolEpoch 不一致 = 该会话建于旧工具基线，需要重建一次上下文。
+      toolEpoch: String(config.toolEpoch ?? ''),
     }
     this.dsh = new DshClient({ baseUrl: config.dsh.baseUrl, logger: this.logger })
     // 外部插件 hook 客户端（P2）：best-effort，没装插件 / DSH 不可达都不影响聊天。
@@ -541,6 +555,8 @@ export class Bridge {
       modelPushes: 0, personaPushes: 0, sessionChecks: 0, skippedRequests: 0,
       // 外部插件 hook：实际生效次数 / 因 drop 丢弃的消息数 / 没人启用时的跳过次数。
       hookCalls: 0, hookDrops: 0, hookSkipped: 0,
+      // 工具能力升级导致的旧会话上下文重建次数（v0.5.1）。
+      capabilityRefreshes: 0,
     }
   }
 
@@ -702,8 +718,12 @@ export class Bridge {
         stale,
         // 重建事件计数：会话失效后重建了几次（排障用，不参与逻辑）。
         rebuilds: Number.isFinite(Number(parsed.rebuilds)) ? Number(parsed.rebuilds) : 0,
+        // 工具能力升级导致的重建次数（v0.5.1，排障用）。
+        capabilityRefreshes: Number.isFinite(Number(parsed.capabilityRefreshes))
+          ? Number(parsed.capabilityRefreshes)
+          : 0,
       }
-    } catch { return { sessions: {}, generation: 0, stale: [], rebuilds: 0 } }
+    } catch { return { sessions: {}, generation: 0, stale: [], rebuilds: 0, capabilityRefreshes: 0 } }
   }
 
   _saveState() {
@@ -983,6 +1003,20 @@ export class Bridge {
   /** 取或建该 QQ 会话对应的 DSH 会话。 */
   async ensureSession(key, msg) {
     const entry = this._entryOf(key)
+    // ── 工具能力升级：旧会话重建一次上下文（v0.5.1）──────────────────
+    //
+    // 根因（2026-10-24 真机实测）：DSH 把会话**首次 request/header** 冻成工具基线，
+    // 之后新增的工具只以 tool-addition 增量下发；在 opencode-go/deepseek 这条路由上，
+    // 老会话里的模型始终认为「没有发图工具」，连显式点名都不调用（重建会话后立刻正常）。
+    // 处理：toolEpoch 和会话记录不一致时，把这条 QQ 会话的 DSH 上下文重建一次。
+    // 旧会话**归档不删**（历史还能翻），QQ 侧表现为「上下文重置了一次」。
+    // 只在发布新工具（epoch 变化）时触发；用户开关技能不会重置任何上下文。
+    if (entry.sessionId) {
+      const epoch = String(this.live?.toolEpoch ?? '')
+      if (epoch !== '' && String(entry.toolEpoch ?? '') !== epoch && this._autoRefreshOnCapabilityChange()) {
+        await this._refreshSessionForCapability(key, entry, epoch)
+      }
+    }
     if (entry.sessionId) {
       if (await this._sessionExists(entry.sessionId)) {
         // 接管已有会话：标题可能还是旧版留下的（比如 LLM 生成的「向」），顺手对齐。
@@ -1006,11 +1040,56 @@ export class Bridge {
     const sessionId = await this.dsh.createSession(workspaceId, this.config.dsh.agentPreset)
     await this._applyModel(sessionId)
     entry.sessionId = sessionId
+    // 记下建这条会话时的工具能力版本：下次发布新工具时据此判断要不要重建。
+    entry.toolEpoch = String(this.live?.toolEpoch ?? '')
     this._saveState()
     this.logger.info?.(`新会话 ${key} -> ${sessionId}`)
     // 建完立刻改名：抢在第一条 prompt 之前，避免 DSH 的自动标题（LLM）先落一个怪名字。
     await this._ensureSessionTitle(key, msg, { force: true })
     return sessionId
+  }
+
+  /**
+   * 工具能力升级时是否自动重建旧会话的上下文（默认 true）。
+   *
+   * 想保留旧上下文、宁可手动清空的用户可以在 `qq-bridge/config.json` 里写
+   * `{ "capability": { "autoRefreshOnUpgrade": false } }` 关掉；关掉后
+   * 旧会话会一直拿不到新工具，需要自己在设置页「清空上下文」一次。
+   */
+  _autoRefreshOnCapabilityChange() {
+    return this.config?.capability?.autoRefreshOnUpgrade !== false
+  }
+
+  /**
+   * 把一条会话的 DSH 上下文重建一次，让「工具基线」带上新工具（v0.5.1）。
+   *
+   * 语义：**归档旧会话 + 清空映射**，随后 ensureSession 会正常建一条新会话。
+   * 绝不删历史（归档只是从活跃列表挪走）；归档失败也只记 stale，绝不阻塞聊天。
+   * @param {string} key QQ 会话 key
+   * @param {object} entry state.sessions[key]
+   * @param {string} epoch 新工具能力版本
+   */
+  async _refreshSessionForCapability(key, entry, epoch) {
+    const oldId = String(entry.sessionId ?? '').trim()
+    if (!oldId) return
+    this.logger.warn?.(
+      `工具能力已升级（${entry.toolEpoch || '旧版本'} → ${epoch}），`
+      + `会话 ${key} 的上下文将自动重建一次（旧会话归档，不删历史），新工具才会进模型基线`,
+    )
+    try {
+      await this.dsh.archiveSession(oldId, { stopActivity: true })
+    } catch (error) {
+      // 归档失败不阻塞：把 id 记进 stale，由清理路由兜底。
+      this._noteStale(oldId)
+      this.logger.warn?.(`能力升级时归档旧会话 ${oldId} 失败（继续重建）：${error?.message ?? error}`)
+    }
+    this._forgetSessionCaches(oldId)
+    entry.sessionId = ''
+    entry.title = ''
+    entry.toolEpoch = epoch
+    this.state.capabilityRefreshes = (Number(this.state.capabilityRefreshes) || 0) + 1
+    this.stats.capabilityRefreshes = (this.stats.capabilityRefreshes ?? 0) + 1
+    this._saveState()
   }
 
   /**
@@ -1161,8 +1240,7 @@ export class Bridge {
     // 不能走 _entryOf('')，否则会在 state.sessions 里留下一个空 key 的垃圾行。
     const entry = (action === 'voice' || action === 'image') ? null : this._entryOf(key)
 
-    if (action === 'persona') {
-      entry.persona = String(op?.text ?? '').slice(0, 20000)
+    if (action === 'persona') {      entry.persona = String(op?.text ?? '').slice(0, 20000)
       this._saveState()
       // 明确保存了人设：清掉同签名缓存，下一条消息必须真的重推一次。
       this._personaSignatures.delete(entry.sessionId)
@@ -1202,6 +1280,8 @@ export class Bridge {
       const workspaceId = await this.dsh.ensureWorkspace(sessionCwd, workspaceTitle)
       const sessionId = await this.dsh.createSession(workspaceId, this.config.dsh.agentPreset)
       entry.sessionId = sessionId
+      // 新建即当前工具基线，记下 epoch（否则下一条消息会再触发一次「能力升级重建」）。
+      entry.toolEpoch = String(this.live?.toolEpoch ?? '')
       entry.title = ''
       entry.unread = 0
       entry.lastAt = 0

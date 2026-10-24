@@ -2739,6 +2739,20 @@ function applyVoiceTool(ctx) {
 /** 「发图片」工具名（guard 与测试共用）。 */
 export const IMAGE_TOOL_NAME = 'qq_send_image'
 /**
+ * 工具能力版本（v0.5.1）。
+ *
+ * 为什么需要它：DSH 会话会把**首次 `request/header`** 冻成工具基线，之后新增的工具
+ * 只能以 `tool-addition` 增量下发；实测（2026-10-24）在 opencode-go/deepseek 路由上，
+ * 老会话的模型会一直认为「没有发图工具」，连显式点名都不调用。只有重建会话
+ * （新的基线 header）才拿得到。
+ *
+ * 所以每次发布**新增/改名模型侧工具**时改一下这个字符串：桥接发现某 QQ 会话的
+ * `toolEpoch` 与它不一致，会在下一条消息时把该会话的 DSH 上下文自动重建一次
+ * （旧会话归档，不删历史），让新工具进基线。它不是 skill 开关的版本——
+ * 用户开关技能不应该重置任何人的上下文。
+ */
+export const TOOL_CAPABILITY_EPOCH = 'v0.5.1-2026-10-24-qq_send_image'
+/**
  * 等桥接回执的上限（毫秒）。
  * 桥接要下网页图片 / 读本地文件 / base64 编码再交给 NapCat，20s 是 p2-contract §3.2 的约定。
  */
@@ -2762,9 +2776,10 @@ function applyImageTool(ctx) {
     const definition = buildToolDefinition({
       name: IMAGE_TOOL_NAME,
       description: '把一张图片或表情包发到当前 QQ 聊天。url 与 file 二选一：'
-        + 'url 给 http/https 图片地址（NapCat 自己下载），file 给本地绝对路径 / file:// / base64://。'
-        + '两个都给时用 url。仅在「发图片」技能开启时可用；**发送失败会抛错**（桥接下载或 NapCat 拒收时），'
-        + '别假设一定成功。',
+        + 'url 给 http/https 图片地址（NapCat 自己下载），file 给本地绝对路径 / file:// / base64://；'
+        + '两个都给时用 url。对方要图片或表情包时**直接调用本工具**，不要回答「没有发图工具」；'
+        + '没有可用的图片地址就如实说「给我个图片链接」，不要编造。'
+        + '**发送失败会抛错**（下载失败或 NapCat 拒收时），失败原因要如实告诉对方。',
       parameters: {
         url: {
           type: 'string',
@@ -2970,6 +2985,11 @@ function applySettings(ctx, config) {
             // Phase 6：技能/插件开关的**派生结果**。guard 与桥接共用同一份判断逻辑，
             // 避免「UI 写着已开启、桥接按 id 算出来却是关」这类漂移。
             features: readFeatureFlags(config),
+            // 工具能力版本（v0.5.1）：新工具/新 skill 上线时改这里。
+            // 桥接据此判断「旧会话的工具基线是不是该重建了」——
+            // DSH 的会话会把首次 request/header 冻成工具基线，之后新增的工具
+            // 只能走 tool-addition 增量，老会话里模型可能一直拿不到新工具。
+            toolEpoch: TOOL_CAPABILITY_EPOCH,
           },
         })
       },

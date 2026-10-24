@@ -14,6 +14,35 @@ DSH 插件：给 QQ 聊天会话装一道**执行期工具门禁**，并提供 Q
 > ⑤ 网页搜索补上 DeepSeek API Key 的配置入口；另含单群独立响应档位、技能配置真实弹窗。
 > 细节见文末两轮「修复记录」。
 
+## v0.5.1：老会话拿不到新工具（真机盲点）→ 已修
+
+**症状**：v0.5.0 后模型在**已有的 QQ 会话**里说「发不了，我这儿没有发图的工具」。
+
+**排查结论（真机取证，不是猜）**：
+
+- Schema 没问题：新建一条 qq-chat 会话，`request/header` 的 `tools` 有 18 个（含 `qq_send_image`），
+  同一句话模型会正常调用；老会话的 header 里其实也有它，但模型列表里就是没有。
+- 开关没问题：`sk-image` 默认开启，老配置缺这项也按开启算；人设【能力】段里有发图引导。
+- 权限没问题：执行期 guard 显式放行 `qq_send_image`（只在技能关闭时拒绝）。
+
+**根因**：DSH 会话把**首次 `request/header`** 冻成工具基线，之后新增工具只以 `tool-addition`
+增量下发；在 `opencode-go/deepseek` 这条路由上，增量没有变成模型可调用的工具声明。
+所以 v0.5.0 之前建的会话，只有重建（清空上下文）才能拿到新工具；重启 DSH 不够，
+基线跟会话历史一起持久化。
+
+**修法**：
+
+1. `/config` 下发 `toolEpoch`（`TOOL_CAPABILITY_EPOCH`，发布新工具时递增）。
+2. 桥接在每条会话记录建会话时的 epoch；不一致就在下一条消息时**自动重建一次上下文**
+   （旧会话归档、不删历史）。新建会话/清空上下文都会写入当前 epoch。
+3. `start.mjs` 启动时**同步拉一次热配置**，保证重启后的第一条消息就能触发重建。
+4. 人设签名纳入 `features`：设置页刚打开某技能时，【能力】段立刻重推（以前要等其他变动）。
+5. 能力段新增权威块【工具可用性（以本段为准）】+ `qq_send_image` 描述明确「对方要图直接调用」，
+   压掉自定义人设里「这里没有发语音/发图工具」这类过时说法。
+
+**开关**：`qq-bridge/config.json` 里 `{"capability":{"autoRefreshOnUpgrade":false}}` 可关闭自动重建
+（关掉后需手动「清空上下文」一次）。
+
 ## P2（v0.5.0）：发图片 / 外部插件真实生效 / 性能与 UI 极速
 
 **① 发图片 / 表情包（`qq_send_image`）**
@@ -55,8 +84,8 @@ DSH 插件：给 QQ 聊天会话装一道**执行期工具门禁**，并提供 Q
   主面板与其它 Tab 不再随轮询重渲染。
 - **Loading**：新增纯 CSS `.qqg-spin`（含 `prefers-reduced-motion`），用于启停桥接 / NapCat、浏览目录、测试运行、重新扫描、会话提交等耗时按钮，pending 时禁用防重复点击。
 
-> 本节的离线回归：`test-image-tool.mjs`（21）、`test-external-hooks.mjs`（17）、sandbox 三件套（+19）、
-> bridge `test-offline`（195）、`test-tts`（31）、UI `test-shell-ui`（14）/ `test-skills`（33，新增 sk-image 与 onBlur 断言）。
+> 本节的离线回归：`test-image-tool.mjs`（22）、`test-external-hooks.mjs`（17）、sandbox 三件套（+19）、
+> bridge `test-offline`（204）、`test-tts`（31）、UI `test-shell-ui`（14）/ `test-skills`（33，新增 sk-image 与 onBlur 断言）。
 
 ## 为什么需要它
 

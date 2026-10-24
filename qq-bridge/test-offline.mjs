@@ -21,7 +21,7 @@ import {
 import { ExternalHooksClient } from './src/external-hooks.mjs'
 import { buildSsml, synthesizeOpenAI } from './src/tts.mjs'
 import { discoverDshBaseUrl, listLocalListeningPorts, DSH_BASE_HOST } from './src/dsh.mjs'
-import { pickHotConfig, applyHotConfig, startConfigPolling, CONFIG_ROUTE_PATH } from './src/runtime-config.mjs'
+import { pickHotConfig, applyHotConfig, startConfigPolling, syncConfigOnce, CONFIG_ROUTE_PATH } from './src/runtime-config.mjs'
 import { buildBridgeStatus, qqStateFromHealth, QQ_STATES } from './src/status.mjs'
 import { acquireInstanceLock, readLiveInstanceLock, lockPath, LOCK_FILE_NAME } from './src/instance-lock.mjs'
 
@@ -449,6 +449,62 @@ await check('startConfigPolling 从桩路由拉到配置并热应用', async () 
     assert.ok(synced >= 1, 'onSync 应被调用')
   } finally { stop(); srv.close() }
 })
+await check('syncConfigOnce：启动时同步拉一次，toolEpoch/features 立即就位（v0.5.1）', async () => {
+  const http = await import('node:http')
+  const srv = http.createServer((req, res) => {
+    if (req.url !== CONFIG_ROUTE_PATH) { res.writeHead(404); res.end(); return }
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      ok: true,
+      config: { bubbleMaxChars: 15, toolEpoch: 'v0.5.1-test', features: { image: true, voice: true } },
+    }))
+  })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  const port = srv.address().port
+  const live = { bubbleMaxChars: 30 }
+  try {
+    const result = await syncConfigOnce({ baseUrl: `http://127.0.0.1:${port}`, liveConfig: live, timeoutMs: 1000 })
+    assert.equal(result.ok, true)
+    assert.equal(live.bubbleMaxChars, 15, '普通热配置要一起应用')
+    assert.equal(live.toolEpoch, 'v0.5.1-test', '★ 第一条消息前就要有 toolEpoch')
+    assert.deepEqual(live.features, { image: true, voice: true })
+    // 失败路径：不许抛，返回 ok:false（启动流程继续用 config.json）。
+    const bad = await syncConfigOnce({ baseUrl: 'http://127.0.0.1:1', liveConfig: {}, timeoutMs: 200 })
+    assert.equal(bad.ok, false)
+  } finally { srv.close() }
+})
+
+await check('startConfigPolling：features 变化也算人设变化（skill 开关会重推【能力】段）', async () => {
+  const http = await import('node:http')
+  let payload = { features: { image: false }, personaBotName: '小鱼' }
+  const srv = http.createServer((req, res) => {
+    if (req.url !== CONFIG_ROUTE_PATH) { res.writeHead(404); res.end(); return }
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: true, config: payload }))
+  })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  const port = srv.address().port
+  const live = {}
+  const calls = []
+  let synced = 0
+  const stop = startConfigPolling({
+    baseUrl: `http://127.0.0.1:${port}`,
+    liveConfig: live,
+    pollMs: 60,
+    timeoutMs: 1000,
+    onSync: () => { synced++ },
+    onPersona: (hot) => { calls.push(hot); return { ok: true, action: 'pushed' } },
+  })
+  try {
+    const deadline = Date.now() + 3000
+    while (synced === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 30))
+    assert.equal(calls.length, 0, '首次同步只记录签名')
+    payload = { ...payload, features: { image: true } }
+    while (calls.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 30))
+    assert.equal(calls.length, 1, `打开「发图片」应触发一次人设重推，实际 ${calls.length}`)
+  } finally { stop(); srv.close() }
+})
+
 await check('pickHotConfig 放行人设新字段（名字/展示名/参与度/附加规则/覆盖）', () => {
   const hot = pickHotConfig({
     personaText: '猫娘',
@@ -968,7 +1024,7 @@ console.log('\n— Phase 4：节奏参数（热配置真实生效）—')
  * 造一个只接假 DSH / 假 QQ 的 Bridge（不建会话、不发消息、不读写真实 state）。
  * 返回 { b, calls }：calls 记录 prompt / archive / 会话创建 / 实际发出的消息。
  */
-function makeBridge({ rhythm, dsh: dshCfg, stateFile, allow, personaDefault } = {}) {
+function makeBridge({ rhythm, dsh: dshCfg, stateFile, allow, personaDefault, capability } = {}) {
   const b = new Bridge({
     config: {
       dsh: {
@@ -978,6 +1034,7 @@ function makeBridge({ rhythm, dsh: dshCfg, stateFile, allow, personaDefault } = 
       onebot: { wsUrl: 'ws://127.0.0.1:1', accessToken: 't' },
       allow: { private: ['1000000001'], groups: ['123456'], admins: [], allowAllWhenEmpty: false, ...(allow ?? {}) },
       ...(personaDefault ? { personaDefault } : {}),
+      ...(capability ? { capability } : {}),
       sendDelayMs: 0,
       stateFile: stateFile ?? path.join(os.tmpdir(), `qq-bridge-state-${process.pid}-${Math.random().toString(36).slice(2)}.json`),
       ...(rhythm ? { rhythm } : {}),
@@ -2277,6 +2334,83 @@ await check('同一批 [image, clear]：image 后台执行、clear 回执先到�
   assert.ok(receipt, `★ image 回执丢了：${JSON.stringify(posted)}`)
   assert.equal(receipt.ok, true)
   assert.match(receipt.detail, /已发送图片/)
+})
+
+console.log('\n— 工具能力升级：旧会话自动重建上下文（v0.5.1）—')
+await check('toolEpoch 不一致 → 归档旧会话、建新会话、记录新 epoch（只发生一次）', async () => {
+  const stateFile = path.join(os.tmpdir(), `qq-bridge-state-${process.pid}-epoch1.json`)
+  fs.writeFileSync(stateFile, JSON.stringify({
+    sessions: { 'g:123456': { sessionId: 'old-sess', toolEpoch: 'v0.4.0' } },
+  }))
+  const { b, calls } = makeBridge({ stateFile })
+  b.live.toolEpoch = 'v0.5.1-test'
+  const sid = await b.ensureSession('g:123456')
+  assert.equal(sid, 's1', '应重建出新会话')
+  assert.deepEqual(calls.archived, ['old-sess'], '旧会话必须归档')
+  assert.deepEqual(calls.archiveOpts[0], { stopActivity: true }, '归档要带 stopActivity（旧会话可能还在跑）')
+  assert.equal(calls.existChecks.length, 0, '能力升级直接重建，不必先查旧会话在不在')
+  assert.equal(b.state.sessions['g:123456'].sessionId, 's1')
+  assert.equal(b.state.sessions['g:123456'].toolEpoch, 'v0.5.1-test')
+  assert.equal(b.stats.capabilityRefreshes, 1)
+  // 同一条消息流程里不会二次重建（epoch 已对齐）。
+  calls.created = 1
+  assert.equal(await b.ensureSession('g:123456'), 's1')
+  assert.equal(b.stats.capabilityRefreshes, 1)
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check('epoch 一致 → 复用原会话，不归档', async () => {
+  const stateFile = path.join(os.tmpdir(), `qq-bridge-state-${process.pid}-epoch2.json`)
+  fs.writeFileSync(stateFile, JSON.stringify({
+    sessions: { 'g:123456': { sessionId: 'same-sess', toolEpoch: 'v0.5.1-test' } },
+  }))
+  const { b, calls } = makeBridge({ stateFile })
+  b.live.toolEpoch = 'v0.5.1-test'
+  assert.equal(await b.ensureSession('g:123456'), 'same-sess')
+  assert.deepEqual(calls.archived, [], 'epoch 没变就不许重置上下文')
+  assert.equal(b.stats.capabilityRefreshes, 0)
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check('配置 capability.autoRefreshOnUpgrade=false → 保留旧上下文（工具缺失需手动清空）', async () => {
+  const stateFile = path.join(os.tmpdir(), `qq-bridge-state-${process.pid}-epoch3.json`)
+  fs.writeFileSync(stateFile, JSON.stringify({
+    sessions: { 'g:123456': { sessionId: 'keep-sess', toolEpoch: 'v0.4.0' } },
+  }))
+  const { b, calls } = makeBridge({ stateFile, capability: { autoRefreshOnUpgrade: false } })
+  b.live.toolEpoch = 'v0.5.1-test'
+  assert.equal(await b.ensureSession('g:123456'), 'keep-sess')
+  assert.deepEqual(calls.archived, [])
+  assert.equal(b.stats.capabilityRefreshes, 0)
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check('新建会话即写下当前 epoch（重启后不会反复重建）', async () => {
+  const { b } = makeBridge({})
+  b.live.toolEpoch = 'v0.5.1-test'
+  await b.ensureSession('u:1000000001')
+  assert.equal(b.state.sessions['u:1000000001'].toolEpoch, 'v0.5.1-test')
+})
+
+await check('normalizeSessionEntry 保留 toolEpoch（_loadState 不再丢字段）', () => {
+  const entry = normalizeSessionEntry('g:123456', { sessionId: 's', toolEpoch: 'v0.5.1-test' })
+  assert.equal(entry.toolEpoch, 'v0.5.1-test')
+  assert.equal(normalizeSessionEntry('g:1', { sessionId: 's' }).toolEpoch, '')
+  assert.equal(normalizeSessionEntry('g:1', 'session-abc').toolEpoch, '')
+})
+
+await check('热配置轮询把 toolEpoch 计入人设签名（features 变化会重推人设）', () => {
+  const hot = pickHotConfig({ toolEpoch: 'v0.5.1-test', features: { image: true } })
+  assert.equal(hot.toolEpoch, 'v0.5.1-test')
+  assert.deepEqual(hot.features, { image: true })
+})
+
+await check('能力说明带权威「工具可用性」块（压掉人设/历史里的旧说法）', () => {
+  const on = capabilityLines({ vision: false, search: false, voice: true, image: true }).join('\n')
+  assert.match(on, /【工具可用性（以本段为准）】/)
+  assert.match(on, /不要回答「没有发图工具」/)
+  const off = capabilityLines({ vision: false, search: false, voice: false, image: false }).join('\n')
+  assert.ok(!off.includes('工具可用性'), '技能全关时不打权威块')
 })
 
 console.log('\n— 单群活跃系数 + 人设重推修复（qq-bridge 独立测试文件）—')
