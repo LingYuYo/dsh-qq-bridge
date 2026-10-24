@@ -594,9 +594,12 @@ node render-preview.mjs       # 生成 preview/*.html 静态版式（含弹窗�
 `@deepseek-ai/schemastery`：用 `QQG_SCHEMASTERY` 指向它的 `lib/index.mjs`（**要给绝对路径**），
 不设就自动探测 `node_modules`。
 
-`test-preset-scope.mjs` 需要真正的 DSH 包（`@deepseek-ai/cordis` / `dsh-tools` / `dsh-system-prompt`
-/ `dsh-agent-preset-registry`）：用 `QQG_DSH_MODULES` 指向一个含这些包的 `node_modules`
-（例如从 `app.asar` 抽出来的那份），**没设或找不到就打 SKIP 并 exit 0**，不会把离线套件弄红。
+`test-preset-scope.mjs` 需要真正的 DSH 包（`@deepseek-ai/cordis` / `dsh-scope` / `dsh-tools` /
+`dsh-system-prompt` / `cordis-plugin-loader` / `dsh-agent-preset-registry`）：用 `QQG_DSH_MODULES`
+指向一个含这些包的 `node_modules`，**没设或找不到就打 SKIP 并 exit 0**，不会把离线套件弄红。
+（这些包在 `DeepSeek Harness/resources/app.asar` 里：读前 16 字节拿 JSON header 长度、再按
+`dsh/node_modules/<pkg>/...` 的 offset/size 取文件即可；注意要顺着 import 把依赖闭包一起抽出来，
+大约 25 个包。`@deepseek-ai/schemastery` 从插件自己的 `node_modules` 里拿也行。）
 它是唯一一条「真宿主 + 真实 mountPreset」的用例 —— 2026-10-24 那个 P0 只有它能拦住，
 把判定退回旧写法会红 13 条。
 
@@ -629,9 +632,11 @@ node render-preview.mjs       # 生成 preview/*.html 静态版式（含弹窗�
   因为「误判成顶层」只是 QQ 会话失去门禁（日志可见），「误判成 preset」则是全局 guard
   把浏览器会话全锁死 —— 后者正是 2026-10-20 那次事故。
 - **验证**：`test-preset-scope.mjs`（真宿主 + 真实 `mountPreset`）：修复后
-  `assemble()` 只剩 `deployment:persona-prefix` 一段、`tools.schemas(presetScope)` 里出现
-  `qq_send_voice`、deny 名单里的全局工具被隐藏、全局视角一段没少；顶层装载仍然被拒绝。
-  把判定换回旧写法 → 该文件红 7 条。
+  `assemble()` 只剩 `deployment:persona-prefix` 一段（带 `agent.session.id` 时单人设覆盖生效）、
+  `tools.schemas(presetScope)` 里出现 `qq_send_voice`、deny 名单里的全局工具被隐藏、
+  全局视角一段没少；顶层装载仍然被拒绝；把判定换回旧写法 → 该文件红 13 条。
+- **上线动作**：Host 侧改动要**重启一次 DSH**（bundle patch 在启动时装载，`cordis.yml` 会重新生成）；
+  已经开着的 QQ 会话下一条消息就会走新的 section 组装。
 
 ### 1. 人设没进系统提示（P0）→ 根因见上，已修
 
@@ -650,6 +655,7 @@ node render-preview.mjs       # 生成 preview/*.html 静态版式（含弹窗�
   `onPersona` 返回 Promise，`runtime-config.mjs` 补 `await`；
   `r === undefined` 按契约违例 warn **一次**并推进签名（不再每 2 秒静默重推）。
 - 「全局人设已推送」日志现在只在启动（config 兜底 + 首次同步校准）和真正变化时出现。
+- **上线动作**：桥接是独立进程，改完要**重启桥接**（设置页「运行状态 → 重启桥接」或手动重启）。
 
 ### 3. 发语音失败（P1）→ 已修（工具可见性）
 
