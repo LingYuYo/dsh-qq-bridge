@@ -1830,5 +1830,16 @@ await check('qq-bridge 单群活跃系数回归全绿', async () => {
   assert.match(out, /结果：\d+ 通过 \/ 0 失败/, `单群活跃系数回归未全绿：\n${out}`)
 })
 
+console.log('\n— TTS 通路（baidu / edge 人话错误 / file:// 降级 / op detail）—')
+await check('qq-bridge TTS 通路回归全绿', async () => {
+  const { execFileSync } = await import('node:child_process')
+  const path = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+  const here = path.dirname(fileURLToPath(import.meta.url))
+  const script = path.resolve(here, 'test-tts.mjs')
+  const out = execFileSync(process.execPath, [script], { encoding: 'utf8', env: pluginTestEnv })
+  assert.match(out, /结果：\d+ 通过 \/ 0 失败/, `TTS 通路回归未全绿：\n${out}`)
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 process.exit(fail === 0 ? 0 : 1)

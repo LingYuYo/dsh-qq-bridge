@@ -279,6 +279,15 @@ QQ 账号在线（WS get_status 确认）
 - **生效范围**：不再是「只对新建会话生效」——动态 section 每次组装现读，保存后下一条消息即生效。
 - 「恢复默认人设」= 单人设置空 → 桥接回落到全局 → 全局为空则用 `personaDefault`。
 
+**2026-10-24 补充：人设「被无视」的真因不在这一层。**
+实测确认系统提示词里**就是**人设（`system/message` 6554 字，`complete: true` 生效），
+provider（opencode-go）也不会覆盖 system 提示词（直连 API 注入人设，模型照做）。
+真正盖掉人设的是宿主 `dsh-mnemon`：它在 `agent/pre-step` 里把 USER.md / MEMORY.md 快照当
+**user 消息**插进每一步，模型优先照记忆演。guard 现在会把这类消息（`source.kind='dsh-mnemon'`）
+从 QQ 会话里摘掉 —— 这同时是隐私修复：群友对话不该带主人的长期记忆。
+排查开关：插件 Config `debugPrompt=true` 或 `QQG_PROMPT_DEBUG=1`，会打印
+`[Persona Debug] session=… sections=[名字:字数] contexts=[…]`。
+
 ### 管理员权限（/ 指令）
 
 - `allow.admins`（数组，设置页「白名单管理 → 管理员 QQ 号」）。
@@ -564,19 +573,37 @@ node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔�
 
 - guard 实例在 preset 作用域注册 `qq_send_voice` 工具（`text` 必填，`voice` 可选），
   执行时只把任务入队（`sessionId + text + voice`）——插件不碰 NapCat。
+  **2026-10-24 起工具会等桥接回执**：入队后阻塞到 `session-ops` 的 `{results:[{id,ok,detail}]}`
+  回来，成功返回 `{sent:true, detail}`，失败直接 `throw`，25s 没回执也抛错。
+  以前「入队即成功」害模型在语音其实没发出去时回复「发出去了」。
 - 桥接轮询会话指令时执行 `voice` op：按 `sessionId` 反查 QQ 会话 key → TTS 合成 →
-  `send_group_msg` / `send_private_msg` 的 `record` 段（`base64://...`）发送。
+  `send_group_msg` / `send_private_msg` 的 `record` 段（`base64://...`）发送；
+  base64 失败会自动落盘 `state/voice-<ts>.mp3` 用 `file://` 重发一次，
+  两次都失败保留文件并把两次 retcode 一起带回。
 - TTS 实现 `src/tts.mjs`，零 npm 依赖：
-  - `edge`（默认，免 Key）：微软 Edge 朗读 WebSocket，带 Sec-MS-GEC 签名，输出 mp3；
+  - **`baidu`（默认，免 Key）**：`GET https://fanyi.baidu.com/gettts?lan=zh&...`，回 mp3；
+    单次上限 200 字（超限本地报错，不静默截断）；
+  - `edge`：微软 Edge 朗读 WebSocket。**2026-10-24 起被微软端拒**（握手 403 / WS 1006，
+    上游已改用 `Sec-MS-GEC v2` 签名）；配置里还是 edge 时桥接会**自动降级 baidu 重试一次**，
+    日志与回执都写明降级；
   - `openai`：任意 OpenAI 兼容 `POST /v1/audio/speech`（baseUrl + apiKey）。
 - 单条上限 240 字（约 60 秒）。mp3 → QQ 语音的转码由 NapCat 完成；NapCat 不支持时
-  发送会失败，日志里有 retcode，不会卡住聊天。
-- 技能关闭时工具执行期直接拒绝（guard 层），UI 上也会标「开发中」以外的状态。
+  发送会失败，失败原因经回执回到模型（provider / 体积 / via / retcode 都在 detail 里）。
+- 技能关闭时工具执行期直接拒绝（guard 层）。
 
 ### 网页搜索（sk-search）
 
 - 开启：guard 执行期放行 `web_search` / `web_fetch`（DSH 原生联网工具）；
 - 关闭：执行期拒绝。人设里也会多一行「可以联网检索」的能力说明，只在开启时出现。
+- **2026-10-24：web_search 要 DeepSeek API Key**。`dsh-web-search-deepseek` 的密钥顺序是
+  literal `apiKey` → `credentials.resolve('DEEPSEEK_API_KEY')` → launch env → DeepSeek 账号登录态；
+  本机 credentials 只有 OPENCODE_GO_API_KEY，所以补了设置页入口：插件 Config 的
+  `webSearch.{apiKey,baseUrl,model}`，通过 `/config` 热同步时写进 DSH 的
+  `web-search-deepseek` settings namespace（字段名 `baseURL`），填完 2 秒生效。
+- `web_fetch` 不需要 Key，但它走 DSH 的代理策略（`@deepseek-ai/dsh-http-proxy`），
+  而策略只读**启动环境变量**（`http_proxy`/`https_proxy`/`no_proxy`）：
+  个别站点（如 news.ycombinator.com）在本机直连是 TCP 超时，要让本机代理生效只能
+  `HTTPS_PROXY=http://127.0.0.1:7890` 重启 DSH —— 插件改不了运行中的进程环境。
 
 ### 工具门禁 / 防抖 / 限频（pl-*）
 

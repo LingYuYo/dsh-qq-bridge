@@ -8,6 +8,10 @@ DSH 插件：给 QQ 聊天会话装一道**执行期工具门禁**，并提供 Q
 > `qq_send_voice` / restrict / 执行期白名单**四件事全部静默跳过**（QQ 会话当时既没有系统人设、
 > 也没有执行期门禁）。根因、修法和验证见文末「2026-10-24 修复记录」；同一批还修了
 > 人设每 2 秒重复推送、`web_search` 未挂载、单群独立响应档位、技能配置弹窗。
+>
+> **同日晚第二轮真机复测**又查出三件事（见文末「第二轮」）：人设被宿主注入的
+> USER.md/MEMORY.md 当 user 消息盖掉（已摘掉，顺带堵了隐私口子）、微软 Edge 朗读接口 403
+> （TTS 换 baidu 免 Key 通路 + 失败必回模型）、`web_search` 缺 DeepSeek API Key（齿轮弹窗可填）。
 
 ## 为什么需要它
 
@@ -164,8 +168,8 @@ profile 顶层实例持有配置，投影到「设置 → QQ 桥接」。左侧�
 | 条目 | 真实行为 |
 | --- | --- |
 | 图片理解 `sk-vision` | 桥接下载 QQ 图片 → base64 → 按 DSH prompt content 的 image part 投递；模型不支持时退回纯文本并如实说明 |
-| 网页搜索 `sk-search` | `tools.guard` 放行 `web_search` / `web_fetch`；关闭即执行期拒绝 |
-| 发语音 `sk-voice` | guard 注册 `qq_send_voice` 工具 → 入队 → 桥接 Edge TTS / OpenAI 兼容 TTS 合成 → NapCat record 段发送 |
+| 网页搜索 `sk-search` | `tools.guard` 放行 `web_search` / `web_fetch`；关闭即执行期拒绝。**需要 DeepSeek API Key**：齿轮弹窗里填（写入 DSH 的 `web-search-deepseek`），没配时工具会报 `WEB_PROVIDER_CREDENTIAL_MISSING` |
+| 发语音 `sk-voice` | guard 注册 `qq_send_voice` 工具（**等桥接回执，失败会抛错**）→ 入队 → 桥接 baidu / Edge / OpenAI 兼容 TTS 合成 → NapCat record 段发送（base64 失败自动降级 file://） |
 | 工具门禁 `pl-guard` | `tools.guard` 总开关；关闭 = 显式放弃执行期白名单（restrict 仍隐藏全局工具，UI 有红字警告） |
 | 防抖合并 `pl-debounce` | 关闭则消息不再攒窗口，立即投递 |
 | 频率控制 `pl-ratelimit` | 关闭则不做每会话每分钟限频 |
@@ -174,9 +178,10 @@ profile 顶层实例持有配置，投影到「设置 → QQ 桥接」。左侧�
 桥接与 guard 共用同一份判断，避免两端各写一套 id 逻辑而漂移。桥接每 2 秒热读，
 改完下一条消息生效。
 
-语音合成配置在「全局设置 → 语音合成（TTS）」：provider = `edge`（免 Key）或
-`openai`（baseUrl + apiKey），音色默认 `zh-CN-XiaoyiNeural`。合成在桥接进程里做，
-插件只写配置 + 入队；NapCat 负责 mp3 → QQ 语音的转码，失败会写日志、不影响聊天。
+语音合成配置在「技能与插件 → 发语音」的齿轮弹窗（也可以去「全局设置 → 语音合成」）：
+`voice.provider` = `baidu`（免 Key，**默认**，2026-10-24 起）/ `edge`（微软已端拒，会自动降级到 baidu）
+/ `openai`（baseUrl + apiKey）。合成在桥接进程里做，插件只写配置 + 入队；
+NapCat 负责 mp3 → QQ 语音的转码，失败会写日志、不影响聊天，**并且会把失败原因回给模型**。
 
 ### 2026-10-24：齿轮弹窗接真实 Config（不再是「暂无可配置项」）
 
@@ -572,6 +577,7 @@ node test-status-napcat.mjs   # 运行状态页的 NapCat 面板（启停路由 
 node test-autostart.mjs       # autoStart / 单实例 / 崩溃重启上限
 node test-render.mjs          # 五个 Tab + 八个弹窗的渲染冒烟（假 React）
 node test-tile-config.mjs     # 技能/插件配置弹窗接真实 Config（字段集 / 保存路径 / 开发中 / 只读禁用，17 例）
+node test-web-config.mjs      # 网页搜索凭据弹窗（Key 密码框 / 未配提示 / 写入路径 / 代理说明，9 例）
 node test-usage-stats.mjs     # 用量拦截 / 去重 / 多段峰谷 / 工作日节假日 / 规则变化重建 / 回填幂等 / 两条路由（19 例）
 node test-usage-ui.mjs        # 用量页真实数据接线（轮询 / 图表 / 三表 / 多段峰谷 / 工作日开关 / 单价写回，11 例）
 node test-skills.mjs          # 技能页交互逻辑（拖拽排序 / 上下移 / 增删 / 弹窗 / Esc / autoStart 开关）
@@ -603,10 +609,10 @@ node render-preview.mjs       # 生成 preview/*.html 静态版式（含弹窗�
 它是唯一一条「真宿主 + 真实 mountPreset」的用例 —— 2026-10-24 那个 P0 只有它能拦住，
 把判定退回旧写法会红 13 条。
 
-`qq-bridge/test-offline.mjs` 会串跑这四组；桥接侧另有 `test-activity.mjs` / `test-persona.mjs` / `test-timeout.mjs`。
+`qq-bridge/test-offline.mjs` 会串跑这四组；桥接侧另有 `test-activity.mjs` / `test-tts.mjs` / `test-persona.mjs` / `test-timeout.mjs`。
 
-2026-10-24 基线：guard 23 个文件全绿（`test-guard-scope` 32 例、`test-preset-scope` 31 例【联机】），
-桥接 `test-offline.mjs` 167 例 0 失败。
+2026-10-24 基线（第二轮）：guard 24 个文件 + 桥接 5 个文件全绿 —— `test-guard-scope` 33、
+`test-preset-scope` 31【联机】、`test-tile-config` 17、`test-web-config` 9、`test-offline` 168、`test-tts` 29。
 
 ## 2026-10-24 修复记录（真机 Bug 清单 → 已修）
 
@@ -690,6 +696,72 @@ node render-preview.mjs       # 生成 preview/*.html 静态版式（含弹窗�
   现在两个都补上（`null` 原样保留，不走 `num()`），并有 3 条测试盯着。
 - **`render-preview.mjs` 的 hook 序号漂移**：三张弹窗预览一直渲染成「添加技能」。
   已对齐 `useState` 顺序，并给 `emit()` 加了关键文案断言，下次再漂会直接报错而不是默默出空弹窗。
+
+## 2026-10-24 第二轮真机修复：人设 / TTS / 网页搜索
+
+> 上一轮把 guard 装回来了（工具清单 35 → 15，`qq_send_voice` / `web_search` 都在），
+> 但真机复测还剩三件事。下面每条都先给**实测证据**，再给修法。
+
+### 1. 人设「保存了但模型无视」→ 是宿主把记忆当 user 消息塞进来了
+
+- **证据链**（全部来自会话日志与会话现场，不是猜）：
+  1. 重启后该 QQ 会话的最近一条 `system/message` 就是我们的 `deployment:persona-prefix`
+     （6554 字，`complete: true` 生效，全局 Harness 自述没穿透）；
+  2. 直接打 `https://opencode.ai/zen/go/v1/chat/completions`（provider=opencode-go，
+     `system` 写一段人设）→ 模型**照做人设**（回了「我是牛头…[PERSONA-OK]」）
+     ⇒ 上游没有覆盖系统提示词；
+  3. 但会话日志里 `MNEMON RUNTIME MEMORY SNAPSHOT` 出现 **23 次**、`USER.md` **55 次**，
+     而且它们不是系统提示词 —— 是 `source.kind = "dsh-mnemon"` 的**user 消息**
+     （`form:"recall"` 的 3863 字快照 + `form:"instructions"` 的引导语）。
+     模型在思维链里直接引用 USER.md 的「称呼：翎羽 / 自称小鱼」→ 它在照记忆演。
+- **根因**：`dsh-mnemon` 在 `agent/pre-step` 瀑布里 `createPluginMessage(text,'recall')`
+  把 USER.md / MEMORY.md 快照当普通 user 消息插进每一步。对模型来说**user 消息比系统人设更硬**，
+  我们的人设就被整段无视了。`suppressRuntimeContext()` 管不了它（那是 system-prompt 的
+  context 面，而这是 pre-step 的消息面）。
+- **修法**：`applyContextFilter(ctx)` —— guard 在 preset 作用域挂 `agent/pre-step` 监听（`{prepend:true}`），
+  调完 `next()` 后按 `source.kind === 'dsh-mnemon'`（外加文本标记兜底）把这些消息摘掉。
+  `prepend` 是必须的：mnemon 的监听器在 profile 顶层先注册、处在最外层，不 prepend 我们就在内层，
+  `next()` 回来时快照还没被追加进去，过滤等于白做。
+  顺带解决**隐私问题**：QQ 群友的对话不该带着主人的长期记忆（本轮之前模型能直接读到 USER.md）。
+- **诊断开关**：Config `debugPrompt = true`（或环境变量 `QQG_PROMPT_DEBUG=1`）会打印
+  `[Persona Debug] session=… sections=[名字:字数] contexts=[…] personaHead="…"`，
+  只在内容变化时打，用来确认「组装出来的到底有没有人设」。
+
+### 2. TTS：微软 Edge 朗读已被端拒 → 换 baidu 免 Key 通路，失败必回模型
+
+- **证据**：
+  - 桥接日志 `[13:03:39] ⚠️ 语音合成失败 …：Edge TTS WebSocket 错误：`（错误被吞）；
+  - 直跑 `synthesizeEdge()`：WS close code **1006**，error event 的 `message` 是空串；
+  - 裸 https 握手探测 `speech.platform.bing.com/.../edge/v1`：带不带 `Sec-MS-GEC`、带 Origin、
+    Chromium 128/130/143 都 **403**。上游 edge-tts 已改用 `Sec-MS-GEC v2`
+    （DRM 魔改 SHA256 + CS64），旧算法不再被接受。
+  - 对照组：`https://fanyi.baidu.com/gettts?lan=zh&text=…&spd=5&source=web` → 200 + `audio/mpeg`
+    + 合法 MP3（magic `fff3`）。
+- **修法**：
+  - 新增 TTS provider **`baidu`（免 Key，默认）**；`edge` 保留，但失败信息翻成人话
+    （含状态码 + 「已升级 v2」的已知根因）。v2 算法没实现（魔改 SHA256 移植成本高、随时还会变）。
+  - 配置里仍是 `edge` 的用户，桥接会**自动降级到 baidu 重试一次**，日志与回执都写明降级。
+  - **失败必须回到模型**：`qq_send_voice` 以前「入队即返回 queued」，模型以为发出去了而 QQ 里什么都没有。
+    现在工具**等桥接回执**（`POST /dsh-qq-guard/session-ops {results}` 的 `{ok, detail}`）：
+    成功返回 `{sent:true, detail}`，失败 `throw new Error('语音发送失败：<detail>')`，
+    25s 拿不到回执照样抛错。detail 带 provider / 体积 / via / retcode，够模型跟用户解释。
+  - NapCat `record` 段：`base64://` 失败会自动落盘 `state/voice-<ts>.mp3` 用 `file://` 重发一次，
+    两次都失败保留文件并带回两次 retcode。
+
+### 3. 网页搜索：不是白名单，是缺 DeepSeek API Key；web_fetch 是个别站点被墙
+
+- **证据**：`web_search` 报 `DeepSeek search has no API key for "DEEPSEEK_API_KEY"…`；
+  `~/.dsh/.credentials.yaml` 里只有 `OPENCODE_GO_API_KEY`，没有任何 DEEPSEEK 键。
+  `web_fetch` 本身没坏：`https://techcrunch.com/` 成功；`https://news.ycombinator.com/`
+  **TCP 443 直接超时**（站点级不可达，不是证书、不是插件 bug）。
+- **修法**：Config 新增 `webSearch.{apiKey, baseUrl, model}`，
+  「技能与插件 → 网页搜索」齿轮弹窗里可填；桥接每 2 秒轮询 `/config` 时顺手把 Key 写进
+  DSH 的 `web-search-deepseek` settings namespace（字段名是 **baseURL**，大写 URL），
+  填完最多 2 秒生效、不用重启。Key 留空则**不动** DSH 现有配置。
+  弹窗里同时说明：web_fetch 走 DSH 的代理策略，而策略只读**启动环境变量** ——
+  想让本机代理（如 `127.0.0.1:7890`）生效，得用 `HTTPS_PROXY=…` 重启 DSH，插件改不了运行中的进程。
+- **前提**：DeepSeek 搜索要 DeepSeek Platform 的 Key（或用 DeepSeek 账号登录的会话）。
+  没有 Key 时把「网页搜索」技能关掉更诚实，模型会直接说搜不了。
 
 ## 许可
 

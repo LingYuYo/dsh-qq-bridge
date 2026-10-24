@@ -117,7 +117,15 @@ function makeCtx({ presetId, scoped = presetId !== undefined, hasWebServer = fal
 function makeSettingsCtx(calls) {
   return {
     fiber: {},
-    settings: { configure() { calls.effects.push('configure'); return () => {} } },
+    // 这个假 ctx 同时被当作 `sessionPersistence` 等注入服务的 ctx 用：
+    // 真 ctx 一定有 get()，而用量回填的 2.5s 定时器会去 `persistenceCtx.get(...)`，
+    // 少了它就会在测试跑完之后抛 uncaughtTypeError（2026-10-24 踩到）。给个空实现。
+    get() { return undefined },
+    settings: {
+      configure() { calls.effects.push('configure'); return () => {} },
+      // 网页搜索凭据同步会调 settings.update(ns, section)；假实现按需记账即可。
+      update(ns) { calls.settingsUpdates = calls.settingsUpdates ?? []; calls.settingsUpdates.push(ns); return Promise.resolve() },
+    },
     effect(fn) { calls.effects.push(fn); try { fn() } catch { /* 忽略 */ } return () => {} },
   }
 }
@@ -476,16 +484,44 @@ await check('qq_send_voice：技能关闭 → 执行抛错且不入队', async (
   await assert.rejects(() => tool.execute({ text: '你好' }, { agent: { id: 's-1' } }), /发语音/)
   assert.equal(mod.sessionOpsSnapshot().queued, before, '关掉的技能不该入队')
 })
-await check('qq_send_voice：开启 → 入队（桥接按 sessionId 反查 QQ 会话）', async () => {
+await check('qq_send_voice：开启 → 入队 + 等桥接回执成功', async () => {
   mod.bindFeatureConfigSource(Config({ role: 'settings' }))
   const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })
   apply(ctx, Config({ role: 'guard' }))
   const tool = calls.registeredTools.find((t) => t.name === 'qq_send_voice')
   const before = mod.sessionOpsSnapshot().queued
-  const value = await tool.execute({ text: '你好呀' }, { agent: { id: 'session-abc' } })
+  const pending = tool.execute({ text: '你好呀' }, { agent: { id: 'session-abc' } })
+  // 等入队落定，再从队列里拿到 id 模拟桥接回执（真实路径是 session-ops 的 results POST）。
+  const opId = await new Promise((resolve) => {
+    const timer = setInterval(() => {
+      const ids = mod.sessionOpsSnapshot().ids
+      if (ids.length > before) { clearInterval(timer); resolve(ids[ids.length - 1]) }
+    }, 5)
+  })
+  assert.ok(opId, '应该拿到会话指令 id')
+  mod.settleSessionOpResult(opId, { ok: true, detail: '已发送语音（baidu，16KB，via=base64，retcode=0）' })
+  const value = await pending
   assert.equal(value.queued, true)
+  assert.equal(value.sent, true, '★ 只有桥接真的发出去才算成功')
+  assert.match(String(value.detail), /已发送语音/)
   assert.equal(value.chars, 3)
-  assert.ok(mod.sessionOpsSnapshot().queued > before, '应该进了会话指令队列')
+  mod.bindFeatureConfigSource(null)
+})
+await check('qq_send_voice：桥接回执失败 → 工具抛错（不再假装成功）', async () => {
+  mod.bindFeatureConfigSource(Config({ role: 'settings' }))
+  const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })
+  apply(ctx, Config({ role: 'guard' }))
+  const tool = calls.registeredTools.find((t) => t.name === 'qq_send_voice')
+  const before = mod.sessionOpsSnapshot().queued
+  const pending = tool.execute({ text: '再说一句' }, { agent: { id: 'session-def' } })
+  const opId = await new Promise((resolve) => {
+    const timer = setInterval(() => {
+      const ids = mod.sessionOpsSnapshot().ids
+      if (ids.length > before) { clearInterval(timer); resolve(ids[ids.length - 1]) }
+    }, 5)
+  })
+  mod.settleSessionOpResult(opId, { ok: false, detail: '语音发送失败（baidu，via=file）：retcode=1404' })
+  await assert.rejects(() => pending, /语音发送失败/)
   mod.bindFeatureConfigSource(null)
 })
 

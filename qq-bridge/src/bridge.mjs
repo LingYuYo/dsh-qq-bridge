@@ -22,7 +22,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { OneBotClient, normalizeTypingCharTiers, normalizeTypingMsTiers } from './onebot.mjs'
 import { DshClient } from './dsh.mjs'
-import { synthesize, TTS_MAX_CHARS } from './tts.mjs'
+import { synthesize, TTS_MAX_CHARS, DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER } from './tts.mjs'
 
 /**
  * 非管理员说话时追加到人设末尾的安全提示。
@@ -1146,43 +1146,141 @@ export class Bridge {
   }
 
   /**
+   * 本次语音合成要用的 voice 配置：热配置的 `voice` 段 + 单次音色覆盖。
+   *
+   * provider 不在这里兜底（`tts.synthesize` 默认走 baidu）：设置页没配 provider 时
+   * 也应该能发声，而不是因为一个空字段直接失败。
+   *
+   * @param {{voice?:string}} [op] 语音指令（可带单次音色覆盖）
+   * @returns {object}
+   */
+  _voiceConfig(op) {
+    const live = this.live?.voice
+    const config = live && typeof live === 'object' && !Array.isArray(live) ? { ...live } : {}
+    const override = typeof op?.voice === 'string' ? op.voice.trim() : ''
+    if (override) config.voice = override
+    return config
+  }
+
+  /**
    * 执行一条语音任务：按 sessionId 反查 QQ 会话 → TTS → record 段发送。
    *
-   * 失败语义：不抛错（轮询器需要回执），把原因放在 error 里；
-   * 语音是增强体验，绝不能反过来卡住聊天主链路。
+   * 失败语义（2026-10-24 改）：仍然不抛错（session-ops 轮询器需要回执），但
+   * **必须把可读原因放进 `error` 和 `detail`**——Host 侧 `qq_send_voice` 现在是
+   * 「等回执再返回」，模型能不能看到失败原因全靠这两个字段：
+   *   · `error`：一句话可读原因（兼容旧 Host：旧版就是把它当 detail 用）
+   *   · `detail`：同义，新版 session-ops 优先取它
+   *   · `stage`：'tts'（合成失败）| 'send'（NapCat 发送失败）
+   *   · `retcode` / `status` / `via`：NapCat 的原始码，排障用（send 阶段才有）
+   *
+   * 成功时带 `detail`（含 provider / 体积 / via / retcode），Host 可以原样回给模型。
    *
    * @param {{sessionId?:string, text?:string, voice?:string}} op
-   * @param {object} entry state.sessions[key]（调用方已按 key 取好）
+   * @param {object} entry state.sessions[key]（调用方已按 key 取好；voice 不用它）
+   * @returns {Promise<{ok:boolean, action:'voice', key?:string, sessionId?:string,
+   *   error?:string, detail?:string, stage?:string, provider?:string, bytes?:number,
+   *   via?:string, retcode?:number|null, status?:string, sent?:boolean}>}
    */
   async _applyVoiceOp(op, entry) {
     const sessionId = String(op?.sessionId ?? '').trim()
     const key = Object.keys(this.state.sessions ?? {})
       .find((candidate) => this.state.sessions[candidate]?.sessionId === sessionId)
-    if (!key) return { ok: false, error: 'no-session', action: 'voice', sessionId }
-    if (!this._features().voice) return { ok: false, error: 'voice-disabled', action: 'voice', key }
+    if (!key) {
+      return {
+        ok: false, error: 'no-session', action: 'voice', sessionId,
+        detail: `桥接找不到这个 DSH 会话（sessionId=${sessionId || '(空)'}）对应的 QQ 会话：`
+          + '可能刚被删除或重建。让用户再发一条 QQ 消息后重试。',
+      }
+    }
+    if (!this._features().voice) {
+      return {
+        ok: false, error: 'voice-disabled', action: 'voice', key,
+        detail: '「发语音」技能当前是关闭的：请先在设置页「技能与插件」里打开，再重试。',
+      }
+    }
     const text = String(op?.text ?? '').trim().slice(0, TTS_MAX_CHARS)
-    if (!text) return { ok: false, error: 'empty-text', action: 'voice', key }
+    if (!text) return { ok: false, error: 'empty-text', action: 'voice', key, detail: '要合成的文字是空的' }
     const { kind, qq } = parseSessionKey(key)
     const target = String(qq || this.state.sessions[key]?.qq || '').trim()
-    if (!target) return { ok: false, error: 'no-qq', action: 'voice', key }
-    const voiceConfig = {
-      ...(this.live?.voice ?? {}),
-      ...(typeof op?.voice === 'string' && op.voice.trim() !== '' ? { voice: op.voice.trim() } : {}),
-    }
-    try {
-      const audio = await this.tts.synthesize(text, voiceConfig)
-      if (!audio?.base64) return { ok: false, error: 'empty-audio', action: 'voice', key }
-      const sent = await this.qq.sendVoice(kind, target, audio.base64)
-      if (sent?.ok === false) {
-        this.logger.warn?.(`语音发送失败 ${key}：${sent.error ?? '未知原因'}`)
-        return { ok: false, error: sent.error ?? 'send-failed', action: 'voice', key }
+    if (!target) {
+      return {
+        ok: false, error: 'no-qq', action: 'voice', key,
+        detail: `会话 ${key} 没有可用的 QQ 号/群号，无法发语音`,
       }
-      this.stats.voices++
-      this.logger.info?.(`已发送语音 ${key}（${text.length} 字，${audio.provider ?? 'tts'}，${Math.round((audio.bytes ?? 0) / 1024)}KB）`)
-      return { ok: true, action: 'voice', key, bytes: audio.bytes ?? 0, provider: audio.provider ?? '' }
+    }
+
+    const voiceConfig = this._voiceConfig(op)
+    let audio
+    try {
+      audio = await this.tts.synthesize(text, voiceConfig)
     } catch (error) {
-      this.logger.warn?.(`语音合成失败 ${key}（不影响聊天）：${error?.message ?? error}`)
-      return { ok: false, error: error?.message ?? String(error), action: 'voice', key }
+      const reason = String(error?.message ?? error ?? '').trim() || '未知原因'
+      const provider = String(voiceConfig?.provider ?? '').trim() || DEFAULT_TTS_PROVIDER
+      // 日志里带 provider：一眼看出走的是 baidu 还是 edge/openai。
+      this.logger.warn?.(`语音合成失败 ${key}（provider=${provider}，不影响聊天）：${reason}`)
+      // 2026-10-24：edge 已被微软端拒（403 / Sec-MS-GEC v2），配置里还留着 edge 的用户
+      // 不该连语音都用不了。provider=edge 失败时**自动用 baidu 重试一次**，
+      // 并在 detail 里说明这次降级，别让用户以为配的 edge 生效了。
+      if (provider === 'edge') {
+        const fallbackConfig = { ...voiceConfig, provider: 'baidu' }
+        try {
+          const fallbackAudio = await this.tts.synthesize(text, fallbackConfig)
+          if (fallbackAudio?.base64) {
+            this.logger.warn?.(`已自动降级到 baidu（edge 不可用：${reason.slice(0, 80)}）`)
+            audio = fallbackAudio
+            voiceConfig.provider = 'baidu'
+            voiceConfig.edgeError = reason
+          }
+        } catch (fallbackError) {
+          this.logger.warn?.(`降级到 baidu 也失败：${fallbackError?.message ?? fallbackError}`)
+        }
+      }
+      if (!audio?.base64) {
+        return {
+          ok: false, action: 'voice', key, stage: 'tts', provider,
+          error: `语音合成失败（${provider}）：${reason}`,
+          detail: `语音合成失败（${provider}）：${reason}`,
+        }
+      }
+      // 降级成功：把 edge 的失败原因记进 detail，Host/模型能看到「实际用的是 baidu」。
+      this.logger.warn?.(`语音合成已降级（原 provider=edge 失败）：${reason.slice(0, 120)}`)
+    }
+    if (!audio?.base64) {
+      const provider = String(audio?.provider ?? voiceConfig?.provider ?? '').trim() || DEFAULT_TTS_PROVIDER
+      return {
+        ok: false, action: 'voice', key, stage: 'tts', provider,
+        error: `语音合成失败（${provider}）：合成器返回了空音频`,
+        detail: `语音合成失败（${provider}）：合成器返回了空音频`,
+      }
+    }
+
+    // NapCat 发送：base64:// 失败会自动落盘用 file:// 重发一次（见 sendVoice）。
+    const sent = await this.qq.sendVoice(kind, target, audio.base64, {
+      fallbackDir: this.statePath ? path.dirname(this.statePath) : '',
+    })
+    const provider = String(audio.provider ?? voiceConfig?.provider ?? '').trim() || 'tts'
+    if (sent?.ok === false) {
+      const detail = `语音发送失败（${provider}，via=${sent.via ?? 'base64'}）：${sent.error ?? '未知原因'}`
+      this.logger.warn?.(`${detail}｜会话 ${key}${sent.file ? `｜临时文件 ${sent.file}` : ''}`)
+      return {
+        ok: false, action: 'voice', key, stage: 'send', provider,
+        error: detail, detail,
+        // NapCat 的原始码原样带回，Host/模型都能看到（不是只有一句「发送失败」）。
+        retcode: sent.retcode ?? null,
+        ...(sent.firstRetcode !== undefined ? { firstRetcode: sent.firstRetcode } : {}),
+        status: sent.status ?? '',
+        via: sent.via ?? '',
+      }
+    }
+    const via = sent?.via ?? 'base64'
+    const retcode = sent?.retcode ?? null
+    const detail = `已发送语音（${provider}，${Math.round((audio.bytes ?? 0) / 1024)}KB，via=${via}`
+      + `${retcode === null ? '' : `，retcode=${retcode}`}）`
+    this.stats.voices++
+    this.logger.info?.(`已发送语音 ${key}（${text.length} 字，${provider}，${Math.round((audio.bytes ?? 0) / 1024)}KB，via=${via}）`)
+    return {
+      ok: true, action: 'voice', key, sent: true, provider,
+      bytes: audio.bytes ?? 0, via, retcode, status: sent?.status ?? '', detail,
     }
   }
 

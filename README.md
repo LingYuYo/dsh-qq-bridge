@@ -12,33 +12,31 @@ QQ ──► NapCat (OneBot v11 正向 WS) ──► qq-bridge ──► DSH Web
 
 ## 版本演进
 
-当前版本：**v0.3.1-alpha**
+当前版本：**v0.3.2-alpha**
 
-本版（2026-10-24，真机 Bug 修复 + 配置体验）：
+本版（2026-10-24 晚，第二轮真机复测）：
 
-- **P0：guard 在 preset 内整体失活** —— 「我是不是装在 preset 里」的判定用错了 API
-  （`composedPreset()` 对 preset 子行的 ctx 恒返回 `undefined`，只对 `agent.ctx` 有效），
-  于是 `applyGuard()` 第一步就 return，**人设 section / `qq_send_voice` / restrict /
-  执行期白名单四件事全部静默跳过**。真机后果：QQ 会话的 system 提示是全局 Harness 自述
-  （助手腔），且**当时没有任何执行期门禁**。现在改成 `composedPreset` + `restrict` 作用域探针
-  两层判定、兜底 fail-closed；新增唯一一条「真宿主」回归测试 `test-preset-scope.mjs`。
-- **发语音 `qq_send_voice` 进 schema**：改用官方 `defineTool()` 编译参数（合法 JSON Schema），
-  之前手写的裸参数 spec 让工具注册了却进不了模型侧工具列表。
-- **`web_search` 接入**：`qq-chat` preset 漏了 `@deepseek-ai/dsh-tool-web` 这一行，
-  不是白名单问题；已补挂载，技能开关仍由 guard 执行期控制。
-- **人设重复推送**：`onPersona` 返回值契约 + 缺 `await` 两层问题一起修，
-  「全局人设已推送」不再每 2 秒刷屏（正文签名去重，只在真变化时推）。
-- **单群独立响应档位**：每个群可在「会话管理」右侧单独配 0–3 档，落盘 `sessions.json`
-  的 `activityLevel`（`null` = 跟随全局），私聊不受影响。
-- **技能与插件齿轮弹窗接真实 Config**：发语音（后端 / 音色 / API Key / baseUrl）、
-  防抖（窗口）、频控（每分钟上限 / 突发 / 静默）都能在卡片里直接改；
-  未实装条目明确标「开发中」+ 原因，不再假装有表单。
-- **顺手修的静默 bug**：Host 的 `sanitizeSessionRow()` 白名单漏了 `activityLevel` / `persona`
-  （上报了也被裁掉，UI 永远读不到）；`render-preview.mjs` 的 hook 序号漂移导致三张弹窗预览是空壳。
+- **人设被无视 → 宿主把记忆当 user 消息塞进来了**：真机上系统提示词确实是人设
+  （6554 字、`complete: true` 生效），provider 也不覆盖 system 提示词（直连 API 验证过）。
+  盖掉人设的是 `dsh-mnemon`：它在 `agent/pre-step` 里把 USER.md / MEMORY.md 快照当
+  **user 消息**插进每一步，模型优先照记忆演。guard 现在按 `source.kind='dsh-mnemon'`
+  把这些消息从 QQ 会话摘掉（`{prepend:true}` 保证在外层生效）——
+  **同时是隐私修复**：此前群友对话能让模型读到主人的长期记忆。
+  新增诊断开关 `debugPrompt` / `QQG_PROMPT_DEBUG`，可打印 `[Persona Debug] sections=[…]`。
+- **TTS 发不出去的真因**：微软 Edge 朗读接口已被端拒（握手 403 / WS 1006，上游改成
+  `Sec-MS-GEC v2` 签名）。新增免 Key 的 **baidu** provider 并设为默认，edge 失败自动降级；
+  `qq_send_voice` 改成**等桥接回执**，失败直接抛错给模型（以前入队即成功，模型会说
+  「发出去了」）；NapCat `record` 的 base64 失败会自动落盘 mp3 用 `file://` 重发。
+- **网页搜索**：根因不是白名单，是缺 `DEEPSEEK_API_KEY`（本机 credentials 只有
+  OPENCODE_GO_API_KEY）。「技能与插件 → 网页搜索」齿轮里可填 Key / baseUrl / model，
+  经 `/config` 热同步写进 DSH 的 `web-search-deepseek` namespace，2 秒生效。
+  `web_fetch` 本身正常（techcrunch 成功、news.ycombinator TCP 超时=站点级不可达），
+  代理只认启动环境变量，弹窗里有说明。
 
-上一版（v0.3.0-alpha）：
+上一版（v0.3.1-alpha，同日早些时候）：guard 在 preset 内整体失活（P0）、`qq_send_voice`
+非法 schema、`web_search` 未挂载、人设每 2 秒重复推送、单群独立响应档位、技能配置弹窗。
 
-本次新增（WIP）：
+更早（v0.3.0-alpha）：
 
 - **多模态与交互**
   - **群聊 @ 文本格式修复**：入站把 `at` 段转成 `@昵称 `（拿不到昵称退回 `@QQ号 `），并保证与正文之间有一个空格。
@@ -71,13 +69,16 @@ QQ ──► NapCat (OneBot v11 正向 WS) ──► qq-bridge ──► DSH Web
 > [`plugins/dsh-qq-guard/README.md`](plugins/dsh-qq-guard/README.md) 的「2026-10-24 修复记录」一节。
 > 下面保留现状待办，都是「离线验不到、必须真机跑一次」的项目。
 
-- **TTS 发送链路未在真机复验**：工具已经能进 schema，但 NapCat `record` 段对
-  `base64://` + mp3 的兼容性（是否必须 silk、落盘 mp3 用 `file://` 是否更稳）还没实测。
-  判据是桥接日志里的 `已发送语音 …` / `语音发送失败 … retcode`。
-- **`web_search` 需要在真 profile 确认**：preset 行已补，离线只能验到「不会误伤同名全局工具」；
-  重启 DSH 后开一条 QQ 会话看 `request/header` 是否出现 `web_search`。
-- **活着跑着的桥接进程要重启一次**：`onPersona` / 单群档位都是桥接侧改动，进程不重启还是旧逻辑
-  （设置页改完能落盘，但旧进程不认新字段）。
+- **TTS 的 NapCat 转码仍未真机跑通一遍**：合成侧已换成 baidu（免 Key，实测拿到合法 mp3），
+  但「mp3 → QQ 语音条」这一步要 NapCat 真发一次才知道；失败会自动降级 `file://` 重发，
+  结果（含两次 retcode）经回执回到模型与日志，判据是 `已发送语音 …` / `语音发送失败 … retcode`。
+- **`web_search` 要 DeepSeek API Key**：已在「技能与插件 → 网页搜索」加了配置入口
+  （写入 DSH 的 `web-search-deepseek`），没配 Key 时工具会如实报
+  `WEB_PROVIDER_CREDENTIAL_MISSING`，别把它当「插件没接上」。
+- **个别站点 web_fetch 连不上是网络层**（如 news.ycombinator.com TCP 超时）。
+  DSH 的代理策略只读启动环境变量，要用本机代理得 `HTTPS_PROXY=…` 重启 DSH。
+- **桥接进程改完要重启一次**：TTS provider、回执 detail、单群档位都是桥接侧改动，
+  进程不重启还是旧逻辑（设置页改完能落盘，但旧进程不认新字段）。
 
 ## 仓库结构
 

@@ -588,6 +588,10 @@ window.__ModuleLoader__.load({
 .qqg-setdesc-text { font-size: 11.5px; line-height: 1.6; color: var(--dsw-alias-label-secondary); }
 .qqg-setdesc-list { margin: 0; padding-left: 16px; font-size: 11.5px; line-height: 1.7;
   color: var(--dsw-alias-label-secondary); }
+/* 右栏里「只说明、不写配置」的补充块（例如网页搜索的代理现状）。 */
+.qqg-setdesc-note { font-size: 11.5px; line-height: 1.6; color: var(--dsw-alias-label-secondary);
+  padding: 9px 11px; border-radius: 9px; border: 1px dashed var(--dsw-alias-border-l1); }
+.qqg-setdesc-note b { color: var(--dsw-alias-label-primary); font-weight: 600; }
 .qqg-kv { display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
   font-size: 11.5px; color: var(--dsw-alias-label-secondary); }
 .qqg-kv b { font-weight: 600; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
@@ -757,6 +761,11 @@ window.__ModuleLoader__.load({
       'voice.baseUrl': '',
       'voice.apiKey': '',
       'voice.voice': 'zh-CN-XiaoyiNeural',
+      // 网页搜索（web_search）的 DeepSeek Key / 接口地址 / 模型：默认空 = 未配置。
+      // 必须与 Host 侧 Config 的 webSearch.* 默认值保持一致（否则「恢复默认」会写错值）。
+      'webSearch.apiKey': '',
+      'webSearch.baseUrl': '',
+      'webSearch.model': '',
       // 运行节奏默认值：「活跃设置」弹窗与技能卡片弹窗共用这组字段，口径必须一致。
       'rhythm.activityLevel': 1,
       'rhythm.debounceWindowMs': 800,
@@ -2938,6 +2947,8 @@ window.__ModuleLoader__.load({
      * Edge 走微软朗读接口，用 zh-CN-*Neural 这种完整名；OpenAI 兼容接口用 alloy 这类短名。
      */
     const VOICE_OPTIONS = {
+      // 百度免 Key：不支持选音色（接口只吃 lan/spd），所以候选给一个中性项并隐藏字段。
+      baidu: [{ value: 'baidu-default', label: '百度默认（中文女声）' }],
       edge: [
         { value: 'zh-CN-XiaoyiNeural', label: '晓伊 · 女声（默认）' },
         { value: 'zh-CN-XiaoxiaoNeural', label: '晓晓 · 女声' },
@@ -2960,13 +2971,17 @@ window.__ModuleLoader__.load({
         {
           path: 'voice.provider', type: 'select', label: '语音后端',
           options: [
-            { value: 'edge', label: 'Edge TTS（免 Key）' },
+            { value: 'baidu', label: '百度（免 Key，当前可用）' },
+            { value: 'edge', label: 'Edge TTS（微软已拒，403）' },
             { value: 'openai', label: 'OpenAI 兼容（需 baseUrl + Key）' },
           ],
-          hint: 'edge 走微软朗读接口，开箱可用；openai 走任意 OpenAI 兼容的 /v1/audio/speech。',
+          hint: 'baidu 走百度翻译朗读接口，免 Key、当下可用；edge 自 2026-10-24 起被微软端拒'
+            + '（Sec-MS-GEC v2），选了它桥接会自动降级到 baidu 并在日志里说明。',
         },
         {
           path: 'voice.voice', type: 'select', label: '音色',
+          // 百度接口没有音色参数：隐藏该字段（切回 edge/openai 时再出现）。
+          when: (valueOf) => valueOf('voice.provider') !== 'baidu',
           // 音色候选跟着后端走：切后端时会自动落到该后端的第一项。
           options: (valueOf) => VOICE_OPTIONS[valueOf('voice.provider')] ?? VOICE_OPTIONS.edge,
           hint: '音色名对不上后端时合成会失败，换完后端建议重新选一次。',
@@ -2982,6 +2997,26 @@ window.__ModuleLoader__.load({
           when: (valueOf) => valueOf('voice.provider') === 'openai',
           hint: '例如 https://api.openai.com/v1（不要带后面的 /audio/speech）。',
           placeholder: 'https://api.openai.com/v1',
+        },
+      ],
+      // 网页搜索：三个字段都写在本插件 Config 的 webSearch.* 下，
+      // Host 侧 apply 时再同步到 DSH 的 web-search-deepseek settings namespace。
+      'sk-search': [
+        {
+          path: 'webSearch.apiKey', type: 'secret', label: 'DeepSeek API Key',
+          placeholder: 'sk-…',
+          hint: 'web_search 走 DeepSeek 搜索接口；没配 Key 时会直接报 WEB_PROVIDER_CREDENTIAL_MISSING。'
+            + 'Key 从 DeepSeek Platform 拿，保存在插件配置里，优先级高于启动环境变量。',
+        },
+        {
+          path: 'webSearch.baseUrl', type: 'text', label: '接口地址 baseUrl',
+          placeholder: 'https://api.deepseek.com',
+          hint: '留空 = 用插件默认地址；只有走中转 / 自建代理时才需要改。',
+        },
+        {
+          path: 'webSearch.model', type: 'text', label: '搜索模型 model',
+          placeholder: '留空 = 跟随插件默认',
+          hint: '留空 = 用插件默认模型；一般不用改。',
         },
       ],
       'pl-debounce': [
@@ -3017,6 +3052,32 @@ window.__ModuleLoader__.load({
       'pl-compact': '上下文压缩由 DSH 会话内部完成，桥接侧没有可调参数。',
       'pl-persona': '人设改在「运行状态」页的「人设配置」里，这里不再做第二份。',
       'pl-archive': '日志归档还没实装。',
+    }
+
+    /**
+     * 卡片 → 弹窗左栏顶部的状态提示。入参是弹窗里的 valueOf(path)，
+     * 看的是「当前草稿或已存值」：用户一旦开始填 Key 提示就消失，不用等到保存。
+     */
+    const TILE_ALERTS = {
+      'sk-search': (valueOf) => (String(valueOf('webSearch.apiKey') ?? '').trim() === ''
+        ? '未配置 Key：QQ 会话里调 web_search 会直接报错（WEB_PROVIDER_CREDENTIAL_MISSING）；'
+          + '填入 DeepSeek Platform 的 Key 并保存后生效。'
+        : null),
+    }
+
+    /**
+     * 卡片 → 弹窗右栏的补充说明。只做说明，不写任何配置：
+     * 代理是 DSH 启动期决定的事（只读启动环境变量），插件侧改不了，所以这里只给操作办法。
+     */
+    const TILE_MODAL_NOTES = {
+      'sk-search': [
+        {
+          title: 'web_fetch 走代理的现状',
+          text: 'web_fetch 的代理策略只读 DSH 启动时的环境变量（HTTPS_PROXY / HTTP_PROXY / NO_PROXY），'
+            + '本页改不了。想让 DSH 用上本机代理（例如 Clash 的 127.0.0.1:7890），'
+            + '得用 HTTPS_PROXY=http://127.0.0.1:7890 重启 DSH。',
+        },
+      ],
     }
 
     /* ══════════ Tab 3 · 技能与插件 ══════════ */
@@ -3103,13 +3164,17 @@ window.__ModuleLoader__.load({
       const setField = (path, value) => setDraft((prev) => {
         const next = { ...prev, [path]: value }
         // 切后端时把音色拉回该后端的第一项，避免存下对方不认的音色名。
-        if (path === 'voice.provider') {
+        // 百度接口没有音色参数（字段在 UI 上隐藏），不用跟着改。
+        if (path === 'voice.provider' && value !== 'baidu') {
           const allowed = (VOICE_OPTIONS[value] ?? []).map((o) => o.value)
           if (!allowed.includes(next['voice.voice'] ?? get('voice.voice'))) next['voice.voice'] = allowed[0]
         }
         return next
       })
       const visible = (field) => (typeof field.when === 'function' ? field.when(valueOf) === true : true)
+      // 卡片级状态提示 / 右栏说明（按 id 查表；没有条目的卡片两者都为空）。
+      const alert = typeof TILE_ALERTS[id] === 'function' ? TILE_ALERTS[id](valueOf) : null
+      const notes = TILE_MODAL_NOTES[id] ?? []
 
       const control = (field) => {
         const value = valueOf(field.path)
@@ -3221,6 +3286,10 @@ window.__ModuleLoader__.load({
         h('div', null,
           configurable
             ? h(React.Fragment, null,
+              // 状态提示（例如网页搜索没配 Key）放在字段上方，先说明后果再让人填。
+              alert ? h('div', {
+                className: 'qqg-status qqg-status-err', style: { marginBottom: 10 },
+              }, alert) : null,
               writable ? null : h('div', {
                 className: 'qqg-status qqg-status-err', style: { marginBottom: 10 },
               }, '当前配置不可写，下面的值只能看不能改。'),
@@ -3234,6 +3303,9 @@ window.__ModuleLoader__.load({
         h('div', { className: 'qqg-setdesc' },
           h('div', { className: 'qqg-setdesc-title' }, '说明'),
           h('div', { className: 'qqg-setdesc-text' }, item.desc ?? ''),
+          // 右栏补充说明（只说明不写盘）：例如网页搜索的 web_fetch 代理现状。
+          notes.map((note, i) => h('div', { key: 'note' + i, className: 'qqg-setdesc-note' },
+            h('b', null, note.title + '：'), note.text)),
           item.author ? h('div', { className: 'qqg-kv' }, h('span', null, '作者'), h('b', null, item.author)) : null,
           h('div', { className: 'qqg-kv' }, h('span', null, '版本'), h('b', null, 'v' + (item.ver ?? '0.0.0'))),
           h('div', { className: 'qqg-kv' }, h('span', null, '分类'), h('b', null, item.tag ?? '未分类')),

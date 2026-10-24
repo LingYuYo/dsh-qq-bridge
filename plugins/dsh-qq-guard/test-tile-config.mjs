@@ -234,7 +234,8 @@ await check('sk-voice：字段集 = 后端 / 音色（Edge 默认不显示 Key �
   tree = render()
   const provider = byAria(tree, '语音后端')
   truthy(provider, '缺少「语音后端」下拉')
-  eq(optionValues(provider), ['edge', 'openai'], '后端候选')
+  // 2026-10-24：baidu（免 Key）成为默认后端，候选里排第一；edge 保留但已不可用。
+  eq(optionValues(provider), ['baidu', 'edge', 'openai'], '后端候选')
   const voice = byAria(tree, '音色')
   eq(optionValues(voice), ['zh-CN-XiaoyiNeural', 'zh-CN-XiaoxiaoNeural', 'zh-CN-YunxiNeural', 'zh-CN-YunyangNeural'], 'Edge 音色候选')
   eq(provider.props.value, 'edge', '初值取真实配置')

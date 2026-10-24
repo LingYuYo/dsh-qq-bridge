@@ -11,6 +11,9 @@
  *   · 鉴权：查询串 ?access_token=xxx（每次重连都重建 URL，重新带上）
  */
 
+import fs from 'node:fs'
+import path from 'node:path'
+
 const DEFAULT_WS_URL = 'ws://127.0.0.1:3001'
 const DEFAULT_CALL_TIMEOUT_MS = 10_000
 const DEFAULT_RECONNECT_MS = 3_000
@@ -771,41 +774,102 @@ export class OneBotClient {
   /**
    * 发一条 QQ 语音（record 段，2026-10-23「发语音」技能）。
    *
-   * 为什么用 `base64://` 而不是文件路径：
-   *   · 桥接进程不保证和 NapCat 共享同一个文件系统视图；
-   *   · 落盘还要处理清理（语音文件攒多了很占地方）。
-   * NapCat 对 record 段的 file 支持 base64://，内部会转码成 QQ 语音所需格式。
+   * 双通道（2026-10-24 真机加固）：
+   *   ① 先 `base64://`（不落盘、不依赖桥接与 NapCat 共享文件系统）；
+   *   ② base64 被拒且传了 `fallbackDir` 时，把 mp3 写到 `state/voice-<ts>.mp3`，
+   *      改用 `file://` 绝对路径**重发一次**。NapCat 各版本对 base64 的接受度
+   *      不一致，这个降级能把「合成成功但发不出去」救回来。
+   *
+   * 两种方式都失败时，两次的 retcode/status 原样带回，由上层写进 op 的 detail
+   * （模型能看到失败原因，而不是以为发出去了）。
    *
    * @param {'private'|'group'} kind
    * @param {string|number} targetId QQ 号 / 群号
-   * @param {string} base64 纯 base64（不带 data: 前缀）
-   * @param {{atUserId?:string}} [opts]
-   * @returns {Promise<{ok:boolean, messageIds:string[], error?:string, bytes?:number}>}
+   * @param {string} base64 纯 base64（不带 data: 前缀），mp3 字节
+   * @param {{atUserId?:string, fallbackDir?:string}} [opts]
+   *   `fallbackDir`：允许落盘降级时的目录（通常是桥接的 state/）；不传则不降级
+   * @returns {Promise<{ok:boolean, messageIds:string[], error?:string, bytes?:number,
+   *   via?:'base64'|'file', retcode?:number|null, status?:string, file?:string}>}
    */
-  async sendVoice(kind, targetId, base64, { atUserId } = {}) {
+  async sendVoice(kind, targetId, base64, { atUserId, fallbackDir } = {}) {
     const id = String(targetId ?? '').trim()
     if (!/^\d+$/.test(id) || id === '0') {
       return { ok: false, messageIds: [], error: `${kind === 'private' ? 'user_id' : 'group_id'} 必须是正整数：${targetId}` }
     }
     const data = String(base64 ?? '').trim()
     if (!data) return { ok: false, messageIds: [], error: '语音内容为空' }
-    const message = []
-    if (kind === 'group' && atUserId !== undefined && /^\d+$/.test(String(atUserId).trim())) {
-      message.push({ type: 'at', data: { qq: String(atUserId).trim() } })
-      message.push({ type: 'text', data: { text: ' ' } })
-    }
-    message.push({ type: 'record', data: { file: `base64://${data}` } })
-    const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg'
-    const params = kind === 'private' ? { user_id: Number(id), message } : { group_id: Number(id), message }
-    try {
-      const res = await this.call(action, params)
-      if (res?.status === 'ok' && Number(res?.retcode) === 0) {
-        const mid = res?.data?.message_id
-        return { ok: true, messageIds: mid === undefined || mid === null ? [] : [String(mid)], bytes: data.length }
+
+    /** 按给定 file 字段拼消息并发一次；永远 resolve（失败也带 retcode/status）。 */
+    const attempt = async (file) => {
+      const message = []
+      if (kind === 'group' && atUserId !== undefined && /^\d+$/.test(String(atUserId).trim())) {
+        message.push({ type: 'at', data: { qq: String(atUserId).trim() } })
+        message.push({ type: 'text', data: { text: ' ' } })
       }
-      return { ok: false, messageIds: [], error: `retcode=${res?.retcode} status=${res?.status}` }
+      message.push({ type: 'record', data: { file } })
+      const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg'
+      const params = kind === 'private' ? { user_id: Number(id), message } : { group_id: Number(id), message }
+      try {
+        const res = await this.call(action, params)
+        const ok = res?.status === 'ok' && Number(res?.retcode) === 0
+        const mid = res?.data?.message_id
+        return {
+          ok,
+          messageIds: ok && mid !== undefined && mid !== null ? [String(mid)] : [],
+          retcode: Number.isFinite(Number(res?.retcode)) ? Number(res.retcode) : null,
+          status: String(res?.status ?? ''),
+          ...(ok ? {} : { error: `retcode=${res?.retcode} status=${res?.status}` }),
+        }
+      } catch (error) {
+        return { ok: false, messageIds: [], retcode: null, status: 'exception', error: error?.message ?? String(error) }
+      }
+    }
+
+    const first = await attempt(`base64://${data}`)
+    if (first.ok) {
+      return {
+        ok: true, messageIds: first.messageIds, bytes: data.length,
+        via: 'base64', retcode: first.retcode, status: first.status,
+      }
+    }
+    // 没给落盘目录（或 base64 本身非法）就如实返回第一次失败，不做降级。
+    const dir = String(fallbackDir ?? '').trim()
+    if (!dir) {
+      return {
+        ok: false, messageIds: [], error: first.error,
+        retcode: first.retcode, status: first.status, via: 'base64',
+      }
+    }
+
+    // 降级 ②：落盘 + file:// 重发一次。
+    let filePath = ''
+    try {
+      fs.mkdirSync(dir, { recursive: true })
+      filePath = path.join(dir, `voice-${Date.now()}.mp3`)
+      fs.writeFileSync(filePath, Buffer.from(data, 'base64'))
     } catch (error) {
-      return { ok: false, messageIds: [], error: error?.message ?? String(error) }
+      return {
+        ok: false, messageIds: [],
+        error: `base64 发送失败（${first.error}）；落盘降级也失败：${error?.message ?? error}`,
+        retcode: first.retcode, status: first.status, via: 'base64',
+      }
+    }
+    // Windows 绝对路径 C:\a\b.mp3 → file:///C:/a/b.mp3（OneBot 的 file 上传协议）。
+    const fileUrl = `file:///${path.resolve(filePath).replace(/\\/gu, '/')}`
+    const second = await attempt(fileUrl)
+    if (second.ok) {
+      try { fs.unlinkSync(filePath) } catch { /* 删不掉不影响已经发出去了 */ }
+      return {
+        ok: true, messageIds: second.messageIds, bytes: data.length,
+        via: 'file', retcode: second.retcode, status: second.status,
+      }
+    }
+    // 两次都失败：保留临时文件供排查（日志里带路径），两次的 retcode 都带回去。
+    return {
+      ok: false, messageIds: [],
+      error: `base64 发送失败（${first.error}）→ file:// 重发失败（${second.error}）`,
+      retcode: second.retcode, firstRetcode: first.retcode,
+      status: second.status, via: 'file', file: filePath,
     }
   }
 

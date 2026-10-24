@@ -526,9 +526,10 @@ const Config = Schema.object({
   // OpenAI 兼容 /v1/audio/speech（需要 baseUrl + apiKey）。合成在桥接进程里做，
   // 通过 NapCat 的 record 段发出去 —— 插件本身不连线，只负责把配置热同步下去。
   voice: Schema.object({
-    provider: Schema.union(['edge', 'openai'])
-      .description('edge = Edge TTS（免 Key）；openai = OpenAI 兼容 /v1/audio/speech。')
-      .default('edge').volatile(),
+    provider: Schema.union(['baidu', 'edge', 'openai'])
+      .description('baidu = 百度免 Key（当前可用，默认）；edge = 微软朗读（2026-10-24 起被拒，403）；'
+        + 'openai = OpenAI 兼容 /v1/audio/speech（需要 baseUrl + apiKey）。')
+      .default('baidu').volatile(),
     baseUrl: Schema.string()
       .description('OpenAI 兼容接口的 baseUrl（仅 provider=openai 时需要），如 https://api.openai.com/v1。')
       .default('').volatile(),
@@ -539,6 +540,27 @@ const Config = Schema.object({
       .description('音色名。Edge：zh-CN-XiaoyiNeural / zh-CN-XiaoxiaoNeural；OpenAI：alloy 等。')
       .default('zh-CN-XiaoyiNeural').volatile(),
   }).description('语音合成（发语音技能）').default({}),
+
+  // ── 网页搜索的 DeepSeek 凭据（2026-10-24：真机 web_search 报 no API key）──
+  //
+  // `@deepseek-ai/dsh-web-search-deepseek` 的密钥解析顺序：
+  //   literal config.apiKey → credentials.resolve('DEEPSEEK_API_KEY') → launch env → 账号登录态
+  // 本机 profile 的 credentials 里只有 OPENCODE_GO_API_KEY，所以 QQ 会话里 web_search 直接报
+  // WEB_PROVIDER_CREDENTIAL_MISSING。这里给出一个设置页入口：改完 apply 时写进 DSH 的
+  // `web-search-deepseek` settings namespace（字段名 baseURL 是大写 URL，别写成 baseUrl）。
+  webSearch: Schema.object({
+    apiKey: Schema.string()
+      .description('DeepSeek Platform 的 API Key（sk-…）。留空 = 不覆盖 DSH 现有配置。'
+        + '填了才会写入 web-search-deepseek，web_search 才能用。')
+      .default('')
+      .role('secret').volatile(),
+    baseUrl: Schema.string()
+      .description('搜索接口 baseUrl（留空用默认 https://api.deepseek.com/anthropic/v1）。')
+      .default('').volatile(),
+    model: Schema.string()
+      .description('搜索模型 id（留空用 provider 默认）。')
+      .default('').volatile(),
+  }).description('网页搜索（DeepSeek）').default({}),
 
   // ── 用量成本价目表（「数据与用量」面板）──────────────────────
   //
@@ -581,6 +603,10 @@ const Config = Schema.object({
   antiDebounceMs: Schema.number()
     .description('消息防抖合并窗口（毫秒）。0 = 沿用「活跃设置」里的 debounceWindowMs（默认 800）。')
     .default(0).min(0).max(60000).volatile(),
+  debugPrompt: Schema.boolean()
+    .description('人设诊断日志：开启后每步打印 system sections / runtime contexts 的名字与字数'
+      + '（只在内容变化时打，用于排查「人设没生效」）。默认关。')
+    .default(false).volatile(),
 
   // ── 白名单（批次 4A-UI）──────────────────────────────────────
   // 桥接每处理一条消息都从热配置现读，改完下一条即生效。
@@ -879,6 +905,53 @@ export function readFeatureFlags(config = featureState.source) {
 const sessionOpsQueue = new Map() // id -> { id, op, key, text, sessionId, voice, at, lease }
 let sessionOpsSeq = 0
 
+/**
+ * 等桥接回执的挂起项（2026-10-24）。
+ *
+ * 为什么需要：`qq_send_voice` 以前「入队即返回 queued」，桥接那边 Edge TTS 失败、
+ * NapCat 拒收时模型完全不知道，还回复「发出去了」（真机就是这么翻车的）。
+ * 现在工具会**等到桥接回执**再返回：成功给出 detail，失败把 detail 原样 throw 给模型。
+ *
+ * key = 会话指令 id，value = { resolve, reject, timer }。
+ * 回执由 `POST /dsh-qq-guard/session-ops {results:[{id, ok, detail}]}` 那条链路送回来
+ * （桥接侧 session-ops.mjs 每轮把执行结果回传）。
+ */
+const pendingOpResults = new Map()
+
+/**
+ * 等待某条会话指令的桥接回执。
+ * @param {string} id 指令 id
+ * @param {number} timeoutMs 超时（拿不到回执就 reject，绝不假装成功）
+ * @returns {Promise<{ok:boolean, detail?:string}>}
+ */
+function waitForOpResult(id, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingOpResults.delete(id)
+      reject(new Error(`桥接没有回执（${timeoutMs}ms 内没等到）：可能桥接没在跑，或这条指令被丢弃了`))
+    }, timeoutMs)
+    pendingOpResults.set(id, { resolve, reject, timer })
+  })
+}
+
+/**
+ * 收到回执时唤醒挂起的工具调用。
+ * @param {string} id 指令 id
+ * @param {{ok?:boolean, detail?:string}} result
+ * @returns {boolean} 是否命中了一个挂起项
+ */
+function settleOpResult(id, result) {
+  const pending = pendingOpResults.get(id)
+  if (pending === undefined) return false
+  pendingOpResults.delete(id)
+  clearTimeout(pending.timer)
+  pending.resolve({
+    ok: result?.ok !== false,
+    detail: typeof result?.detail === 'string' ? result.detail : '',
+  })
+  return true
+}
+
 /** 清掉过期指令（5 分钟没被桥接取走就作废）。 */
 function pruneSessionOps() {
   const now = Date.now()
@@ -923,7 +996,18 @@ function enqueueSessionOp(op, key, text = '', extra = {}) {
 
 /** 诊断用：队列长度（不含指令内容）。 */
 export function sessionOpsSnapshot() {
-  return { queued: sessionOpsQueue.size }
+  return { queued: sessionOpsQueue.size, ids: [...sessionOpsQueue.keys()] }
+}
+
+/**
+ * 手动结算一条指令的回执（导出给测试用；生产路径由 session-ops 路由的
+ * `{results:[{id, ok, detail}]}` 触发）。
+ * @param {string} id
+ * @param {{ok?:boolean, detail?:string}} result
+ * @returns {boolean} 是否命中挂起项
+ */
+export function settleSessionOpResult(id, result) {
+  return settleOpResult(id, result)
 }
 
 
@@ -1818,6 +1902,132 @@ function detectPresetScope(ctx) {
 }
 
 /**
+ * 宿主注入的「运行时上下文」消息标记。
+ *
+ * 2026-10-24 真机抓到的人设失效真因：DSH 的 mnemon 插件把 **USER.md / MEMORY.md
+ * 的运行时快照当成一条 user 消息**塞进每一步（`agent/pre-step` 里
+ * `createPluginMessage(text,'recall')`，source.kind = 'dsh-mnemon'，还有一条
+ * form='instructions' 的引导语）。实测该消息 3863 字，内容是「称呼：用户翎羽…
+ * 技术任务要求精简…」这类主人格设定 —— 对模型来说**用户消息比系统人设更硬**，
+ * 于是它照着 USER.md 演，把我们 `complete: true` 的人设整段无视。
+ *
+ * 这既是人设问题，也是**隐私问题**：QQ 群友的对话不该带着主人的长期记忆。
+ * 所以 QQ 会话里这两类消息一律摘掉（用 source.kind 精确匹配，不靠文本猜）。
+ */
+const INJECTED_CONTEXT_SOURCES = new Set(['dsh-mnemon', 'mnemon'])
+/** 兜底文本标记：source.kind 变了也能认出来（宁可多摘一条，也不要漏）。 */
+const INJECTED_CONTEXT_MARKERS = ['MNEMON RUNTIME MEMORY SNAPSHOT', 'Runtime Memory keeps compact hot memory']
+
+/**
+ * 这条 pre-step 消息是不是宿主注入的运行时上下文（不是 QQ 那头真说的话）。
+ * @param {unknown} message
+ * @returns {boolean}
+ */
+function isInjectedContextMessage(message) {
+  const source = message?.source
+  if (source && typeof source === 'object' && INJECTED_CONTEXT_SOURCES.has(String(source.kind ?? ''))) {
+    return true
+  }
+  const blocks = Array.isArray(message?.content) ? message.content : []
+  for (const block of blocks) {
+    const text = typeof block?.text === 'string' ? block.text : ''
+    if (text === '') continue
+    if (INJECTED_CONTEXT_MARKERS.some((marker) => text.includes(marker))) return true
+  }
+  return false
+}
+
+/**
+ * 从 QQ 会话的每一步里摘掉宿主注入的运行时上下文（人设失效 + 隐私）。
+ *
+ * 为什么用 `agent/pre-step` 且必须 `{ prepend: true }`：
+ *   cordis 瀑布「先注册的在最外层，外层返回值最终生效」。mnemon 的监听器在
+ *   profile 顶层**先**注册，所以它是外层、我们默认是内层 —— 内层拿到 next() 时
+ *   mnemon 还没把快照追加进去，过滤等于白做。prepend 之后我们变最外层，
+ *   `next()` 回来时消息已经齐了，这时候再摘，最终结果一定干净。
+ *
+ * 作用域：本函数只在 `role: guard` 的 preset 实例里调用，监听器带该 preset 的 scope
+ * 标记，只会收到 qq-chat 会话的事件，浏览器会话一条都不碰。
+ *
+ * @param {object} ctx guard 实例 ctx（preset 作用域）
+ */
+function applyContextFilter(ctx) {
+  ctx.on('agent/pre-step', async (payload, next) => {
+    const decision = await next()
+    if (decision === undefined || decision === null || decision.kind === 'reject') return decision
+    const messages = Array.isArray(decision.messages) ? decision.messages : []
+    if (messages.length === 0) return decision
+    const kept = messages.filter((message) => !isInjectedContextMessage(message))
+    const dropped = messages.length - kept.length
+    if (dropped === 0) return decision
+    console.info?.(`[qq-guard] 已摘掉 ${dropped} 条宿主注入上下文（运行时记忆不会进 QQ 会话）`)
+    return { ...decision, messages: kept }
+  }, { prepend: true })
+}
+
+/**
+ * 人设/上下文诊断日志（老板要求的「暴力日志」，默认关）。
+ *
+ * 打开方式（任一）：
+ *   · 本插件 Config 的 `debugPrompt = true`（设置页「全局设置 → 高级参数」暂未暴露，
+ *     但可以在 profile 的 cordis.patch.yml 里手写）；
+ *   · 环境变量 `QQG_PROMPT_DEBUG=1`（改完重启 DSH 生效）。
+ *
+ * 输出：每一步组装后的 system sections（名字 + 字数）+ runtime contexts（名字）+ 人设正文前 120 字。
+ * 只在**内容变化**时打，避免每步刷屏。看日志的位置是 DSH 主进程 stdout。
+ *
+ * @param {object} ctx guard 实例 ctx（preset 作用域）
+ * @param {() => boolean} enabled 现读开关
+ */
+function applyPromptDebug(ctx, enabled) {
+  const lastBySession = new Map()
+  ctx.on('system-prompt/assemble', async (assembly, context, next) => {
+    const out = await next()
+    try {
+      if (!enabled()) return out
+      const sessionId = String(context?.agent?.session?.id ?? context?.agent?.id ?? '-')
+      const sections = (out?.sections ?? []).map((section) => ({
+        name: String(section?.name ?? '?'),
+        chars: String(section?.text ?? '').length,
+      }))
+      const contexts = (out?.contexts ?? []).map((entry) => String(entry?.name ?? '?'))
+      const persona = (out?.sections ?? []).find((s) => s?.name === PERSONA_PREFIX_SECTION)
+      const signature = JSON.stringify({ sections, contexts, personaHead: String(persona?.text ?? '').slice(0, 40) })
+      if (lastBySession.get(sessionId) === signature) return out
+      lastBySession.set(sessionId, signature)
+      while (lastBySession.size > 200) lastBySession.delete(lastBySession.keys().next().value)
+      console.info(
+        `[Persona Debug] session=${sessionId} `
+        + `sections=[${sections.map((s) => `${s.name}:${s.chars}`).join(', ')}] `
+        + `contexts=[${contexts.join(', ')}] `
+        + `personaHead=${JSON.stringify(String(persona?.text ?? '').slice(0, 120))}`,
+      )
+      if (process.env.QQG_PROMPT_DEBUG === 'dump') {
+        console.info('[Persona Debug] full sections:', JSON.stringify(out?.sections ?? []))
+      }
+    } catch (error) {
+      console.warn?.(`[qq-guard] Persona Debug 日志失败（已忽略）：${error?.message ?? error}`)
+    }
+    return out
+  }, { prepend: true })
+}
+
+/**
+ * 人设/上下文诊断日志是否开启。
+ *
+ * 三个来源任一为真即开：环境变量 `QQG_PROMPT_DEBUG`、本行 Config 的 `debugPrompt`、
+ * 设置页那份共享 Config 的 `debugPrompt`（guard 子行拿不到设置页配置，所以要读共享源）。
+ *
+ * @param {unknown} config guard 实例自己的 Config
+ * @returns {boolean}
+ */
+function promptDebugEnabled(config) {
+  if (process.env.QQG_PROMPT_DEBUG) return true
+  if (plainConfig(config)?.debugPrompt === true) return true
+  try { return plainConfig(featureState.source)?.debugPrompt === true } catch { return false }
+}
+
+/**
  * 工具门禁：**只能在 preset 作用域里跑**。
  *
  * 为什么必须校验：`ctx.tools.guard` 在 plain context 上是**全局**的
@@ -1858,6 +2068,17 @@ function applyGuard(ctx, config) {
   // 三者都为空的极端情况下 section 文本为空串 —— 不会崩，但模型会没有身份，
   // 所以 cordis.patch.yml 里 personaDefault 必须始终有内容。
   applyPersonaSection(ctx, config)
+
+  // ── 第 0.2 层：摘掉宿主注入的运行时上下文（人设失效 / 隐私的真正元凶）──
+  //
+  // 只靠 `complete: true` 的 section 不够：DSH 的 mnemon 插件会把 USER.md / MEMORY.md
+  // 的快照当成**一条 user 消息**塞进每一步（source.kind='dsh-mnemon'）。实测 3863 字，
+  // 内容就是主人格设定（称呼/说话方式/技术任务要求），模型会优先照它演 ——
+  // 表现就是「保存了人设但完全被无视」。顺带也是隐私问题：群友对话不该带上主人的记忆。
+  applyContextFilter(ctx)
+
+  // ── 第 0.3 层：人设/上下文诊断日志（默认关，见 applyPromptDebug 注释）──
+  applyPromptDebug(ctx, () => promptDebugEnabled(config))
 
   // ── 第 0.5 层：语音工具（注册在 preset 作用域，不是全局）──────────
   // 注册了就常驻 schema，开关关闭时由下面的 guard 在执行期拒绝。
@@ -1941,6 +2162,11 @@ function applyGuard(ctx, config) {
 export const VOICE_TOOL_NAME = 'qq_send_voice'
 /** 单条语音的文字上限：QQ 语音条约 60 秒，中文按 ~4 字/秒估。 */
 export const VOICE_MAX_CHARS = 240
+/**
+ * 等桥接回执的上限（毫秒）。
+ * 一条语音 op 的最坏耗时 ≈ TTS 20s 超时 + base64/file 两次发送，25s 是留了余量的上限。
+ */
+export const VOICE_RECEIPT_TIMEOUT_MS = 25000
 
 /**
  * 注册「发语音」工具（Phase 6）。
@@ -1961,7 +2187,7 @@ function applyVoiceTool(ctx) {
     name: VOICE_TOOL_NAME,
     description: '把一段中文文字合成语音，以 QQ 语音条发到当前聊天。'
       + `仅在「发语音」技能开启时可用；单次最多 ${VOICE_MAX_CHARS} 字（QQ 语音条约 60 秒），`
-      + '超出请先精简。发送是异步的：工具返回「已提交」不代表已经播放。',
+      + '超出请先精简。**发送失败会抛错**（桥接合成或 NapCat 拒收时），别假设一定成功。',
     parameters: {
       text: {
         type: 'string',
@@ -1979,13 +2205,17 @@ function applyVoiceTool(ctx) {
         additionalProperties: false,
         properties: {
           queued: { type: 'boolean', required: true },
+          sent: { type: 'boolean', required: true, description: '桥接是否真的把语音发到了 QQ。' },
           chars: { type: 'integer', required: true },
           id: { type: 'string', required: true, description: '队列里的任务 id，排障用。' },
+          detail: { type: 'string', required: true, description: '桥接回执原文（成功=发送摘要，失败=原因）。' },
         },
       },
       render: (_args, value) => [{
         type: 'text',
-        text: `已提交语音合成（${Number(value?.chars) || 0} 字），桥接会在几秒内发送到 QQ。`,
+        text: value?.sent === true
+          ? `语音已发到 QQ（${Number(value?.chars) || 0} 字）：${String(value?.detail ?? '')}`
+          : `语音没有发出去（${Number(value?.chars) || 0} 字）：${String(value?.detail ?? '')}`,
       }],
     },
     execute: async (args, exec) => {
@@ -2009,7 +2239,25 @@ function applyVoiceTool(ctx) {
         sessionId,
         ...(voice !== '' ? { voice } : {}),
       })
-      return { queued: true, chars, id }
+      // ★ 等桥接回执再回答模型（2026-10-24 真机教训）：以前「入队即成功」，桥接那边
+      //   TTS 403 / NapCat 拒收时模型仍回复「发出去了」，QQ 里其实什么都没有。
+      //   一条语音 op 的最坏耗时 ≈ TTS 20s + 两次发送，这里给 25s。
+      let receipt
+      try {
+        receipt = await waitForOpResult(id, VOICE_RECEIPT_TIMEOUT_MS)
+      } catch (error) {
+        throw new Error(`语音没有发出去：${error?.message ?? error}`)
+      }
+      if (!receipt.ok) {
+        throw new Error(`语音发送失败：${receipt.detail || '桥接没有给出原因'}`)
+      }
+      return {
+        queued: true,
+        sent: true,
+        chars,
+        id,
+        detail: receipt.detail || '桥接已发送',
+      }
     },
     presentCall: (args) => ({
       card: 'generic',
@@ -2019,10 +2267,12 @@ function applyVoiceTool(ctx) {
     }),
     presentResult: (_args, result) => ({
       card: 'generic',
-      title: 'QQ 语音已入队',
+      title: result?.sent === true ? 'QQ 语音已发送' : 'QQ 语音未发送',
       content: [{
         type: 'text',
-        text: `已入队 ${Number(result?.chars) || 0} 字，任务 ${String(result?.id ?? '') || '(无 id)'}。`,
+        text: result?.sent === true
+          ? `已发送 ${Number(result?.chars) || 0} 字：${String(result?.detail ?? '')}`
+          : `未发送 ${Number(result?.chars) || 0} 字：${String(result?.detail ?? '无原因')}`,
       }],
     }),
     })
@@ -2063,6 +2313,51 @@ export function plainConfig(value) {
 }
 
 /**
+ * 把「网页搜索」的 DeepSeek 凭据同步给 DSH 自己的 provider（2026-10-24）。
+ *
+ * 为什么需要：`web_search` 用的是 `@deepseek-ai/dsh-web-search-deepseek`，它只认
+ * ① 自己的 Config.apiKey ② `credentials.resolve('DEEPSEEK_API_KEY')` ③ launch env。
+ * 本机 profile 的 credentials 里没有 DEEPSEEK 键，所以 QQ 会话里搜索直接报
+ * WEB_PROVIDER_CREDENTIAL_MISSING。这里把设置页填的 Key 写进 DSH 的
+ * `web-search-deepseek` settings namespace（字段名是 **baseURL**，大写 URL）。
+ *
+ * 触发时机：桥接每 2 秒轮询 `/dsh-qq-guard/config`，顺手调一次 —— 填完 Key 最多 2 秒生效，
+ * 不需要重启 DSH。按「上次写过的值」去重，不会每 2 秒重复写盘。
+ * Key 留空时**不动** DSH 现有配置（尊重用户在别处配好的凭据）。
+ *
+ * @param {object} cfg 设置页那份 Config（已 plainConfig）
+ */
+let webSearchSyncedSignature = ''
+async function syncWebSearchCredential(cfg) {
+  try {
+    const web = cfg?.webSearch
+    if (!web || typeof web !== 'object') return
+    const apiKey = typeof web.apiKey === 'string' ? web.apiKey.trim() : ''
+    if (apiKey === '') return
+    const baseUrl = typeof web.baseUrl === 'string' ? web.baseUrl.trim() : ''
+    const model = typeof web.model === 'string' ? web.model.trim() : ''
+    const signature = `${apiKey.length}:${apiKey.slice(0, 6)}|${baseUrl}|${model}`
+    if (signature === webSearchSyncedSignature) return
+    const settings = webSearchSyncTarget
+    if (!settings || typeof settings.update !== 'function') return
+    const section = {
+      apiKey,
+      ...(baseUrl === '' ? {} : { baseURL: baseUrl }),
+      ...(model === '' ? {} : { model }),
+    }
+    await settings.update('web-search-deepseek', section)
+    webSearchSyncedSignature = signature
+    console.info?.('[qq-guard] 已把网页搜索凭据写入 DSH 的 web-search-deepseek（web_search 现在可用）')
+  } catch (error) {
+    // 写失败不能影响配置轮询（桥接靠它热更新）。下次轮询会重试。
+    console.warn?.(`[qq-guard] 同步网页搜索凭据失败（下次轮询重试）：${error?.message ?? error}`)
+  }
+}
+
+/** 设置服务句柄：applySettings 里注入成功后挂上来（syncWebSearchCredential 用）。 */
+let webSearchSyncTarget
+
+/**
  * 桥接运行时配置（profile 顶层行）。
  * 只在有 webServer 的顶层 ctx 上跑：注册只读配置路由 + 声明自管设置页。
  */
@@ -2092,6 +2387,9 @@ function applySettings(ctx, config) {
         // personaDefault 存在 guard 子行的 config 里，顶层实例拿不到；
         // 从自己的 patch 文件读出来合并进去，桥接才能拼出带默认人设的 prompt。
         const cfg = plainConfig(config) ?? {}
+        // 顺带把网页搜索的 DeepSeek 凭据同步给 DSH 自己的 provider：
+        // 桥接每 2 秒轮询这条路由，等于「设置页填完 Key，2 秒内生效」，不用重启 DSH。
+        void syncWebSearchCredential(cfg)
         sendJson(res, 200, {
           ok: true,
           config: {
@@ -2212,11 +2510,14 @@ function applySettings(ctx, config) {
         // 桥接回执：{ results: [{ id, ok, detail }] }
         if (Array.isArray(body?.results)) {
           let removed = 0
+          let settled = 0
           for (const result of body.results.slice(0, 100)) {
             const id = typeof result?.id === 'string' ? result.id : ''
             if (id && sessionOpsQueue.delete(id)) removed++
+            // 唤醒在等回执的工具调用（qq_send_voice）：成功/失败/原因都要传回去。
+            if (id && settleOpResult(id, result)) settled++
           }
-          sendJson(res, 200, { ok: true, removed })
+          sendJson(res, 200, { ok: true, removed, settled })
           return
         }
         // UI 入队：{ op, key, text?, level? }
@@ -3052,6 +3353,8 @@ function applySettings(ctx, config) {
   // 自带设置页：告诉 Settings 别用 schema 自动生成（官方明确没有客户端实现 autoGenerate）。
   // 这几行必须放在 ctx.inject(['settings'], ...) 子级里，否则 profile 没装 Settings 时插件会挂。
   ctx.inject(['settings'], (settingsCtx) => {
+    // 网页搜索凭据同步要写别的 namespace，句柄挂到模块级（见 syncWebSearchCredential）。
+    webSearchSyncTarget = settingsCtx.settings
     settingsCtx.effect(
       () => settingsCtx.settings.configure({ auto: false }, settingsCtx.fiber),
       'qq-guard: settings page policy',

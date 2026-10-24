@@ -101,10 +101,16 @@ export function startSessionOpsPolling({
       for (const op of ops) {
         try {
           const result = await bridge.applySessionOp(op)
+          const ok = result?.ok !== false
+          // detail 优先：voice 这类 op 会把「可读原因」写进 detail（error 只留短码）。
+          // Host 侧 `qq_send_voice` 靠它把失败原因回给模型，不能只回 ok=false。
+          const detail = typeof result?.detail === 'string' && result.detail.trim() !== ''
+            ? result.detail
+            : (ok ? '' : (result?.error ?? '执行失败'))
           results.push({
             id: op.id,
-            ok: result?.ok !== false,
-            ...(result?.ok === false ? { detail: result.error ?? '执行失败' } : {}),
+            ok,
+            ...(detail ? { detail } : {}),
           })
         } catch (error) {
           results.push({ id: op.id, ok: false, detail: error?.message ?? String(error) })
