@@ -1161,7 +1161,7 @@ await check('防抖：窗口内 3 条合并成 1 次 prompt（换行拼接）', 
   assert.ok(await waitUntil(() => calls.prompts.length > 0, 2000), '窗口结束后应投递')
   await tick(20) // 给可能的第二次投递留时间
   assert.equal(calls.prompts.length, 1, `实际 ${calls.prompts.length} 次 prompt`)
-  assert.equal(calls.prompts[0].text, '第一句\n第二句\n第三句')
+  assert.equal(calls.prompts[0].text, '[群友 1000000001(1000000001)]: 第一句\n[群友 1000000001(1000000001)]: 第二句\n[群友 1000000001(1000000001)]: 第三句')
 })
 await check('防抖：超过窗口的两条分别投递', async () => {
   const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 30 } })
@@ -1169,7 +1169,7 @@ await check('防抖：超过窗口的两条分别投递', async () => {
   assert.ok(await waitUntil(() => calls.prompts.length === 1, 1000))
   await b.handleMessage(groupMsg('乙', { id: 'e2' }))
   assert.ok(await waitUntil(() => calls.prompts.length === 2, 1000))
-  assert.deepEqual(calls.prompts.map((p) => p.text), ['甲', '乙'])
+  assert.deepEqual(calls.prompts.map((p) => p.text), ['[群友 1000000001(1000000001)]: 甲', '[群友 1000000001(1000000001)]: 乙'])
 })
 await check('热配置改 debounceWindowMs 立即生效', async () => {
   const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 0 } })
@@ -1180,7 +1180,7 @@ await check('热配置改 debounceWindowMs 立即生效', async () => {
   await b.handleMessage(groupMsg('三', { id: 'w3' }))
   assert.equal(calls.prompts.length, 1, '改窗口后应攒着')
   assert.ok(await waitUntil(() => calls.prompts.length === 2, 1000))
-  assert.equal(calls.prompts[1].text, '二\n三')
+  assert.equal(calls.prompts[1].text, '[群友 1000000001(1000000001)]: 二\n[群友 1000000001(1000000001)]: 三')
 })
 await check('限频：超过 perMin+burst 静默丢弃（silent=true）', async () => {
   const { b, calls } = makeBridge({

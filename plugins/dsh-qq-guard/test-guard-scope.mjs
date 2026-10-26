@@ -263,6 +263,8 @@ await check('role=settings 有 webServer → 注册全部设置面路由，且�
     '/dsh-qq-guard/napcat-qr',
     // 单人设覆盖（桥接每条消息前 POST；guard 实例动态 section 现读）
     '/dsh-qq-guard/persona',
+    // 每小时人设归纳（桥接 POST 群聊记录，Host 侧调模型归纳；2026-10-26）
+    '/dsh-qq-guard/persona-summarize',
     // 原生目录选择器（NapCat 安装目录的「浏览」按钮）
     '/dsh-qq-guard/pick-dir',
     // 会话指令队列（清空 / 删除 / 单人设；桥接 2 秒轮询）
@@ -271,7 +273,7 @@ await check('role=settings 有 webServer → 注册全部设置面路由，且�
     // 真实用量统计（数据与用量面板）+ 历史回填
     '/dsh-qq-guard/usage',
     '/dsh-qq-guard/usage/backfill',
-  ], `路由应为 15 条，实际 ${JSON.stringify(paths)}`)
+  ], `路由应为 16 条，实际 ${JSON.stringify(paths)}`)
   assert.ok(calls.webRoutes.every((r) => r.kind === 'exact'))
 })
 await check('role=settings 无 webServer → 安全跳过', () => {

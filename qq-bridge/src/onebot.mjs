@@ -51,12 +51,13 @@ const WS_OPEN = 1
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-/** logger 可能为 undefined，字段也可能缺失；一律容错成空操作。 */
+/** logger 可能为 undefined，字段也可能缺失；一律容错成空操作。
+ *  debug 是后加的（2026-10-26，notice 事件只记 debug）：老 logger 没有这个方法时自动退化成空操作。 */
 function makeLogger(logger) {
   const bind = (name) => (logger && typeof logger[name] === 'function'
     ? (msg) => { try { logger[name](msg) } catch { /* 日志自身出错不影响主链路 */ } }
     : () => {})
-  return { info: bind('info'), warn: bind('warn'), error: bind('error') }
+  return { info: bind('info'), warn: bind('warn'), error: bind('error'), debug: bind('debug') }
 }
 
 /** 日志里不能出现 access_token。 */
@@ -95,6 +96,35 @@ export function extractImages(message) {
       file,
       summary,
       size: Number.isFinite(size) && size > 0 ? size : 0,
+    })
+  }
+  return out
+}
+
+/**
+ * 抽出视频段（2026-10-26，插件联动契约 §6）。
+ *
+ * OneBot/NapCat 的 video 段通常带 `url`（可直接下载）和 `file`（文件名/本地路径），
+ * 部分版本还带 `file_size`。这里只做结构提取，不在这里发网络请求——
+ * 下载落盘在 bridge.mjs / plugin-hub.mjs，便于注入测试。
+ *
+ * @param {Array|string} message OneBot 消息段
+ * @returns {Array<{url:string, file:string, fileSize:number}>}
+ */
+export function extractVideos(message) {
+  if (!Array.isArray(message)) return []
+  const out = []
+  for (const seg of message) {
+    if (!seg || seg.type !== 'video') continue
+    const data = seg.data && typeof seg.data === 'object' ? seg.data : {}
+    const url = String(data.url ?? '').trim()
+    const file = String(data.file ?? '').trim()
+    if (!url && !file) continue
+    const size = Number(data.file_size)
+    out.push({
+      url: url || file,
+      file,
+      fileSize: Number.isFinite(size) && size > 0 ? size : 0,
     })
   }
   return out
@@ -559,6 +589,37 @@ export function imageFileVia(file) {
   return 'file'
 }
 
+/** 取前 24 个 base64 字符解码，看是不是 GIF 魔数（GIF87a / GIF89a）。 */
+function base64HeadIsGif(text) {
+  try {
+    const head = Buffer.from(String(text ?? '').slice(0, 24), 'base64')
+    return head.length >= 3 && head.subarray(0, 3).toString('ascii') === 'GIF'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 这个图片引用是不是 GIF（只看后缀与魔数，不打网络）。
+ *
+ * 为什么要判：`sub_type:1` 的表情段里，GIF 还要带 `summary:'[动画表情]'`，
+ * QQ 才按动画表情渲染；静态图不需要这个字段，多给反而可能干扰。
+ * @param {string} file 图片地址（url / data: / base64:// / file:/// / 绝对路径）
+ * @returns {boolean}
+ */
+export function imageRefLooksGif(file) {
+  const ref = String(file ?? '').trim()
+  if (!ref) return false
+  if (/^base64:\/\//i.test(ref)) return base64HeadIsGif(ref.slice('base64://'.length))
+  if (/^data:/i.test(ref)) {
+    const comma = ref.indexOf(',')
+    return comma >= 0 && base64HeadIsGif(ref.slice(comma + 1))
+  }
+  // http(s) / file:/// / 绝对路径：只看路径部分的扩展名（忽略 ?query / #hash）。
+  const pathPart = ref.split(/[?#]/)[0]
+  return /\.gif$/i.test(pathPart)
+}
+
 export class OneBotClient {
   /**
    * @param {object} opts
@@ -636,6 +697,9 @@ export class OneBotClient {
     this._pending = new Map() // echo -> {resolve, reject, timer, action}
     this._seq = 0
     this._handlers = new Set()
+    // notice 处理器（2026-10-26，戳一戳）：和消息处理器分开，避免桥接的 message
+    // 回调被通知事件串到（签名也不同）。
+    this._noticeHandlers = new Set()
     this._seen = new Set()
     this._seenOrder = []
     // 群成员昵称缓存（2026-10-23）：@ 段通常只有 QQ 号，没有昵称。
@@ -703,6 +767,44 @@ export class OneBotClient {
     if (typeof handler !== 'function') throw new TypeError('onMessage 需要一个函数')
     this._handlers.add(handler)
     return () => this._handlers.delete(handler)
+  }
+
+  /**
+   * 注册 notice 处理器（2026-10-26，目前只有戳一戳）。
+   * handler({ kind:'poke', userId, targetId, groupId, selfId, time, raw })
+   * @returns {Function} 注销函数
+   */
+  onNotice(handler) {
+    if (typeof handler !== 'function') throw new TypeError('onNotice 需要一个函数')
+    this._noticeHandlers.add(handler)
+    return () => this._noticeHandlers.delete(handler)
+  }
+
+  /**
+   * 已知昵称查询（群成员 / 好友缓存），取不到返回 ''。
+   *
+   * 缓存本身由消息事件顺手填（`_rememberName`），这里只是暴露给桥接（戳一戳文案
+   * 要拿戳的人昵称）。scopeKey 容错两种写法：
+   *   · OneBot 原生作用域：群号 / `'u'`（私聊只有一个桶）；
+   *   · 桥接的会话 key：`g:<群号>` / `u:<QQ号>`（bridge.keyOf 的格式）。
+   * 这样 §5.3 里不管桥接传哪种都能取到名字，取不到就让调用方退回 QQ 号。
+   * @param {string} scopeKey
+   * @param {string|number} qq
+   * @returns {string}
+   */
+  nameOf(scopeKey, qq) {
+    const scope = String(scopeKey ?? '').trim()
+    const id = String(qq ?? '').trim()
+    if (!scope || !id) return ''
+    const candidates = [scope]
+    if (/^g:/iu.test(scope)) candidates.push(scope.slice(2))
+    else if (/^u:/iu.test(scope)) candidates.push('u')
+    else if (/^\d+$/u.test(scope)) candidates.push('u') // 私聊只有一个桶，群号是数字时也兜一下
+    for (const key of candidates) {
+      const name = this._nameOf(key, id)
+      if (name) return name
+    }
+    return ''
   }
 
   /** 建立连接并开始自动重连。返回后不代表已连上。 */
@@ -786,6 +888,71 @@ export class OneBotClient {
   }
 
   /**
+   * 回戳（戳一戳，2026-10-26）。
+   *
+   * NapCat 的戳一戳 action 名声不统一，按「首选 + 兜底」两段打：
+   *   · 群聊：`group_poke` `{group_id, user_id}` → 失败再试 `send_poke` `{user_id, group_id}`；
+   *   · 私聊：`friend_poke` `{user_id}` → 失败再试 `send_poke` `{user_id}`。
+   * 「失败」包括 retcode 非 0 / status 非 ok / 传输层抛错。**永不抛**：全部失败
+   * 也返回对象，由桥接自己决定只 warn 还是提示（戳一戳失败不该影响主链路）。
+   *
+   * @param {'private'|'group'} kind
+   * @param {string|number} target 群号（group）或对方 QQ 号（private）
+   * @param {{userId?:string|number}} [opts] 被戳的人（回戳时就是戳你的人）
+   * @returns {Promise<{ok:boolean, action:string, retcode:number|null, error?:string}>}
+   */
+  async sendPoke(kind, target, { userId } = {}) {
+    const isGroup = kind === 'group'
+    const targetId = String(target ?? '').trim()
+    const poker = String(userId ?? (isGroup ? '' : targetId)).trim()
+    if (!/^\d+$/u.test(targetId) || targetId === '0') {
+      return {
+        ok: false, action: '',
+        error: `${isGroup ? 'group_id' : 'user_id'} 必须是正整数：${target}`,
+        retcode: null,
+      }
+    }
+    if (!/^\d+$/u.test(poker) || poker === '0') {
+      return { ok: false, action: '', error: `user_id 必须是正整数：${userId}`, retcode: null }
+    }
+
+    // 首选按协议扩展分叉；兜底统一走 send_poke（部分实现只有这一个）。
+    const attempts = isGroup
+      ? [
+        { action: 'group_poke', params: { group_id: Number(targetId), user_id: Number(poker) } },
+        { action: 'send_poke', params: { user_id: Number(poker), group_id: Number(targetId) } },
+      ]
+      : [
+        { action: 'friend_poke', params: { user_id: Number(poker) } },
+        { action: 'send_poke', params: { user_id: Number(poker) } },
+      ]
+
+    const failures = []
+    let lastRetcode = null
+    let lastAction = ''
+    for (const attempt of attempts) {
+      lastAction = attempt.action
+      try {
+        const res = await this.call(attempt.action, attempt.params)
+        const retcode = Number.isFinite(Number(res?.retcode)) ? Number(res.retcode) : null
+        const ok = res?.status === 'ok' && retcode === 0
+        if (ok) {
+          this.log.info(`回戳成功（${attempt.action} ${isGroup ? `group:${targetId}` : `private:${targetId}`} → ${poker}）`)
+          return { ok: true, action: attempt.action, retcode }
+        }
+        lastRetcode = retcode
+        failures.push(`${attempt.action}: retcode=${res?.retcode} status=${res?.status}`)
+        this.log.warn(`回戳被拒（${attempt.action}）：retcode=${res?.retcode} status=${res?.status}，尝试兜底 action`)
+      } catch (err) {
+        lastRetcode = null
+        failures.push(`${attempt.action}: ${err?.message ?? String(err)}`)
+        this.log.warn(`回戳异常（${attempt.action}）：${err?.message ?? err}，尝试兜底 action`)
+      }
+    }
+    return { ok: false, action: lastAction, error: failures.join('；'), retcode: lastRetcode }
+  }
+
+  /**
    * 发一张图片 / 表情包（image 段，P2「发图片」技能）。
    *
    * `file` **原样**交给 NapCat：http(s) URL 由它自己下载；`base64://` / `file:///` /
@@ -798,11 +965,14 @@ export class OneBotClient {
    * @param {'private'|'group'} kind
    * @param {string|number} targetId QQ 号 / 群号
    * @param {string} file 图片地址（url / file:/// / base64:// / 绝对路径）
-   * @param {{atUserId?:string}} [opts] 群聊可带 @（发图片默认不 @，见 _applyImageOp）
+   * @param {{atUserId?:string, subType?:0|1, position?:'before'|'after'}} [opts]
+   *   群聊可带 @（发图片默认不 @，见 _applyImageOp）；
+   *   `subType`：0=普通图片，1=表情（NapCat 按 `sub_type` 升成表情包，GIF 再补 summary）；
+   *   `position`：只写进回执 detail 便于排障，不改变发送时机（见 p2-contract，避免引入队列等待）。
    * @returns {Promise<{ok:boolean, messageIds:string[], error?:string,
    *   retcode:number|null, status:string, via:'url'|'file'|'base64'|''}>}
    */
-  async sendImage(kind, targetId, file, { atUserId } = {}) {
+  async sendImage(kind, targetId, file, { atUserId, subType, position } = {}) {
     const id = String(targetId ?? '').trim()
     const ref = String(file ?? '').trim()
     const via = imageFileVia(ref)
@@ -821,7 +991,12 @@ export class OneBotClient {
       message.push({ type: 'at', data: { qq: String(atUserId).trim() } })
       message.push({ type: 'text', data: { text: ' ' } })
     }
-    message.push({ type: 'image', data: { file: ref } })
+    // sub_type 只在调用方明确给了 0/1 时下发：缺省保持老消息段形状，不改变既有行为。
+    const hasSubType = subType === 0 || subType === 1
+    const imageData = { file: ref, ...(hasSubType ? { sub_type: subType } : {}) }
+    // 表情 + GIF 才补 summary：NapCat 认这个字段，静态图加了反而可能被当成表情包。
+    if (subType === 1 && imageRefLooksGif(ref)) imageData.summary = '[动画表情]'
+    message.push({ type: 'image', data: imageData })
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg'
     const params = kind === 'private' ? { user_id: Number(id), message } : { group_id: Number(id), message }
     try {
@@ -1295,7 +1470,14 @@ export class OneBotClient {
       return
     }
 
-    if (postType !== 'message') return // notice / request 暂不处理
+    // 通知事件（2026-10-26，戳一戳）：必须放在「非 message 直接 return」之前，
+    // 否则 notice 全被吞掉。只认 notify/poke，其余交给 _dispatchNotice 静默。
+    if (postType === 'notice') {
+      this._dispatchNotice(packet)
+      return
+    }
+
+    if (postType !== 'message') return // request 等事件暂不处理
 
     const kind = packet.message_type
     if (kind !== 'private' && kind !== 'group') return
@@ -1324,6 +1506,57 @@ export class OneBotClient {
     }
   }
 
+  /**
+   * notice 事件分发（2026-10-26，戳一戳）。
+   *
+   * 只认 `notice_type === 'notify' && sub_type === 'poke'`，其他通知只记 debug 并丢弃
+   * —— 通知类事件绝不能抛错把消息主链路带崩（`_onRaw` 在 WS 回调里同步调用）。
+   *
+   * 字段容错（NapCat 各版本 / go-cqhttp 系实现不一致）：
+   *   · 戳的人：`user_id`，老实现可能只给 `sender_id`；
+   *   · 被戳的人：`target_id`，缺了就空串（桥接侧再判是不是自己）；
+   *   · 机器人自己：`self_id`，缺了回落到 get_login_info 得到的 `_selfId`。
+   * 自戳（`userId === selfId`）直接丢：NapCat 会把机器人自己的操作也回灌成事件。
+   * @param {object} packet
+   */
+  _dispatchNotice(packet) {
+    const noticeType = String(packet.notice_type ?? '')
+    const subType = String(packet.sub_type ?? '')
+    if (noticeType !== 'notify' || subType !== 'poke') {
+      this.log.debug(`忽略通知事件：notice_type=${noticeType || '?'} sub_type=${subType || '?'}`)
+      return
+    }
+    const userId = String(packet.user_id ?? packet.sender_id ?? '')
+    const selfId = String(packet.self_id ?? this._selfId ?? '')
+    if (!userId) {
+      this.log.debug('戳一戳事件缺 user_id/sender_id，已忽略')
+      return
+    }
+    if (selfId && userId === selfId) {
+      this.log.debug(`自己戳自己已忽略（${userId}）`)
+      return
+    }
+    const event = {
+      kind: 'poke',
+      userId,
+      targetId: String(packet.target_id ?? ''),
+      groupId: packet.group_id == null ? null : String(packet.group_id),
+      selfId,
+      time: Number.isFinite(Number(packet.time)) ? Number(packet.time) : null,
+      raw: packet,
+    }
+    for (const handler of this._noticeHandlers) {
+      try {
+        const ret = handler(event)
+        if (ret && typeof ret.then === 'function') {
+          ret.catch((err) => this.log.error(`notice 处理器异常：${err?.message ?? err}`))
+        }
+      } catch (err) {
+        this.log.error(`notice 处理器异常：${err?.message ?? err}`)
+      }
+    }
+  }
+
   _parseMessageEvent(packet, kind) {
     const rawSender = packet.sender && typeof packet.sender === 'object' ? packet.sender : {}
     const userId = String(packet.user_id ?? rawSender.user_id ?? '')
@@ -1344,6 +1577,8 @@ export class OneBotClient {
       // 图片段单独抽出来：text 里仍保留 [图片] 占位（审计/日志用），
       // 但桥接要拿 url 去下载，喂给支持多模态的模型（2026-10-23，任务 5）。
       images: extractImages(message),
+      // 视频段同理（契约 §6）：桥接据 url 下载到 state/media/，追加本地路径给模型。
+      videos: extractVideos(message),
       messageId: packet.message_id === undefined || packet.message_id === null ? '' : String(packet.message_id),
       senderName,
       sender: rawSender,

@@ -155,20 +155,32 @@ function readOverride(agent) {
 const WATCHDOG_CODE = 'WATCHDOG_TIMEOUT'
 
 /**
- * 当前被接管的模型路由集合（主模型 + 所有备用）。
+ * 该会话是否登记了这条路由（主模型或它的某个备用）；没登记 → 一律不碰。
  *
- * 看门狗只包这些路由的流 —— 其它会话（浏览器里用户自己的、子代理的）一律不碰，
- * 避免把「长思考不吐字」的正常请求误杀。
- * @returns {Set<string>}
+ * 为什么按 **sessionId** 而不是按「全局路由集合」匹配（2026-10-26 修 bug）：
+ * `llm/stream` 的 options 就是 GenerateOptions，里面带 `sessionId`
+ * （dsh-agent-loop 的 buildRequest 返回 `{...header.config, messages, sessionId: this.session.id, signal}`）。
+ * 旧实现只看路由，于是**任何**会话（浏览器里用户自己的、子代理的、本插件自己的旁路调用）
+ * 只要模型撞上被接管的路由，就会被静默看门狗一起切断 —— 长思考不吐字本来是正常现象，
+ * 不该被误杀。改成「只有该 sessionId 自己登记过这条路由才包」。
+ *
+ * `mode: 'default'` 的条目不算接管（它只是把会话钉回全局默认，不参与看门狗）。
+ *
+ * @param {string|undefined} sessionId 本次请求的会话 id
+ * @param {string} route `${provider}/${model}`
+ * @returns {{provider:string, model:string, mode?:string}|undefined} 命中的条目（主模型或备用）
  */
-function managedRoutes() {
-  const routes = new Set()
-  for (const entry of overrides.values()) {
-    if (entry.mode === 'default') continue
-    if (entry.provider && entry.model) routes.add(`${entry.provider}/${entry.model}`)
-    for (const fallback of entry.fallbacks ?? []) routes.add(`${fallback.provider}/${fallback.model}`)
+function managedEntryFor(sessionId, route) {
+  if (typeof sessionId !== 'string' || sessionId.length === 0) return undefined
+  const entry = overrides.get(sessionId)
+  if (entry === undefined) return undefined
+  if (entry.mode === 'default') return undefined
+  if (entry.provider !== undefined && entry.model !== undefined
+    && `${entry.provider}/${entry.model}` === route) return entry
+  for (const fallback of entry.fallbacks ?? []) {
+    if (`${fallback.provider}/${fallback.model}` === route) return fallback
   }
-  return routes
+  return undefined
 }
 
 /**
@@ -399,12 +411,13 @@ export function installModelOverride(ctx, { logger = console, config } = {}) {
   }, { prepend: true })
 
   // 4c. 静默看门狗：把「模型挂着不返回」翻成终态 finish(error)，好让上面的降级链接管。
-  //     只包被接管的路由（主模型 + 备用），其它会话的流原样透传。
+  //     只包「该 sessionId 自己登记过的主模型/备用路由」，其它会话的流原样透传
+  //     （按 sessionId 判断，不按路由集合——见 managedEntryFor 的注释）。
   const disposeWatchdog = ctx.on('llm/stream', (options, next) => {
     const idleMs = Number(readVolatile(config?.modelWatchdogMs) ?? 0)
     if (!Number.isFinite(idleMs) || idleMs <= 0) return next()
     const route = `${options?.provider ?? ''}/${options?.model ?? ''}`
-    if (!managedRoutes().has(route)) return next()
+    if (managedEntryFor(options?.sessionId, route) === undefined) return next()
     const inner = next()
     // 防御：waterfall 下游正常返回 AsyncIterable；不是流就不碰。
     if (inner === null || typeof inner?.[Symbol.asyncIterator] !== 'function') return inner

@@ -18,6 +18,17 @@ const SECRET_BYTES = 32
 const COOKIE_PREFIX = 'dsh-auth-'
 const COOKIE_LIFETIME_MS = 60 * 60 * 1000
 const COOKIE_REFRESH_MARGIN_MS = 5 * 60 * 1000
+/**
+ * 人设归纳路由的超时（2026-10-26）：Host 那边要拿模型跑一轮，比普通 RPC 慢得多。
+ * 桥接每小时才调一次，等久一点可以接受；超时只当「本轮没结果」，不影响聊天。
+ *
+ * 为什么是 70s 而不是 60s：Host 侧归纳路由自己就有 60s 的 AbortController 上限。
+ * 两边都卡 60s 的话桥接会**先**断连，日志里只剩「HTTP 超时/断连」看不到真正原因；
+ * 多留 10s 余量，让 Host 的 `{ok:false, reason}` 先回来。
+ */
+const SUMMARIZE_TIMEOUT_MS = 70 * 1000
+/** 与 plugins/dsh-qq-guard/index.js 的 SUMMARIZE_ROUTE_PATH 一致（规格 §3）。 */
+const PERSONA_SUMMARIZE_PATH = '/dsh-qq-guard/persona-summarize'
 
 const b64url = (buf) => Buffer.from(buf).toString('base64')
   .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
@@ -675,5 +686,54 @@ export class DshClient {
       throw error
     }
     return payload
+  }
+
+  /**
+   * 让 Host 侧用模型归纳「这一小时的群聊该往人设里补什么」（2026-10-26 每小时归纳）。
+   *
+   * 为什么不在桥接里直接调模型：桥接是独立进程，拿不到 `ctx.llm`；
+   * guard 插件在 Host 进程里，所以由它代跑一轮（规格 §3 路由）。
+   *
+   * 协议：POST /dsh-qq-guard/persona-summarize
+   *   { groupName, currentPersona, messages: [{name, qq, text}] }
+   *   → { ok:true, persona:'…' } / { ok:false, reason:'…' }
+   *
+   * ⚠️ **失败不抛**：每小时归纳是锦上添花，插件没装 / DSH 换端口 / 模型报错
+   * 都只返回 `{ ok:false, reason }`，由调用方打日志跳过本轮。返回的 reason 是
+   * 给日志看的英文原因，**绝不发往 QQ**。
+   *
+   * @param {{groupName?:string, currentPersona?:string,
+   *   messages?:Array<{name?:string, qq?:string, text?:string}>}} request
+   * @returns {Promise<{ok:boolean, persona?:string, reason?:string}>}
+   */
+  async summarizePersona({ groupName = '', currentPersona = '', messages = [] } = {}) {
+    try {
+      // 端口可能在 DSH 重启后变了：先对齐一次（首次探测后是空操作）。
+      await this.ensureBaseUrl()
+      const res = await fetch(`${this.baseUrl}${PERSONA_SUMMARIZE_PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: this.ensureCookie() },
+        body: JSON.stringify({
+          groupName: String(groupName ?? ''),
+          currentPersona: String(currentPersona ?? ''),
+          messages: Array.isArray(messages)
+            ? messages.map((item) => ({
+              name: String(item?.name ?? ''),
+              qq: String(item?.qq ?? ''),
+              text: String(item?.text ?? ''),
+            }))
+            : [],
+        }),
+        // 60s：比普通 RPC 的 timeoutMs 长得多，因为 Host 那边要真跑一轮模型。
+        signal: AbortSignal.timeout(SUMMARIZE_TIMEOUT_MS),
+      })
+      const payload = await res.json().catch(() => ({}))
+      if (!res.ok || payload?.ok !== true) {
+        return { ok: false, reason: String(payload?.reason ?? `HTTP ${res.status}`) }
+      }
+      return { ok: true, persona: typeof payload.persona === 'string' ? payload.persona : '' }
+    } catch (error) {
+      return { ok: false, reason: String(error?.message ?? error) }
+    }
   }
 }

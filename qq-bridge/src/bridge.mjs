@@ -19,6 +19,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { OneBotClient, normalizeTypingCharTiers, normalizeTypingMsTiers } from './onebot.mjs'
 import { DshClient } from './dsh.mjs'
@@ -156,6 +157,23 @@ const IMAGE_PREFETCH_CONCURRENCY = 2
 /** 会话存在性正结果缓存时长（P2）：30 秒内不重复查。 */
 const SESSION_EXISTS_TTL_MS = 30_000
 
+// ── 原始图片字节转交（2026-10-26，GIF 动画保真）───────────────────────────
+// 为什么需要：DSH 的附件服务对所有 GIF/动图强制重编码成单帧 webp/jpeg
+// （`canPassThroughNormalization()` 对 image/gif 与 animated 一律 false），
+// 插件从 attachments 永远拿不到动画帧。桥接本来就下载了原始 Buffer，
+// 这里另送一份给 qq-sticker 插件的原始图池（POST /dsh-qq-sticker/raw-image），
+// 插件按 `[[qqimg:<token>]]` 标记取用。**best-effort**：超时/404/没装插件都不影响聊天。
+const RAW_IMAGE_ROUTE = '/dsh-qq-sticker/raw-image'
+/** POST 超时：本地回环 + 最多 ~13MB base64，1.5s 是契约值；超了就只 warn 一次。 */
+const RAW_IMAGE_TIMEOUT_MS = 1_500
+/** mediaType → 落盘后缀（与插件 rawstore 的 EXT_BY_MEDIA_TYPE 对齐，插件仍以自己为准）。 */
+const RAW_IMAGE_EXT = {
+  'image/gif': 'gif',
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+}
+
 /**
  * 技能/插件开关的默认值（与插件 Config 的 DEFAULT_SKILLS / DEFAULT_PLUGINS 对齐）。
  * 热配置里拿不到 features 时用它，保证旧配置文件下行为与升级前一致。
@@ -277,6 +295,77 @@ const PREVIEW_MAX = 80
 /** 上报给设置页的会话行上限（多余的不展示，也不会无限撑大 POST 体积）。 */
 const SESSION_VIEW_CAP = 100
 
+// ── 2026-10-26 体验升级：人设动态补充 / 每小时归纳 / 戳一戳 ──────────────
+
+/** 人设动态补充（`personaDelta`）的容量上限：超了截掉**最旧**的段落（新设定优先）。 */
+const PERSONA_DELTA_MAX = 4000
+/** 单条群友「你要改成…」指令允许的最大长度（防止一句话把整个 delta 撑爆）。 */
+const PERSONA_DELTA_ADD_MAX = 2000
+/**
+ * 追加在最终人设后面的「本群动态设定」段标题。
+ *
+ * 为什么显式写「优先级低于上面的人设」：群友授权 / 模型归纳出来的补充可能是
+ * 一句玩笑，不能让它把管理员定的主设定挤掉。
+ */
+const PERSONA_DELTA_HEADER = '【本群动态设定（群友授权/自动归纳，优先级低于上面的人设，冲突时以上面为准）】'
+/** 每小时归纳的聊天记录缓冲上限（每会话）与时间窗口。 */
+const CHAT_LOG_MAX = 80
+const CHAT_LOG_WINDOW_MS = 60 * 60 * 1000
+/** 归纳定时器周期：1 小时（启动后不立刻跑第一次，避免重启浪潮）。 */
+const SUMMARIZE_INTERVAL_MS = 60 * 60 * 1000
+/** 每小时归纳的最少样本：少于这个数就跳过（样本太少归纳出来全是瞎猜）。 */
+const SUMMARIZE_MIN_MESSAGES = 5
+/** 戳一戳节流：同一会话 3 秒内最多回一次，防刷屏。 */
+const POKE_THROTTLE_MS = 3 * 1000
+/** 超时/看门狗兜底文案（`timeoutReplyText` 也为空时才用它）。 */
+const DEFAULT_TIMEOUT_REPLY_TEXT = '（模型脑子卡住了，稍后再试）'
+/** 戳一戳「文字回复」模式的默认模板，支持 {nick} / {qq} 占位。 */
+const DEFAULT_POKE_REPLY_TEXT = '（被戳了一下，戳回去）'
+
+/**
+ * 把 `personaDelta` 截到容量上限内（**保留最新**的段落，旧的先丢）。
+ *
+ * 为什么按行截而不是直接 slice(-4000)：一刀切可能把一句话拦腰截断，
+ * 模型看到半句设定反而更容易理解歪。单行本身超长（一行就 > 上限）时才退化成 slice。
+ * @param {unknown} text
+ * @returns {string}
+ */
+function trimPersonaDelta(text) {
+  const source = String(text ?? '')
+  if (source.length <= PERSONA_DELTA_MAX) return source
+  const lines = source.split('\n')
+  const kept = []
+  let size = 0
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]
+    if (size + line.length + 1 > PERSONA_DELTA_MAX) break
+    kept.unshift(line)
+    size += line.length + 1
+  }
+  return kept.length > 0 ? kept.join('\n').trim() : source.slice(-PERSONA_DELTA_MAX).trim()
+}
+
+/**
+ * 归一化戳一戳配置（`poke`）：缺字段按规格默认值补。
+ *
+ * 单独抽函数是因为它有两个读取点（`handleNotice` 与热配置初值），
+ * 而热配置是**整对象替换**，缺键会变 undefined——必须每次现算一份完整的。
+ * @param {unknown} source
+ * @returns {{enabled:boolean, mode:'poke'|'text', replyText:string}}
+ */
+function normalizePoke(source) {
+  const raw = source && typeof source === 'object' && !Array.isArray(source) ? source : {}
+  const replyText = typeof raw.replyText === 'string' && raw.replyText.trim() !== ''
+    ? raw.replyText
+    : DEFAULT_POKE_REPLY_TEXT
+  return {
+    enabled: raw.enabled !== false,
+    // 只认 'text'，其它（含脏数据）一律按默认「回戳」。
+    mode: raw.mode === 'text' ? 'text' : 'poke',
+    replyText,
+  }
+}
+
 /**
  * 解析会话 key：`u:<QQ号>` = 私聊，`g:<群号>` = 群聊。
  * @param {string} key
@@ -338,6 +427,9 @@ export function normalizeSessionEntry(key, raw) {
     nameAt: Number.isFinite(nameAt) && nameAt > 0 ? nameAt : 0,
     // 单人设：空串 = 沿用全局人设（由插件 slot 兜底）。
     persona: typeof value.persona === 'string' ? value.persona : '',
+    // 本群动态设定（2026-10-26）：群友 @bot 授权 / 每小时归纳追加的补充设定。
+    // 老记录没有这个字段 → 补空串（语义 = 没有补充），不要求用户迁移 state 文件。
+    personaDelta: trimPersonaDelta(typeof value.personaDelta === 'string' ? value.personaDelta : ''),
     // 单群活跃系数（0..3）：null = 跟随全局 rhythm.activityLevel，数字 = 该群独立档位。
     activityLevel: normalizeActivityLevel(value.activityLevel),
     // 建这条会话时的工具能力版本（v0.5.1）：空串 = 旧版本建的，下次消息会触发一次上下文重建。
@@ -448,6 +540,14 @@ export class Bridge {
     this._debounce = new Map() // key -> { texts, msg, timer } 防抖缓冲
     this._muted = new Map()    // key -> 静音截止时间戳（ms）
     this._rate = new Map()     // key -> 最近回复时间戳数组（滑动窗口）
+    // 2026-10-26 体验升级的运行时状态（全是内存态，不落盘）：
+    // 戳一戳节流：同一会话 3 秒内最多回一次。
+    this._pokeAt = new Map()   // key -> 上次回戳时间戳（ms）
+    // 每小时归纳的聊天记录缓冲：key -> [{ name, qq, text, at }]（群聊才有）。
+    this._chatLog = new Map()
+    // 归纳定时器（start 里建、stop 里清）与并发保护（一轮 60s 超时内不叠第二轮）。
+    this._summarizeTimer = null
+    this._summarizing = false
     // 随机源可注入：测试里替换掉它，2 档的随机放行就能确定性断言。
     this._random = Math.random
     // preset 内置人设：preset 里已经删掉静态 persona 行，默认人设正文改由
@@ -504,6 +604,15 @@ export class Bridge {
         : 'normal',
       personaExtraRules: typeof config.personaExtraRules === 'string' ? config.personaExtraRules : '',
       personaSystemPrompt: typeof config.personaSystemPrompt === 'string' ? config.personaSystemPrompt : '',
+      // 超时/看门狗失败时发给 QQ 的文案（2026-10-26）：空串 = 用内置默认，
+      // 绝不把 DSH 的英文报错发到群里（见 _timeoutReplyText / _isTimeoutish）。
+      timeoutReplyText: typeof config.timeoutReplyText === 'string' ? config.timeoutReplyText : '',
+      // 人设锁定：默认锁（只有显式 false 才允许群友 @bot 改本群设定）。
+      personaLocked: config.personaLocked !== false,
+      // 每小时自动归纳的总开关（仍受 personaLocked 约束）。
+      personaAutoUpdate: config.personaAutoUpdate !== false,
+      // 戳一戳响应：enabled / mode('poke'|'text') / replyText。
+      poke: normalizePoke(config.poke),
       // OneBot 连接信息（只读展示用；改它要重启桥接）。
       onebot: {
         wsUrl: config.onebot?.wsUrl ?? '',
@@ -542,6 +651,13 @@ export class Bridge {
     this._imagePrefetchQueue = []        // 待预取的图片地址（并发限 IMAGE_PREFETCH_CONCURRENCY）
     this._imagePrefetchPending = new Set()
     this._imagePrefetchActive = 0
+    // 原始图转交的 warn 只打一次（best-effort 路径，插件没装时不该每轮刷日志）。
+    this._rawRelayWarned = false
+    // 插件通道（2026-10-26）：由 start.mjs 创建后挂上来；没有它时所有插件接点自动跳过。
+    this.pluginHub = null
+    // DSH sessionId → QQ 会话 key 反查表（插件工具执行时要注入 chatKey）。
+    // 只在 ensureSession 建/换会话时写；查不到再扫 state（规模小），见 chatKeyForSession。
+    this._sessionKeys = new Map()
     this.stats = {
       received: 0, replied: 0, blocked: 0, denied: 0, failed: 0,
       // 节奏相关（Phase 4），供设置页排障：跳过/静音中/被限频。
@@ -555,6 +671,8 @@ export class Bridge {
       modelPushes: 0, personaPushes: 0, sessionChecks: 0, skippedRequests: 0,
       // 外部插件 hook：实际生效次数 / 因 drop 丢弃的消息数 / 没人启用时的跳过次数。
       hookCalls: 0, hookDrops: 0, hookSkipped: 0,
+      // 插件通道的自动回复命中数（契约 §3：命中 = 不进 DSH）。
+      autoReplies: 0,
       // 工具能力升级导致的旧会话上下文重建次数（v0.5.1）。
       capabilityRefreshes: 0,
     }
@@ -708,8 +826,10 @@ export class Bridge {
       for (const [key, raw] of Object.entries(rawSessions)) {
         const entry = normalizeSessionEntry(key, raw)
         // 空壳（没有映射也没有未读）不保留，避免一次次重建后留下垃圾行。
-        // 例外：配过单群活跃系数的 key 必须保留，否则桥接重启后设置就丢了。
-        if (!entry.sessionId && entry.unread === 0 && entry.activityLevel === null) continue
+        // 例外：配过单群活跃系数 / 攒过动态人设的 key 必须保留，
+        // 否则桥接重启后设置与群友授权的人设补充一起丢了。
+        if (!entry.sessionId && entry.unread === 0
+          && entry.activityLevel === null && entry.personaDelta === '') continue
         sessions[key] = entry
       }
       return {
@@ -887,10 +1007,18 @@ export class Bridge {
     const base = String(entry.persona ?? '').trim()
       || this._globalPersona
       || this.buildPersonaPrompt()
-    const text = admin || base === '' ? base : `${base}\n\n${ADMIN_GUARD_NOTE}`
+    // 本群动态设定（2026-10-26）：群友授权 / 每小时归纳的文字追加在基础人设之后。
+    // 用独立段落 + 明确的优先级说明，避免补充设定盖掉管理员定的主设定。
+    const delta = String(entry.personaDelta ?? '').trim()
+    const merged = delta === ''
+      ? base
+      : (base === '' ? `${PERSONA_DELTA_HEADER}\n${delta}` : `${base}\n\n${PERSONA_DELTA_HEADER}\n${delta}`)
+    const text = admin || merged === '' ? merged : `${merged}\n\n${ADMIN_GUARD_NOTE}`
     // 同签名不重复 POST（P2）：人设没变就不该每条消息都推一次。
     // 签名含 sessionId + 人设正文 + 是否管理员；设置页改人设 / 单人设保存会清缓存（见 applySessionOp）。
-    const signature = `${sessionId}|${admin ? 'admin' : 'guest'}|${text}`
+    // ⚠️ 必须显式带上 delta：人设正文没变、只有群友补充设定变了时（例如归纳追加），
+    //    签名不变的话缓存会让新设定永远推不出去。
+    const signature = `${sessionId}|${admin ? 'admin' : 'guest'}|${delta}|${text}`
     if (this._personaSignatures.get(sessionId) === signature) {
       this.stats.skippedRequests++
       return
@@ -933,6 +1061,39 @@ export class Bridge {
     if (entry.unread === 0) return
     entry.unread = 0
     this._saveState()
+  }
+
+  /**
+   * 记一条群聊上下文，供「每小时归纳」用（2026-10-26）。
+   *
+   * 口径：
+   *   · 只记群聊（私聊不参与群体人设归纳）；调用点在白名单之后、档位判定之前，
+   *     所以「没达档位 / 被静音」的消息也算上下文——它们同样反映了这个群在聊什么；
+   *   · **`/` 开头的指令不入**（那是显式操作，不是聊天内容，混进去会污染归纳）；
+   *   · 纯图片记 `[图片]`；
+   *   · 每会话最多 {@link CHAT_LOG_MAX} 条、只保留最近 {@link CHAT_LOG_WINDOW_MS}。
+   *
+   * 注意：这里记的是**原文**，不带群聊发送人标签（标签只在送进模型的正文里加）。
+   * @param {string} key
+   * @param {object} msg
+   * @param {string} text
+   * @param {Array<object>} [images]
+   */
+  _noteChatLog(key, msg, text, images = []) {
+    if (msg?.kind !== 'group') return
+    const body = String(text ?? '').trim()
+    if (body.startsWith('/')) return
+    const line = body || (Array.isArray(images) && images.length > 0 ? '[图片]' : '')
+    if (!line) return
+    const now = Date.now()
+    const list = (this._chatLog.get(key) ?? []).filter((item) => now - item.at < CHAT_LOG_WINDOW_MS)
+    list.push({
+      name: String(msg.senderName ?? '').trim(),
+      qq: String(msg.userId ?? ''),
+      text: line,
+      at: now,
+    })
+    this._chatLog.set(key, list.slice(-CHAT_LOG_MAX))
   }
 
   /**
@@ -1040,6 +1201,8 @@ export class Bridge {
     const sessionId = await this.dsh.createSession(workspaceId, this.config.dsh.agentPreset)
     await this._applyModel(sessionId)
     entry.sessionId = sessionId
+    // 记下 sessionId → key：插件工具执行时靠它反查该把 chatKey 注入到哪个会话。
+    this._sessionKeys.set(sessionId, key)
     // 记下建这条会话时的工具能力版本：下次发布新工具时据此判断要不要重建。
     entry.toolEpoch = String(this.live?.toolEpoch ?? '')
     this._saveState()
@@ -1478,7 +1641,10 @@ export class Bridge {
    *
    * 群聊**不带 @**（契约 3.3）：图片不需要 @ 人也看得见，@ 反而刷屏。
    *
-   * @param {{sessionId?:string, url?:string, file?:string}} op
+   * @param {{sessionId?:string, url?:string, file?:string, subType?:0|1,
+   *   position?:'before'|'after'}} op
+   *   `subType`：0=普通图片，1=表情（guard 的 qq_send_image 透传，见 p2-contract）；
+   *   `position`：'before'|'after' 仅原样传给 onebot 写进 detail，不改变发送时机。
    * @returns {Promise<{ok:boolean, action:'image', key?:string, sessionId?:string,
    *   error?:string, detail?:string, stage?:string, via?:string,
    *   retcode?:number|null, status?:string, sent?:boolean}>}
@@ -1517,10 +1683,15 @@ export class Bridge {
       }
     }
 
-    const sent = await this.qq.sendImage(kind, target, source, { atUserId: undefined })
+    // subType 只认 0/1（guard 已校验过；这里再兜一层，脏数据按缺省处理）。
+    const subType = op?.subType === 0 || op?.subType === 1 ? op.subType : undefined
+    const position = op?.position === 'before' || op?.position === 'after' ? op.position : undefined
+    const sent = await this.qq.sendImage(kind, target, source, { atUserId: undefined, subType, position })
     const via = sent?.via ?? ''
+    // position 只进 detail：这一版不按它改发送顺序（避免引入等待/队列逻辑，风险高）。
+    const positionNote = position ? `，position=${position}` : ''
     if (sent?.ok === false) {
-      const detail = `图片发送失败（via=${via || 'file'}）：${sent.error ?? '未知原因'}`
+      const detail = `图片发送失败（via=${via || 'file'}${positionNote}）：${sent.error ?? '未知原因'}`
       this.logger.warn?.(`${detail}｜会话 ${key}`)
       return {
         ok: false, action: 'image', key, stage: 'send',
@@ -1531,9 +1702,9 @@ export class Bridge {
       }
     }
     const retcode = sent?.retcode ?? null
-    const detail = `已发送图片（via=${via || 'file'}${retcode === null ? '' : `，retcode=${retcode}`}）`
+    const detail = `已发送图片（via=${via || 'file'}${positionNote}${retcode === null ? '' : `，retcode=${retcode}`}）`
     this.stats.images++
-    this.logger.info?.(`已发送图片 ${key}（via=${via || 'file'}${retcode === null ? '' : `，retcode=${retcode}`}）`)
+    this.logger.info?.(`已发送图片 ${key}（via=${via || 'file'}${positionNote}${retcode === null ? '' : `，retcode=${retcode}`}）`)
     return {
       ok: true, action: 'image', key, sent: true,
       via, retcode, status: sent?.status ?? '', detail,
@@ -1634,6 +1805,199 @@ export class Bridge {
     }
   }
 
+  /**
+   * DSH sessionId → QQ 会话 key（`u:` / `g:`）。
+   *
+   * 插件通道的工具执行要往 args 里注入 `chatKey`（契约 §2.2），而 guard 只拿得到
+   * sessionId。`_applyVoiceOp` 原本是线性扫一遍 `state.sessions`，这里同源但加了
+   * `_sessionKeys` 反查表（`ensureSession` 时写），扫不到的仍回落到扫描。
+   *
+   * @param {string} sessionId
+   * @returns {string} 找不到返回空串
+   */
+  chatKeyForSession(sessionId) {
+    const id = String(sessionId ?? '').trim()
+    if (!id) return ''
+    const cached = this._sessionKeys.get(id)
+    // 缓存要校验：会话可能被清空/重建（entry.sessionId 换了），过期就丢掉。
+    if (cached && String(this.state.sessions?.[cached]?.sessionId ?? '') === id) return cached
+    if (cached) this._sessionKeys.delete(id)
+    for (const [key, raw] of Object.entries(this.state.sessions ?? {})) {
+      const entry = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null
+      if (String(entry?.sessionId ?? '') === id) {
+        this._sessionKeys.set(id, key)
+        return key
+      }
+    }
+    return ''
+  }
+
+  /**
+   * 插件通道的自动回复判定（契约 §3）：返回 `{handled:true, reply}` 时调用方直接发送。
+   *
+   * best-effort：没装 hub / 没启用 / 超时 / 失败一律返回 `null`，消息照常进 DSH。
+   * 负缓存与 warn 都在 plugin-hub.mjs 里（30s，口径同 external-hooks.mjs）。
+   *
+   * @param {object} msg
+   * @param {string} key
+   * @param {string} text
+   * @returns {Promise<{handled:boolean, reply:string}|null>}
+   */
+  async _matchAutoReply(msg, key, text) {
+    const hub = this.pluginHub
+    if (!hub || typeof hub.matchAutoReply !== 'function') return null
+    if (hub.config?.autoReply?.enabled !== true) return null
+    const { kind, qq } = parseSessionKey(key)
+    if (!kind || !qq) return null
+    const result = await hub.matchAutoReply({
+      kind,
+      qq,
+      text,
+      senderName: String(msg?.senderName ?? ''),
+      senderId: String(msg?.userId ?? ''),
+      groupId: msg?.kind === 'group' ? String(msg.groupId ?? '') : undefined,
+    }).catch(() => null)
+    if (!result?.handled) return null
+    const reply = String(result.reply ?? '').trim()
+    return reply ? { handled: true, reply } : null
+  }
+
+  /**
+   * 视频落盘（契约 §6）：消息一进来就在后台下载，返回**永不 reject** 的 Promise。
+   *
+   * 成功 resolve 要追加到送模型正文末尾的行（每个视频一行
+   * `[视频]（本地文件：<绝对路径>）`，原 `[视频]` 占位保留）；失败/关闭 resolve 空串。
+   * 下载逻辑、大小/超时/并发限制都在 plugin-hub.mjs。
+   *
+   * @param {object} msg
+   * @returns {Promise<string>}
+   */
+  _startVideoNote(msg) {
+    const videos = Array.isArray(msg?.videos) ? msg.videos : []
+    const hub = this.pluginHub
+    if (videos.length === 0 || !hub || typeof hub.downloadVideos !== 'function') return Promise.resolve('')
+    if (hub.config?.video?.enabled !== true) return Promise.resolve('')
+    return hub.downloadVideos(videos)
+      .then((result) => (Array.isArray(result?.paths) ? result.paths : [])
+        .map((file) => `[视频]（本地文件：${file}）`)
+        .join('\n'))
+      .catch(() => '')
+  }
+
+  /**
+   * 群聊「@bot 你要改成…」动态人设指令（2026-10-26）。
+   *
+   * 为什么放在静音/档位之前：这是**显式指令**，不是闲聊——群友明确说了要改什么，
+   * 不该因为活跃档位没到就被吞掉（和 `/` 指令同一个理由）。
+   *
+   * 规则（规格 §5.4）：
+   *   · 只有**群聊** + @ 了机器人 + 正文含「你要改成…」才触发；私聊一律不管
+   *     （避免和单人人设混淆，私聊改人设仍走设置页）；
+   *   · `personaLocked !== false`（默认锁）→ 回一句拒绝，**不投递模型**；
+   *   · 解锁 → 追加进 state.sessions[key].personaDelta、落盘、清人设签名、重推、短确认。
+   *
+   * @returns {Promise<boolean>} true = 本条已被消化（调用方直接 return）
+   */
+  async _handlePersonaCommand(msg, text, key) {
+    if (msg?.kind !== 'group' || !this.isMentioned(msg)) return false
+    const matched = /你要改成\s*([\s\S]*)$/u.exec(String(text ?? ''))
+    if (!matched) return false
+    const entry = this._entryOf(key)
+    // 锁定（默认）→ 明确拒绝。人设是管理员资产，群友不能一句话改掉。
+    if (this.live?.personaLocked !== false) {
+      this.logger.info?.(`人设锁定中，拒绝群友修改（${key} sender=${msg.userId}）`)
+      const sent = await this._send(msg, '人设锁着呢，改不了（管理员可去设置页解锁）')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    const delta = this._cleanPersonaCommandText(matched[1])
+    if (!delta) {
+      const sent = await this._send(msg, '你要改成什么？')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    // 追加一行（段落间用 \n）；总量超上限时截掉最旧的段落。
+    entry.personaDelta = trimPersonaDelta(entry.personaDelta ? `${entry.personaDelta}\n${delta}` : delta)
+    this._saveState()
+    const sessionId = String(entry.sessionId ?? '').trim()
+    if (sessionId) {
+      // 清签名才能让「只改了 delta」的情况真的重推（否则会被去重缓存吞掉）。
+      this._personaSignatures.delete(sessionId)
+      await this._applyPersona(key, sessionId, this.isAdmin(msg))
+    }
+    this.logger.info?.(`群友追加本群动态设定（${key} sender=${msg.userId}，${delta.length} 字）`)
+    const sent = await this._send(msg, '好，本群设定加上了')
+    if (!(sent && sent.ok === false)) this._noteReplied(key)
+    return true
+  }
+
+  /**
+   * 清理「你要改成」后面捕获到的正文：去首尾空白 / `@xxx` 残留，按上限截断。
+   * @param {string} raw
+   * @returns {string} 空串 = 群友没写内容（调用方回「你要改成什么？」）
+   */
+  _cleanPersonaCommandText(raw) {
+    let text = String(raw ?? '').trim()
+    // at 残留：QQ 的 at 段解析后可能留在正文最前面（「@bot 你要改成 @bot 更凶」）。
+    text = text.replace(/^(?:@\S+\s*)+/u, '').trim()
+    if (text.length > PERSONA_DELTA_ADD_MAX) text = text.slice(0, PERSONA_DELTA_ADD_MAX).trim()
+    return text
+  }
+
+  /**
+   * 每小时人设归纳（2026-10-26）。
+   *
+   * 把最近一小时群聊交给 Host 侧模型，问「该往本群人设里补什么」；成功就把返回文本
+   * 追加进该群的 `personaDelta` 并重推。设计取舍：
+   *   · 锁定（默认）/ 关掉自动归纳 → **一次请求都不发**；
+   *   · 每群少于 {@link SUMMARIZE_MIN_MESSAGES} 条 → 跳过（样本太少，归纳出来全是瞎猜）；
+   *   · `_summarizing` 并发保护：一轮要等 Host 跑模型（桥接侧上限 70s），重叠就跳过本轮；
+   *   · 失败只记日志：归纳是锦上添花，绝不影响聊天；
+   *   · 只有成功才清空该群缓冲（失败留着下一小时再试）。
+   */
+  async _summarizePersonas() {
+    if (this.live?.personaLocked !== false) return
+    if (this.live?.personaAutoUpdate === false) return
+    if (this._summarizing) {
+      this.logger.info?.('上一轮人设归纳还没结束，跳过本轮')
+      return
+    }
+    if (typeof this.dsh?.summarizePersona !== 'function') return
+    this._summarizing = true
+    const now = Date.now()
+    try {
+      for (const [key, raw] of Object.entries(this.state.sessions ?? {})) {
+        const entry = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null
+        if (!entry || !String(key).startsWith('g:')) continue
+        const list = (this._chatLog.get(key) ?? []).filter((item) => now - item.at < CHAT_LOG_WINDOW_MS)
+        if (list.length < SUMMARIZE_MIN_MESSAGES) continue
+        const result = await this.dsh.summarizePersona({
+          groupName: String(entry.name ?? '').trim(),
+          currentPersona: String(entry.personaDelta ?? ''),
+          messages: list.map((item) => ({ name: item.name, qq: item.qq, text: item.text })),
+        })
+        const persona = typeof result?.persona === 'string' ? result.persona.trim() : ''
+        if (!result?.ok || persona === '') {
+          this.logger.info?.(`群 ${key} 人设归纳无结果（${result?.reason || '空文本'}），下一小时再试`)
+          continue
+        }
+        entry.personaDelta = trimPersonaDelta(entry.personaDelta ? `${entry.personaDelta}\n${persona}` : persona)
+        this._saveState()
+        const sessionId = String(entry.sessionId ?? '').trim()
+        if (sessionId) {
+          this._personaSignatures.delete(sessionId)
+          await this._applyPersona(key, sessionId, false)
+        }
+        this._chatLog.delete(key)
+        this.logger.info?.(`群 ${key} 人设已自动归纳（+${persona.length} 字，共 ${String(entry.personaDelta).length} 字）`)
+      }
+    } catch (error) {
+      this.logger.warn?.(`人设归纳失败（不阻塞聊天）：${error?.message ?? error}`)
+    } finally {
+      this._summarizing = false
+    }
+  }
+
   async handleMessage(msg) {
     this.stats.received++
     if (!this.isAllowed(msg)) {
@@ -1647,6 +2011,8 @@ export class Bridge {
     const images = Array.isArray(msg.images) ? msg.images : []
     // 图片预取（P2）：消息一进来就在后台开始下载，不阻塞后面的判定 / 入队。
     this._prefetchImages(images)
+    // 视频落盘（契约 §6）：同样先起后台任务，真正追加本地路径在入队之前。
+    const videoNote = this._startVideoNote(msg)
     // 外部插件 hook（P2）：message 事件。可在入队前改写文本或直接 drop；
     // best-effort，失败/超时一律按原样放行（见 external-hooks.mjs）。
     const hook = await this._runMessageHook(msg, key, text, images)
@@ -1664,7 +2030,25 @@ export class Bridge {
       this.logger.info?.(`收到空消息（${key}），跳过`)
       return
     }
-    // 0) `/` 开头的指令：只有 allow.admins 里的人能执行。
+    // 0) 群聊 @bot「你要改成…」：动态人设指令（显式指令，先于静音/档位判定）。
+    //    已消化时直接 return，也不进每小时归纳的上下文缓冲（那不是聊天内容）。
+    if (await this._handlePersonaCommand(msg, text, key)) return
+    // 0.5) 插件通道的自动回复（契约 §3）：命中就直接发、不进 DSH。
+    //      位置刻意放在静音 / 响应档位之前——插件是「有人问就答」，不受节奏设置影响；
+    //      `/` 指令不拦截（显式操作仍归管理员）。失败只 warn，消息照常往下走。
+    if (text && !text.startsWith('/')) {
+      const auto = await this._matchAutoReply(msg, key, text)
+      if (auto?.handled) {
+        this.stats.autoReplies++
+        const sent = await this._send(msg, auto.reply)
+        if (!(sent && sent.ok === false)) this._noteReplied(key)
+        this.logger.info?.(`插件自动回复 ${key}：${auto.reply.slice(0, 40)}`)
+        return
+      }
+    }
+    // 每小时归纳的上下文缓冲：通过白名单的群聊消息都算（`/` 指令由 _noteChatLog 自己排除）。
+    this._noteChatLog(key, msg, text, images)
+    // 1) `/` 开头的指令：只有 allow.admins 里的人能执行。
     //    非管理员直接回一句提示并丢弃，**不投递 DSH**（省 token，也不给模型被诱导的机会）。
     //    管理员指令不过响应档位（私聊/群聊都算），但白名单仍然有效——见 isAllowed。
     const isCommand = text.startsWith('/')
@@ -1678,23 +2062,56 @@ export class Bridge {
       }
       this.logger.info?.(`管理员指令放行：${key} text=${text.slice(0, 60)}`)
     }
-    // 1) 禁言指令：命中即静音该会话，自己也不回复（否则「闭嘴」还在说话）。
+    // 2) 禁言指令：命中即静音该会话，自己也不回复（否则「闭嘴」还在说话）。
     if (this._handleMuteCommand(key, text)) return
-    // 2) 静音期内一律不回复、不建会话。
+    // 3) 静音期内一律不回复、不建会话。
     if (this._isMuted(key)) {
       this.stats.muted++
       this.logger.info?.(`会话 ${key} 静音中，忽略本条`)
       return
     }
-    // 3) 响应档位（activityLevel）：判否时**不回复、不建会话**，避免白建一堆会话。
+    // 4) 响应档位（activityLevel）：判否时**不回复、不建会话**，避免白建一堆会话。
     //    管理员指令是显式操作，不受档位限制（否则群里没 @ 就永远执行不了）。
     if (!isCommand && !this.shouldRespond(msg, text, key)) {
       this.stats.skipped++
       this.logger.info?.(`会话 ${key} 未达响应档位（activityLevel=${this._activityLevelFor(key)}），跳过`)
       return
     }
-    // 4) 同会话防抖合并：窗口内没有新消息才真正投递（见 _enqueue）。
+    // 5) 同会话防抖合并：窗口内没有新消息才真正投递（见 _enqueue）。
+    //    视频本地路径追加在正文末尾（契约 §6）：原 `[视频]` 占位保留，成功才加这一行。
+    const note = await videoNote
+    if (note) text = text ? `${text}\n${note}` : note
     await this._enqueue(key, msg, text, images)
+  }
+
+  /**
+   * 群聊「送进模型的正文」加发送人标签（2026-10-26 群聊发送人识别）。
+   *
+   * 格式**严格**：`[群友 昵称(QQ号)]: 内容`（英文冒号 + 一个空格）；昵称取
+   * `msg.senderName`，空则退回 QQ 号。私聊保持原样（不套群聊逻辑）。
+   *
+   * 为什么在 `_enqueue` 里按条打而不是合并后打：防抖合并会把同一个窗口里
+   * 不同人说的话拼成一段，合并后再打就只剩最后一个发送者的标签了。
+   *
+   * 注意作用域：只有**送进模型的正文**带标签；日志 / 未读预览 / 外部插件 hook
+   * 的 `text` 仍用原文（见 handleMessage 里 _noteIncoming 与 _runMessageHook）。
+   *
+   * `/` 开头的管理员指令**不打标**：DSH 的斜杠指令必须仍以 `/` 开头才能被识别，
+   * 前面加标签会直接让指令失效。
+   *
+   * @param {object} msg
+   * @param {string} text
+   * @returns {string}
+   */
+  _labelForModel(msg, text) {
+    const body = String(text ?? '').trim()
+    if (msg?.kind !== 'group') return body
+    if (body.startsWith('/')) return body
+    const qq = String(msg?.userId ?? '').trim()
+    const nick = String(msg?.senderName ?? '').trim() || qq
+    const label = `[群友 ${nick}(${qq})]:`
+    // 纯图片消息没有正文：标签自己就是文本位置，图片说明句由 _buildPromptContent 接在后面。
+    return body ? `${label} ${body}` : label
   }
 
   /**
@@ -1709,18 +2126,20 @@ export class Bridge {
    *   · 「防抖合并」插件开关（pl-debounce）关掉时直接投递，不再攒。
    */
   async _enqueue(key, msg, text, images = []) {
+    // 群聊发送人标签：**每条消息各自打**（不同人各带各的标签），合并后仍按行拼。
+    const labelled = this._labelForModel(msg, text)
     // 防抖窗口优先级：高级参数 antiDebounceMs（0=不启用）> 节奏里的 debounceWindowMs。
     // 高级参数是给排障用的「一个开关压过全部节奏设置」，所以它在最前面。
     const advanced = Number(this.live?.antiDebounceMs ?? this.config?.antiDebounceMs ?? 0)
     const windowMs = advanced > 0 ? advanced : this._rhythm().debounceWindowMs
     // 0 = 关闭防抖，或「防抖合并」插件被关掉：立即投递（保持旧行为，也让测试可控）。
     if (!(windowMs > 0) || !this._features().debounce) {
-      return await this._processBatch(key, msg, [text], images)
+      return await this._processBatch(key, msg, [labelled], images)
     }
 
     const prev = this._debounce.get(key)
     const entry = prev ?? { texts: [], images: [], msg, timer: null }
-    if (text) entry.texts.push(text)
+    if (labelled) entry.texts.push(labelled)
     if (images.length > 0) entry.images.push(...images)
     entry.msg = msg // 以最后一条消息为回复目标（群聊 @ 最后说话的人）
     if (entry.timer) clearTimeout(entry.timer)
@@ -1782,8 +2201,14 @@ export class Bridge {
             .map((item) => `[外部上下文：${String(item.title ?? '').trim()}]\n${String(item.text).trim()}`)
           promptText = sections.length > 0 ? `${replaced}\n\n${sections.join('\n\n')}` : replaced
           // 多模态时 DSH 用 content 数组，正文替换/追加必须同步进第一个 text 段。
+          // ⚠️ 原始图标记（[[qqimg:...]]）只在这一段里，替换时要补回去，否则插件
+          // 找不到 token → GIF 又回落到单帧附件路径。
           if (built.images > 0 && Array.isArray(built.content) && built.content[0]?.type === 'text') {
-            built.content[0] = { type: 'text', text: promptText }
+            const markers = Array.isArray(built.rawMarkers) ? built.rawMarkers : []
+            const text = markers.length > 0
+              ? `${promptText}\n\n${markers.map((token) => `[[qqimg:${token}]]`).join('\n')}`
+              : promptText
+            built.content[0] = { type: 'text', text }
           }
           built.fallbackText = promptText
         }
@@ -1837,10 +2262,11 @@ export class Bridge {
       } catch (error) {
         this.stats.failed++
         this.logger.error?.(`处理 ${key} 失败：${error?.message ?? error}`)
-        // 超时会先 session/cancel（见 dsh.mjs promptAndWait）；这里再给 QQ 用户一个明确信号，
-        // 别让人对着空气干等。发不出去也不能把错误处理本身搞崩。
-        const line = error?.code === 'TIMEOUT'
-          ? '（模型没及时响应，这次先不回了）'
+        // 超时 / 看门狗类错误 → 用可配置的 timeoutReplyText（live → config → 默认）；
+        // 其它仍用原中文提示。⚠️ 这里**只拼接固定中文**，绝不把 error.message 发到 QQ
+        // （DSH 的报错是英文的，外泄既看不懂又难看）。
+        const line = this._isTimeoutish(error)
+          ? this._timeoutReplyText()
           : '（这次处理出错了，稍后再试）'
         const sent = await this._send(msg, line).catch(() => undefined)
         // 出错时也回了一句提示：用户已经被「回应」过，红点不该一直挂着。
@@ -1870,6 +2296,9 @@ export class Bridge {
     const list = Array.isArray(images)
       ? images.filter((item) => item && (item.url || item.file))
       : []
+    // 本轮已交给原始图池的 token（顺序 = 图片顺序），拼进 prompt 文本给插件看。
+    const rawMarkers = []
+    const rawRelays = []
     if (list.length === 0) {
       return { content: [{ type: 'text', text: plain }], fallbackText: plain, images: 0 }
     }
@@ -1883,20 +2312,86 @@ export class Bridge {
       const fallbackText = note(`（对方发来 ${list.length} 张图片，但当前模型不支持图片输入，你看不到图片内容，别编造。）`)
       return { content: [{ type: 'text', text: fallbackText }], fallbackText, images: 0 }
     }
-    const parts = await this._loadImageParts(list)
+    const parts = await this._loadImageParts(list, (value) => {
+      // 每张成功下载的图：先生成短 token（同步、不 await），再 fire-and-forget 把
+      // **原始字节**转交给 qq-sticker 的原始图池（GIF 动画保真，见 _relayRawImage）。
+      // token 先落进 markers，POST 失败只是插件那边 peek 不到 → 自然回落到附件路径。
+      const token = randomUUID().replace(/-/g, '').slice(0, 16)
+      rawMarkers.push(token)
+      rawRelays.push(this._relayRawImage(token, value))
+    })
     if (parts.length === 0) {
       const fallbackText = note('（对方发来图片，但下载或解码失败，你看不到图片内容，别编造。）')
       return { content: [{ type: 'text', text: fallbackText }], fallbackText, images: 0 }
     }
+    // 等 POST 落定（每张上限 RAW_IMAGE_TIMEOUT_MS、并发发出）：插件只认池子里**真的存在**
+    // 的 token（peek），不等就等于标记白写。
+    // ⚠️ 插件是「文本里 token 的顺序 → image 块顺序」对齐的，所以只能取**成功前缀**：
+    //    第 k 张失败就到此为止（后面即使成功也不能补，否则 token 会挂到错误的图上）。
+    //    全失败时一个标记都不留，行为完全回到原样。这里不抛：_relayRawImage 自己吞异常。
+    const relayed = rawRelays.length > 0 ? await Promise.all(rawRelays) : []
+    let successPrefix = 0
+    while (successPrefix < relayed.length && relayed[successPrefix] === true) successPrefix++
+    const keepMarkers = rawMarkers.slice(0, successPrefix)
     // 图片已经作为 image part 附上了，文本里的 [图片] 占位就没必要再给模型看，
     // 免得它把占位符当成「看不到」的证据。纯图片消息则补一句中性说明。
     const cleaned = plain.replace(/\[图片\]/gu, '').trim()
     const head = cleaned || '（对方只发了图片，没有文字）'
+    // 标记只进**发给 DSH 的 prompt content**（插件按文本顺序对齐 image 块），
+    // 不影响 QQ 里显示的文本（那是消息本身，不经这里）。
+    const headWithMarkers = keepMarkers.length > 0
+      ? `${head}\n\n${keepMarkers.map((token) => `[[qqimg:${token}]]`).join('\n')}`
+      : head
     const fallbackText = note('（图片已收到，但本轮没能作为图像交给模型，请根据上下文回复，不要编造图片内容。）')
     return {
-      content: [{ type: 'text', text: head }, ...parts],
+      content: [{ type: 'text', text: headWithMarkers }, ...parts],
       fallbackText,
       images: parts.length,
+      rawMarkers: keepMarkers,
+    }
+  }
+
+  /**
+   * 把一张图的原始字节转交给 qq-sticker 的原始图池（POST /dsh-qq-sticker/raw-image）。
+   *
+   * 为什么需要（2026-10-26 实测）：DSH 的附件服务对所有 GIF/动图强制重编码成单帧
+   * webp/jpeg，插件从 attachments 永远拿不到动画帧。桥接这里的 `base64` 就是**原始**
+   * 字节（decodeImageBuffer 只做格式嗅探，不转码），所以另送一份即可。
+   *
+   * best-effort：超时 1.5s、失败只 warn 一次，绝不影响聊天；插件没装/路由 404 同理。
+   * @param {string} token
+   * @param {{base64:string, mediaType:string}} value
+   * @returns {Promise<boolean>} 提交成功与否（调用方一般不 await）
+   */
+  async _relayRawImage(token, value) {
+    const mediaType = String(value?.mediaType ?? '').toLowerCase().trim()
+    const dataB64 = String(value?.base64 ?? '')
+    if (!dataB64 || !RAW_IMAGE_EXT[mediaType]) return false
+    const base = String(this.dsh?.baseUrl ?? this.config?.dsh?.baseUrl ?? '').replace(/\/+$/, '')
+    if (!base) return false
+    let cookie = ''
+    try { cookie = this.dsh?.ensureCookie?.() ?? '' } catch { cookie = '' }
+    try {
+      const res = await fetch(`${base}${RAW_IMAGE_ROUTE}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(cookie ? { cookie } : {}),
+        },
+        body: JSON.stringify({ token, mediaType, ext: RAW_IMAGE_EXT[mediaType], dataB64 }),
+        signal: AbortSignal.timeout(RAW_IMAGE_TIMEOUT_MS),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const payload = await res.json().catch(() => ({}))
+      if (payload?.ok !== true) throw new Error(payload?.reason ?? '响应 ok!=true')
+      return true
+    } catch (error) {
+      // 只 warn 一次：这是可选的增强路径，刷日志反而干扰排障。
+      if (!this._rawRelayWarned) {
+        this._rawRelayWarned = true
+        this.logger.warn?.(`原始图转交失败（不影响聊天，后续静默）：${error?.message ?? error}`)
+      }
+      return false
     }
   }
 
@@ -1986,8 +2481,13 @@ export class Bridge {
     return promise
   }
 
-  /** 下载并转成 DSH prompt 需要的 image part；失败的单张跳过。 */
-  async _loadImageParts(images) {
+  /**
+   * 下载并转成 DSH prompt 需要的 image part；失败的单张跳过。
+   * @param {Array<{url?:string, file?:string}>} images
+   * @param {(value:{base64:string, mediaType:string}) => void} [onLoaded]
+   *   每张**成功**下载的图回调一次（顺序 = 图片顺序）；用于把原始字节转交 qq-sticker。
+   */
+  async _loadImageParts(images, onLoaded) {
     const parts = []
     const seen = new Set()
     for (const image of images.slice(0, IMAGE_MAX_COUNT)) {
@@ -1998,6 +2498,8 @@ export class Bridge {
       const result = await this._loadImageRef(ref)
       if (result?.ok && result.value) {
         parts.push({ type: 'image', data: result.value.base64, mediaType: result.value.mediaType })
+        // 回调自己不许抛：转交是可选增强，坏了也不能挡住这一轮聊天。
+        try { onLoaded?.(result.value) } catch { /* 忽略 */ }
       } else if (result && result.ok === false) {
         this.logger.warn?.(`图片下载失败（跳过）：${result.error?.message ?? result.error}`)
       }
@@ -2194,11 +2696,121 @@ export class Bridge {
     this._rate.set(key, stamps)
   }
 
-  async _send(msg, text) {
+  /**
+   * 这条错误算不算「模型没及时响应」类（2026-10-26）。
+   *
+   * 为什么不止看 `code === 'TIMEOUT'`：超时可能出现在三层——
+   *   ① dsh.promptAndWait 自己抛的 TIMEOUT（带 code）；
+   *   ② Host 看门狗切断流后 DSH 回的错误（消息里是 `WATCHDOG_TIMEOUT`）；
+   *   ③ 传输层/取消导致的 `aborted`、或别的实现只用中文/英文写「超时」。
+   * 这三类对 QQ 用户是同一件事（模型没吭声），统一走 timeoutReplyText。
+   *
+   * @param {unknown} error
+   * @returns {boolean}
+   */
+  _isTimeoutish(error) {
+    if (error?.code === 'TIMEOUT') return true
+    return /WATCHDOG_TIMEOUT|watchdog|超时|timeout|aborted/i.test(String(error?.message ?? error))
+  }
+
+  /**
+   * 超时/看门狗失败时发给 QQ 的文案。
+   *
+   * 优先级：热配置 `timeoutReplyText` → config.json → 内置默认；`trim()` 后为空
+   * 也按默认处理（设置页把输入框清空 = 恢复默认，而不是发一条空消息）。
+   * @returns {string}
+   */
+  _timeoutReplyText() {
+    const pick = (value) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : '')
+    return pick(this.live?.timeoutReplyText)
+      || pick(this.config?.timeoutReplyText)
+      || DEFAULT_TIMEOUT_REPLY_TEXT
+  }
+
+  /** 现读戳一戳配置（热配置优先，config.json 兜底；缺字段由 normalizePoke 补默认）。 */
+  _pokeConfig() {
+    const hot = this.live?.poke
+    const source = hot && typeof hot === 'object' && !Array.isArray(hot) ? hot : (this.config?.poke ?? {})
+    return normalizePoke(source)
+  }
+
+  /**
+   * notice 事件入口（2026-10-26，目前只有戳一戳）。
+   *
+   * 规则（规格 §5.3）：
+   *   · 只认 `kind === 'poke'`；被戳的必须是**机器人自己**，自己戳自己直接忽略；
+   *   · 白名单沿用 isAllowed（群聊按群号、私聊按 QQ 号），名单外不回复；
+   *   · 同一会话 3 秒内最多回一次（防戳一戳刷屏）；
+   *   · `poke.enabled === false` → 完全忽略；
+   *   · `mode: 'poke'` → 回戳（失败只 warn，绝不影响聊天）；`mode: 'text'` → 发模板，
+   *     支持 `{nick}`（取 this.qq.nameOf，取不到退回 QQ 号）与 `{qq}`。
+   *
+   * 永不抛：notice 是旁路事件，处理失败不该污染消息主链路。
+   * @param {{kind?:string, userId?:string, targetId?:string, groupId?:string|null,
+   *   selfId?:string, time?:number, raw?:object}} notice
+   */
+  async handleNotice(notice) {
+    try {
+      if (!notice || notice.kind !== 'poke') return
+      const poke = this._pokeConfig()
+      if (!poke.enabled) return
+      // 被戳者必须是机器人自己。拿不到 selfId 时（刚启动还没 login_info）放行，
+      // 宁可多回一次，也别该回不回。
+      const selfId = String(this.qq?.selfId ?? notice.selfId ?? '').trim()
+      const targetId = String(notice.targetId ?? '').trim()
+      if (!targetId) return
+      if (selfId && targetId !== selfId) return
+      const poker = String(notice.userId ?? '').trim()
+      if (!poker || (selfId && poker === selfId)) return
+      const scope = notice.groupId
+        ? { kind: 'group', groupId: String(notice.groupId), userId: poker }
+        : { kind: 'private', groupId: null, userId: poker }
+      if (!this.isAllowed(scope)) {
+        this.logger.info?.(`戳一戳来自白名单外，忽略：${this.keyOf(scope)} sender=${poker}`)
+        return
+      }
+      const key = this.keyOf(scope)
+      const now = Date.now()
+      if (now - (this._pokeAt.get(key) ?? 0) < POKE_THROTTLE_MS) return
+      this._pokeAt.set(key, now)
+      if (poke.mode === 'text') {
+        // {nick} 取群成员/好友昵称缓存；取不到用 QQ 号（别在文案里留空）。
+        const nick = String(this.qq?.nameOf?.(key, poker) ?? '').trim() || poker
+        const text = poke.replyText.replace(/\{nick\}/gu, nick).replace(/\{qq\}/gu, poker)
+        const sent = await this._send(scope, text)
+        if (!(sent && sent.ok === false)) this._noteReplied(key)
+        this.logger.info?.(`被 ${poker} 戳了一下（${key}），文字回复：${text.slice(0, 40)}`)
+        return
+      }
+      const target = scope.kind === 'group' ? scope.groupId : poker
+      if (typeof this.qq.sendPoke !== 'function') {
+        this.logger.warn?.('OneBot 客户端没有 sendPoke（版本过旧），跳过回戳')
+        return
+      }
+      const result = await this.qq.sendPoke(scope.kind, target, { userId: poker })
+      if (result?.ok) {
+        this.logger.info?.(`被 ${poker} 戳了一下（${key}），已回戳（${result.action}）`)
+      } else {
+        // 回戳失败只告警：某些 NapCat 版本没有 poke action，不该因此报错刷屏。
+        this.logger.warn?.(`回戳失败（${key}）：${result?.error ?? '未知原因'}`)
+      }
+    } catch (error) {
+      this.logger.warn?.(`处理戳一戳失败（忽略）：${error?.message ?? error}`)
+    }
+  }
+
+  /**
+   * 发一条文本（日志 / 延迟 / 失败统计的统一出口）。
+   *
+   * @param {object} msg 至少要有 kind 与对应目标（userId / groupId）
+   * @param {string} text
+   * @param {{at?:boolean}} [opts] `at:false` = 不 @ 人（插件通道发送用，契约 §2.1）
+   */
+  async _send(msg, text, { at = true } = {}) {
     const delay = this.config.sendDelayMs ?? 400
     const key = this.keyOf(msg)
     // 群聊 @ 发送者：按 groupAtReply / groupAtPosition 决定，私聊一律不带 @。
-    const atOpts = (this.qq.groupAtReply && msg.kind === 'group')
+    const atOpts = (at && this.qq.groupAtReply && msg.kind === 'group')
       ? { atUserId: msg.userId, atPosition: this.qq.groupAtPosition }
       : {}
     const result = msg.kind === 'private'
@@ -2207,10 +2819,10 @@ export class Bridge {
     // 分片级失败：已成功的分片不重复发送，这里只如实上报，不整条重试。
     if (result && result.ok === false) {
       this.stats.failed++
-      const at = result.failedIndex === undefined
+      const atNote = result.failedIndex === undefined
         ? '（未发出任何分片）'
         : `第 ${result.failedIndex}/${result.total} 片`
-      this.logger.error?.(`QQ 发送失败 ${key} ${at}：${result.error ?? '未知原因'}`)
+      this.logger.error?.(`QQ 发送失败 ${key} ${atNote}：${result.error ?? '未知原因'}`)
     }
     if (delay > 0) await sleep(delay)
     return result
@@ -2221,7 +2833,19 @@ export class Bridge {
     this.qq.onMessage((msg) => {
       this.handleMessage(msg).catch((e) => this.logger.error?.(`handleMessage 异常：${e?.message ?? e}`))
     })
+    // 戳一戳（2026-10-26）：notice 走独立处理器，和消息处理互不干扰。
+    // 用可选调用：onebot 客户端版本过旧（没有 onNotice）时最多收不到戳一戳，
+    // 绝不能因此让整条消息链路起不来。
+    this.qq.onNotice?.((notice) => {
+      this.handleNotice(notice).catch((e) => this.logger.warn?.(`handleNotice 异常：${e?.message ?? e}`))
+    })
     await this.qq.start()
+    // 每小时人设归纳（2026-10-26）：间隔 1 小时，**不立刻跑第一次**（避免重启浪潮：
+    // 桥接频繁重启时不该每次都拿聊天记录去打一轮模型）。unref：别拖住进程退出。
+    this._summarizeTimer = setInterval(() => {
+      void this._summarizePersonas()
+    }, SUMMARIZE_INTERVAL_MS)
+    if (typeof this._summarizeTimer.unref === 'function') this._summarizeTimer.unref()
     // 只做只读探活，确认 DSH 可达；不可达时桥接仍会启动，等 DSH 恢复。
     try {
       await this.dsh.call('agentPresets/list', {})
@@ -2237,6 +2861,9 @@ export class Bridge {
       if (entry.timer) clearTimeout(entry.timer)
     }
     this._debounce.clear()
+    // 每小时归纳的定时器必须清掉，否则 stop 之后还会再跑（测试里会阴魂不散）。
+    if (this._summarizeTimer) clearInterval(this._summarizeTimer)
+    this._summarizeTimer = null
     await this.qq.stop?.()
   }
 }

@@ -288,6 +288,47 @@ provider（opencode-go）也不会覆盖 system 提示词（直连 API 注入人
 排查开关：插件 Config `debugPrompt=true` 或 `QQG_PROMPT_DEBUG=1`，会打印
 `[Persona Debug] session=… sections=[名字:字数] contexts=[…]`。
 
+### 动态人设：锁定 + 群友授权 + 每小时归纳（2026-10-26）
+
+人设有两级来源：**主设定**（设置页的 `persona` / 全局默认，管理员资产）和
+**本群动态设定**（`personaDelta`，群友授权或模型归纳的补充）。后者永远追加在后面，
+并带一行「优先级低于上面的人设，冲突时以上面为准」，不会盖掉主设定。
+
+| 配置 | 默认 | 行为 |
+|---|---|---|
+| `personaLocked` | `true` | 锁定时群友在群里 `@bot 你要改成…` 得到「人设锁着呢，改不了」，**不投递模型**；解锁才允许改 |
+| `personaAutoUpdate` | `true` | 每小时归纳总开关（仍受锁定约束：锁定时一次请求都不发） |
+
+- 存储：`state/sessions.json` 的 `sessions[<g:群号>].personaDelta`（老记录缺失当空串，
+  超 4000 字按行截掉**最旧**的段落）。`persona` 字段语义不变（仍是设置页的完整覆盖）。
+- 合成顺序（`_applyPersona`）：`persona` → 全局人设 → `buildPersonaPrompt()` 兜底，
+  之后追加 `【本群动态设定…】` + `personaDelta`；非管理员再追加 `ADMIN_GUARD_NOTE`。
+  签名里显式包含 delta，所以「只有补充设定变了」也能立刻重推。
+- 群友授权指令：仅**群聊 + @bot + 正文含「你要改成…」**触发（插在静音/档位判定之前）；
+  锁定时回拒绝、解锁时追加一行 + 落盘 + 重推 + 回「好，本群设定加上了」。私聊不触发。
+- 每小时归纳：群聊消息进内存缓冲（每群最多 80 条、1 小时窗口，纯图片记 `[图片]`，
+  `/` 指令不入）；每群最近 1 小时 ≥ 5 条才跑；成功把返回文本追加进 `personaDelta`
+  并清该群缓冲，失败保留缓冲下小时再试。`_summarizing` 防并发；启动后不立刻跑第一次。
+- 归纳本身由 Host 代劳（桥接进程调不到 `ctx.llm`）：`POST /dsh-qq-guard/persona-summarize`
+  `{groupName, currentPersona, messages}` → `{ok, persona}`，Host 用插件 Config 里的 QQ 模型
+  打一次一次性请求（60s 上限），桥接 HTTP 超时留了 10s 余量（70s）。
+  这条请求**不挂 sessionId**，所以不会被 QQ 会话的看门狗误切，也不产生 `request/header`
+  → **不计入用量统计**。
+
+### 群聊发送人识别（消息打标，2026-10-26）
+
+群聊送进模型的正文按条带发送人标签，格式固定：
+
+```
+[群友 昵称(QQ号)]: 消息内容
+```
+
+- 在 `_enqueue` 入口**按每条消息**打标（防抖合并时不同发送者各带各的标签，合并后按行拼）；
+- 昵称取 `msg.senderName`（OneBot 的 `sender.card || sender.nickname`），取不到退回 QQ 号；
+- **私聊不套这套逻辑**：私聊正文保持原样，不加标签；
+- `/` 开头的管理员指令**不打标**（DSH 斜杠指令必须仍以 `/` 开头才能识别）；
+- 标签只进「送进模型的正文」：日志、未读预览、外部插件 hook 的 `text` 一律仍是原文。
+
 ### 管理员权限（/ 指令）
 
 - `allow.admins`（数组，设置页「白名单管理 → 管理员 QQ 号」）。
@@ -295,6 +336,24 @@ provider（opencode-go）也不会覆盖 system 提示词（直连 API 注入人
   **不投递 DSH**，未读清零；在名单 → 正常投递（等 DSH/后续指令实现处理）。
 - 管理员身份**不绕过白名单**：不在 `allow.private` / `allow.groups` 里，普通消息仍会被挡。
 - 配置每次现读（热更新），改完下一条生效。
+
+### 戳一戳（2026-10-26）
+
+监听 OneBot 的 `notice` 事件（`notice_type=notify`、`sub_type=poke`），被戳的是机器人自己时按配置回应：
+
+- `poke.enabled`（默认开）：总开关，关了完全不响应；
+- `poke.mode`：`poke` = 回戳对方（默认）；`text` = 用模板发一句文字；
+- `poke.replyText`（默认 `（被戳了一下，戳回去）`）：文字模式模板，支持 `{nick}` / `{qq}`，
+  昵称取群成员/好友缓存（`onebot.nameOf`），取不到退回 QQ 号。
+
+细节：
+
+- 白名单照旧（群聊按群号、私聊按 QQ 号），名单外不回应；
+- 同一会话 **3 秒内最多回一次**，防戳一戳刷屏；
+- 回戳依次尝试 `group_poke` / `friend_poke`，失败再兜底 `send_poke`（NapCat 各版本 action 名不统一），
+  全失败只 warn、绝不影响聊天；文字模式走正常发送链路（分片、打字延时都生效）；
+- 事件里 `user_id` 是戳的人、`target_id` 是被戳的人；缺 `target_id` 时直接忽略（不猜），
+  自己戳自己（`user_id === self_id`）在 OneBot 层就丢掉了。
 
 ### 会话指令（清空 / 删除 / 单人设保存）
 
@@ -381,13 +440,20 @@ node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔�
 
 ### 高级参数（热读）
 
-设置页「全局设置 → 高级参数」有三个时间常数，桥接每 2 秒轮询热读，改完下一条消息生效：
+设置页「全局设置 → 高级参数」里有几个时间常数与兜底文案，桥接每 2 秒轮询热读，改完下一条消息生效：
 
 | 字段 | 用法 | 优先级 |
 |---|---|---|
 | `replyTimeoutMs` | `promptAndWait` 的等待上限（默认 20000） | 设置页 > `config.json` > 20000 |
 | `modelWatchdogMs` | 只用于**日志提示**：等待超过它就打 `⏳ 等待回复已超 N 秒，可能正在触发看门狗降级…`（真正的切断在 Host 插件里） | 设置页 > `config.json` > 8000 |
 | `antiDebounceMs` | 防抖合并窗口；0 = 沿用 `rhythm.debounceWindowMs` | 高级参数 > 节奏参数 |
+| `timeoutReplyText` | 超时/看门狗类失败发给 QQ 的文案（默认「（模型脑子卡住了，稍后再试）」）；留空按默认 | 设置页 > `config.json` > 内置默认 |
+
+**超时不再把英文报错发给群友**（2026-10-26）：`_isTimeoutish()` 认三类失败
+（桥接自己的 `code=TIMEOUT`、Host 看门狗切断后回来的 `WATCHDOG_TIMEOUT`、
+以及消息里带 `timeout/超时/aborted` 的），统一发 `timeoutReplyText`；
+其它错误仍发「（这次处理出错了，稍后再试）」。两条都是固定中文，
+**任何情况下都不会把 `error.message` 拼进 QQ 正文**。
 
 ## 响应节奏（Phase 4）
 
@@ -644,6 +710,55 @@ node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔�
   后该事件 30 秒内不再请求（按事件分开缓存，`message` 没有 hook 不影响 `before-context`）；
 - 桥接**不做工具代理**：`qq_ext_*` 由 Host 在 preset 作用域自行注册。
 
+## 插件通道（plugin hub，2026-10-26）
+
+给 `D:\DeepSeekHarness_workarea\Dsh-QQ-Mod` 下的独立插件（auto-reply / feiyu-voice /
+video-frames）和 DSH 内的 guard 用的一小块**本地 HTTP**。契约见
+`.recon/plugin-integration-contract.md` §0-§3、§6。
+
+**默认全关**：`config.json` 不写 `pluginHub` 时端口不起、`/match` 不发、视频不下载，
+行为与升级前完全一致。想开就加（缺的字段由代码里的默认值补齐）：
+
+```json
+"pluginHub": {
+  "enabled": true,
+  "port": 39410,
+  "token": "",
+  "autoReply": { "enabled": true, "url": "http://127.0.0.1:39411", "timeoutMs": 800 },
+  "plugins": [
+    { "id": "feiyu-voice",  "url": "http://127.0.0.1:39412", "timeoutMs": 120000 },
+    { "id": "video-frames", "url": "http://127.0.0.1:39413", "timeoutMs": 30000 }
+  ],
+  "video": { "enabled": true, "maxBytes": 52428800, "timeoutMs": 30000 }
+}
+```
+
+接口（只绑 `127.0.0.1`；`token` 空串 = 不校验，配了就要 `Authorization: Bearer <token>`；
+普通请求体 ≤1MB、`/send/record` ≤64MB；业务失败一律 **HTTP 200 + `{ok:false,error}`**）：
+
+| 接口 | 方向 | 说明 |
+|---|---|---|
+| `POST /send/text` `{chatKey,text}` | 插件 → 桥接 | 复用 `_send`（`sendDelayMs` 延迟、失败计 `stats.failed`），**不 @ 人**；回 `{ok,messageIds}` |
+| `POST /send/record` `{chatKey,base64,format}` | 插件 → 桥接 | `qq.sendVoice` 发送；base64 被拒时落盘到桥接 `state/` 再 `file://` 重发（`format` 只做校验/回执，落盘降级文件名沿用 onebot 的 `.mp3`） |
+| `GET /plugins/tools` | guard → 桥接 | 聚合各插件 `GET /tools`，只下发 `qq_ext_*`，带 `plugin` 来源；单个插件不可达跳过 + warn，5 秒内不重试 |
+| `POST /plugins/tools/execute` `{name,args,sessionId}` | guard → 桥接 | 按工具名找到插件，`args` 里**注入 `chatKey`**（sessionId 反查 QQ 会话），超时用清单里的 `timeoutMs`（缺省 8s）；`content` 原样透传 |
+| `GET /health` | 排障 | `{ok:true,plugin:'bridge-plugin-hub',port}` |
+
+- `chatKey` 统一写 `private:<QQ号>` / `group:<群号>`（插件侧按前缀判断会话类型）；
+  桥接内部是 `u:` / `g:`，两套都收，进来就折成内部 key。
+- sessionId → chatKey 反查：`ensureSession` 建/换会话时记进 `_sessionKeys`，查不到再扫
+  `state/sessions.json`；都查不到回「先让用户发条 QQ 消息，桥接才能定位会话」。
+- **入站自动回复**（`autoReply.enabled`）：位置在白名单 / 消息 hook / 空消息 / 人设指令之后，
+  静音与响应档位之前（插件是「有人问就答」，不受节奏设置影响；`/` 指令不拦）。
+  命中就 `_send` 发出、`stats.autoReplies++`、清未读、**不进 DSH**；未命中 / 超时 /
+  插件不可达照常往下走，失败 30 秒负缓存 + 只 warn 一次。
+- **视频落盘**（`video.enabled`）：`onebot.mjs` 把 video 段解成 `msg.videos`
+  （`{url,file,fileSize}`）；消息进来就后台下载到 `state/media/video-<ts>-<n>.mp4`
+  （并发 ≤2、限大小/超时），成功后在送模型的正文末尾追加一行
+  `[视频]（本地文件：<绝对路径>）`（原 `[视频]` 占位保留），失败只 warn。
+- 生命周期：`start.mjs` 在 `bridge.start()` 之后起 hub，退出时关闭；起不来只 warn。
+  auto-reply / 视频下载是**桥接出站**调用，不依赖监听端口成功。
+
 ## 桥接性能（P2，2026-10-24）
 
 目标：无效网络请求清零、慢操作不阻塞主链路。全部是内存态，重启即清。
@@ -741,9 +856,10 @@ value = v1.<base64url(JSON{version,authority,issuedAt,expiresAt})>.<base64url(HM
 ## 自测
 
 ```bash
-node test-offline.mjs   # 主回归（含 P2：发图片 / 外部 hook / 性能去重）
-node test-tts.mjs       # TTS 通路 + voice op detail + voice detached 不阻塞
-node test-timeout.mjs   # 等待超时：默认 20s / 超时必 session/cancel / 错误码 TIMEOUT
+node test-offline.mjs     # 主回归（含 P2：发图片 / 外部 hook / 性能去重）
+node test-plugin-hub.mjs  # 插件通道：send/text、send/record、tools 聚合、auto-reply、视频落盘
+node test-tts.mjs         # TTS 通路 + voice op detail + voice detached 不阻塞
+node test-timeout.mjs     # 等待超时：默认 20s / 超时必 session/cancel / 错误码 TIMEOUT
 ```
 
 覆盖回复审计、消息解析（array / 字符串 / 混合段）、长文本分片、分气泡（强边界 / 语义切 /
@@ -755,8 +871,9 @@ node test-timeout.mjs   # 等待超时：默认 20s / 超时必 session/cancel /
 `plugins/dsh-qq-guard/test-napcat.mjs`（NapCat 进程管理）、
 `plugins/dsh-qq-guard/test-autostart.mjs`（autoStart / 单实例 / 崩溃重启上限）、
 `test-persona.mjs`（人设写入不丢插件）。
-**不连 QQ、不启 NapCat、不碰 DSH 会话。** 当前基线（2026-10-24 v0.5.1）：`204 通过 / 0 失败`
-（bridge 五个测试文件：204 / 16 / 31 / 13 / 6，全绿）。
+**不连 QQ、不启 NapCat、不碰 DSH 会话。** 当前基线（2026-10-26）：`node test-offline.mjs`
+`204 通过 / 0 失败`（bridge 五个测试文件：204 / 16 / 31 / 13 / 6，全绿）；
+`node test-plugin-hub.mjs` `32 通过 / 0 失败`（fake 插件服务 + fake onebot/bridge）。
 
 ## 排障
 

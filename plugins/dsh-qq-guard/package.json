@@ -16,6 +16,7 @@
     "napcat.mjs",
     "bridge-runner.mjs",
     "model-override.js",
+    "persona-summary.js",
     "holidays.json",
     "sandbox/*.mjs",
     "cordis.patch.yml",

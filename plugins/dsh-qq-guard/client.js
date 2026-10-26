@@ -772,6 +772,15 @@ window.__ModuleLoader__.load({
       replyTimeoutMs: 20000,
       modelWatchdogMs: 8000,
       antiDebounceMs: 0,
+      // 超时兜底文案：空串按默认处理，绝不把英文报错发到 QQ。
+      timeoutReplyText: '（模型脑子卡住了，稍后再试）',
+      // 人设锁定 / 每小时自动归纳：默认都开（与 Host 侧 Config 一致）。
+      personaLocked: true,
+      personaAutoUpdate: true,
+      // 戳一戳：默认开、默认回戳（与 Host 侧 Config 一致）。
+      'poke.enabled': true,
+      'poke.mode': 'poke',
+      'poke.replyText': '（被戳了一下，戳回去）',
       // 语音合成（「发语音」技能的后端）默认值：Edge 免 Key，音色用晓伊。
       'voice.provider': 'edge',
       'voice.baseUrl': '',
@@ -1855,6 +1864,23 @@ window.__ModuleLoader__.load({
             type: 'button', className: 'qqg-btn qqg-btn-primary',
             onClick: () => setOpen(true),
           }, '⚙️ 编辑人设')),
+        // 人设锁定 / 每小时归纳：直接写配置（不进人设弹窗的草稿），开关立即生效。
+        h(Field, {
+          label: '锁定人设',
+          desc: '锁定后人设只读，群友在群里说「@bot 你要改成…」不会生效；解锁后才会把这句话追加成本群动态设定。',
+        },
+          h(Switch, {
+            checked: get('personaLocked') !== false, disabled: !writable,
+            ariaLabel: '锁定人设', onChange: (v) => write('personaLocked', v),
+          })),
+        h(Field, {
+          label: '每小时自动归纳人设',
+          desc: '每小时把本群聊天记录交给模型归纳，自动补充设定（需先解锁）。',
+        },
+          h(Switch, {
+            checked: get('personaAutoUpdate') !== false, disabled: !writable,
+            ariaLabel: '每小时自动归纳人设', onChange: (v) => write('personaAutoUpdate', v),
+          })),
         open
           ? h(PersonaModal, {
             key: `persona-${botName}-${participation}-${[...text].length}`,
@@ -1862,6 +1888,43 @@ window.__ModuleLoader__.load({
             onClose: () => setOpen(false),
           })
           : null)
+    }
+
+    /**
+     * 戳一戳（群聊互动）配置卡。
+     *
+     * 群友双击头像 / 拍一拍 bot 时怎么回：总开关 + 回戳或文字回复 + 文字模板。
+     * 具体响应在桥接进程里做（节流 3 秒、白名单外不回应），这里只负责写配置。
+     */
+    function PokeSection({ get, write, writable }) {
+      const mode = String(get('poke.mode') ?? 'poke')
+      return h('div', { className: 'qqg-group' },
+        h('div', { className: 'qqg-group-title' }, '戳一戳（群聊互动）'),
+        h(Field, { label: '响应戳一戳', desc: '群友戳 bot 时回一下。关闭 = 完全不响应。' },
+          h(Switch, {
+            checked: get('poke.enabled') !== false, disabled: !writable,
+            ariaLabel: '响应戳一戳', onChange: (v) => write('poke.enabled', v),
+          })),
+        h(Field, { label: '回应方式', desc: '回戳 = 戳回去；文字回复 = 用下面的模板回一条。' },
+          h('select', {
+            className: 'qqg-input', value: mode, disabled: !writable,
+            'aria-label': '回应方式',
+            onChange: (e) => write('poke.mode', e.target.value),
+          },
+          h('option', { value: 'poke' }, '回戳对方'),
+          h('option', { value: 'text' }, '文字回复'))),
+        h(Field, {
+          label: '文字回复模板',
+          desc: '仅「文字回复」模式生效。占位符：{nick} = 对方昵称，{qq} = 对方 QQ 号。',
+        },
+          h(TextInput, {
+            value: String(get('poke.replyText') ?? ''),
+            placeholder: '（被戳了一下，戳回去）', disabled: !writable,
+            ariaLabel: '文字回复模板',
+            onCommit: (v) => write('poke.replyText', v),
+          })),
+        h('div', { className: 'qqg-hint' },
+          '同一会话 3 秒内最多回一次，防戳一戳刷屏；白名单外的会话不回应。'))
     }
 
     /**
@@ -2049,6 +2112,16 @@ window.__ModuleLoader__.load({
             h(NumberField, {
               value: get('antiDebounceMs'), min: 0, max: 60000, disabled: !writable,
               ariaLabel: '防抖合并窗口', onCommit: (n) => write('antiDebounceMs', n),
+            })),
+          h(Field, {
+            label: '超时回复文案',
+            desc: '看门狗触发且备用模型也失败时发到 QQ 的中文提示。留空 = 用默认「（模型脑子卡住了，稍后再试）」；英文报错永远不会发出去。',
+          },
+            h(TextInput, {
+              value: String(get('timeoutReplyText') ?? ''),
+              placeholder: '（模型脑子卡住了，稍后再试）', disabled: !writable,
+              ariaLabel: '超时回复文案',
+              onCommit: (v) => write('timeoutReplyText', v),
             })),
           h('div', { className: 'qqg-hint' },
             '改完保存即生效：桥接每 2 秒轮询一次配置，下一条消息就按新值走。')))
@@ -4618,6 +4691,7 @@ window.__ModuleLoader__.load({
         h('div', { id: 'qqg-anchor-advanced', className: 'qqg-anchor' }, h(AdvancedSection, common)),
         h('div', { id: 'qqg-anchor-voice', className: 'qqg-anchor' }, h(VoiceSection, common)),
         h('div', { id: 'qqg-anchor-persona', className: 'qqg-anchor' }, h(PersonaSection, common)),
+        h('div', { id: 'qqg-anchor-poke', className: 'qqg-anchor' }, h(PokeSection, common)),
         h('div', { id: 'qqg-anchor-allow', className: 'qqg-anchor' }, h(AllowSection, common)),
         h('div', { id: 'qqg-anchor-onebot', className: 'qqg-anchor' }, h(OneBotSection, common)),
         h('div', { id: 'qqg-anchor-napcat', className: 'qqg-anchor' }, h(NapcatSection, common)),

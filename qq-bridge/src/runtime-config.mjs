@@ -64,6 +64,12 @@ const HOT_KEYS = [
   'replyTimeoutMs',
   'modelWatchdogMs',
   'antiDebounceMs',
+  // 2026-10-26 体验升级：超时文案 / 人设锁定 / 每小时归纳 / 戳一戳都要热更新
+  // （用户在设置页点完开关，不该还要重启桥接才生效）。
+  'timeoutReplyText',
+  'personaLocked',
+  'personaAutoUpdate',
+  'poke',
   // OneBot 连接信息只用于 UI 展示；WS 连接在启动时建立，改它仍需重启桥接。
   'onebot',
 ]

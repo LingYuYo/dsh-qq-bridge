@@ -83,6 +83,7 @@ import { NapcatManager, DEFAULT_WS_PORT, findQrcodeImage } from './napcat.mjs'
 import { BridgeRunner, DEFAULT_BRIDGE_DIR } from './bridge-runner.mjs'
 import { SandboxManager } from './sandbox/manager.mjs'
 import { installModelOverride } from './model-override.js'
+import { SUMMARIZE_ROUTE_PATH, handlePersonaSummarizeRoute } from './persona-summary.js'
 import {
   UsageScope,
   UsageStatsStore,
@@ -604,6 +605,33 @@ const Config = Schema.object({
     .description('静默看门狗：被接管的模型多少毫秒没有任何输出就判定超时、切备用模型（0 = 关闭）。'
       + '只作用于 QQ 会话下发的路由，不影响浏览器里的会话。')
     .default(8000).min(0).max(120000).volatile(),
+  // 看门狗判超时、备用模型也没救回来时发给 QQ 的文案（2026-10-26）。
+  // 桥接侧读它替换掉原来写死的中文提示；留空/只有空白 → 用默认值。
+  // 关键约束：DSH 的原生报错（英文）任何情况下都不能出现在发往 QQ 的正文里。
+  timeoutReplyText: Schema.string()
+    .description('看门狗判超时、且备用模型也失败时发给 QQ 的文案。留空按默认处理。')
+    .default('（模型脑子卡住了，稍后再试）').volatile(),
+  // ── 人设锁定 + 动态人设（2026-10-26）────────────────────────
+  // 默认锁住人设：群友在群里说「@bot 你要改成…」只有解锁后才生效，避免被群友带偏。
+  // 每小时归纳也受同一个开关约束（锁定 = 人设只读，自动归纳也不许改）。
+  personaLocked: Schema.boolean()
+    .description('锁定人设：开启后群友不能通过「@bot 你要改成…」改本群设定（管理员仍可在设置页改）。')
+    .default(true).volatile(),
+  personaAutoUpdate: Schema.boolean()
+    .description('每小时把本群聊天记录交给模型归纳、自动补充人设（仍受「锁定人设」约束）。')
+    .default(true).volatile(),
+  // 戳一戳：回戳还是发一句文字，由桥接侧的 notice 处理决定（这里只是开关与文案）。
+  poke: Schema.object({
+    enabled: Schema.boolean()
+      .description('戳一戳响应总开关。')
+      .default(true).volatile(),
+    mode: Schema.union(['poke', 'text'])
+      .description('回复方式：poke = 回戳；text = 发一句文字。')
+      .default('poke').volatile(),
+    replyText: Schema.string()
+      .description('文字回复模板，支持 {nick} / {qq} 占位。')
+      .default('（被戳了一下，戳回去）').volatile(),
+  }).description('戳一戳').default({}),
   antiDebounceMs: Schema.number()
     .description('消息防抖合并窗口（毫秒）。0 = 沿用「活跃设置」里的 debounceWindowMs（默认 800）。')
     .default(0).min(0).max(60000).volatile(),
@@ -709,6 +737,30 @@ const Config = Schema.object({
       .default({}).volatile(),
   }).description('外部插件挂载').default({}),
 
+  // ── QQ 插件 HTTP 工具源（plugin-integration-contract §5，默认关）──
+  //
+  // 桥接新增的 plugin hub 把三个常驻插件进程（auto-reply / feiyu-voice /
+  // video-frames）的工具聚合成 `GET /plugins/tools`；guard 按清单注册**同名**代理
+  // 工具（约定 `qq_ext_` 前缀，执行期白名单 SAFE_PREFIXES 已放行），执行时转发到
+  // `POST /plugins/tools/execute`，由桥接补 chatKey 再打给插件。
+  //
+  // 只允许回环地址：这些工具会真的发 QQ 消息、读本机视频文件，指向外部主机
+  // 等于把「发消息 / 读文件」的能力借给别人。不是回环就 warn 并跳过。
+  httpTools: Schema.object({
+    enabled: Schema.boolean()
+      .description('是否从桥接 plugin hub 拉取并注册 QQ 插件工具。默认关；关掉时行为与以前完全一致。')
+      .default(false).volatile(),
+    baseUrl: Schema.string()
+      .description('桥接 plugin hub 地址（bridge pluginHub.port）。只接受 127.0.0.1 / localhost。')
+      .default('http://127.0.0.1:39410').volatile(),
+    token: Schema.string()
+      .description('Bearer token，必须与桥接 pluginHub.token 一致；空串 = 不校验（本机默认）。')
+      .default('').role('secret').volatile(),
+    timeoutMs: Schema.number()
+      .description('工具执行超时(ms)。契约 §5 规定执行上限 8s，这里是更严格的收紧值（只能调小）。')
+      .default(10000).min(500).max(600000).volatile(),
+  }).description('QQ 插件工具源（桥接 plugin hub）').default({}),
+
   // ── DSH 会话（Phase 4）──────────────────────────────────────
   //
   // 桥接的 pickHotConfig 只放行这个子键（`dsh.baseUrl` / `sessionCwd` 这类
@@ -777,6 +829,26 @@ const EXTERNAL_HOOK_TIMEOUT_MS = 1500
 const EXTERNAL_HOOK_BUDGET_MS = 2000
 /** 外部工具代理执行时的默认超时（p2-contract §4.3：10s）。 */
 const EXTERNAL_TOOL_TIMEOUT_MS = 10_000
+/** QQ 插件工具源：plugin hub 默认地址（bridge pluginHub.port）。 */
+export const HTTP_TOOLS_DEFAULT_BASE_URL = 'http://127.0.0.1:39410'
+/** QQ 插件工具源：拉清单超时（契约 §5：5s）。 */
+const HTTP_TOOLS_MANIFEST_TIMEOUT_MS = 5000
+/** QQ 插件工具源：清单没写 timeoutMs 时的兜底执行超时（可被 httpTools.timeoutMs 覆盖）。 */
+const HTTP_TOOLS_EXECUTE_TIMEOUT_MS = 8000
+/**
+ * QQ 插件工具源：执行超时的硬上限。
+ *
+ * 有些工具本来就慢（肥鱼语音合成清单里声明 120s，服务端排队时更久），
+ * 8s 会把它们一刀切死；所以按「清单里的 timeoutMs > 配置的 httpTools.timeoutMs > 8s」
+ * 取实际值，再统一钳到这个上限。桥接侧的 pluginHub.plugins[].timeoutMs 也要同步够长。
+ */
+const HTTP_TOOLS_EXECUTE_MAX_MS = 180_000
+/** 单次 execute 最多转几张图片（视频抽帧一次最多 12 张，别把上下文撑爆）。 */
+const HTTP_TOOLS_MAX_IMAGES = 8
+/** 清单里最多注册多少个工具（防桥接回包异常大）。 */
+const HTTP_TOOLS_MAX_TOOLS = 64
+/** 工具名合法字符：provider 侧对工具名的容忍度比 DSH 窄，先自己挡一道。 */
+const HTTP_TOOLS_NAME_RE = /^[A-Za-z0-9_]{1,64}$/
 /** 路由路径：清理 QQ 工作区里失效的会话（Phase 4）。 */
 const CLEANUP_ROUTE_PATH = '/dsh-qq-guard/cleanup-sessions'
 /** 路由路径：单人设覆盖（桥接每条消息前 POST；guard 实例只读共享内存）。 */
@@ -1004,9 +1076,11 @@ function pruneSessionOps() {
  * @param {string} op clear | delete | persona | voice | image | activity
  * @param {string} key 会话 key（voice / image 为空串：桥接用 sessionId 反查）
  * @param {string} [text]
- * @param {{sessionId?:string, voice?:string, url?:string, file?:string, level?:number|null}} [extra]
+ * @param {{sessionId?:string, voice?:string, url?:string, file?:string, level?:number|null,
+ *   subType?:0|1}} [extra]
  *   `level`：单群响应档位（0..3），null = 跟随全局；只有 activity 指令会带。
  *   `url` / `file`：image 指令二选一的图片来源（P2）。
+ *   `subType`：image 指令的呈现形态（0=普通图片，1=表情，2026-10-26）；缺省不带。
  */
 function enqueueSessionOp(op, key, text = '', extra = {}) {
   pruneSessionOps()
@@ -1036,6 +1110,8 @@ function enqueueSessionOp(op, key, text = '', extra = {}) {
   }
   const id = `op-${Date.now().toString(36)}-${++sessionOpsSeq}`
   const level = (typeof extra.level === 'number' || extra.level === null) ? extra.level : undefined
+  // subType 只在 image 指令上、且明确是 0/1 时进队（缺省不留字段，老桥接不受影响）。
+  const subType = (op === 'image' && (extra.subType === 0 || extra.subType === 1)) ? extra.subType : undefined
   sessionOpsQueue.set(id, {
     id, op, key, text,
     sessionId: typeof extra.sessionId === 'string' ? extra.sessionId : '',
@@ -1043,6 +1119,7 @@ function enqueueSessionOp(op, key, text = '', extra = {}) {
     url: typeof extra.url === 'string' ? extra.url : '',
     file: typeof extra.file === 'string' ? extra.file : '',
     ...(level === undefined ? {} : { level }),
+    ...(subType === undefined ? {} : { subType }),
     at: Date.now(), lease: 0,
   })
   while (sessionOpsQueue.size > SESSION_OPS_CAP) {
@@ -1416,6 +1493,379 @@ function applyExternalToolProxies(ctx) {
   if (typeof ctx.effect === 'function') {
     ctx.effect(() => () => { externalRuntime.appliers.delete(applier) }, 'qq-guard: external tool proxies')
   }
+}
+
+// ── QQ 插件 HTTP 工具源（plugin-integration-contract §5）───────────────
+//
+// 桥接新增的 plugin hub（默认 127.0.0.1:39410）把三个常驻插件进程的工具聚合成
+// `GET /plugins/tools`。这里按清单注册**同名**代理工具（约定 `qq_ext_` 前缀，
+// 执行期白名单 SAFE_PREFIXES 已经放行，不需要改白名单），执行时转发到
+// `POST /plugins/tools/execute`，由桥接补 chatKey 再打给插件。
+//
+// 全部 best-effort：清单拉不到 / 桥接没开只 warn（同一原因限流一次），
+// 不影响 guard 的其它功能；下次配置重载时会重新 apply。
+
+/** 清单拉取/执行失败的 warn 去重（同一 key 只打一次，配置变了 key 也会变）。 */
+const httpToolsWarned = new Set()
+
+/** 同一个原因只 warn 一次（LOOP，避免每个 QQ 会话/每次重载都刷屏）。 */
+function warnHttpToolsOnce(key, message) {
+  if (httpToolsWarned.has(key)) return
+  httpToolsWarned.add(key)
+  while (httpToolsWarned.size > 24) httpToolsWarned.delete(httpToolsWarned.values().next().value)
+  console.warn?.(`[qq-guard] ${message}`)
+}
+
+/** 测试用的超时覆盖：把 5s / 8s 的固定超时调小，免得用例真的干等。 */
+const httpToolsTestOverrides = { manifestTimeoutMs: 0, executeTimeoutMs: 0 }
+
+/**
+ * 仅供 `test-http-tools.mjs`：调小清单/执行超时。
+ * @param {{manifestTimeoutMs?:number, executeTimeoutMs?:number}} overrides 0 = 恢复默认
+ */
+export function setHttpToolsTimeoutsForTests(overrides = {}) {
+  httpToolsTestOverrides.manifestTimeoutMs = Number(overrides.manifestTimeoutMs) > 0
+    ? Math.floor(Number(overrides.manifestTimeoutMs)) : 0
+  httpToolsTestOverrides.executeTimeoutMs = Number(overrides.executeTimeoutMs) > 0
+    ? Math.floor(Number(overrides.executeTimeoutMs)) : 0
+}
+
+const httpToolsManifestTimeout = () => httpToolsTestOverrides.manifestTimeoutMs || HTTP_TOOLS_MANIFEST_TIMEOUT_MS
+const httpToolsExecuteCap = () => httpToolsTestOverrides.executeTimeoutMs || HTTP_TOOLS_EXECUTE_TIMEOUT_MS
+
+/**
+ * baseUrl 是不是回环地址。
+ *
+ * 只认 `127.0.0.1` / `localhost`（契约 §1「只绑 127.0.0.1，不接受外部网卡」）：
+ * 这些工具能真的发 QQ 消息、读本机视频文件，指向外部主机等于把这能力借出去。
+ * @param {unknown} baseUrl
+ * @returns {boolean}
+ */
+export function isLoopbackHttpUrl(baseUrl) {
+  let url
+  try { url = new URL(String(baseUrl ?? '')) } catch { return false }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+  const host = url.hostname.toLowerCase()
+  return host === '127.0.0.1' || host === 'localhost'
+}
+
+/**
+ * 解析 `httpTools` 配置（解 volatile 包装，给默认值）。
+ *
+ * 生效优先级：guard 行自己的配置 > 设置页（顶层 settings 实例）的配置。
+ * 为什么让设置页也能配：httpTools 的字段是 volatile（设置页只投影 volatile），
+ * 用户在设置页打开后，preset 子行未必跟着变 —— 这份兜底让 UI 上的开关不是装饰。
+ *
+ * @param {unknown} config guard 实例的 Config
+ * @param {unknown} [settingsConfig] 顶层 settings 实例的 Config（featureState.source）
+ * @returns {{enabled:boolean, baseUrl:string, token:string, timeoutMs:number}}
+ */
+export function resolveHttpToolsConfig(config, settingsConfig) {
+  const read = (source) => {
+    const raw = plainConfig(source)?.httpTools
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+    const baseUrl = typeof raw.baseUrl === 'string' && raw.baseUrl.trim() !== ''
+      ? raw.baseUrl.trim()
+      : HTTP_TOOLS_DEFAULT_BASE_URL
+    const timeout = Number(raw.timeoutMs)
+    return {
+      enabled: raw.enabled === true,
+      baseUrl,
+      token: typeof raw.token === 'string' ? raw.token.trim() : '',
+      timeoutMs: Number.isFinite(timeout) && timeout > 0 ? Math.floor(timeout) : HTTP_TOOLS_EXECUTE_TIMEOUT_MS,
+    }
+  }
+  const own = read(config)
+  if (own?.enabled) return own
+  const shared = read(settingsConfig)
+  if (shared?.enabled) return shared
+  return own ?? shared ?? {
+    enabled: false,
+    baseUrl: HTTP_TOOLS_DEFAULT_BASE_URL,
+    token: '',
+    timeoutMs: HTTP_TOOLS_EXECUTE_TIMEOUT_MS,
+  }
+}
+
+/** 打桥接 plugin hub 的一个 JSON 接口；HTTP 非 2xx 不抛，交给调用方按状态码给可读原因。 */
+async function httpToolsFetchJson(url, { method = 'GET', body, token, timeoutMs, signal } = {}) {
+  const headers = { accept: 'application/json' }
+  const init = { method, headers }
+  if (token) headers.authorization = `Bearer ${token}`
+  if (body !== undefined) {
+    headers['content-type'] = 'application/json'
+    init.body = JSON.stringify(body)
+  }
+  const signals = []
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) signals.push(AbortSignal.timeout(timeoutMs))
+  if (signal) signals.push(signal)
+  if (signals.length === 1) init.signal = signals[0]
+  else if (signals.length > 1) {
+    init.signal = typeof AbortSignal.any === 'function' ? AbortSignal.any(signals) : signals[0]
+  }
+  const response = await fetch(url, init)
+  const text = await response.text()
+  let data
+  try { data = text === '' ? {} : JSON.parse(text) } catch {
+    throw new Error(`返回的不是 JSON（HTTP ${response.status}）`)
+  }
+  return { status: response.status, ok: response.ok, data }
+}
+
+/** 网络层失败的「中文可读」原因。 */
+function describeHttpFailure(error) {
+  const message = String(error?.message ?? error)
+  if (error?.name === 'TimeoutError' || /aborted due to timeout|timed? ?out/i.test(message)) {
+    return `超过时限没有响应（${message}）`
+  }
+  return message
+}
+
+const isTimeoutFailure = (error) => error?.name === 'TimeoutError'
+  || /aborted due to timeout|timed? ?out/i.test(String(error?.message ?? ''))
+
+/**
+ * 桥接回包里的图片块 → DSH 认的图片块。
+ *
+ * ⚠️ 为什么不能把 `{type:'image', data, mimeType}` 原样收下：DSH 模型侧的 image block
+ * 是**附件引用** `{type:'image', attachment:{attachmentId, mediaType, bytes, width, height}}`，
+ * 证据是 dsh-llm-pi-ai/lib/index.js 的 userContent()：`block.attachment.attachmentId`
+ * （collectImageRefs 同样直接取 `.attachment`）。原始 base64 块会让 pi-ai 在拼请求时
+ * TypeError，所以这里先落附件存储，拿不到附件服务就把图片降级成一行文字。
+ *
+ * @param {object} ctx guard 实例 ctx（preset 作用域，向上能找到 profile 顶层的 attachments）
+ * @param {object} block 桥接给的 `{type:'image', data, mimeType}`
+ * @param {string} label 报错用的「插件 / 工具」标识
+ * @returns {Promise<{block?:object, text?:string}>}
+ */
+async function httpToolImageBlock(ctx, block, label) {
+  const rawMime = typeof block?.mimeType === 'string' ? block.mimeType.trim().toLowerCase() : ''
+  const mediaType = rawMime !== '' ? rawMime : 'image/jpeg'
+  const base64 = typeof block?.data === 'string' ? block.data.trim() : ''
+  const bytes = base64 === '' ? 0 : Math.floor((base64.length * 3) / 4)
+  const sizeText = bytes > 0 ? `约 ${Math.max(1, Math.round(bytes / 1024))} KB` : '大小未知'
+  const fallbackText = `[收到一张图片（${mediaType}，${sizeText}），当前会话没法直接展示图片内容]`
+  if (!/^image\/(png|jpeg|webp|gif)$/.test(mediaType)) {
+    return { text: `[收到一张 ${mediaType} 的图片，格式不支持展示]` }
+  }
+  if (base64 === '') return { text: fallbackText }
+  const attachments = ctx?.get?.('attachments') ?? ctx?.attachments
+  if (!attachments || typeof attachments.saveImage !== 'function') return { text: fallbackText }
+  try {
+    const buffer = Buffer.from(base64, 'base64')
+    if (buffer.byteLength === 0) return { text: fallbackText }
+    const ref = await attachments.saveImage({ data: new Uint8Array(buffer), mediaType })
+    if (!ref || typeof ref !== 'object' || typeof ref.attachmentId !== 'string') return { text: fallbackText }
+    return { block: { type: 'image', attachment: ref } }
+  } catch (error) {
+    warnHttpToolsOnce(`image:${label}:${String(error?.message ?? error)}`,
+      `QQ 插件工具「${label}」返回的图片存不进附件区，已降级成文字：${error?.message ?? error}`)
+    return { text: fallbackText }
+  }
+}
+
+/** 桥接 execute 回包的 content → DSH 工具结果 content blocks（text / 附件图片）。 */
+async function httpToolContentBlocks(ctx, content, label) {
+  const blocks = []
+  let images = 0
+  let dropped = 0
+  for (const block of Array.isArray(content) ? content : []) {
+    if (block?.type === 'text') {
+      blocks.push({ type: 'text', text: String(block.text ?? '') })
+      continue
+    }
+    if (block?.type === 'image') {
+      if (images >= HTTP_TOOLS_MAX_IMAGES) { dropped += 1; continue }
+      const converted = await httpToolImageBlock(ctx, block, label)
+      if (converted.block) { blocks.push(converted.block); images += 1 }
+      else if (converted.text) blocks.push({ type: 'text', text: converted.text })
+      continue
+    }
+    blocks.push({ type: 'text', text: `（未知内容块 ${String(block?.type ?? '?')}，已忽略）` })
+  }
+  if (dropped > 0) blocks.push({ type: 'text', text: `（另外 ${dropped} 张图片超出单次上限，已省略）` })
+  if (blocks.length === 0) blocks.push({ type: 'text', text: '（QQ 插件没有返回内容）' })
+  return blocks
+}
+
+/**
+ * 按清单造一个代理工具定义。
+ * @param {object} ctx guard 实例 ctx
+ * @param {{name:string,title?:string,description?:string,parameters?:unknown,plugin?:string}} tool 清单项
+ * @param {{cfg:{baseUrl:string,token:string,timeoutMs:number}, base:string}} options
+ * @returns {object} registry-ready definition
+ */
+function makeHttpToolDefinition(ctx, tool, { cfg, base }) {
+  const name = tool.name
+  const pluginName = typeof tool.plugin === 'string' && tool.plugin.trim() !== '' ? tool.plugin.trim() : '未知插件'
+  const title = typeof tool.title === 'string' && tool.title.trim() !== '' ? tool.title.trim() : name
+  const label = `${pluginName} / ${title}`
+  const rawDescription = typeof tool.description === 'string' && tool.description.trim() !== ''
+    ? tool.description.trim()
+    : 'QQ 插件提供的工具'
+  const description = `${rawDescription}（由 QQ 插件「${pluginName}」经桥接提供；桥接或插件没开时会报错）`
+  return buildToolDefinition({
+    name,
+    description: description.slice(0, 1000),
+    // 复用外部插件那套 JSON Schema → 作者 spec 的转换，不复制第二份。
+    parameters: adaptExternalToolParameters(tool.parameters),
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: {} },
+      render: (_args, value) => (Array.isArray(value?.blocks) && value.blocks.length > 0
+        ? value.blocks
+        : [{ type: 'text', text: '（QQ 插件没有返回内容）' }]),
+    },
+    execute: async (args, exec) => {
+      // sessionId 是桥接反查 chatKey 的唯一凭据（与 qq_send_voice 同口径）：
+      // agent.id 与 agent.session.id 是同一个共享 id，优先取前者。
+      const sessionId = String(exec?.agent?.id ?? exec?.agent?.session?.id ?? '').trim()
+      // 超时口径：清单里的 timeoutMs 优先（插件自己声明，比如语音合成 120s），
+      // 没声明才退回配置的 httpTools.timeoutMs；测试注入的覆盖值仍然生效。
+      const declaredMs = Number(tool?.timeoutMs) > 0 ? Math.floor(Number(tool.timeoutMs)) : cfg.timeoutMs
+      const executeCap = httpToolsTestOverrides.executeTimeoutMs > 0
+        ? httpToolsTestOverrides.executeTimeoutMs
+        : HTTP_TOOLS_EXECUTE_MAX_MS
+      const timeoutMs = Math.min(Math.max(declaredMs > 0 ? declaredMs : HTTP_TOOLS_EXECUTE_TIMEOUT_MS, 1000), executeCap)
+      let response
+      try {
+        response = await httpToolsFetchJson(`${base}/plugins/tools/execute`, {
+          method: 'POST',
+          body: { name, args: args ?? {}, sessionId },
+          token: cfg.token,
+          timeoutMs,
+        })
+      } catch (error) {
+        if (isTimeoutFailure(error)) {
+          throw new Error(`QQ 插件工具「${label}」执行超时（${timeoutMs}ms 内没返回）：桥接或插件卡住了，稍后再试`)
+        }
+        throw new Error(`QQ 插件工具「${label}」执行失败：连不上桥接插件通道（${base}）：${describeHttpFailure(error)}`)
+      }
+      if (response.status === 401) {
+        throw new Error(`QQ 插件工具「${label}」执行失败：桥接返回 401，httpTools.token 与桥接 pluginHub.token 不一致？`)
+      }
+      if (!response.ok) {
+        throw new Error(`QQ 插件工具「${label}」执行失败：桥接返回 HTTP ${response.status}`)
+      }
+      const data = response.data ?? {}
+      if (data.ok !== true) {
+        const reason = typeof data.error === 'string' && data.error.trim() !== ''
+          ? data.error.trim()
+          : '桥接没有给出原因'
+        throw new Error(`QQ 插件工具「${label}」执行失败：${reason}`)
+      }
+      return { blocks: await httpToolContentBlocks(ctx, data.content, label) }
+    },
+  })
+}
+
+/**
+ * QQ 插件工具源：拉清单 → 注册同名代理工具。
+ *
+ * 注册时机：applyGuard 时（配置重载会重新 apply，旧 fiber 掉了工具也就没了）。
+ * 返回「这次拉取 + 注册」的 promise，失败已经内部吞掉（只 warn），主要给测试 await。
+ *
+ * @param {object} ctx guard 实例 ctx（preset 作用域）
+ * @param {unknown} config guard 实例的 Config
+ * @returns {Promise<{registered:string[]}>}
+ */
+export function applyHttpTools(ctx, config) {
+  const result = { registered: [] }
+  const tools = ctx.get?.('tools') ?? ctx.tools
+  if (!tools || typeof tools.register !== 'function') return Promise.resolve(result)
+  const cfg = resolveHttpToolsConfig(config, featureState.source)
+  if (cfg.enabled !== true) return Promise.resolve(result)
+  if (!isLoopbackHttpUrl(cfg.baseUrl)) {
+    warnHttpToolsOnce(`non-loopback:${cfg.baseUrl}`,
+      `httpTools.baseUrl 不是回环地址（${cfg.baseUrl}），已跳过 QQ 插件工具注册：`
+      + '这些工具能真的发 QQ 消息、读本机视频文件，只接受 127.0.0.1 / localhost')
+    return Promise.resolve(result)
+  }
+  if (typeof fetch !== 'function') return Promise.resolve(result)
+  const base = cfg.baseUrl.replace(/\/+$/, '')
+  const controller = new AbortController()
+  if (typeof ctx.effect === 'function') {
+    try {
+      ctx.effect(() => () => controller.abort(), 'qq-guard: http tools')
+    } catch { /* effect 注册失败不影响本次拉取 */ }
+  }
+
+  const load = async () => {
+    try {
+      let response
+      try {
+        response = await httpToolsFetchJson(`${base}/plugins/tools`, {
+          token: cfg.token,
+          timeoutMs: httpToolsManifestTimeout(),
+          signal: controller.signal,
+        })
+      } catch (error) {
+        if (controller.signal.aborted) return
+        warnHttpToolsOnce(`manifest:${base}:${String(error?.message ?? error)}`,
+          `拉取 QQ 插件工具清单失败（${base}）：${describeHttpFailure(error)}；`
+          + 'guard 其它功能不受影响，桥接 plugin hub 起来后重载配置即可重试')
+        return
+      }
+      if (response.status === 401) {
+        warnHttpToolsOnce(`manifest:${base}:401`,
+          '拉取 QQ 插件工具清单被拒（HTTP 401）：httpTools.token 与桥接 pluginHub.token 不一致？'
+          + '已跳过，guard 其它功能不受影响')
+        return
+      }
+      if (!response.ok) {
+        warnHttpToolsOnce(`manifest:${base}:http-${response.status}`,
+          `拉取 QQ 插件工具清单失败：桥接返回 HTTP ${response.status}，已跳过（guard 其它功能不受影响）`)
+        return
+      }
+      const data = response.data ?? {}
+      if (data.ok !== true) {
+        warnHttpToolsOnce(`manifest:${base}:ok-${String(data.error ?? '')}`,
+          `拉取 QQ 插件工具清单失败：桥接回包 ok!=true（${String(data.error ?? '没有给原因')}），已跳过`)
+        return
+      }
+      if (!Array.isArray(data.tools)) {
+        warnHttpToolsOnce(`manifest:${base}:bad-payload`,
+          '拉取 QQ 插件工具清单失败：回包里没有 tools 数组，已跳过')
+        return
+      }
+      const used = new Set()
+      for (const tool of data.tools.slice(0, HTTP_TOOLS_MAX_TOOLS)) {
+        if (controller.signal.aborted) return
+        const name = typeof tool?.name === 'string' ? tool.name.trim() : ''
+        if (!HTTP_TOOLS_NAME_RE.test(name)) {
+          warnHttpToolsOnce(`bad-name:${base}:${String(tool?.name)}`,
+            `QQ 插件工具清单里有非法工具名（${JSON.stringify(tool?.name)}），已跳过`)
+          continue
+        }
+        if (used.has(name)) {
+          warnHttpToolsOnce(`duplicate:${base}:${name}`,
+            `QQ 插件工具清单里出现重复工具名 ${name}，只注册第一个`)
+          continue
+        }
+        used.add(name)
+        if (!name.startsWith(EXTERNAL_TOOL_PREFIX)) {
+          warnHttpToolsOnce(`no-prefix:${base}:${name}`,
+            `QQ 插件工具 ${name} 不以 qq_ext_ 开头：虽然注册了，但执行期白名单会拒绝它，建议插件改名`)
+        }
+        try {
+          tools.register(makeHttpToolDefinition(ctx, tool, { cfg, base }))
+          result.registered.push(name)
+        } catch (error) {
+          warnHttpToolsOnce(`register:${base}:${name}`,
+            `QQ 插件工具 ${name} 注册失败（已跳过）：${error?.message ?? error}`)
+        }
+      }
+      if (result.registered.length > 0) {
+        console.info?.(`[qq-guard] 已从桥接注册 ${result.registered.length} 个 QQ 插件工具（${base}）：`
+          + result.registered.join(', '))
+      }
+    } catch (error) {
+      // 兜底：清单处理里的意外错误也只 warn，绝不冒泡到 applyGuard。
+      warnHttpToolsOnce(`unexpected:${base}:${String(error?.message ?? error)}`,
+        `QQ 插件工具源初始化异常（已忽略）：${error?.message ?? error}`)
+    }
+  }
+
+  return load().then(() => result)
 }
 
 
@@ -2535,6 +2985,10 @@ function applyGuard(ctx, config) {
   // ── 第 0.7 层：外部插件工具代理（P2，qq_ext_<slug>，按已加载插件注册）──
   applyExternalToolProxies(ctx)
 
+  // ── 第 0.75 层：桥接 plugin hub 的 QQ 插件工具（契约 §5，默认关）──
+  // 异步拉清单，拉不到只 warn（限流一次）；返回的 promise 没人等，失败已在内部吞掉。
+  void applyHttpTools(ctx, config)
+
   // ── 第 1 层：从 schema 隐藏 ────────────────────────────────────
   // `restrict()` 会**整批原子失败**：名单里只要有一个当下未注册的名字就抛错，
   // 整批限制都不生效。所以逐个注册，并且把"失败"记下来——不再静默吞错。
@@ -2779,6 +3233,7 @@ function applyImageTool(ctx) {
         + 'url 给 http/https 图片地址（NapCat 自己下载），file 给本地绝对路径 / file:// / base64://；'
         + '两个都给时用 url。对方要图片或表情包时**直接调用本工具**，不要回答「没有发图工具」；'
         + '没有可用的图片地址就如实说「给我个图片链接」，不要编造。'
+        + 'subType=1 时按表情发（QQ 里是小表情，可长按收藏），缺省按普通图片发。'
         + '**发送失败会抛错**（下载失败或 NapCat 拒收时），失败原因要如实告诉对方。',
       parameters: {
         url: {
@@ -2788,6 +3243,11 @@ function applyImageTool(ctx) {
         file: {
           type: 'string',
           description: '本地图片：绝对路径 / file:// / base64://（与 url 二选一）。',
+        },
+        subType: {
+          type: 'number',
+          description: '1 = 表情（QQ 里显示为小表情，可长按收藏），0 = 普通图片；'
+            + '不传按普通图片发。只有确实是表情包时才用 1。',
         },
       },
       output: {
@@ -2813,6 +3273,13 @@ function applyImageTool(ctx) {
         if (!flags.image) throw new Error('「发图片」技能未开启：请先在 QQ 桥接设置页的「技能与插件」里打开它。')
         if (args?.url !== undefined && typeof args.url !== 'string') throw new Error('url 必须是字符串')
         if (args?.file !== undefined && typeof args.file !== 'string') throw new Error('file 必须是字符串')
+        // subType 只认 0 / 1；其它值（含字符串 "1"）直接拒，别把脏字段透给桥接。
+        if (args?.subType !== undefined) {
+          if (typeof args.subType !== 'number' || (args.subType !== 0 && args.subType !== 1)) {
+            throw new Error('subType 只能是 0（普通图片）或 1（表情）')
+          }
+        }
+        const subType = args?.subType === 0 || args?.subType === 1 ? args.subType : undefined
         const url = String(args?.url ?? '').trim()
         const file = String(args?.file ?? '').trim()
         // 契约：恰好给一个；两个都给用 url；都不给直接抛错（不要静默发空气）。
@@ -2825,6 +3292,8 @@ function applyImageTool(ctx) {
         const id = enqueueSessionOp('image', '', '', {
           sessionId,
           ...(url !== '' ? { url } : { file }),
+          // subType 缺省时不带这个字段：老桥接不认识它也不受影响。
+          ...(subType !== undefined ? { subType } : {}),
         })
         // ★ 等桥接回执：下载失败 / NapCat 拒收时把真实原因抛给模型，别假装发出去了。
         let receipt
@@ -3042,6 +3511,19 @@ function applySettings(ctx, config) {
     'qq-guard: persona route',
   )
 
+  // ── 人设归纳（每小时动态人设）：桥接 POST 群聊记录，Host 侧调模型归纳 ──────
+  //
+  // 桥接是独立进程，调不到 ctx.llm；归纳又必须用真实模型。所以由 Host 代劳：
+  // 实现与校验都在 persona-summary.js（协议见规格 §3），这里只负责挂路由。
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: SUMMARIZE_ROUTE_PATH,
+      handler: (req, res) => handlePersonaSummarizeRoute(ctx, config, req, res, ctx.logger ?? console),
+    }),
+    'qq-guard: persona summarize route',
+  )
+
   // ── 会话指令队列（清空 / 删除 / 单人设）────────────────────────
   //
   // 为什么需要队列：桥接是独立进程，`state/sessions.json` 与 DSH 会话都是它在管，
@@ -3084,6 +3566,8 @@ function applySettings(ctx, config) {
               // P2 图片：url / file 二选一（桥接 _applyImageOp 原样取用）。
               ...(op.url ? { url: op.url } : {}),
               ...(op.file ? { file: op.file } : {}),
+              // 图片呈现形态（2026-10-26）：0 / 1 是明确语义，0 也要下发，故不能按 truthy 判。
+              ...(op.subType === 0 || op.subType === 1 ? { subType: op.subType } : {}),
               // 单群响应档位：null 也要下发（null = 跟随全局，是明确的语义，不是缺省）。
               ...(op.level === undefined ? {} : { level: op.level }),
             })

@@ -527,8 +527,10 @@ QQ 会话切模型，**不能**走 `session/selectModel` —— 它会顺带 `ag
 
 三个设计要点：
 
-- **只包被接管的流**：`managedRoutes()` 只包含 QQ 会话的主模型 + 备用模型，
-  浏览器里的会话、子代理一律原样透传，不会把「长思考不吐字」误杀。
+- **只包「该会话自己登记的」流**：`managedEntryFor(sessionId, route)` 按 `llm/stream` 的
+  `options.sessionId`（就是 `GenerateOptions.sessionId`）判断 —— 只有这个会话自己 POST 过
+  这条 route（主模型或它的某个备用）才包，其它会话（浏览器里的、子代理的、旁路归纳请求的）
+  一律原样透传。（2026-10-26 修：旧实现按「全局路由集合」匹配，同路由的别的会话也会被误杀。）
 - **错误码故意不叫 `TIMEOUT`**：`TIMEOUT` 在 `dsh-llm-retry` 的可重试名单里，
   会先同模型重试 5 次，把降级推迟到一分钟以后；未知码直接交给降级链。
 - **不 `await iterator.return()`**：适配器卡在 `await`（不是 yield 点）时 `return()` 永远不 resolve，
@@ -558,10 +560,34 @@ QQ 会话切模型，**不能**走 `session/selectModel` —— 它会顺带 `ag
 | `replyTimeoutMs` | 20000 | 桥接等回复上限；超时会 `session/cancel` 并给 QQ 回提示 |
 | `modelWatchdogMs` | 8000 | 看门狗切断时间（0=关）；只作用于 QQ 会话下发的路由 |
 | `antiDebounceMs` | 0 | 防抖窗口；0 = 沿用「活跃设置」里的 `debounceWindowMs`（默认 800） |
+| `timeoutReplyText` | （模型脑子卡住了，稍后再试） | 看门狗触发且备用模型也失败时发给 QQ 的文案；留空按默认，**英文报错绝不外发** |
 
-三个都进了 Config（`.volatile()`）、面板「全局设置 → 高级参数」有输入框，
+四个都进了 Config（`.volatile()`）、面板「全局设置 → 高级参数」有输入框，
 桥接侧通过 `runtime-config.mjs` 的 `HOT_KEYS` 热读 —— 改完保存，下一条消息生效，不用重启桥接。
 等待超过看门狗时间还没回复时，桥接日志会打一条 `⏳ 等待回复已超 N 秒，可能正在触发看门狗降级…`。
+
+### 人设锁定 / 戳一戳 / 每小时人设归纳（2026-10-26）
+
+这一批加了三个「群友侧可感知」的开关，全部在设置页、全部热更新：
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `personaLocked` | `true` | 锁定人设：群友在群里 `@bot 你要改成…` 被拒；解锁后才会把这句话追加成本群动态设定（存 `state/sessions.json` 的 `personaDelta`，不改主设定） |
+| `personaAutoUpdate` | `true` | 每小时把本群聊天记录交给模型归纳、自动补充设定；**仍受 `personaLocked` 约束** |
+| `poke.enabled` / `poke.mode` / `poke.replyText` | 开 / `poke` / `（被戳了一下，戳回去）` | 被戳一戳时：回戳 or 文字回复（模板支持 `{nick}` / `{qq}`） |
+
+归纳本身需要模型，而桥接是独立进程调不到 `ctx.llm`，所以加了一条 Host 路由：
+
+```
+POST /dsh-qq-guard/persona-summarize
+  { groupName, currentPersona, messages: [{name, qq, text}] }
+  → { ok: true, persona } | { ok: false, reason }
+```
+
+实现在 `persona-summary.js`：用插件 Config 里的 QQ 模型（provider 不可路由则回落全局默认）
+打一次**不带 sessionId** 的一次性请求（60s 上限），所以不会被 QQ 会话的看门狗误切；
+只输出 1–5 条短句，输入限 80 条 / 24000 字符，输出再截 2000 字。
+这条请求不产生 `request/header` → **不计入「数据与用量」统计**（已知口径）。
 
 ### 限制
 
@@ -611,6 +637,40 @@ QQ 会话切模型，**不能**走 `session/selectModel` —— 它会顺带 `ag
 
 面板侧 `useUsage()` 每 5 秒拉一次 `GET /dsh-qq-guard/usage`，失败保留上一份数据；
 「今日用量概览」用 `days=2`（今日 + 昨日算环比），「数据与用量」用 `days=7`。
+
+## QQ 插件工具源（`httpTools`，桥接 plugin hub）
+
+桥接新增的 plugin hub（默认 `127.0.0.1:39410`）把三个常驻插件进程
+（auto-reply / feiyu-voice / video-frames）的工具聚合成 `GET /plugins/tools`；
+guard 在 `applyGuard` 时拉一次清单，把每个工具注册成**同名**代理工具
+（`qq_ext_*` 前缀 → 执行期白名单 `SAFE_PREFIXES` 自动放行，不用改白名单）。
+模型调工具时 guard 转发 `POST /plugins/tools/execute {name, args, sessionId}`，
+由桥接按 `sessionId` 反查 `chatKey` 再打给插件。
+
+配置（写在 preset 子行 `qq-guard` 的 config 里，设置页那一行也能开）：
+
+```yaml
+httpTools:
+  enabled: true                      # 默认 false：关掉时行为与以前完全一致
+  baseUrl: http://127.0.0.1:39410    # 只接受 127.0.0.1 / localhost，否则 warn 并跳过
+  token: ''                          # 与桥接 pluginHub.token 一致；空串 = 不校验
+  timeoutMs: 10000                   # 执行超时；契约 §5 的 8s 是硬上限，这里只能调小
+```
+
+- **清单拉取**：5s 超时、`Authorization: Bearer <token>`；拉不到 / 401 / 桥接没开
+  **只 warn（同一原因限流一次）**，不影响 guard 其它功能；下次配置重载会重试。
+- **execute**：8s 超时（`min(httpTools.timeoutMs, 8000)`）。失败一律 throw 中文可读错误
+  （含「插件 / 工具」与原因：`ok:false` 的 error、401、HTTP 状态码、超时、连不上）。
+- **返回内容**：桥接给 `[{type:'text'},{type:'image',data,mimeType}]`。text 直通；
+  image **不能**原样塞进工具结果 —— DSH 的模型侧图片块是附件引用
+  `{type:'image', attachment:{attachmentId, mediaType, bytes, width, height}}`
+  （证据：`dsh-llm-pi-ai/lib/index.js` 的 `userContent()` / `collectImageRefs()`
+  直接读 `block.attachment.attachmentId`），裸 base64 会让 pi-ai 拼请求时炸。
+  所以 guard 先用 `ctx.get('attachments').saveImage()` 落附件存储再返回引用块；
+  附件服务不可用 / 存不进去时降级成一行文字（`[收到一张图片（image/jpeg，…）]`），
+  不抛错。单次最多转 8 张图片，超出的追加一行说明。
+- **容错**：清单里的坏名字（非 `[A-Za-z0-9_]` / 重名）跳过并 warn；单个工具
+  `register` 失败只 warn 不影响其它工具；非 `qq_ext_` 前缀会注册但提醒「白名单会拒它」。
 
 ## HTTP 路由
 
@@ -666,6 +726,7 @@ node test-sandbox-protocol.mjs # 沙箱 NDJSON 协议（分帧 / 半行 / 坏帧
 node test-sandbox-manager.mjs  # 沙箱管理器（假 subprocess：ready / 超时 / 熔断 / 单飞 / dispose）
 node test-sandbox-child.mjs    # 真 node 子进程（setup / fs 拦截 / 越界引用 / 死循环超时）
 node test-sandbox-route.mjs    # POST /external-plugins/test 路由（同源 / 路径注入 / 受控拒绝）
+node test-http-tools.mjs       # QQ 插件工具源：清单/注册/execute 转发/图片块/401/超时/回环限制（25 例，fake plugin hub）
 node verify-layout.mjs        # 布局几何（左导航底部按钮沉底、输入框不溢出、遮罩铺满、弹窗居中）
 node render-preview.mjs       # 生成 preview/*.html 静态版式（含弹窗与深色版；弹窗页带关键文案断言）
 ```

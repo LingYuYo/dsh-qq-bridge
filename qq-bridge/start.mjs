@@ -12,6 +12,7 @@ import { startConfigPolling, syncConfigOnce } from './src/runtime-config.mjs'
 import { startSessionOpsPolling } from './src/session-ops.mjs'
 import { buildBridgeStatus } from './src/status.mjs'
 import { acquireInstanceLock } from './src/instance-lock.mjs'
+import { PluginHub, normalizePluginHubConfig } from './src/plugin-hub.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const CONFIG_PATH = process.env.QQ_BRIDGE_CONFIG || path.join(HERE, 'config.json')
@@ -98,6 +99,31 @@ try {
 await bridge.start()
 logger.info('桥接已启动，等待 QQ 消息。按 Ctrl+C 退出。')
 
+// 插件通道（契约 §2/§3/§6）：默认全关（config.pluginHub 缺省 = enabled:false，
+// autoReply / video 也各自 false），不配置时行为与现在完全一致。
+//
+// 生命周期：必须在 bridge.start() 之后起（契约要求），退出时关闭。
+// 起不来**只 warn** —— 聊天主链路绝不能因为插件端口被占 / 插件没装而受影响。
+// 注意 autoReply 判定与视频落盘是**桥接出站**调用，不依赖这里监听成功：
+// 所以即使 start() 抛错，也把 hub 挂在 bridge 上（端口起不来只影响插件→桥接方向）。
+let pluginHub = null
+try {
+  pluginHub = new PluginHub({
+    bridge,
+    config: normalizePluginHubConfig(config.pluginHub),
+    logger,
+  })
+  bridge.pluginHub = pluginHub
+  const hubStarted = await pluginHub.start()
+  if (hubStarted.ok) {
+    logger.info(`插件通道已启动：http://127.0.0.1:${hubStarted.port}（token=${pluginHub.config.token ? '已配置' : '不校验'}）`)
+  } else {
+    logger.info('插件通道未启用（config.pluginHub.enabled=false）')
+  }
+} catch (error) {
+  logger.warn(`插件通道启动失败（不影响桥接）：${error?.message ?? error}`)
+}
+
 // 人设里现在带【底层模型】一行，必须在第一条消息之前就位。
 //
 // preset 里已经删掉静态 persona 行，默认人设正文由插件的动态 section 承载：
@@ -181,6 +207,8 @@ const shutdown = async (sig) => {
   logger.info(`收到 ${sig}，正在停止…`)
   stopPolling()
   stopOpsPolling()
+  // 插件通道先关：别再收插件的发送请求（autoReply 出站调用也随进程一起结束）。
+  if (pluginHub) await pluginHub.stop().catch(() => {})
   logger.info(`统计：${JSON.stringify(bridge.stats)}`)
   await bridge.stop().catch(() => {})
   process.exit(0)

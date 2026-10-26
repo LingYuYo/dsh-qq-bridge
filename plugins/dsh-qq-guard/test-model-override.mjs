@@ -292,7 +292,7 @@ await check('看门狗：被接管的模型静默超时 → 产出 WATCHDOG_TIME
   // 模拟「连接挂着、一个 chunk 都不吐」的适配器流
   async function* hanging() { await new Promise(() => {}) }
   const stream = hookOf(listeners, 'llm/stream').fn(
-    { provider: 'workbuddy', model: 'deepseek-v4.1-flash' },
+    { provider: 'workbuddy', model: 'deepseek-v4.1-flash', sessionId: 's-wd-1' },
     () => hanging(),
   )
   const chunks = []
@@ -315,7 +315,7 @@ await check('看门狗：正常吐字的流原样透传，不误杀', async () =
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
   const stream = hookOf(listeners, 'llm/stream').fn(
-    { provider: 'workbuddy', model: 'deepseek-v4.1-flash' },
+    { provider: 'workbuddy', model: 'deepseek-v4.1-flash', sessionId: 's-wd-2' },
     () => steady(),
   )
   const chunks = []
@@ -324,17 +324,77 @@ await check('看门狗：正常吐字的流原样透传，不误杀', async () =
   assert.equal(chunks.at(-1).reason.kind, 'stop')
 })
 
-await check('看门狗：没被接管的会话（不同路由）不加表，原样返回', () => {
+await check('看门狗：没被接管的会话（没有登记）不加表，原样返回', () => {
   const { ctx, listeners, routes } = makeCtx()
   installModelOverride(ctx, { logger: { warn() {}, info() {} }, config: { modelWatchdogMs: 40 } })
-  // 没有任何偏好 → managedRoutes 为空
+  // 没有任何偏好 → 没有会话登记，看门狗一律不碰
   const marker = { marker: true }
   const out = hookOf(listeners, 'llm/stream').fn(
-    { provider: 'raccoon', model: 'raccoon-model' },
+    { provider: 'raccoon', model: 'raccoon-model', sessionId: 's-unknown' },
     () => marker,
   )
   assert.equal(out, marker, '不该包没接管的流')
   assert.equal(routes.length, 3)
+})
+
+// ── 2026-10-26 看门狗 sessionId 隔离（真 bug 回归）──────────────────
+// 旧实现按「全局被接管路由集合」匹配：别的会话只要模型撞上就一起被切断。
+
+await check('看门狗隔离：同一路由、另一个 sessionId 静默超时也不得产出 WATCHDOG_TIMEOUT', async () => {
+  const { ctx, listeners, routes } = makeCtx()
+  installModelOverride(ctx, { logger: { warn() {}, info() {} }, config: { modelWatchdogMs: 40 } })
+  // s-iso-1 登记了 workbuddy/deepseek-v4.1-flash
+  await callRoute(routes[0], { method: 'POST', body: { sessionId: 's-iso-1', provider: 'workbuddy', model: 'deepseek-v4.1-flash' } })
+
+  async function* hanging() { await new Promise(() => {}) }
+  // 另一个会话（浏览器里用户自己的 / 子代理）用的是同一条路由，但它没登记
+  const stream = hookOf(listeners, 'llm/stream').fn(
+    { provider: 'workbuddy', model: 'deepseek-v4.1-flash', sessionId: 's-other' },
+    () => hanging(),
+  )
+  // 若被看门狗包住：40ms 就会吐 finish(error)。这里等 150ms 必须一个 chunk 都没有。
+  const first = await Promise.race([
+    (async () => { for await (const chunk of stream) return chunk })(),
+    new Promise((resolve) => setTimeout(() => resolve('idle'), 150)),
+  ])
+  assert.equal(first, 'idle', `别的会话不得被看门狗切断，实际收到：${JSON.stringify(first)}`)
+})
+
+await check('看门狗隔离：被接管会话的备用路由照样被包住（原行为不回归）', async () => {
+  const { ctx, listeners, routes } = makeCtx()
+  installModelOverride(ctx, { logger: { warn() {}, info() {} }, config: { modelWatchdogMs: 30 } })
+  await callRoute(routes[0], {
+    method: 'POST',
+    body: { sessionId: 's-iso-fb', provider: 'workbuddy', model: 'deepseek-v4.1-flash', fallbacks: [{ provider: 'raccoon', model: 'raccoon-model' }] },
+  })
+  async function* hanging() { await new Promise(() => {}) }
+  // 同一个 sessionId，流的是备用路由 → 也要被看门狗盯住
+  const stream = hookOf(listeners, 'llm/stream').fn(
+    { provider: 'raccoon', model: 'raccoon-model', sessionId: 's-iso-fb' },
+    () => hanging(),
+  )
+  const chunks = []
+  for await (const chunk of stream) chunks.push(chunk)
+  assert.equal(chunks.length, 1, `备用路由超时应只产出一个终态 chunk，实际 ${chunks.length}`)
+  assert.equal(chunks[0].type, 'finish')
+  assert.equal(chunks[0].reason.failure.code, 'WATCHDOG_TIMEOUT')
+})
+
+await check('看门狗隔离：没有 sessionId 的 options 一律透传', async () => {
+  const { ctx, listeners, routes } = makeCtx()
+  installModelOverride(ctx, { logger: { warn() {}, info() {} }, config: { modelWatchdogMs: 40 } })
+  await callRoute(routes[0], { method: 'POST', body: { sessionId: 's-iso-3', provider: 'workbuddy', model: 'deepseek-v4.1-flash' } })
+  async function* hanging() { await new Promise(() => {}) }
+  // 旁路调用（例如人设归纳）刻意不带 sessionId：不该被会话级看门狗碰
+  const stream = hookOf(listeners, 'llm/stream').fn(
+    { provider: 'workbuddy', model: 'deepseek-v4.1-flash' },
+    () => hanging(),
+  )
+  const first = await Promise.race([
+    (async () => { for await (const chunk of stream) return chunk })(),
+    new Promise((resolve) => setTimeout(() => resolve('idle'), 150)),
+  ])
+  assert.equal(first, 'idle', `没有 sessionId 时不得包看门狗，实际收到：${JSON.stringify(first)}`)
 })
 
 await check('系统事件：看门狗触发后 /system-events 能读到（error 级）', async () => {
@@ -344,7 +404,7 @@ await check('系统事件：看门狗触发后 /system-events 能读到（error 
 
   async function* hanging() { await new Promise(() => {}) }
   const stream = hookOf(listeners, 'llm/stream').fn(
-    { provider: 'workbuddy', model: 'deepseek-v4.1-flash' },
+    { provider: 'workbuddy', model: 'deepseek-v4.1-flash', sessionId: 's-ev-1' },
     () => hanging(),
   )
   // 把流消费到终态（看门狗会在 30ms 后产出 finish 并结束）
