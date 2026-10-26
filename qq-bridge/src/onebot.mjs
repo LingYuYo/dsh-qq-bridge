@@ -149,6 +149,155 @@ export function cqToText(text) {
     .trim()
 }
 
+// ── 分享卡片（json / xml 消息段，2026-10-27）────────────────────────────
+//
+// 群友分享 B 站/小程序/网页时，NapCat 给的是 json 或 xml 段，里面是一整坨结构化数据。
+// 以前一律落成 `[卡片]`，模型只能回"卡片是空的"。这里把 title 和跳转链接抠出来，
+// 正文里留下 `[分享卡片: 标题 - 链接]`，模型能据此接话/问要不要展开。
+//
+// 兼容的常见形态：
+//   · 结构化消息 com.tencent.structmsg → meta.news / meta.detail_1 里的 title / jumpUrl
+//   · 小程序 com.tencent.miniapp_01  → meta.detail_1.title / qqdocurl / preview
+//   · 旧版 xml 卡片（<title>…</title> + <qqdocurl> / <url>）
+// 都解析不出来才退回 `[卡片]`，绝不把原始 JSON 塞进 prompt。
+
+const CARD_TITLE_MAX = 120
+const CARD_URL_MAX = 500
+/** URL 字段优先级：qqdocurl 是 QQ 文档/分享的跳转地址，最准。 */
+const CARD_URL_KEYS = ['qqdocurl', 'jumpurl', 'url', 'href', 'link']
+
+/** HTML/XML 实体解码（卡片标题里 &amp;&#39; 很常见）。 */
+function decodeCardEntities(text) {
+  return String(text ?? '')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;|&#39;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#(?:x([0-9a-f]+)|(\d+));/gi, (whole, hex, dec) => {
+      const code = hex ? parseInt(hex, 16) : parseInt(dec, 10)
+      if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) return whole
+      try { return String.fromCodePoint(code) } catch { return whole }
+    })
+}
+
+function cleanCardTitle(value) {
+  const title = decodeCardEntities(String(value ?? ''))
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+  return title.length > CARD_TITLE_MAX ? `${title.slice(0, CARD_TITLE_MAX)}…` : title
+}
+
+function cleanCardUrl(value) {
+  const url = decodeCardEntities(String(value ?? '')).trim()
+  // 只认能点开的 http(s)；卡片里还有一堆 `xxx.png` / 内部 scheme。
+  if (!/^https?:\/\//i.test(url)) return ''
+  return url.length > CARD_URL_MAX ? url.slice(0, CARD_URL_MAX) : url
+}
+
+/** 递归收集卡片 JSON 里的标题/链接候选（卡片结构各平台不一样，按字段名找最稳）。 */
+function collectCardFields(node, depth, acc) {
+  if (!node || typeof node !== 'object' || depth > 8) return acc
+  if (Array.isArray(node)) {
+    for (const item of node) collectCardFields(item, depth + 1, acc)
+    return acc
+  }
+  for (const [key, value] of Object.entries(node)) {
+    if (value && typeof value === 'object') {
+      collectCardFields(value, depth + 1, acc)
+      continue
+    }
+    if (typeof value !== 'string') continue
+    const k = String(key).toLowerCase()
+    if (k === 'title') acc.titles.push(value)
+    else if (k === 'desc' || k === 'summary') acc.summaries.push(value)
+    if (CARD_URL_KEYS.includes(k)) acc.urls.push({ key: k, value })
+  }
+  return acc
+}
+
+/** xml 卡片：标签取值（容忍属性、CDATA）。 */
+function xmlTagValue(xml, tagName) {
+  const re = new RegExp(`<${tagName}[^>]*>([\\s\\S]*?)</${tagName}>`, 'i')
+  const match = re.exec(xml)
+  if (!match) return ''
+  const raw = match[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+  return decodeCardEntities(raw).trim()
+}
+
+/**
+ * 从 json / xml 消息段里抽分享卡片的标题和链接。
+ *
+ * @param {{type?:string, data?:object}} segment OneBot 消息段
+ * @returns {{title:string, url:string}|null} 两者都抽不到返回 null
+ */
+export function extractCardInfo(segment) {
+  if (!segment || typeof segment !== 'object') return null
+  const type = String(segment.type ?? '')
+  if (type !== 'json' && type !== 'xml') return null
+  const data = segment.data && typeof segment.data === 'object' ? segment.data : {}
+
+  // NapCat 的 json 段把整张卡片塞在 data 字符串里（字段名就是 data）。
+  const payload = data.data ?? data.content ?? data.value ?? ''
+  const text = typeof payload === 'string' ? payload : (payload ? JSON.stringify(payload) : '')
+
+  if (type === 'json') {
+    let parsed = null
+    if (payload && typeof payload === 'object') {
+      parsed = payload
+    } else if (text.trim()) {
+      const candidates = [text, decodeCardEntities(text)]
+      for (const candidate of candidates) {
+        try { parsed = JSON.parse(candidate); break } catch { /* 换下一种（实体转义后再试） */ }
+      }
+    }
+    if (!parsed || typeof parsed !== 'object') return null
+    const acc = { titles: [], summaries: [], urls: [] }
+    collectCardFields(parsed, 0, acc)
+    const title = cleanCardTitle(acc.titles.find((item) => cleanCardTitle(item)) || acc.summaries.find((item) => cleanCardTitle(item)) || '')
+    const url = pickCardUrl(acc.urls)
+    if (!title && !url) return null
+    return { title, url }
+  }
+
+  // xml：标题 + 链接标签，链接常见 <qqdocurl> / <url> / <jumpUrl>。
+  if (!text.trim()) return null
+  const title = cleanCardTitle(xmlTagValue(text, 'title'))
+  let url = ''
+  for (const tag of ['qqdocurl', 'jumpUrl', 'url', 'href']) {
+    url = cleanCardUrl(xmlTagValue(text, tag))
+    if (url) break
+  }
+  if (!title && !url) return null
+  return { title, url }
+}
+
+/** 按 qqdocurl > jumpUrl > url … 的优先级挑一个能点开的链接。 */
+function pickCardUrl(urls) {
+  for (const key of CARD_URL_KEYS) {
+    for (const item of urls) {
+      if (item.key !== key) continue
+      const url = cleanCardUrl(item.value)
+      if (url) return url
+    }
+  }
+  return ''
+}
+
+/**
+ * 卡片段 → 正文里的文字。
+ *
+ * @param {{type?:string, data?:object}} segment
+ * @returns {string} 解析成功返回 `[分享卡片: 标题 - 链接]`，失败返回 `[卡片]`
+ */
+export function formatCardSegment(segment) {
+  const card = extractCardInfo(segment)
+  if (!card) return '[卡片]'
+  if (card.title && card.url) return `[分享卡片: ${card.title} - ${card.url}]`
+  return card.title ? `[分享卡片: ${card.title}]` : `[分享卡片: ${card.url}]`
+}
+
 /**
  * 消息段转纯文本。
  *
@@ -189,7 +338,7 @@ export function parseMessage(message, rawMessage = '', options = {}) {
         case 'video': parts.push('[视频]'); break
         case 'file': parts.push('[文件]'); break
         case 'forward': parts.push('[合并转发]'); break
-        case 'json': case 'xml': parts.push('[卡片]'); break
+        case 'json': case 'xml': parts.push(formatCardSegment(seg)); break
         // 这些段没有文本价值，直接丢掉（reply 尤其不该把被引用内容重复一遍）
         case 'reply': case 'poke': case 'shake': case 'anonymous': case 'rps': case 'dice': break
         default: parts.push(`[${type}]`)

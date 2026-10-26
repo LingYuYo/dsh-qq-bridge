@@ -17,6 +17,7 @@ import { planRenames } from './src/rename-plan.mjs'
 import {
   OneBotClient, parseMessage, splitText, splitBubbles, charCount, typingDelayFor,
   normalizeTypingCharTiers, normalizeTypingMsTiers, extractImages, imageFileVia,
+  extractCardInfo, formatCardSegment,
 } from './src/onebot.mjs'
 import { ExternalHooksClient } from './src/external-hooks.mjs'
 import { buildSsml, synthesizeOpenAI } from './src/tts.mjs'
@@ -68,6 +69,95 @@ await check('字符串形式的消息也能解析', () => {
   const r = parseMessage('直接是字符串')
   assert.equal(typeof r, "string")
   assert.ok(r.includes('直接是字符串'))
+})
+
+console.log('\n— 分享卡片（json / xml 段）—')
+await check('B 站结构化卡片：解析出标题 + qqdocurl/jumpUrl，替换 [卡片]', () => {
+  const card = {
+    app: 'com.tencent.structmsg',
+    meta: {
+      news: {
+        title: '诗朗诵《将进token》',
+        desc: '一个关于大模型写诗的整活',
+        jumpUrl: 'https://b23.tv/AbCdEf',
+        tag: '哔哩哔哩',
+      },
+    },
+    view: 'news',
+  }
+  const seg = { type: 'json', data: { data: JSON.stringify(card) } }
+  assert.deepEqual(extractCardInfo(seg), { title: '诗朗诵《将进token》', url: 'https://b23.tv/AbCdEf' })
+  const text = parseMessage([seg])
+  assert.equal(text, '[分享卡片: 诗朗诵《将进token》 - https://b23.tv/AbCdEf]')
+})
+await check('小程序卡片：meta.detail_1 的 title + qqdocurl', () => {
+  const card = {
+    app: 'com.tencent.miniapp_01',
+    meta: {
+      detail_1: {
+        title: '抽卡模拟器',
+        desc: '点我一起抽卡',
+        qqdocurl: 'https://m.q.qq.com/a/s/abc123?from=share',
+        preview: 'https://x/preview.png',
+      },
+    },
+  }
+  const text = parseMessage([{ type: 'text', data: { text: '看这个 ' } }, { type: 'json', data: { data: JSON.stringify(card) } }])
+  assert.equal(text, '看这个 [分享卡片: 抽卡模拟器 - https://m.q.qq.com/a/s/abc123?from=share]')
+})
+await check('卡片 JSON 被 HTML 实体转义过也能解析（&quot; 等）', () => {
+  // 单层实体转义（卡片里最常见的形态：标题里带 &amp; / &quot;）
+  const escaped = '{"meta":{"news":{"title":"A &amp; B&quot;测试&quot;","jumpUrl":"https://b23.tv/xyz"}}}'
+  const text = parseMessage([{ type: 'json', data: { data: escaped } }])
+  assert.equal(text, '[分享卡片: A & B"测试" - https://b23.tv/xyz]')
+})
+await check('xml 卡片：<title> + <qqdocurl>', () => {
+  const xml = '<msg serviceID="1" templateID="1" action="web" brief="[分享] 测试">'
+    + '<item layout="2"><title><![CDATA[一个 XML 卡片]]></title><summary>摘要</summary></item>'
+    + '<source name="哔哩哔哩"/><qqdocurl>https://b23.tv/XmlCard</qqdocurl></msg>'
+  const text = parseMessage([{ type: 'xml', data: { data: xml } }])
+  assert.equal(text, '[分享卡片: 一个 XML 卡片 - https://b23.tv/XmlCard]')
+})
+await check('只有标题 / 只有链接 也能给出一半信息', () => {
+  assert.equal(
+    parseMessage([{ type: 'json', data: { data: JSON.stringify({ meta: { news: { title: '只有标题' } } }) } }]),
+    '[分享卡片: 只有标题]',
+  )
+  assert.equal(
+    parseMessage([{ type: 'json', data: { data: JSON.stringify({ meta: { news: { jumpUrl: 'https://b23.tv/OnlyUrl' } } }) } }]),
+    '[分享卡片: https://b23.tv/OnlyUrl]',
+  )
+})
+await check('解析失败 / 没有可用字段：退回 [卡片]', () => {
+  assert.equal(formatCardSegment({ type: 'json', data: { data: '{这不是 JSON' } }), '[卡片]')
+  assert.equal(formatCardSegment({ type: 'json', data: { data: '{}' } }), '[卡片]')
+  assert.equal(formatCardSegment({ type: 'json', data: { data: JSON.stringify({ meta: { news: { title: '', jumpUrl: 'javascript:void(0)' } } }) } }), '[卡片]')
+  assert.equal(formatCardSegment({ type: 'xml', data: { data: '<msg><item/></msg>' } }), '[卡片]')
+  assert.equal(parseMessage([{ type: 'json', data: { data: 'bad' } }]), '[卡片]')
+})
+await check('卡片段与普通消息混排：顺序和空白正常', () => {
+  const card = JSON.stringify({ meta: { news: { title: '混排卡片', jumpUrl: 'https://b23.tv/Mix' } } })
+  const text = parseMessage([
+    { type: 'at', data: { qq: '1000000001' } },
+    { type: 'text', data: { text: ' 看这个 ' } },
+    { type: 'json', data: { data: card } },
+    { type: 'text', data: { text: ' 挺有意思' } },
+  ])
+  assert.ok(text.startsWith('@1000000001 看这个 [分享卡片: 混排卡片 - https://b23.tv/Mix]'), text)
+  assert.ok(text.endsWith('挺有意思'), text)
+})
+
+await check('消息事件：卡片段进 event.text，模型能拿到标题 + 链接', () => {
+  const c = new OneBotClient({ logger: undefined })
+  const event = c._parseMessageEvent({
+    message_type: 'group', group_id: 1, user_id: 2, message_id: 3,
+    sender: { nickname: '小明' },
+    message: [{
+      type: 'json',
+      data: { data: JSON.stringify({ meta: { news: { title: '事件里的卡片', jumpUrl: 'https://b23.tv/Event' } } }) },
+    }],
+  }, 'group')
+  assert.equal(event.text, '[分享卡片: 事件里的卡片 - https://b23.tv/Event]')
 })
 
 console.log('\n— 长文本分片 —')
