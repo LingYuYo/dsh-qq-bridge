@@ -408,24 +408,24 @@ console.log('\n— GET /plugins/tools（聚合 + 不可达跳过 + 5s 不重打�
 
 const fakeTools = [
   {
-    name: 'qq_ext_fake_echo',
+    name: 'fake_echo',
     title: '回声',
     description: '把参数回显',
     parameters: { type: 'object', properties: { x: { type: 'number' } }, required: [] },
     timeoutMs: 120000,
   },
   {
-    name: 'qq_ext_fake_slow',
+    name: 'fake_slow',
     title: '慢工具',
     description: '永远超时',
     parameters: { type: 'object', properties: {} },
     timeoutMs: 100,
   },
-  // 契约 §4 要求工具名 qq_ext_ 开头：不在白名单里的不应下发。
-  { name: 'evil_tool', title: '不该出现', parameters: { type: 'object', properties: {} } },
+  // 名字非法的（含空格）不下发；合法的短 id 由 guard 统一加 qq_ext_ 前缀。
+  { name: 'evil tool', title: '不该出现', parameters: { type: 'object', properties: {} } },
 ]
 
-await check('聚合多个插件：qq_ext_ 前缀过滤、timeoutMs 取清单值、plugin 标来源', async () => {
+await check('聚合多个插件：名字校验（短 id 原样下发）、timeoutMs 取清单值、plugin 标来源', async () => {
   const fake = await startFakePlugin({ tools: fakeTools })
   const logs = quietLogger()
   const { b } = makeBridge()
@@ -441,7 +441,7 @@ await check('聚合多个插件：qq_ext_ 前缀过滤、timeoutMs 取清单值�
   assert.equal(res.status, 200)
   assert.equal(res.body.ok, true)
   const names = res.body.tools.map((tool) => tool.name)
-  assert.deepEqual(names, ['qq_ext_fake_echo', 'qq_ext_fake_slow'])
+  assert.deepEqual(names, ['fake_echo', 'fake_slow'])
   const echo = res.body.tools[0]
   assert.equal(echo.plugin, 'fake-a')
   assert.equal(echo.title, '回声')
@@ -472,12 +472,12 @@ await check('私聊 sessionId → args.chatKey=private:<QQ号>，content 原样�
   const hub = await attachHub(b, { enabled: true, port: 0, plugins: [{ id: 'fake-a', url: fake.url }] }, { start: true })
   const res = await api(hub, '/plugins/tools/execute', {
     method: 'POST',
-    body: { name: 'qq_ext_fake_echo', args: { x: 7 }, sessionId: 'sess-private' },
+    body: { name: 'fake_echo', args: { x: 7 }, sessionId: 'sess-private' },
   })
   assert.equal(res.status, 200)
   assert.equal(res.body.ok, true)
-  assert.equal(res.body.content[0].text, 'echo qq_ext_fake_echo 7 private:1000000001')
-  assert.equal(fake.state.lastExecute.name, 'qq_ext_fake_echo')
+  assert.equal(res.body.content[0].text, 'echo fake_echo 7 private:1000000001')
+  assert.equal(fake.state.lastExecute.name, 'fake_echo')
   assert.equal(fake.state.lastExecute.args.x, 7)
   assert.equal(fake.state.lastExecute.args.chatKey, 'private:1000000001')
 })
@@ -491,7 +491,7 @@ await check('群聊 sessionId → args.chatKey=group:<群号>', async () => {
   const hub = await attachHub(b, { enabled: true, port: 0, plugins: [{ id: 'fake-a', url: fake.url }] }, { start: true })
   const res = await api(hub, '/plugins/tools/execute', {
     method: 'POST',
-    body: { name: 'qq_ext_fake_echo', args: {}, sessionId: 'sess-group' },
+    body: { name: 'fake_echo', args: {}, sessionId: 'sess-group' },
   })
   assert.equal(res.body.ok, true)
   assert.equal(res.body.content[0].text, 'group:123456')
@@ -503,7 +503,7 @@ await check('sessionId 反查不到 → 可读错误（不发插件请求）', a
   const hub = await attachHub(b, { enabled: true, port: 0, plugins: [{ id: 'fake-a', url: fake.url }] }, { start: true })
   const res = await api(hub, '/plugins/tools/execute', {
     method: 'POST',
-    body: { name: 'qq_ext_fake_echo', args: {}, sessionId: 'unknown-session' },
+    body: { name: 'fake_echo', args: {}, sessionId: 'unknown-session' },
   })
   assert.equal(res.body.ok, false)
   assert.match(res.body.error, /先让用户发条 QQ 消息/u)
@@ -516,7 +516,7 @@ await check('工具名不存在 → {ok:false,error}', async () => {
   const hub = await attachHub(b, { enabled: true, port: 0, plugins: [{ id: 'fake-a', url: fake.url }] }, { start: true })
   const res = await api(hub, '/plugins/tools/execute', {
     method: 'POST',
-    body: { name: 'qq_ext_not_there', args: {}, sessionId: 'sess-private' },
+    body: { name: 'not_there', args: {}, sessionId: 'sess-private' },
   })
   assert.equal(res.body.ok, false)
   assert.match(res.body.error, /没有这个工具/u)
@@ -534,7 +534,7 @@ await check('插件执行超时按清单 timeoutMs 截断，回可读错误', as
   const started = Date.now()
   const res = await api(hub, '/plugins/tools/execute', {
     method: 'POST',
-    body: { name: 'qq_ext_fake_slow', args: {}, sessionId: 'sess-private' },
+    body: { name: 'fake_slow', args: {}, sessionId: 'sess-private' },
   })
   assert.equal(res.body.ok, false)
   assert.match(res.body.error, /超时/u)
@@ -551,7 +551,7 @@ await check('插件不可达：清单拉不到 → 工具不存在（不抛错�
   }, { start: true, logger: logs.logger })
   const res = await api(hub, '/plugins/tools/execute', {
     method: 'POST',
-    body: { name: 'qq_ext_anything', args: {}, sessionId: 'sess-private' },
+    body: { name: 'anything', args: {}, sessionId: 'sess-private' },
   })
   assert.equal(res.status, 200)
   assert.equal(res.body.ok, false)

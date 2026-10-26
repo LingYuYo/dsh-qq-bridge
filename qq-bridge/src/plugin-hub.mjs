@@ -44,6 +44,13 @@ export const AUTO_REPLY_NEGATIVE_TTL_MS = 30_000
 export const DEFAULT_TOOL_TIMEOUT_MS = 8000
 /** 工具名白名单前缀（契约 §4：guard 按前缀放行）。 */
 const TOOL_NAME_PREFIX = 'qq_ext_'
+/**
+ * 插件清单里的工具名（2026-10-27 改口径）：插件报**短 id**（`send_custom_voice` /
+ * `read_video` / `feiyu_status`），由 guard 统一加 `qq_ext_` 前缀再给模型——
+ * 前缀是"执行期白名单"的标记，不该让插件各自拼，拼错了模型看到的名字也对不上。
+ * 老插件仍可能报 `qq_ext_*` 全名，两种都收（guard 侧判断是否已有前缀）。
+ */
+const TOOL_NAME_RE = /^[A-Za-z0-9_]{1,64}$/
 /** 单条消息最多下载几个视频 / 并发几个（防止一条消息塞十个大文件）。 */
 const MAX_VIDEO_COUNT = 4
 const VIDEO_CONCURRENCY = 2
@@ -471,7 +478,7 @@ export class PluginHub {
       for (const tool of manifest.tools) {
         if (!tool || typeof tool !== 'object') continue
         const name = String(tool.name ?? '').trim()
-        if (!name.startsWith(TOOL_NAME_PREFIX) || seen.has(name)) continue
+        if (!TOOL_NAME_RE.test(name) || seen.has(name)) continue
         seen.add(name)
         tools.push({
           name,

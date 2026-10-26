@@ -1289,12 +1289,16 @@ const EXTERNAL_TOOL_SLUG_MAX = 48
  * @param {string} raw 工具名 / id
  * @param {Set<string>} used 已占用的工具名
  */
-function externalToolProxyName(raw, used) {
-  const base = String(raw ?? '')
+export function externalToolProxyName(raw, used, fallback = '') {
+  /** 摘要成 [a-z0-9_]：中文名会被整段吃掉，所以留一个 ASCII 兜底（toolId）。 */
+  const slug = (value) => String(value ?? '')
     .toLowerCase()
     .replace(/[^a-z0-9_]+/g, '_')
     .replace(/^_+|_+$/g, '')
-    .slice(0, EXTERNAL_TOOL_SLUG_MAX) || 'tool'
+  // 2026-10-27 修：`keyword-reply` 这类插件的中文工具名以前全被摘要成空串，
+  // 于是注册出 `qq_ext_tool` / `qq_ext_tool_2`——模型完全看不出是干什么的。
+  // 现在名字摘要不出来就退回工具的 ASCII id（`<模块>__<工具>`）。
+  const base = (slug(raw) || slug(fallback)).slice(0, EXTERNAL_TOOL_SLUG_MAX) || 'tool'
   let name = EXTERNAL_TOOL_PREFIX + base
   let seq = 2
   while (used.has(name)) {
@@ -1441,7 +1445,7 @@ function applyExternalToolProxies(ctx) {
         const already = [...registered.values()]
           .some((item) => item.moduleId === plugin.moduleId && item.toolId === toolId)
         if (already) continue
-        const proxyName = externalToolProxyName(String(tool.name || toolId), used)
+        const proxyName = externalToolProxyName(String(tool.name || toolId), used, toolId)
         used.add(proxyName)
         const displayName = String(tool.name || toolId)
         const description = `${String(tool.description ?? '').trim() || `外部插件 ${plugin.name} 提供的工具`}`
@@ -1695,8 +1699,11 @@ async function httpToolContentBlocks(ctx, content, label) {
  * @param {{cfg:{baseUrl:string,token:string,timeoutMs:number}, base:string}} options
  * @returns {object} registry-ready definition
  */
-function makeHttpToolDefinition(ctx, tool, { cfg, base }) {
+function makeHttpToolDefinition(ctx, tool, { cfg, base, execName }) {
   const name = tool.name
+  // 注册名（DSH 可见，带 qq_ext_ 前缀）与执行名（桥接清单里的原名）可能不同：
+  // 前缀只用于白名单识别，桥接只认插件自己报的短 id。
+  const callName = typeof execName === 'string' && execName.trim() !== '' ? execName.trim() : name
   const pluginName = typeof tool.plugin === 'string' && tool.plugin.trim() !== '' ? tool.plugin.trim() : '未知插件'
   const title = typeof tool.title === 'string' && tool.title.trim() !== '' ? tool.title.trim() : name
   const label = `${pluginName} / ${title}`
@@ -1730,7 +1737,7 @@ function makeHttpToolDefinition(ctx, tool, { cfg, base }) {
       try {
         response = await httpToolsFetchJson(`${base}/plugins/tools/execute`, {
           method: 'POST',
-          body: { name, args: args ?? {}, sessionId },
+          body: { name: callName, args: args ?? {}, sessionId },
           token: cfg.token,
           timeoutMs,
         })
@@ -1830,10 +1837,19 @@ export function applyHttpTools(ctx, config) {
       const used = new Set()
       for (const tool of data.tools.slice(0, HTTP_TOOLS_MAX_TOOLS)) {
         if (controller.signal.aborted) return
-        const name = typeof tool?.name === 'string' ? tool.name.trim() : ''
-        if (!HTTP_TOOLS_NAME_RE.test(name)) {
+        const rawName = typeof tool?.name === 'string' ? tool.name.trim() : ''
+        if (rawName === '') {
           warnHttpToolsOnce(`bad-name:${base}:${String(tool?.name)}`,
-            `QQ 插件工具清单里有非法工具名（${JSON.stringify(tool?.name)}），已跳过`)
+            `QQ 插件工具清单里有空工具名，已跳过`)
+          continue
+        }
+        // 2026-10-27 改口径：插件清单报**短 id**（send_custom_voice / read_video），
+        // 由这里统一加 qq_ext_ 前缀再注册——前缀只属于"执行期白名单标记"，
+        // 不该让每个插件自己拼。老插件仍报全名时不再重复加。
+        const name = rawName.startsWith(EXTERNAL_TOOL_PREFIX) ? rawName : EXTERNAL_TOOL_PREFIX + rawName
+        if (!HTTP_TOOLS_NAME_RE.test(name)) {
+          warnHttpToolsOnce(`bad-name:${base}:${name}`,
+            `QQ 插件工具清单里有非法工具名（${JSON.stringify(name)}），已跳过`)
           continue
         }
         if (used.has(name)) {
@@ -1842,12 +1858,8 @@ export function applyHttpTools(ctx, config) {
           continue
         }
         used.add(name)
-        if (!name.startsWith(EXTERNAL_TOOL_PREFIX)) {
-          warnHttpToolsOnce(`no-prefix:${base}:${name}`,
-            `QQ 插件工具 ${name} 不以 qq_ext_ 开头：虽然注册了，但执行期白名单会拒绝它，建议插件改名`)
-        }
         try {
-          tools.register(makeHttpToolDefinition(ctx, tool, { cfg, base }))
+          tools.register(makeHttpToolDefinition(ctx, { ...tool, name }, { cfg, base, execName: rawName }))
           result.registered.push(name)
         } catch (error) {
           warnHttpToolsOnce(`register:${base}:${name}`,

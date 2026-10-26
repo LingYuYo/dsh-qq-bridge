@@ -69,7 +69,7 @@ async function check(name, fn) {
 /* ── fake 桥接（plugin hub）─────────────────────────────────────── */
 
 const TOOL_VOICE = {
-  name: 'qq_ext_feiyu_send_voice',
+  name: 'send_custom_voice',
   title: '发语音',
   description: '把一段文字合成语音并以 QQ 语音条发出。',
   parameters: {
@@ -85,7 +85,7 @@ const TOOL_VOICE = {
 }
 
 const TOOL_VIDEO = {
-  name: 'qq_ext_video_read',
+  name: 'read_video',
   title: '读视频',
   description: '抽帧后把画面交给模型。',
   parameters: {
@@ -220,6 +220,18 @@ const ping = (tool, args = {}, exec = {}) => tool.execute(args, exec)
 
 console.log('QQ 插件 HTTP 工具源（fake plugin hub）：')
 
+/* ── 0. 外部插件代理命名（2026-10-27 回归：中文工具名曾退化成 qq_ext_tool） ── */
+
+await check('externalToolProxyName：中文名用 ASCII id 兜底，不再变成 qq_ext_tool / _2', () => {
+  const first = mod.externalToolProxyName('关键词自动回复', new Set(), 'keyword-reply__keyword_reply')
+  assert.equal(first, 'qq_ext_keyword_reply__keyword_reply')
+  const second = mod.externalToolProxyName('查看关键词列表', new Set([first]), 'keyword-reply__keyword_reply_list')
+  assert.equal(second, 'qq_ext_keyword_reply__keyword_reply_list')
+  assert.notEqual(second, 'qq_ext_tool_2')
+  // 连 ASCII 兜底都没有时才退回 tool（最后一道保险）
+  assert.equal(mod.externalToolProxyName('中文', new Set()), 'qq_ext_tool')
+})
+
 /* ── 1. 清单 → 注册 ─────────────────────────────────────────────── */
 
 const bridge = await startFakeBridge()
@@ -236,12 +248,12 @@ const bridge = await startFakeBridge()
     assert.ok(manifestReq, '没有请求清单')
     assert.equal(manifestReq.method, 'GET')
     assert.equal(manifestReq.headers.authorization, 'Bearer secret-token')
-    assert.deepEqual(result.registered, ['qq_ext_feiyu_send_voice', 'qq_ext_video_read'])
+    assert.deepEqual(result.registered, ['qq_ext_send_custom_voice', 'qq_ext_read_video'])
     assert.deepEqual(calls.registeredTools.map((tool) => tool.name), result.registered)
   })
 
-  const voice = calls.registeredTools.find((tool) => tool.name === 'qq_ext_feiyu_send_voice')
-  const video = calls.registeredTools.find((tool) => tool.name === 'qq_ext_video_read')
+  const voice = calls.registeredTools.find((tool) => tool.name === 'qq_ext_send_custom_voice')
+  const video = calls.registeredTools.find((tool) => tool.name === 'qq_ext_read_video')
 
   await check('描述：保留清单原文 + 标明来源插件', () => {
     assert.match(voice.description, /把一段文字合成语音/)
@@ -275,7 +287,8 @@ const bridge = await startFakeBridge()
     const value = await ping(voice, { text: '你好呀', style: 'cute' }, { agent: { id: 'sess-42' } })
     const request = bridge.state.requests.filter((req) => req.url === '/plugins/tools/execute').at(-1)
     assert.deepEqual(request.body, {
-      name: 'qq_ext_feiyu_send_voice',
+      // 执行时发给桥接的是清单里的**原名**（短 id），前缀只是 DSH 侧的白名单标记
+      name: 'send_custom_voice',
       args: { text: '你好呀', style: 'cute' },
       sessionId: 'sess-42',
     })
@@ -338,7 +351,7 @@ const bridge = await startFakeBridge()
       baseUrl: bridge.baseUrl,
     }))
     assert.equal(slowResult.registered.length, 2, '工具要先注册出来')
-    const slowVoice = slowCalls.registeredTools.find((tool) => tool.name === 'qq_ext_feiyu_send_voice')
+    const slowVoice = slowCalls.registeredTools.find((tool) => tool.name === 'qq_ext_send_custom_voice')
     try {
       await ping(slowVoice, { text: 'x' }, { agent: { id: 'sess-1' } })
       assert.fail('应该抛错')
@@ -374,7 +387,7 @@ const imageBridge = await startFakeBridge()
   }
   const { ctx, calls } = makeGuardCtx({ attachments })
   await mod.applyHttpTools(ctx, httpConfig({ enabled: true, baseUrl: imageBridge.baseUrl }))
-  const video = calls.registeredTools.find((tool) => tool.name === 'qq_ext_video_read')
+  const video = calls.registeredTools.find((tool) => tool.name === 'qq_ext_read_video')
 
   await check('图片块：落附件存储，返回 DSH 的 {type:"image",attachment} 块', async () => {
     imageBridge.state.execute = () => ({
@@ -401,7 +414,7 @@ const imageBridge = await startFakeBridge()
   await check('图片块：附件服务不可用 → 降级成一行文字（不抛错）', async () => {
     const { ctx: plainCtx, calls: plainCalls } = makeGuardCtx()
     await mod.applyHttpTools(plainCtx, httpConfig({ enabled: true, baseUrl: imageBridge.baseUrl }))
-    const plainVideo = plainCalls.registeredTools.find((tool) => tool.name === 'qq_ext_video_read')
+    const plainVideo = plainCalls.registeredTools.find((tool) => tool.name === 'qq_ext_read_video')
     imageBridge.state.execute = () => ({
       ok: true,
       content: [{ type: 'image', data: jpegBase64, mimeType: 'image/jpeg' }],
@@ -493,7 +506,7 @@ const badBridge = await startFakeBridge()
     const warns = await captureWarns(async () => {
       const { ctx, calls } = makeGuardCtx()
       const result = await mod.applyHttpTools(ctx, httpConfig({ enabled: true, baseUrl: badBridge.baseUrl }))
-      assert.deepEqual(result.registered, ['qq_ext_feiyu_send_voice', 'qq_ext_video_read'])
+      assert.deepEqual(result.registered, ['qq_ext_send_custom_voice', 'qq_ext_read_video'])
       assert.equal(calls.registeredTools.length, 2)
     })
     assert.ok(warns.some((line) => line.includes('重复工具名')), JSON.stringify(warns))
@@ -514,7 +527,7 @@ const badBridge = await startFakeBridge()
     const doomed = await startFakeBridge()
     const { ctx, calls } = makeGuardCtx()
     await mod.applyHttpTools(ctx, httpConfig({ enabled: true, baseUrl: doomed.baseUrl }))
-    const doomedVoice = calls.registeredTools.find((tool) => tool.name === 'qq_ext_feiyu_send_voice')
+    const doomedVoice = calls.registeredTools.find((tool) => tool.name === 'qq_ext_send_custom_voice')
     assert.ok(doomedVoice, '工具没注册出来')
     await doomed.close()
     try {
@@ -603,12 +616,12 @@ await check('applyGuard 挂上 httpTools：注册出工具，且 qq_ext_ 前缀�
     await waitFor(() => httpToolNames().length >= 2)
   })
   assert.deepEqual(httpToolNames().sort(), [
-    'qq_ext_feiyu_send_voice',
-    'qq_ext_video_read',
+    'qq_ext_read_video',
+    'qq_ext_send_custom_voice',
   ])
   assert.ok(gateBridge.state.requests.length > before, 'applyGuard 没去拉清单')
   assert.ok(calls.guardFn, 'tools.guard 没注册')
-  assert.equal(calls.guardFn({ name: 'qq_ext_feiyu_send_voice' }), undefined, 'qq_ext_ 应被执行期白名单放行')
+  assert.equal(calls.guardFn({ name: 'qq_ext_send_custom_voice' }), undefined, 'qq_ext_ 应被执行期白名单放行')
   assert.match(String(calls.guardFn({ name: 'ops_bash' })), /白名单/)
   assert.ok(!warns.some((line) => line.includes('拉取 QQ 插件工具清单失败')))
 })
