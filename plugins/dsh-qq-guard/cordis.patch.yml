@@ -159,7 +159,9 @@
         # OneBot 连接：只为 UI 展示与 4B 做准备；改它仍需重启桥接。
         onebot:
           wsUrl: ws://127.0.0.1:3001
-          accessToken: CHANGE_ME_随机令牌
+          # 这里留空是为了能安全入库：真实的 NapCat token 在 profile 的
+          # cordis.patch.yml（~/.dsh/profiles/<profile>/）里，加载时覆盖这份默认值。
+          accessToken: ''
           httpUrl: ''
         # NapCat 进程管理（批次 4B）。dir 留空 = 用插件内置默认目录。
         napcat:

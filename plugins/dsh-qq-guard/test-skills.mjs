@@ -138,6 +138,9 @@ const VALUE = {
   personaText: '', personaPresetDefault: '', allow: { private: [], groups: [], allowAllWhenEmpty: false },
   onebot: { wsUrl: '', accessToken: '' }, napcat: { dir: '', quickLoginQQ: '' },
   bridge: { dir: '', autoStart: false },
+  // 2026-10-27 新增两张卡用的配置块。
+  quote: { forwardMaxImages: 3 },
+  contextAware: { enabled: true, turns: 15 },
 }
 const form = {
   getSnapshot: () => ({ status: 'ready', value: VALUE, writable: true, source: 'remote' }),
@@ -640,9 +643,11 @@ check('切「发图片」开关 → 写回整数组（含 sk-image，enabled=fal
   const sk = written.find((x) => x.id === 'sk-image')
   if (!sk) throw new Error('写回的数组里没有 sk-image（老配置点一下就丢了默认项）')
   eq(sk.enabled, false, '写回的 sk-image.enabled')
-  // 2026-10-27：默认技能多了 sk-poke（戳一戳回复），合并后是 catalog + 2。
-  eq(written.length, CONFIG_CATALOG.skills.length + 2, '写回的是合并后的整数组（补 sk-image + sk-poke）')
-  if (!written.find((x) => x.id === 'sk-poke')) throw new Error('写回的数组里没有 sk-poke（新默认项丢了）')
+  // 2026-10-27：默认技能补了 sk-poke / sk-quote / sk-context，合并后是 catalog + 4。
+  eq(written.length, CONFIG_CATALOG.skills.length + 4, '写回的是合并后的整数组（补 4 个内置技能）')
+  for (const id of ['sk-poke', 'sk-quote', 'sk-context']) {
+    if (!written.find((x) => x.id === id)) throw new Error(`写回的数组里没有 ${id}（新默认项丢了）`)
+  }
 })
 
 check('老配置里没有 sk-poke → 面板补出「戳一戳回复」卡片', () => {
@@ -768,6 +773,52 @@ check('切换 autoStart 写回 bridge.autoStart（真实配置）', () => {
   eq(VALUE.bridge.autoStart, true, '配置没写回')
   tree = renderTab()
   eq(switchByLabel(tree, 'DSH 启动时自动拉起桥接进程').props['aria-checked'], 'true', '界面没跟着更新')
+})
+
+check('聊天记录解析卡片：齿轮里能改「最大读取图片数」并写回', () => {
+  VALUE.skills = [
+    ...CONFIG_CATALOG.skills.map((x) => ({ ...x })),
+    { id: 'sk-quote', name: '聊天记录解析', icon: 'search', tag: '内置', ver: '1.0.0',
+      enabled: true, desc: '合并转发读图' },
+  ]
+  VALUE.quote = { forwardMaxImages: 3 }
+  let tree = resetSkills()
+  btn(tree, '聊天记录解析 设置').props.onClick({ stopPropagation() {} })
+  tree = renderSkills()
+  const input = findAll(tree, (n) => n.tag === 'input'
+    && n.props?.['aria-label'] === '聊天记录最大读取图片数')[0]
+  if (!input) throw new Error('缺少「聊天记录最大读取图片数」输入框')
+  input.props.onChange({ target: { value: '5' } })
+  tree = renderSkills()
+  btnByText(tree, '保存').props.onClick()
+  eq(VALUE.quote.forwardMaxImages, 5, '应写回 quote.forwardMaxImages')
+})
+
+check('上下文感知卡片：开关 + 读取条数都能写回', () => {
+  VALUE.skills = [
+    ...CONFIG_CATALOG.skills.map((x) => ({ ...x })),
+    { id: 'sk-context', name: '上下文感知', icon: 'memory', tag: '内置', ver: '1.0.0',
+      enabled: true, desc: '注入最近聊天记录' },
+  ]
+  VALUE.contextAware = { enabled: true, turns: 15, smartMatch: true }
+  let tree = resetSkills()
+  btn(tree, '上下文感知 设置').props.onClick({ stopPropagation() {} })
+  tree = renderSkills()
+  const input = findAll(tree, (n) => n.tag === 'input'
+    && n.props?.['aria-label'] === '读取条数')[0]
+  if (!input) throw new Error('缺少「读取条数」输入框')
+  input.props.onChange({ target: { value: '8' } })
+  tree = renderSkills()
+  // 智能匹配开关：默认开 → 关掉后保存要写回 contextAware.smartMatch=false
+  const smart = switchByLabel(tree, '智能匹配')
+  if (!smart) throw new Error('缺少「智能匹配」开关')
+  eq(smart.props['aria-checked'], 'true', '智能匹配默认应为开启')
+  smart.props.onClick()
+  tree = renderSkills()
+  btnByText(tree, '保存').props.onClick()
+  eq(VALUE.contextAware.turns, 8, '应写回 contextAware.turns')
+  eq(VALUE.contextAware.enabled, true, '开关保持开启')
+  eq(VALUE.contextAware.smartMatch, false, '应写回 contextAware.smartMatch')
 })
 
 console.log(`\n结果：${pass} 通过 / ${process.exitCode ? 1 : 0} 失败`)

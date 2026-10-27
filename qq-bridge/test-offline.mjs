@@ -12,6 +12,7 @@ import {
   auditReply, Bridge, matchActivityKeyword, normalizeRhythm,
   normalizeSessionEntry, parseSessionKey, sessionTitleFor, ADMIN_GUARD_NOTE,
   normalizeFeatures, featuresFromManifests, capabilityLines, stripMetaNotes,
+  extractBilibiliRefs, fetchBilibiliInfo, formatBilibiliContext,
 } from './src/bridge.mjs'
 import { planRenames } from './src/rename-plan.mjs'
 import {
@@ -158,6 +159,131 @@ await check('消息事件：卡片段进 event.text，模型能拿到标题 + �
     }],
   }, 'group')
   assert.equal(event.text, '[分享卡片: 事件里的卡片 - https://b23.tv/Event]')
+})
+
+console.log('\n— B 站链接解析（直连官方 API）—')
+await check('extractBilibiliRefs：长链 / 短链 / 去重 / 非 B 站忽略 / 上限 2 条', () => {
+  const refs = extractBilibiliRefs(
+    '看这个 https://www.bilibili.com/video/BV1xx411c7mD?p=1 和 https://b23.tv/AbCd，还有 https://example.com/x',
+  )
+  assert.equal(refs.length, 2)
+  assert.equal(refs[0].bvid, 'BV1xx411c7mD')
+  assert.equal(refs[1].short, true)
+  assert.equal(extractBilibiliRefs('重复 https://b23.tv/AbCd https://b23.tv/AbCd').length, 1)
+  assert.deepEqual(extractBilibiliRefs('没有链接的普通消息'), [])
+  const many = extractBilibiliRefs(
+    'https://b23.tv/A1 https://b23.tv/A2 https://b23.tv/A3',
+  )
+  assert.equal(many.length, 2, '一条消息最多解析 2 条')
+})
+await check('fetchBilibiliInfo：直连 x/web-interface/view，取 title / desc / owner', async () => {
+  const calls = []
+  const fakeFetch = async (url, init) => {
+    calls.push({ url, headers: init?.headers ?? {} })
+    return {
+      ok: true,
+      url,
+      json: async () => ({ code: 0, data: { title: '测试视频', desc: '这是简介', owner: { name: 'UP主' } } }),
+    }
+  }
+  const info = await fetchBilibiliInfo(
+    { url: 'https://www.bilibili.com/video/BV1xx411c7mD', bvid: 'BV1xx411c7mD', short: false },
+    { fetchImpl: fakeFetch },
+  )
+  assert.equal(info.title, '测试视频')
+  assert.equal(info.desc, '这是简介')
+  assert.equal(info.owner, 'UP主')
+  assert.match(calls[0].url, /api\.bilibili\.com\/x\/web-interface\/view\?bvid=BV1xx411c7mD/)
+  assert.match(String(calls[0].headers['user-agent']), /Mozilla/)
+})
+await check('fetchBilibiliInfo：短链先跟 302 拿 BV 号，再查接口', async () => {
+  const seen = []
+  const fakeFetch = async (url) => {
+    seen.push(url)
+    if (url.startsWith('https://b23.tv/')) {
+      return { ok: true, url: 'https://www.bilibili.com/video/BV1ab411c7mD?share_source=qq', json: async () => ({}) }
+    }
+    return { ok: true, url, json: async () => ({ code: 0, data: { title: '短链视频', desc: '' } }) }
+  }
+  const info = await fetchBilibiliInfo({ url: 'https://b23.tv/XyZ', bvid: '', short: true }, { fetchImpl: fakeFetch })
+  assert.equal(info.bvid, 'BV1ab411c7mD')
+  assert.equal(info.title, '短链视频')
+  assert.equal(seen.length, 2, '短链 + API 各一次')
+})
+await check('fetchBilibiliInfo：code!=0 / 网络异常 / 短链没跳对 → null（永不抛）', async () => {
+  const apiRef = { url: 'https://www.bilibili.com/video/BV1xx411c7mD', bvid: 'BV1xx411c7mD', short: false }
+  assert.equal(await fetchBilibiliInfo(apiRef, {
+    fetchImpl: async () => ({ ok: true, json: async () => ({ code: -400, message: 'bad' }) }),
+  }), null)
+  assert.equal(await fetchBilibiliInfo(apiRef, {
+    fetchImpl: async () => { throw new Error('offline') },
+  }), null)
+  assert.equal(await fetchBilibiliInfo({ url: 'https://b23.tv/x', bvid: '', short: true }, {
+    fetchImpl: async () => ({ ok: true, url: 'https://b23.tv/login-wall' }),
+  }), null)
+})
+await check('formatBilibiliContext：标题 / 简介 / UP 主 / 链接，空值返回空串', () => {
+  const text = formatBilibiliContext({
+    title: '标题', desc: '简介', owner: 'UP',
+    url: 'https://www.bilibili.com/video/BV1xx411c7mD',
+  })
+  assert.match(text, /【B站视频】/)
+  assert.match(text, /标题：标题/)
+  assert.match(text, /简介：简介/)
+  assert.match(text, /UP主：UP/)
+  assert.equal(formatBilibiliContext(null), '')
+})
+await check('_enrichBilibiliLinks：正文追加解析结果；同 BV 命中缓存只请求一次', async () => {
+  const { b } = makeBridge()
+  let calls = 0
+  b.fetchImpl = async (url) => {
+    calls++
+    return { ok: true, url, json: async () => ({ code: 0, data: { title: '视频标题', desc: '视频简介', owner: { name: 'UP' } } }) }
+  }
+  const text = '分享 https://www.bilibili.com/video/BV1xx411c7mD 看看'
+  const once = await b._enrichBilibiliLinks(text)
+  assert.match(once, /【B站视频】/)
+  assert.match(once, /标题：视频标题/)
+  assert.match(once, /简介：视频简介/)
+  assert.equal(calls, 1)
+  await b._enrichBilibiliLinks(text)
+  assert.equal(calls, 1, '10 分钟内同一 BV 不再请求')
+})
+await check('_enrichBilibiliLinks：解析失败原样返回；开关关掉一个请求都不发', async () => {
+  const { b } = makeBridge()
+  b.fetchImpl = async () => { throw new Error('offline') }
+  const text = '看 https://b23.tv/xxx'
+  assert.equal(await b._enrichBilibiliLinks(text), text)
+
+  const { b: off } = makeBridge()
+  off.config.bilibili = { enabled: false }
+  let called = 0
+  off.fetchImpl = async () => { called++; return { ok: true, json: async () => ({}) } }
+  await off._enrichBilibiliLinks('https://www.bilibili.com/video/BV1xx411c7mD')
+  assert.equal(called, 0)
+})
+
+console.log('\n— 上下文感知：智能匹配 —')
+await check('smartMatch=true 只取最近一段连续对话（>5 分钟断开）', () => {
+  const { b } = makeBridge()
+  const now = Date.now()
+  b._chatLog.set('g:123456', [
+    { name: 'A', qq: '1', text: '很早以前', at: now - 30 * 60 * 1000 },
+    { name: 'B', qq: '2', text: '最近一', at: now - 3 * 60 * 1000 },
+    { name: 'C', qq: '3', text: '最近二', at: now - 2 * 60 * 1000 },
+    { name: 'D', qq: '4', text: '最近三', at: now - 60 * 1000 },
+  ])
+  const smart = b._recentChatLines('g:123456', 15, { smartMatch: true })
+  assert.equal(smart.length, 3, smart)
+  const plain = b._recentChatLines('g:123456', 15, { smartMatch: false })
+  assert.equal(plain.length, 4, plain)
+})
+await check('上下文感知：按 chatKey 严格隔离，另一个群读不到', () => {
+  const { b } = makeBridge()
+  const now = Date.now()
+  b._chatLog.set('g:123456', [{ name: 'A', qq: '1', text: '本群消息', at: now - 1000 }])
+  assert.equal(b._recentChatLines('g:123456', 15).length, 1)
+  assert.equal(b._recentChatLines('g:999999', 15).length, 0)
 })
 
 console.log('\n— 长文本分片 —')

@@ -28,6 +28,13 @@ const DEFAULT_MERGE_MAX_CHARS = 15
 const MIN_FIRST_PIECE_CHARS = 6
 const DEFAULT_SEND_INTERVAL_MS = 500
 const DEFAULT_DEDUP_CAPACITY = 500
+/**
+ * 引用解析（get_msg / get_forward_msg）的单次超时。
+ *
+ * 为什么不用 10s 的默认值：引用解析是**回复前的阻塞步骤**，NapCat 被风控时
+ * 一个请求能挂到天黑。给 5s，超了就静默降级只发当前消息。
+ */
+const QUOTE_FETCH_TIMEOUT_MS = 5_000
 // 打字延时分级：<10 → 200ms；10~14 → 450ms；15+ → 800ms。
 // 2026-10-23：三档的**字数边界**与**毫秒基准**都改成可配置（设置页 → 信息发送配置），
 // 这里的常量只作兜底，见 typingDelayFor 的第三参。
@@ -130,9 +137,200 @@ export function extractVideos(message) {
   return out
 }
 
+/**
+ * 解析 CQ 码里的 `k=v,k=v` 参数段。
+ *
+ * 值里的逗号/方括号在 CQ 里会被转成 HTML 实体（`&#44;` `&#91;` `&#93;`），
+ * 这里只还原这几种——URL 里的 `&` 也是实体，一并处理。
+ * @param {string} body
+ * @returns {Record<string, string>}
+ */
+function parseCqParams(body) {
+  const out = {}
+  for (const part of String(body ?? '').split(',')) {
+    const eq = part.indexOf('=')
+    if (eq <= 0) continue
+    const key = part.slice(0, eq).trim().toLowerCase()
+    const value = part.slice(eq + 1).trim()
+      .replace(/&#91;/gu, '[')
+      .replace(/&#93;/gu, ']')
+      .replace(/&#44;/gu, ',')
+      .replace(/&amp;/gu, '&')
+    if (key) out[key] = value
+  }
+  return out
+}
+
+/**
+ * 从 **CQ 码字符串**里抽图片（2026-10-27）。
+ *
+ * 为什么必须支持：`get_forward_msg` 返回的节点，`content` 在部分协议端里是
+ * `[CQ:image,file=xxx,url=https://…]` 这种字符串，不是消息段数组。
+ * 之前只处理数组，字符串走 `cqToText` 变成 `[图片]`、URL 整个丢掉——
+ * 真机表现就是「聊天记录里的图模型完全看不到」。
+ *
+ * @param {string} text
+ * @returns {Array<{url:string, file:string, summary:string, size:number}>}
+ */
+export function extractImagesFromCq(text) {
+  const out = []
+  const source = String(text ?? '')
+  const re = /\[CQ:image,([^\]]*)\]/gi
+  let matched
+  while ((matched = re.exec(source)) !== null) {
+    const params = parseCqParams(matched[1])
+    const url = String(params.url ?? '').trim()
+    const file = String(params.file ?? '').trim()
+    if (!url && !file) continue
+    const size = Number(params.file_size)
+    out.push({
+      url: url || file,
+      file,
+      summary: String(params.summary ?? params.sub_type ?? '').trim(),
+      size: Number.isFinite(size) && size > 0 ? size : 0,
+    })
+  }
+  return out
+}
+
+/** 从 CQ 码字符串里抽视频（同 extractImagesFromCq，但 type 是 video）。 */
+export function extractVideosFromCq(text) {
+  const out = []
+  const source = String(text ?? '')
+  const re = /\[CQ:video,([^\]]*)\]/gi
+  let matched
+  while ((matched = re.exec(source)) !== null) {
+    const params = parseCqParams(matched[1])
+    const url = String(params.url ?? '').trim()
+    const file = String(params.file ?? '').trim()
+    if (!url && !file) continue
+    const size = Number(params.file_size)
+    out.push({
+      url: url || file,
+      file,
+      fileSize: Number.isFinite(size) && size > 0 ? size : 0,
+    })
+  }
+  return out
+}
+
+/**
+ * 统一入口：数组走 `extractImages`，CQ 字符串走 `extractImagesFromCq`。
+ * 调用方不用关心协议端给的是哪种形态（NapCat 各版本 / go-cqhttp 不一致）。
+ * @param {Array|string} message
+ * @returns {Array<{url:string, file:string, summary:string, size:number}>}
+ */
+export function extractImagesFromMessage(message) {
+  if (Array.isArray(message)) return extractImages(message)
+  if (typeof message === 'string') return extractImagesFromCq(message)
+  return []
+}
+
+/** 统一入口：视频版。 */
+export function extractVideosFromMessage(message) {
+  if (Array.isArray(message)) return extractVideos(message)
+  if (typeof message === 'string') return extractVideosFromCq(message)
+  return []
+}
+
+/**
+ * 从消息段里抽「被引用的消息 / 合并转发」的标识（2026-10-27）。
+ *
+ * 为什么要单独抽：`parseMessage` 解析时 reply 段必须被丢掉（否则正文会把被引用
+ * 内容再念一遍），但桥接需要拿 id 去拉原文（get_msg）和聊天记录（get_forward_msg）。
+ *
+ * 支持的形态：
+ *   · `type:'reply'`  → `data.id` / `data.message_id` = 被引用消息 id
+ *   · `type:'forward'`→ `data.id` = 合并转发 id
+ *   · `type:'node'`   → NapCat 有时把转发节点内联展开，没有 id，直接给内容
+ *   · `type:'json'`   → 少数客户端的「聊天记录」分享会在 JSON 里带 forward_id
+ *
+ * @param {Array|string} message
+ * @returns {{replyId:string, forwardIds:string[], inlineNodes:Array<object>}}
+ */
+export function parseQuoteSegments(message) {
+  const out = { replyId: '', forwardIds: [], inlineNodes: [] }
+  if (!Array.isArray(message)) return out
+  for (const seg of message) {
+    if (!seg || typeof seg !== 'object') continue
+    const type = String(seg.type ?? '')
+    const data = seg.data && typeof seg.data === 'object' ? seg.data : {}
+    if (type === 'reply') {
+      const id = String(data.id ?? data.message_id ?? '').trim()
+      if (id && !out.replyId) out.replyId = id
+    } else if (type === 'forward') {
+      const id = String(data.id ?? data.forward_id ?? '').trim()
+      if (id) out.forwardIds.push(id)
+    } else if (type === 'node') {
+      if (data && typeof data === 'object') out.inlineNodes.push(data)
+    } else if (type === 'json') {
+      const id = findForwardIdInCard(data)
+      if (id) out.forwardIds.push(id)
+    }
+  }
+  return out
+}
+
+/**
+ * 从 json 卡片里找「聊天记录」的 forward_id。
+ *
+ * 不确定各客户端把 id 放在哪层，直接在序列化后的文本里按字段名抓；
+ * 抓不到就返回空串（静默，不影响卡片本身的文字化）。
+ * @param {object} data json 段的 data
+ * @returns {string}
+ */
+function findForwardIdInCard(data) {
+  const payload = data.data ?? data.content ?? data.value ?? ''
+  if (!payload) return ''
+  let text = ''
+  try {
+    text = typeof payload === 'string' ? payload : JSON.stringify(payload)
+  } catch {
+    return ''
+  }
+  const matched = /"forward_id"\s*:\s*"([0-9A-Za-z_-]{4,})"/u.exec(text)
+  return matched ? matched[1] : ''
+}
+
+/**
+ * 把 get_forward_msg 返回的一个节点压成纯文本描述。
+ *
+ * 节点形态在不同实现里不一样（`{data:{content}}` / `{sender, message}`），
+ * 这里两条路都认；图片统一写成 `［图片］`（全角方括号是关键——半角 `[图片]`
+ * 会被 bridge 的占位清理逻辑当成当前消息的占位删掉，见 `_buildPromptContent`）。
+ *
+ * @param {object} node
+ * @returns {{name:string, userId:string, text:string, images:Array<object>}|null}
+ */
+export function normalizeForwardNode(node) {
+  if (!node || typeof node !== 'object') return null
+  // 已经是规范化形态（`get_forward_msg` 内部转过一次，或测试里直接喂的假节点）：
+  // 原样返回。**必须**有这个 guard —— 规范化节点没有 content/message 字段，
+  // 再转一次会把 name/text/images 全部清空。
+  if (typeof node.text === 'string' && Array.isArray(node.images)) return node
+  const data = node.data && typeof node.data === 'object' ? node.data : node
+  const sender = (node.sender && typeof node.sender === 'object' ? node.sender : null)
+    ?? (data.sender && typeof data.sender === 'object' ? data.sender : {})
+  const name = String(data.name ?? sender.card ?? sender.nickname ?? sender.name ?? data.uin ?? '').trim()
+  const raw = data.content ?? data.message ?? node.message ?? ''
+  const message = Array.isArray(raw) ? raw : []
+  const text = parseMessage(message, typeof raw === 'string' ? raw : '').trim()
+  // 关键：节点内容可能是 CQ 字符串，必须用统一入口，否则图片 URL 会被丢掉
+  //（真机表现：聊天记录里的图全变成 `[图片]` 文本，模型看不到）。
+  const images = extractImagesFromMessage(raw)
+  const videos = extractVideosFromMessage(raw)
+  if (!text && images.length === 0 && videos.length === 0) return null
+  return {
+    name: name || '群友',
+    userId: String(data.uin ?? data.user_id ?? sender.user_id ?? ''),
+    text,
+    images,
+    videos,
+  }
+}
+
 /** 字符串格式消息里的 CQ 码转纯文本（array 格式不走这里）。 */
-export function cqToText(text) {
-  return String(text ?? '')
+export function cqToText(text) {  return String(text ?? '')
     // @ 后面必须留一个空格：否则「@123你好」会被模型当成一个整体。
     .replace(/\[CQ:at,[^\]]*qq=([^,\]]+)[^\]]*\]/gi, (_, qq) => (String(qq) === 'all' ? '@全体成员 ' : `@${qq} `))
     .replace(/\[CQ:image[^\]]*\]/gi, '[图片]')
@@ -992,20 +1190,26 @@ export class OneBotClient {
    * 通用 OneBot API 调用（echo 关联 + 超时）。
    * 解析为完整响应对象 {status, retcode, data, echo}；status='failed' 也照样 resolve，
    * 由调用方自己看 retcode。只有传输层问题（未连接 / 发送失败 / 超时）才 reject。
+   *
+   * @param {string} action
+   * @param {object} [params]
+   * @param {{timeoutMs?:number}} [options] 单次超时覆盖（引用解析用短超时，
+   *   不能让它拖住正常回复；见 bridge 的 QUOTE_FETCH_* 常量）。
    */
-  async call(action, params = {}) {
+  async call(action, params = {}, options = {}) {
     const name = String(action ?? '')
     if (!name) throw new Error('call: action 不能为空')
     const ws = this._ws
     if (!ws || ws.readyState !== WS_OPEN) throw new Error(`call ${name}: WebSocket 未连接`)
+    const timeoutMs = Number(options?.timeoutMs) > 0 ? Number(options.timeoutMs) : this.callTimeoutMs
 
     const echo = `dshqq-${++this._seq}`
     const payload = JSON.stringify({ action: name, params: params ?? {}, echo })
     return await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._pending.delete(echo)
-        reject(new Error(`call ${name} 超时（${this.callTimeoutMs}ms）`))
-      }, this.callTimeoutMs)
+        reject(new Error(`call ${name} 超时（${timeoutMs}ms）`))
+      }, timeoutMs)
       this._pending.set(echo, { resolve, reject, timer, action: name })
       try {
         ws.send(payload)
@@ -1017,9 +1221,75 @@ export class OneBotClient {
     })
   }
 
+  /**
+   * 拉一条历史消息的完整内容（引用解析用，2026-10-27）。
+   *
+   * 为什么需要：被引用原消息里的图片/视频/合并转发**不会**随当前消息一起下发，
+   * 只给一个 reply 段 id。不主动 get_msg，模型就只看到「引用了一条消息」。
+   *
+   * 永不抛：超时/撤回/风控一律返回 `{ ok:false, reason }`，由调用方静默降级。
+   * @param {string|number} messageId
+   * @returns {Promise<{ok:boolean, reason?:string, messageId?:string, userId?:string,
+   *   senderName?:string, text?:string, images?:Array<object>, videos?:Array<object>,
+   *   quote?:{replyId:string,forwardIds:string[],inlineNodes:Array<object>}, raw?:object}>}
+   */
+  async getMessage(messageId) {
+    const id = String(messageId ?? '').trim()
+    if (!/^\d+$/u.test(id)) return { ok: false, reason: `非法的 message_id：${id.slice(0, 40)}` }
+    try {
+      const res = await this.call('get_msg', { message_id: Number(id) }, { timeoutMs: QUOTE_FETCH_TIMEOUT_MS })
+      const data = res?.data && typeof res.data === 'object' ? res.data : null
+      if (!data) return { ok: false, reason: `get_msg 返回空（retcode=${res?.retcode}）` }
+      const raw = data.message ?? data.raw_message ?? ''
+      const message = Array.isArray(raw) ? raw : (typeof raw === 'string' && raw ? raw : [])
+      const sender = data.sender && typeof data.sender === 'object' ? data.sender : {}
+      // @ 昵称解析用消息所在群的缓存；私聊用 'u'（和 _parseMessageEvent 一致）。
+      const scopeKey = data.group_id == null ? 'u' : String(data.group_id)
+      return {
+        ok: true,
+        messageId: id,
+        userId: String(data.user_id ?? sender.user_id ?? ''),
+        senderName: String(sender.card || sender.nickname || ''),
+        text: parseMessage(message, data.raw_message, {
+          resolveAtName: (qq) => this._nameOf(scopeKey, qq),
+        }).trim(),
+        images: extractImagesFromMessage(raw),
+        videos: extractVideosFromMessage(raw),
+        quote: parseQuoteSegments(message),
+        raw: data,
+      }
+    } catch (error) {
+      return { ok: false, reason: error?.message ?? String(error) }
+    }
+  }
+
+  /**
+   * 拉一条合并转发（聊天记录）的内容（2026-10-27）。
+   *
+   * 返回的节点已压成 `{ name, userId, text, images }`，拼接格式由 bridge 决定。
+   * 同样永不抛：失败返回 `{ ok:false, nodes: [] }`。
+   * @param {string} forwardId
+   * @returns {Promise<{ok:boolean, reason?:string, nodes:Array<object>}>}
+   */
+  async getForwardMsg(forwardId) {
+    const id = String(forwardId ?? '').trim()
+    if (!id) return { ok: false, reason: '空的 forward_id', nodes: [] }
+    try {
+      const res = await this.call('get_forward_msg', { id }, { timeoutMs: QUOTE_FETCH_TIMEOUT_MS })
+      const data = res?.data ?? res
+      const list = Array.isArray(data?.messages) ? data.messages
+        : Array.isArray(data?.message) ? data.message
+          : Array.isArray(data) ? data
+            : []
+      const nodes = list.map((node) => normalizeForwardNode(node)).filter(Boolean)
+      return { ok: true, nodes }
+    } catch (error) {
+      return { ok: false, reason: error?.message ?? String(error), nodes: [] }
+    }
+  }
+
   /** 私聊发送（自动分片，逐条，固定 sendIntervalMs 兜底）。 */
-  async sendPrivate(userId, text) {
-    return await this._sendText('private', userId, text)
+  async sendPrivate(userId, text) {    return await this._sendText('private', userId, text)
   }
 
   /**
@@ -1742,9 +2012,13 @@ export class OneBotClient {
       }),
       // 图片段单独抽出来：text 里仍保留 [图片] 占位（审计/日志用），
       // 但桥接要拿 url 去下载，喂给支持多模态的模型（2026-10-23，任务 5）。
-      images: extractImages(message),
+      // 用统一入口：NapCat 少数版本给的是 CQ 码字符串，只处理数组会丢图。
+      images: extractImagesFromMessage(message),
       // 视频段同理（契约 §6）：桥接据 url 下载到 state/media/，追加本地路径给模型。
-      videos: extractVideos(message),
+      videos: extractVideosFromMessage(message),
+      // 引用 / 合并转发的标识（2026-10-27）：桥接拿 id 去 get_msg / get_forward_msg
+      // 拉原文，把被引用的图片与聊天记录补进上下文。这里只抽 id，不发请求。
+      quote: parseQuoteSegments(message),
       messageId: packet.message_id === undefined || packet.message_id === null ? '' : String(packet.message_id),
       senderName,
       sender: rawSender,

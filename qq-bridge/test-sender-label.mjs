@@ -110,20 +110,33 @@ await check('标签格式严格：英文冒号 + 一个空格', async () => {
   assert.equal(text.includes('：'), false, '不能用全角冒号')
 })
 
-await check('防抖合并：不同发送者各带各的标签，按行拼', async () => {
-  const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 40 } })
+await check('防抖合并：同一发送者连发两条 → 各带各的标签，按行拼', async () => {
+  const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 60 } })
   await b.handleMessage(groupMsg('第一句', { id: 'a1', senderName: '小明' }))
-  await b.handleMessage(groupMsg('第二句', {
-    id: 'a2', userId: '2000000002', senderName: '小红',
-  }))
+  await b.handleMessage(groupMsg('第二句', { id: 'a2', senderName: '小明' }))
   assert.equal(calls.prompts.length, 0, '窗口内不该立刻投递')
   // 等防抖窗口结束
   for (let i = 0; i < 40 && calls.prompts.length === 0; i++) await sleep(20)
   assert.equal(calls.prompts.length, 1)
   assert.equal(
     calls.prompts[0].text,
-    '[群友 小明(1000000001)]: 第一句\n[群友 小红(2000000002)]: 第二句',
+    '[群友 小明(1000000001)]: 第一句\n[群友 小明(1000000001)]: 第二句',
   )
+})
+
+await check('不同发送者不合并：换人立刻投递上一批（防引用串台）', async () => {
+  const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 200 } })
+  await b.handleMessage(groupMsg('第一句', { id: 'b1', senderName: '小明' }))
+  await b.handleMessage(groupMsg('第二句', {
+    id: 'b2', userId: '2000000002', senderName: '小红',
+  }))
+  // 换人时上一批被立刻 flush，不等 200ms 窗口。
+  for (let i = 0; i < 20 && calls.prompts.length < 1; i++) await sleep(10)
+  assert.equal(calls.prompts.length, 1, '换人应立刻投递上一批')
+  assert.equal(calls.prompts[0].text, '[群友 小明(1000000001)]: 第一句')
+  // 第二批（小红）等自己的窗口到点再发。
+  for (let i = 0; i < 40 && calls.prompts.length < 2; i++) await sleep(20)
+  assert.equal(calls.prompts[1].text, '[群友 小红(2000000002)]: 第二句')
 })
 
 await check('纯图片消息：标签占文本位置，图片说明句接在后面', async () => {

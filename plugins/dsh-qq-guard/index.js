@@ -281,6 +281,11 @@ const DEFAULT_SKILLS = [
   // 2026-10-27「戳一戳回复」：回复列表（文字 + 可选表情包）在齿轮弹窗里增删改。
   { id: 'sk-poke', name: '戳一戳回复', icon: 'activity', tag: '内置', ver: '1.0.0', enabled: true,
     desc: '被戳时从回复列表随机挑一条：先发文字，再单独发表情包（sub_type:1）；也可以选回戳对方。' },
+  // 2026-10-27 两张新卡：合并转发图片上限 / 戳一戳模型回复的上下文注入。
+  { id: 'sk-quote', name: '聊天记录解析', icon: 'search', tag: '内置', ver: '1.0.0', enabled: true,
+    desc: '合并转发里的图片会提取成多模态附件；这里控制最多读几张，避免 Token 爆炸。' },
+  { id: 'sk-context', name: '上下文感知', icon: 'memory', tag: '内置', ver: '1.0.0', enabled: true,
+    desc: '戳一戳选「模型回复」时，把本会话最近 N 条聊天记录注入给模型（按会话隔离）。' },
   { id: 'sk-vision', name: '图片理解', icon: 'image', tag: '内置', ver: '1.3.2', enabled: true,
     desc: '识别聊天里发的截图与照片，提取文字、报错信息和界面元素。' },
   { id: 'sk-search', name: '网页搜索', icon: 'search', tag: '内置', ver: '1.0.4', enabled: true,
@@ -635,8 +640,9 @@ const Config = Schema.object({
     enabled: Schema.boolean()
       .description('戳一戳响应总开关。')
       .default(true).volatile(),
-    mode: Schema.union(['poke', 'text'])
-      .description('回复方式：poke = 回戳；text = 按下面的回复列表随机回一条。')
+    mode: Schema.union(['poke', 'text', 'model'])
+      .description('回复方式：poke = 回戳；text = 按下面的回复列表随机回一条；'
+        + 'model = 让模型读本群最近聊天记录后回一句（依赖「上下文感知」卡片）。')
       .default('poke').volatile(),
     replyText: Schema.string()
       .description('文字回复模板，支持 {nick} / {qq} 占位。回复列表为空时兜底用它。')
@@ -653,7 +659,45 @@ const Config = Schema.object({
         .default(''),
     })).description('固定文本回复候选（随机挑一条）。空 = 退回 replyText。最多 30 条。')
       .default([]).volatile(),
+    // 抽查策略（2026-10-27）：列表里有图时，是保证每次都抽到图，还是纯随机。
+    // 用户反馈「图片触发率低」，所以默认 priority_image（有图必发图）。
+    replyMode: Schema.union(['priority_image', 'pure_random'])
+      .description('抽回复的策略：priority_image = 列表里有图就一定抽图；pure_random = 纯随机。')
+      .default('priority_image').volatile(),
+    // 随机延迟（2026-10-27）：真人反应不是固定毫秒，给一个区间每次现取。
+    delayMinMs: Schema.number()
+      .description('戳一戳响应的最小延迟（毫秒）。0 = 不延迟。')
+      .default(200).min(0).max(10000).volatile(),
+    delayMaxMs: Schema.number()
+      .description('戳一戳响应的最大延迟（毫秒）。小于最小值时按最小值处理。')
+      .default(500).min(0).max(10000).volatile(),
+    // 文字/表情模式下是否也顺手回戳一下（2026-10-27）。
+    withAction: Schema.boolean()
+      .description('「文字 / 表情回复」模式下是否同时回戳对方。仅 text 模式生效。')
+      .default(false).volatile(),
   }).description('戳一戳').default({}),
+  // ── 聊天记录解析（2026-10-27）────────────────────────────────
+  // 合并转发里图片很多，全拉会撑爆 Token；这里控制最多读几张当多模态附件。
+  quote: Schema.object({
+    forwardMaxImages: Schema.number()
+      .description('合并转发里最多读取几张图片作为附件（0 = 只留文本占位；最多 10）。')
+      .default(3).min(0).max(10).volatile(),
+  }).description('聊天记录解析').default({}),
+  // ── 上下文感知（2026-10-27）──────────────────────────────────
+  // 戳一戳选「模型回复」时，把本会话最近 N 条聊天记录注入 prompt。
+  // 严格按会话 key（g:群号 / u:QQ号）隔离，两个群互不串。
+  contextAware: Schema.object({
+    enabled: Schema.boolean()
+      .description('上下文感知总开关：关闭后「模型回复」不带本群聊天记录。')
+      .default(true).volatile(),
+    turns: Schema.number()
+      .description('注入多少条最近聊天记录（0 = 关闭，只让模型回一句；最多 50）。')
+      .default(15).min(0).max(50).volatile(),
+    smartMatch: Schema.boolean()
+      .description('智能匹配：只带最近一段连续对话（相邻两条超过 5 分钟就断开），'
+        + '避免把半小时前的闲聊也塞给模型；关闭则纯取最近 N 条。')
+      .default(true).volatile(),
+  }).description('上下文感知').default({}),
   antiDebounceMs: Schema.number()
     .description('消息防抖合并窗口（毫秒）。0 = 沿用「活跃设置」里的 debounceWindowMs（默认 800）。')
     .default(0).min(0).max(60000).volatile(),

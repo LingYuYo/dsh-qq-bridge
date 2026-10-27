@@ -1,0 +1,15 @@
+# 依赖
+node_modules/
+
+# 运行时配置：含 NapCat access token、白名单、本机路径
+# 模板见 config.example.json（克隆后复制成 config.json 再改）
+config.json
+config.json.bak-*
+
+# 会话状态 / 聊天记录 / 用量统计 / 实例锁
+state/
+.bridge.lock
+
+# 日志
+*.log
+logs/

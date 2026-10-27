@@ -799,6 +799,15 @@ window.__ModuleLoader__.load({
       'poke.replyText': '（被戳了一下，戳回去）',
       // 图文混合回复列表（2026-10-27）：每条 { text, image }，image 是 Host 落盘后的绝对路径。
       'poke.replies': [],
+      // 抽回复策略 / 随机延迟 / 文字模式下是否顺手回戳（2026-10-27）。
+      'poke.replyMode': 'priority_image',
+      'poke.delayMinMs': 200,
+      'poke.delayMaxMs': 500,
+      'poke.withAction': false,
+      // 聊天记录解析 / 上下文感知（2026-10-27）。
+      'quote.forwardMaxImages': 3,
+      'contextAware.enabled': true,
+      'contextAware.turns': 15,
       // 语音合成（「发语音」技能的后端）默认值：Edge 免 Key，音色用晓伊。
       'voice.provider': 'edge',
       'voice.baseUrl': '',
@@ -855,10 +864,28 @@ window.__ModuleLoader__.load({
       desc: '被戳时从回复列表随机挑一条：先发文字，再单独发表情包（sub_type:1）；也可以选回戳对方。',
     }
 
-    /** 内置技能的新增项：配置里缺哪个补哪个，已有条目原样保留（不打断排序）。 */
-    const DEFAULT_SKILLS_LOCAL = [DEFAULT_IMAGE_SKILL, DEFAULT_POKE_SKILL]
+    /**
+     * 内置「聊天记录解析」技能（2026-10-27）：控制合并转发里读几张图。
+     */
+    const DEFAULT_QUOTE_SKILL = {
+      id: 'sk-quote', name: '聊天记录解析', icon: 'search', tag: '内置', ver: '1.0.0', enabled: true,
+      desc: '合并转发里的图片会提取成多模态附件；这里控制最多读几张，避免 Token 爆炸。',
+    }
 
-    /** 合并默认技能项：已有 sk-image / sk-poke 原样返回，缺的补在末尾。 */
+    /**
+     * 内置「上下文感知」技能（2026-10-27）：戳一戳「模型回复」时注入最近聊天记录。
+     */
+    const DEFAULT_CONTEXT_SKILL = {
+      id: 'sk-context', name: '上下文感知', icon: 'memory', tag: '内置', ver: '1.0.0', enabled: true,
+      desc: '戳一戳选「模型回复」时，把本会话最近 N 条聊天记录注入给模型（按会话隔离）。',
+    }
+
+    /** 内置技能的新增项：配置里缺哪个补哪个，已有条目原样保留（不打断排序）。 */
+    const DEFAULT_SKILLS_LOCAL = [
+      DEFAULT_IMAGE_SKILL, DEFAULT_POKE_SKILL, DEFAULT_QUOTE_SKILL, DEFAULT_CONTEXT_SKILL,
+    ]
+
+    /** 合并默认技能项：已有同 id 的原样返回，缺的补在末尾。 */
     function mergeDefaultSkills(list) {
       const rows = Array.isArray(list) ? list : []
       const missing = DEFAULT_SKILLS_LOCAL.filter((item) => !rows.some((row) => row && row.id === item.id))
@@ -3334,7 +3361,7 @@ window.__ModuleLoader__.load({
 
     /** 已真实接入桥接 / Host 的条目 id；其余只加「开发中」标签，不动配置。 */
     const IMPLEMENTED_IDS = {
-      skill: ['sk-voice', 'sk-vision', 'sk-search', 'sk-image', 'sk-poke'],
+      skill: ['sk-voice', 'sk-vision', 'sk-search', 'sk-image', 'sk-poke', 'sk-quote', 'sk-context'],
       plugin: ['pl-guard', 'pl-debounce', 'pl-ratelimit'],
     }
 
@@ -3376,8 +3403,35 @@ window.__ModuleLoader__.load({
           options: [
             { value: 'poke', label: '回戳对方' },
             { value: 'text', label: '文字 / 表情回复（按列表随机）' },
+            { value: 'model', label: '模型回复（读本群最近聊天）' },
           ],
-          hint: '选「回戳」时，下面的回复列表不生效。',
+          hint: '选「回戳」时，下面的回复列表不生效；选「模型回复」会消耗 token。',
+        },
+        {
+          path: 'poke.delayMinMs', type: 'number', label: '最小延迟（毫秒）',
+          min: 0, max: 10000, step: 50,
+          hint: '任何响应（回戳 / 文字 / 表情）之前先等一个随机时长，模拟真人。0 = 不延迟。',
+        },
+        {
+          path: 'poke.delayMaxMs', type: 'number', label: '最大延迟（毫秒）',
+          min: 0, max: 10000, step: 50,
+          hint: '每次现取一个 [最小, 最大] 之间的随机数；小于最小值时按最小值算。',
+        },
+        {
+          // 文字/表情/模型回复模式下顺手戳回去：先 send_poke，再发内容。
+          // 回戳模式本来就在戳，这个开关没意义，所以只在非 poke 模式出现。
+          path: 'poke.withAction', type: 'switch', label: '同时回戳',
+          when: (valueOf) => valueOf('poke.mode') !== 'poke',
+          hint: '开启后延迟结束时先真实戳回去，紧接着再发文字 / 表情 / 模型回复。',
+        },
+        {
+          path: 'poke.replyMode', type: 'select', label: '抽回复策略',
+          when: (valueOf) => valueOf('poke.mode') === 'text',
+          options: [
+            { value: 'priority_image', label: '有图必发（列表里有图就优先抽图）' },
+            { value: 'pure_random', label: '纯随机（按条目数平均）' },
+          ],
+          hint: '觉得表情包出现太少就用「有图必发」；想让它更像随手一发就用「纯随机」。',
         },
         {
           path: 'poke.replies', type: 'replies', label: '回复列表',
@@ -3385,6 +3439,27 @@ window.__ModuleLoader__.load({
           when: (valueOf) => valueOf('poke.mode') === 'text',
           hint: '命中时随机挑一条：先发文字（能引用就带引用），再单独发表情包（sub_type:1）。'
             + '文字支持 {nick} / {qq}；图片存本机，单张 ≤ 5MB。',
+        },
+      ],
+      // 聊天记录解析（2026-10-27）：合并转发里最多读几张图当多模态附件。
+      'sk-quote': [
+        {
+          path: 'quote.forwardMaxImages', type: 'number', label: '聊天记录最大读取图片数',
+          min: 0, max: 10, step: 1,
+          hint: '合并转发里最多提取几张图片作为附件（0 = 只留 [图片] 占位；上限 10）。'
+            + '张数越多越耗 token，默认 3 张。',
+        },
+      ],
+      // 上下文感知（2026-10-27）：戳一戳「模型回复」注入最近聊天记录。
+      'sk-context': [
+        {
+          path: 'contextAware.enabled', type: 'switch', label: '启用上下文感知',
+          hint: '关闭后，「模型回复」不带本会话聊天记录，只让模型回一句。',
+        },
+        {
+          path: 'contextAware.turns', type: 'number', label: '读取条数',
+          min: 0, max: 50, step: 1,
+          hint: '注入最近多少条聊天记录（默认 15；0 = 关闭注入）。按会话隔离，群与群互不串。',
         },
       ],
       'sk-voice': [
@@ -3437,6 +3512,33 @@ window.__ModuleLoader__.load({
           path: 'webSearch.model', type: 'text', label: '搜索模型 model',
           placeholder: '留空 = 跟随插件默认',
           hint: '留空 = 用插件默认模型；一般不用改。',
+        },
+      ],
+      // 聊天记录解析（2026-10-27）：合并转发里最多读几张图。
+      'sk-quote': [
+        {
+          path: 'quote.forwardMaxImages', type: 'number', label: '聊天记录最大读取图片数',
+          min: 0, max: 10, step: 1,
+          hint: '一段聊天记录里常塞十几张图，全读会撑爆 Token。默认 3；0 = 只留文本占位、不读图。',
+        },
+      ],
+      // 上下文感知（2026-10-27）：戳一戳「模型回复」时注入本会话最近聊天记录。
+      // 提取严格按 chatKey（g:群号 / u:QQ号）隔离，不同群不会串。
+      'sk-context': [
+        {
+          path: 'contextAware.enabled', type: 'switch', label: '启用上下文感知',
+          hint: '关闭后「模型回复」只回一句，不带本会话聊天记录。',
+        },
+        {
+          path: 'contextAware.turns', type: 'number', label: '读取条数',
+          min: 0, max: 50, step: 1,
+          hint: '注入最近多少条聊天记录（默认 15）。0 = 等同关闭；按会话严格隔离。',
+          when: (valueOf) => valueOf('contextAware.enabled') !== false,
+        },
+        {
+          path: 'contextAware.smartMatch', type: 'switch', label: '智能匹配',
+          hint: '开启后只带最近一段连续对话（相邻两条超过 5 分钟就断开），避免把半小时前的闲聊也塞给模型。',
+          when: (valueOf) => valueOf('contextAware.enabled') !== false,
         },
       ],
       'pl-debounce': [

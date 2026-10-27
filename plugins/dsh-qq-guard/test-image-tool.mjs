@@ -268,7 +268,7 @@ await check('output.schema 合法（object + additionalProperties:false）且 re
   assert.equal(typeof tool.output.render, 'function')
   const rendered = tool.output.render({}, { queued: true, sent: true, id: 'op-1', detail: '已发送图片（via=url，retcode=0）' })
   assert.equal(rendered[0].type, 'text')
-  assert.match(rendered[0].text, /已发到 QQ/)
+  assert.match(rendered[0].text, /已发送图片|已发到 QQ/u)
 })
 
 console.log('\n— 执行期 guard：技能开关 —')

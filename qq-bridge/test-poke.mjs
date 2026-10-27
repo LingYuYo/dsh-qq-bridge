@@ -36,7 +36,8 @@ function makeBridge({ poke, allow, nameOf } = {}) {
       sendDelayMs: 0,
       stateFile: path.join(os.tmpdir(), `qq-poke-state-${process.pid}-${Math.random().toString(36).slice(2)}.json`),
       rhythm: { activityLevel: 3, debounceWindowMs: 0 },
-      ...(poke === undefined ? {} : { poke }),
+      // 关掉随机延迟（2026-10-27 新增）：这些用例测的是判定与下发，不该每条等 200~500ms。
+      poke: { delayMinMs: 0, delayMaxMs: 0, ...(poke ?? {}) },
     },
     logger: { info() {}, warn() {}, error() {} },
   })

@@ -76,6 +76,9 @@ const HOT_KEYS = [
   'personaLocked',
   'personaAutoUpdate',
   'poke',
+  // 2026-10-27：合并转发读图上限 / 上下文感知（戳一戳「模型回复」注入聊天记录）。
+  'quote',
+  'contextAware',
   // OneBot 连接信息只用于 UI 展示；WS 连接在启动时建立，改它仍需重启桥接。
   'onebot',
 ]

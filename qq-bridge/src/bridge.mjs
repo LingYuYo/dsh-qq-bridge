@@ -21,7 +21,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { OneBotClient, normalizeTypingCharTiers, normalizeTypingMsTiers } from './onebot.mjs'
+import { OneBotClient, normalizeTypingCharTiers, normalizeTypingMsTiers, normalizeForwardNode } from './onebot.mjs'
 import { DshClient } from './dsh.mjs'
 import { synthesize, TTS_MAX_CHARS, DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER } from './tts.mjs'
 import { ExternalHooksClient } from './external-hooks.mjs'
@@ -351,6 +351,168 @@ const POKE_REPLY_MAX = 30
 const POKE_IMAGE_GAP_MS = 350
 /** 表情包单张上限（与 UI 的 5MB 提示一致）；超了不发，只 warn。 */
 const POKE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+/** 戳一戳随机延迟的默认区间（2026-10-27）：模拟真人反应，不做固定延迟。 */
+const POKE_DELAY_DEFAULT_MIN = 200
+const POKE_DELAY_DEFAULT_MAX = 500
+/** 延迟配置的硬上限（配置填错也不至于把一条戳一戳拖到分钟级）。 */
+const POKE_DELAY_MAX_MS = 10_000
+
+/* ── 引用消息深度解析（2026-10-27）──────────────────────────────
+ *
+ * 引用回复时 OneBot 只给一个 `reply` 段（message_id），被引用原消息里的图片、
+ * 视频、合并转发**都不在当前消息里**。不主动拉取，模型就只能看到「引用了一条消息」。
+ *
+ * 代价与约束：
+ *   · get_msg / get_forward_msg 是同步阻塞在回复链路上的 → 单次超时 5s（onebot 侧）；
+ *   · 同一条被多人引用会重复拉 → 结果缓存 10 分钟；
+ *   · 拉不到（撤回/风控/无权限）一律静默降级，只记 debug，不加任何「读取失败」提示
+ *     —— 让模型看到一句「读取失败」比看不到更糟，它会开始解释自己为什么读不到。
+ */
+const QUOTE_CACHE_TTL_MS = 10 * 60 * 1000
+const QUOTE_CACHE_MAX = 100
+/** 聊天记录最多展开多少条节点（再多模型也读不完，还挤占上下文）。 */
+const QUOTE_LOG_MAX_NODES = 40
+/** 拼进上下文的引用文本上限（超了截断，注明截断）。 */
+const QUOTE_TEXT_MAX = 4000
+/** 引用里最多带几张图（防止一条引用把上下文塞满）。 */
+const QUOTE_IMAGE_MAX = 6
+/**
+ * 合并转发里最多提取几张图当附件（2026-10-27）。
+ *
+ * 为什么单独限而不是共用 QUOTE_IMAGE_MAX：一段聊天记录里塞十几张图很常见，
+ * 全拉会把 Token 撑爆，也会让「哪张图对应哪句话」彻底对不上。
+ * 具体上限走配置 `quote.forwardMaxImages`（默认 3，范围 0~10）；设 0 = 只留文本占位。
+ */
+const QUOTE_FORWARD_IMAGE_DEFAULT = 3
+const QUOTE_FORWARD_IMAGE_CAP = 10
+/**
+ * 上下文感知「智能匹配」（2026-10-27）：只取最近一段连续对话。
+ *
+ * 为什么需要：`_chatLog` 保留 1 小时，直接取最近 15 条很可能把半小时前的
+ * 另一段闲聊也带上 —— 模型回一句戳一戳时容易答非所问。开了智能匹配就从最后
+ * 一条往前扫，遇到超过这个间隔就断开，只带当前这一轮聊天的上下文。
+ */
+const CONTEXT_SMART_GAP_MS = 5 * 60 * 1000
+/**
+ * B 站网页解析（2026-10-27）。
+ *
+ * 为什么不让模型走 web_fetch：`bilibili.com` 对无头抓取会弹验证码页
+ * （模型看到的是 Blocked / captcha），白等一轮还答错。这里在桥接侧直连
+ * 官方 `x/web-interface/view` 接口，只取标题 / 简介塞进上下文；
+ * 其它网页仍然让模型自己用 web_fetch。
+ */
+const BILIBILI_VIEW_API = 'https://api.bilibili.com/x/web-interface/view'
+const BILIBILI_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+  + '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+/** 一条消息最多解析几个 B 站链接（再多就成刷屏了）。 */
+const BILIBILI_LINK_MAX = 2
+const BILIBILI_TIMEOUT_MS = 6000
+/** 同一 BV 号 10 分钟内不重复请求（群里常有人连发同一条）。 */
+const BILIBILI_CACHE_TTL_MS = 10 * 60 * 1000
+const BILIBILI_CACHE_MAX = 100
+/** 简介截断：API 的 desc 可能上千字，没必要整段塞进上下文。 */
+const BILIBILI_DESC_MAX = 400
+/** `.../video/BV1xx411c7mD` 与短链 `b23.tv/xxxx`。 */
+const BILIBILI_BVID_RE = /\/video\/(BV[0-9A-Za-z]{10})(?:[/?#]|$)/i
+const BILIBILI_SHORT_RE = /https?:\/\/b23\.tv\/([0-9A-Za-z]+)/gi
+
+/**
+ * 从一段文本里抽 B 站链接（长链带 BV 号 / b23.tv 短链）。
+ *
+ * @param {string} text
+ * @returns {Array<{url:string, bvid:string, short:boolean}>} 按出现顺序去重
+ */
+export function extractBilibiliRefs(text) {
+  const source = String(text ?? '')
+  if (!source) return []
+  const out = []
+  const seen = new Set()
+  const push = (ref) => {
+    const key = ref.bvid || ref.url
+    if (!key || seen.has(key)) return
+    seen.add(key)
+    out.push(ref)
+  }
+  // 先扫长链（能直接拿到 BV 号），再扫短链；短链同一 BV 会去重。
+  const longRe = /https?:\/\/(?:www\.|m\.)?bilibili\.com\/video\/(BV[0-9A-Za-z]{10})(?:[/?#]\S*)?/gi
+  for (const match of source.matchAll(longRe)) {
+    const bvid = match[1]
+    const rawUrl = match[0].replace(/[)）\]】,，。；;！!？?]+$/u, '')
+    push({ url: rawUrl, bvid, short: false })
+  }
+  BILIBILI_SHORT_RE.lastIndex = 0
+  for (const match of source.matchAll(BILIBILI_SHORT_RE)) {
+    push({ url: `https://b23.tv/${match[1]}`, bvid: '', short: true })
+  }
+  return out.slice(0, BILIBILI_LINK_MAX)
+}
+
+/** 一条 B 站视频信息 → 追加到上下文里的文字块。 */
+export function formatBilibiliContext(info) {
+  if (!info) return ''
+  const title = String(info.title ?? '').trim()
+  const desc = String(info.desc ?? '').trim()
+  if (!title && !desc) return ''
+  const lines = ['【B站视频】']
+  if (title) lines.push(`标题：${title}`)
+  if (desc) {
+    lines.push(`简介：${desc.length > BILIBILI_DESC_MAX ? `${desc.slice(0, BILIBILI_DESC_MAX)}…` : desc}`)
+  }
+  const owner = String(info.owner ?? '').trim()
+  if (owner) lines.push(`UP主：${owner}`)
+  if (info.url) lines.push(`链接：${info.url}`)
+  return lines.join('\n')
+}
+
+/**
+ * 查询一条 B 站视频的标题 / 简介。**永不抛**，失败返回 null。
+ *
+ * @param {{url:string, bvid:string, short:boolean}} ref
+ * @param {{fetchImpl?:Function, timeoutMs?:number, logger?:object}} [options]
+ * @returns {Promise<{bvid:string, title:string, desc:string, owner:string, url:string}|null>}
+ */
+export async function fetchBilibiliInfo(ref, options = {}) {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch
+  if (typeof fetchImpl !== 'function') return null
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : BILIBILI_TIMEOUT_MS
+  const headers = {
+    'user-agent': BILIBILI_USER_AGENT,
+    referer: 'https://www.bilibili.com/',
+    accept: 'application/json, text/plain, */*',
+  }
+  const withTimeout = (signal) => signal ?? AbortSignal.timeout(timeoutMs)
+  try {
+    let bvid = String(ref?.bvid ?? '').trim()
+    let url = String(ref?.url ?? '').trim()
+    // 短链要先跟一次跳转拿到 BV 号（b23.tv 只做 302，不返回内容）。
+    if (!bvid && ref?.short) {
+      const res = await fetchImpl(url, { redirect: 'follow', headers, signal: withTimeout() })
+      const finalUrl = String(res?.url ?? '')
+      const match = BILIBILI_BVID_RE.exec(finalUrl)
+      if (!match) return null
+      bvid = match[1]
+    }
+    if (!/^BV[0-9A-Za-z]{10}$/.test(bvid)) return null
+    const res = await fetchImpl(`${BILIBILI_VIEW_API}?bvid=${encodeURIComponent(bvid)}`, {
+      headers,
+      signal: withTimeout(),
+    })
+    if (!res || res.ok === false) return null
+    const json = await res.json().catch(() => null)
+    if (!json || json.code !== 0 || !json.data) return null
+    const data = json.data
+    return {
+      bvid,
+      title: String(data.title ?? ''),
+      desc: String(data.desc ?? ''),
+      owner: String(data.owner?.name ?? ''),
+      url: url || `https://www.bilibili.com/video/${bvid}`,
+    }
+  } catch {
+    return null
+  }
+}
+
 /** 模型中途发的图排在本轮文字之后：间隔与戳一戳一致（太近会被合成一条通知）。 */
 const IMAGE_AFTER_TEXT_GAP_MS = 350
 /**
@@ -452,13 +614,34 @@ function normalizePoke(source) {
     .filter((row) => row.text.trim() !== '' || row.image !== '')
     .slice(0, POKE_REPLY_MAX)
   const mode = String(raw.mode ?? '').trim()
+  // 2026-10-27：新增 'model'（让模型读本会话上下文回一句）。
+  // 'fixed_text' 是 text 的老别名，继续认。
+  const normalizedMode = mode === 'model' ? 'model'
+    : (mode === 'text' || mode === 'fixed_text' ? 'text' : 'poke')
+  // 随机延迟（2026-10-27）：真人反应不是固定毫秒。max < min 时按 min 处理，
+  // 否则区间为空、随机数会算出负数，sleep 直接跳过。
+  const delayMinMs = clampNumber(raw.delayMinMs, POKE_DELAY_DEFAULT_MIN, 0, POKE_DELAY_MAX_MS)
+  const delayMaxMs = Math.max(delayMinMs,
+    clampNumber(raw.delayMaxMs, POKE_DELAY_DEFAULT_MAX, 0, POKE_DELAY_MAX_MS))
   return {
     enabled: raw.enabled !== false,
-    // 只认 'text' / 'fixed_text'（后者是 UI 说法），其它（含脏数据）一律按默认「回戳」。
-    mode: mode === 'text' || mode === 'fixed_text' ? 'text' : 'poke',
+    mode: normalizedMode,
     replyText,
     replies,
+    // 有图必抽 vs 纯随机：用户反馈「图片触发率低」，所以默认有图必抽。
+    replyMode: raw.replyMode === 'pure_random' ? 'pure_random' : 'priority_image',
+    // 文字/表情模式下顺手回戳一下（默认关，保持老行为）。
+    withAction: raw.withAction === true,
+    delayMinMs,
+    delayMaxMs,
   }
+}
+
+/** 数值字段归一：非法值用默认，越界夹到 [min,max]，取整。 */
+function clampNumber(value, fallback, min, max) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(max, Math.max(min, Math.round(n)))
 }
 
 /**
@@ -648,6 +831,13 @@ export class Bridge {
     this._pokeAt = new Map()   // key -> 上次回戳时间戳（ms）
     // 戳一戳回复列表上次抽中的下标：避免连续两次挑到同一条（只有 1 条时无所谓）。
     this._pokeLastPick = new Map() // key -> 上次下标
+    // 引用解析缓存（2026-10-27）：message_id / forward_id -> { at, promise }。
+    // 群里一条消息可能被多人引用，缓存 10 分钟，避免每次都打 get_msg。
+    this._quoteCache = new Map()
+    // B 站视频信息缓存（2026-10-27）：bvid -> { at, info }，同上，10 分钟。
+    this._biliCache = new Map()
+    // fetch 可注入：测试里替换掉它，B 站 API / 短链跳转的解析就能确定性断言。
+    this.fetchImpl = typeof globalThis.fetch === 'function' ? globalThis.fetch : null
     // 图文顺序（2026-10-27）：正在跑模型的那一轮会把 key 记在这里。
     // 模型在思考途中调 qq_send_image 时，图片先排队，等本轮文字发完再发 ——
     // 否则 QQ 上会先弹表情包、后弹文字，看着像发错顺序。
@@ -2236,9 +2426,222 @@ export class Bridge {
       .catch(() => '')
   }
 
-  /**
-   * 群聊「@bot 你要改成…」动态人设指令（2026-10-26）。
+  /* ── 引用消息深度解析（2026-10-27）────────────────────────────
    *
+   * 引用回复时 OneBot 只给一个 reply 段 id，被引用原消息里的图片 / 视频 / 合并转发
+   * 都不会随当前消息下发。这里按需拉回来，拼进送给模型的上下文：
+   *   · 原消息文字 → `[引用 昵称] 原文`
+   *   · 原消息图片 → 追加进 images（走和普通图片一样的多模态通路）
+   *   · 原消息里的合并转发 → 展开成 `[聊天记录] … [结束]`
+   *   · 当前消息自带的合并转发 → 同样展开
+   *
+   * 容错：任何一步失败都静默降级（debug 日志，不往正文写「读取失败」——
+   * 告诉模型「你读不到」比不告诉更糟，它会开始解释自己为什么读不到）。
+   */
+
+  /**
+   * 带 TTL 的引用拉取缓存。
+   *
+   * 缓存的是 **Promise** 而不是结果：同一条消息被多人同时引用时，
+   * 只会真的打一次 get_msg，其余人等同一个 Promise。
+   */
+  _cachedQuoteFetch(cacheKey, loader) {
+    const hit = this._quoteCache.get(cacheKey)
+    if (hit && Date.now() - hit.at < QUOTE_CACHE_TTL_MS) return hit.promise
+    const promise = Promise.resolve()
+      .then(loader)
+      .catch((error) => {
+        this.logger.debug?.(`引用拉取失败（${cacheKey}）：${error?.message ?? error}`)
+        return { ok: false }
+      })
+    this._quoteCache.set(cacheKey, { at: Date.now(), promise })
+    if (this._quoteCache.size > QUOTE_CACHE_MAX) {
+      const oldest = this._quoteCache.keys().next().value
+      this._quoteCache.delete(oldest)
+    }
+    return promise
+  }
+
+  /** get_msg（带缓存）；客户端旧版本没有这个方法时直接降级。 */
+  async _fetchQuotedMessage(messageId) {
+    if (typeof this.qq?.getMessage !== 'function') return { ok: false }
+    return this._cachedQuoteFetch(`msg:${messageId}`, () => this.qq.getMessage(messageId))
+  }
+
+  /** get_forward_msg（带缓存）。 */
+  async _fetchForward(forwardId) {
+    if (typeof this.qq?.getForwardMsg !== 'function') return { ok: false, nodes: [] }
+    return this._cachedQuoteFetch(`fwd:${forwardId}`, () => this.qq.getForwardMsg(forwardId))
+  }
+
+  /**
+   * 把聊天记录节点拼成一段纯文本。
+   *
+   * 格式（刻意用行首换行分层，模型读得出来谁说了什么）：
+   *   [聊天记录]
+   *   张三: 你好
+   *   李四: ［图片］
+   *   [结束]
+   *
+   * ⚠️ 图片占位用**全角** `［图片］`：`_buildPromptContent` 会把当前消息里的
+   * 半角 `[图片]` 占位删掉（因为图片已经作为 image part 附上了），
+   * 聊天记录里的占位必须躲开那条清理，否则模型会以为那个人什么都没发。
+   */
+  _formatForwardLog(nodes) {
+    const list = Array.isArray(nodes) ? nodes.slice(0, QUOTE_LOG_MAX_NODES) : []
+    const rows = []
+    for (const node of list) {
+      const name = String(node?.name ?? '').trim() || '群友'
+      const body = String(node?.text ?? '')
+        .replace(/\[图片\]/gu, '［图片］')
+        .trim()
+      const imageCount = Array.isArray(node?.images) ? node.images.length : 0
+      if (!body && imageCount === 0) continue
+      // 一个节点里多张图时标数量：文本里的占位数量要和真正附上的附件对得上，
+      // 否则模型看到 3 个 image part、文本里只有 1 个 ［图片］，会怀疑自己漏读了。
+      const imageLabel = imageCount > 1 ? `［图片×${imageCount}］` : '［图片］'
+      // 整行只有图片占位（「［图片］［图片］」）时合成「［图片×2］」；
+      // 图文混排的节点保持原样（把占位抠掉会读成「看图」这种半句话）。
+      const onlyImages = /^(?:［图片］\s*)+$/u.test(body)
+      const lineBody = onlyImages && imageCount > 1 ? imageLabel : body
+      // 一行一条；节点内部的原生换行保留（不折叠），缩进对齐一下即可。
+      rows.push(`${name}: ${lineBody || imageLabel}`)
+    }
+    if (rows.length === 0) return ''
+    const truncated = list.length < (Array.isArray(nodes) ? nodes.length : 0)
+      ? '\n…（聊天记录过长，只展开了前面一部分）'
+      : ''
+    return `[聊天记录]\n${rows.join('\n')}${truncated}\n[结束]`
+  }
+
+  /**
+   * 展开一组合并转发（id + 内联节点）。
+   *
+   * 2026-10-27 修：以前只把图片写成文本 `［图片］`，真实 URL 全丢了 —— 模型读得懂
+   * 文字、却完全看不到转发里的图（真机上是「转发里的图是不显示的」）。
+   * 现在节点里的 `type:'image'` 会同时被抽进 `images`，走和普通图片一样的多模态通路。
+   *
+   * @param {{forwardIds?:string[], inlineNodes?:Array<object>}} quote
+   * @returns {Promise<{text:string, images:Array<object>}>}
+   */
+  async _expandForwards(quote) {
+    const ids = Array.isArray(quote?.forwardIds) ? quote.forwardIds : []
+    const inline = Array.isArray(quote?.inlineNodes) ? quote.inlineNodes : []
+    const blocks = []
+    const images = []
+    const seen = new Set()
+    // 上限走配置（默认 3，可在「技能与插件 → 聊天记录解析」里改）。
+    const maxImages = this._quoteConfig().forwardMaxImages
+    /** 按「节点顺序」收集图片：最多 maxImages 张，按 url/file 去重。 */
+    const collectImages = (nodes) => {
+      for (const node of nodes) {
+        for (const image of (Array.isArray(node?.images) ? node.images : [])) {
+          const ref = String(image?.url || image?.file || '')
+          if (!ref || seen.has(ref)) continue
+          seen.add(ref)
+          if (images.length < maxImages) images.push(image)
+        }
+      }
+    }
+    if (inline.length > 0) {
+      const nodes = inline.map((node) => normalizeForwardNode(node)).filter(Boolean)
+      const block = this._formatForwardLog(nodes)
+      if (block) blocks.push(block)
+      collectImages(nodes)
+    }
+    // 一条消息里带多个转发的情况极少，最多展开 3 个，避免一条消息打死桥接。
+    for (const id of ids.slice(0, 3)) {
+      const res = await this._fetchForward(id)
+      if (res?.ok && Array.isArray(res.nodes) && res.nodes.length > 0) {
+        // 再 normalize 一次是幂等的（已有 guard）：真实链路里 get_forward_msg 已经转过，
+        // 但测试 / 老协议端可能直接给原始节点（CQ 字符串那种）。
+        const nodes = res.nodes.map((node) => normalizeForwardNode(node)).filter(Boolean)
+        const block = this._formatForwardLog(nodes)
+        if (block) blocks.push(block)
+        collectImages(nodes)
+      }
+    }
+    // total 是「去重后的图片总数」，用来在正文里如实说明「另有 N 张没附上」。
+    return { text: blocks.join('\n'), images, totalImages: seen.size }
+  }
+
+  /**
+   * 解析本轮要补进上下文的引用内容。
+   *
+   * @param {object} msg OneBot 规范化消息（含 `quote`）
+   * @param {string} key 会话 key（日志用）
+   * @returns {Promise<{text:string, images:Array<object>, videos:Array<object>}>}
+   */
+  async _resolveQuotedContext(msg, key) {
+    const lines = []
+    const images = []
+    const videos = []
+    const quote = msg?.quote && typeof msg.quote === 'object' ? msg.quote : {}
+
+    // ① 被引用的原消息
+    const replyId = String(quote.replyId ?? '').trim()
+    if (replyId) {
+      const quoted = await this._fetchQuotedMessage(replyId)
+      if (quoted?.ok) {
+        const who = String(quoted.senderName || quoted.userId || '').trim() || '某人'
+        const body = String(quoted.text ?? '')
+          .replace(/\[图片\]/gu, '［图片］')
+          .trim()
+        if (body) lines.push(`[引用 ${who}] ${body}`)
+        const quotedImages = Array.isArray(quoted.images) ? quoted.images : []
+        if (quotedImages.length > 0) {
+          images.push(...quotedImages.slice(0, QUOTE_IMAGE_MAX))
+          lines.push(`（引用的消息里有 ${quotedImages.length} 张图片，已一并附上）`)
+        }
+        const quotedVideos = Array.isArray(quoted.videos) ? quoted.videos : []
+        if (quotedVideos.length > 0) videos.push(...quotedVideos.slice(0, 2))
+        // 原消息本身是合并转发 → 继续展开一层（不递归更深，防环）。
+        const nested = await this._expandForwards(quoted.quote)
+        if (nested.text) {
+          lines.push(nested.text)
+          // 文本里有图片占位却一张都没提取到 URL → 多半是协议端返回结构变了，
+          // 这条 warn 是真机排查的唯一线索（2026-10-27 踩过 CQ 字符串那次）。
+          if (nested.images.length === 0 && /［图片/u.test(nested.text)) {
+            this.logger.warn?.(`引用里的聊天记录有图片占位但没提取到 URL（${key}），请检查 get_forward_msg 返回结构`)
+          }
+        }
+        if (nested.images.length > 0) {
+          images.push(...nested.images)
+          const extra = nested.totalImages - nested.images.length
+          lines.push(`（聊天记录里的 ${nested.images.length} 张图片已作为附件一并附上`
+            + `${extra > 0 ? `，另有 ${extra} 张因数量限制没有附上` : ''}）`)
+        }
+      } else {
+        this.logger.debug?.(`引用解析降级（${key}）：${quoted?.reason ?? '拉取失败'}`)
+      }
+    }
+
+    // ② 当前消息自带的合并转发（可能是「聊天记录」分享）
+    if ((quote.forwardIds?.length ?? 0) > 0 || (quote.inlineNodes?.length ?? 0) > 0) {
+      const own = await this._expandForwards(quote)
+      if (own.text) {
+        lines.push(own.text)
+        if (own.images.length === 0 && /［图片/u.test(own.text)) {
+          this.logger.warn?.(`聊天记录有图片占位但没提取到 URL（${key}），请检查 get_forward_msg 返回结构`)
+        }
+      }
+      if (own.images.length > 0) {
+        images.push(...own.images)
+        const extra = own.totalImages - own.images.length
+        lines.push(`（聊天记录里的 ${own.images.length} 张图片已作为附件一并附上`
+          + `${extra > 0 ? `，另有 ${extra} 张因数量限制没有附上` : ''}）`)
+      }
+    }
+
+    let text = lines.join('\n').trim()
+    if (text.length > QUOTE_TEXT_MAX) {
+      text = `${text.slice(0, QUOTE_TEXT_MAX)}\n…（引用内容过长，已截断）`
+    }
+    return { text, images: images.slice(0, QUOTE_IMAGE_MAX), videos }
+  }
+
+  /**
+   * 群聊「@bot 你要改成…」动态人设指令（2026-10-26）。   *
    * 为什么放在静音/档位之前：这是**显式指令**，不是闲聊——群友明确说了要改什么，
    * 不该因为活跃档位没到就被吞掉（和 `/` 指令同一个理由）。
    *
@@ -2377,6 +2780,25 @@ export class Bridge {
     // 未读：通过白名单的消息一律计数（包括后面被档位/静音/限频拦掉的），
     // 只有真的把回复发出去才清零。空文本（纯图片/表情）也计数——那也是消息。
     this._noteIncoming(key, text || (images.length > 0 ? '[图片]' : ''))
+    // 引用 / 合并转发深度解析（2026-10-27）：必须在空消息判定**之前**——
+    // 「只引用了别人的图、自己没打字」也是一条要回的消息。
+    // 聊天记录缓冲（每小时人设归纳）仍用原文与原始图片，别让引用内容污染归纳。
+    const chatText = text
+    const chatImageCount = images.length
+    // 斜杠指令不拼引用块：DSH 只认**以 `/` 开头**的 prompt，前面加一行 `[引用…]`
+    // 会让 `/clear` 之类的指令直接失效（省一次 get_msg，也少一次误触发）。
+    const quoted = chatText.startsWith('/')
+      ? { text: '', images: [], videos: [] }
+      : await this._resolveQuotedContext(msg, key)
+    if (quoted.text) text = text ? `${quoted.text}\n${text}` : quoted.text
+    if (quoted.images.length > 0) {
+      images.push(...quoted.images)
+      this._prefetchImages(quoted.images)
+    }
+    if (quoted.videos.length > 0) {
+      const quotedVideoNote = await this._startVideoNote({ videos: quoted.videos })
+      if (quotedVideoNote) text = text ? `${text}\n${quotedVideoNote}` : quotedVideoNote
+    }
     // 既没有文字也没有图片（纯表情 / 空消息）：没有可投递的内容，跳过。
     if (!text && images.length === 0) {
       this.logger.info?.(`收到空消息（${key}），跳过`)
@@ -2384,12 +2806,14 @@ export class Bridge {
     }
     // 0) 群聊 @bot「你要改成…」：动态人设指令（显式指令，先于静音/档位判定）。
     //    已消化时直接 return，也不进每小时归纳的上下文缓冲（那不是聊天内容）。
-    if (await this._handlePersonaCommand(msg, text, key)) return
+    //    ⚠️ 用 chatText（原文）：引用块里恰好有「你要改成」不该被当成指令。
+    if (await this._handlePersonaCommand(msg, chatText, key)) return
     // 0.5) 插件通道的自动回复（契约 §3）：命中就直接发、不进 DSH。
     //      位置刻意放在静音 / 响应档位之前——插件是「有人问就答」，不受节奏设置影响；
     //      `/` 指令不拦截（显式操作仍归管理员）。失败只 warn，消息照常往下走。
-    if (text && !text.startsWith('/')) {
-      const auto = await this._matchAutoReply(msg, key, text)
+    //      同样用原文匹配：自动回复规则是按「这个人说了什么」写的，不是按引用块。
+    if (chatText && !chatText.startsWith('/')) {
+      const auto = await this._matchAutoReply(msg, key, chatText)
       if (auto?.handled) {
         this.stats.autoReplies++
         const sent = await this._send(msg, auto.reply)
@@ -2399,23 +2823,24 @@ export class Bridge {
       }
     }
     // 每小时归纳的上下文缓冲：通过白名单的群聊消息都算（`/` 指令由 _noteChatLog 自己排除）。
-    this._noteChatLog(key, msg, text, images)
+    // 2026-10-27：用 chatText（原文）而不是拼了引用的 text —— 引用别人的话进归纳会串味。
+    this._noteChatLog(key, msg, chatText, images.slice(0, chatImageCount))
     // 1) `/` 开头的指令：只有 allow.admins 里的人能执行。
     //    非管理员直接回一句提示并丢弃，**不投递 DSH**（省 token，也不给模型被诱导的机会）。
     //    管理员指令不过响应档位（私聊/群聊都算），但白名单仍然有效——见 isAllowed。
-    const isCommand = text.startsWith('/')
+    const isCommand = chatText.startsWith('/')
     if (isCommand) {
       if (!this.isAdmin(msg)) {
         this.stats.commandsBlocked++
-        this.logger.warn?.(`非管理员指令被拦下：${key} sender=${msg.userId} text=${text.slice(0, 40)}`)
+        this.logger.warn?.(`非管理员指令被拦下：${key} sender=${msg.userId} text=${chatText.slice(0, 40)}`)
         const sent = await this._send(msg, '⚠️ 权限不足，只有管理员才能执行此指令。')
         if (!(sent && sent.ok === false)) this._noteReplied(key)
         return
       }
-      this.logger.info?.(`管理员指令放行：${key} text=${text.slice(0, 60)}`)
+      this.logger.info?.(`管理员指令放行：${key} text=${chatText.slice(0, 60)}`)
     }
     // 2) 禁言指令：命中即静音该会话，自己也不回复（否则「闭嘴」还在说话）。
-    if (this._handleMuteCommand(key, text)) return
+    if (this._handleMuteCommand(key, chatText)) return
     // 3) 静音期内一律不回复、不建会话。
     if (this._isMuted(key)) {
       this.stats.muted++
@@ -2424,7 +2849,7 @@ export class Bridge {
     }
     // 4) 响应档位（activityLevel）：判否时**不回复、不建会话**，避免白建一堆会话。
     //    管理员指令是显式操作，不受档位限制（否则群里没 @ 就永远执行不了）。
-    if (!isCommand && !this.shouldRespond(msg, text, key)) {
+    if (!isCommand && !this.shouldRespond(msg, chatText, key)) {
       this.stats.skipped++
       this.logger.info?.(`会话 ${key} 未达响应档位（activityLevel=${this._activityLevelFor(key)}），跳过`)
       return
@@ -2545,8 +2970,11 @@ export class Bridge {
    * 限频、会话建立、投递、审计、发送都在这里收口。
    */
   async _processBatch(key, msg, texts, images = []) {
-    const text = texts.map((t) => String(t ?? '')).filter(Boolean).join('\n').trim()
-    if (!text && images.length === 0) return
+    const rawText = texts.map((t) => String(t ?? '')).filter(Boolean).join('\n').trim()
+    if (!rawText && images.length === 0) return
+    // B 站链接解析（2026-10-27）：模型直接抓 bilibili.com 会撞验证码页，
+    // 这里在投递前把标题/简介补进正文；其它网页仍交给模型的 web_fetch。
+    const text = await this._enrichBilibiliLinks(rawText)
     return await this.queues.run(key, async () => {
       const started = Date.now()
       // 图文顺序：本轮进行中，模型中途发的图先排队（见 _applyImageOp）。
@@ -2728,7 +3156,7 @@ export class Bridge {
       const fallbackText = note(`（对方发来 ${list.length} 张图片，但当前模型不支持图片输入，你看不到图片内容，别编造。）`)
       return { content: [{ type: 'text', text: fallbackText }], fallbackText, images: 0 }
     }
-    const parts = await this._loadImageParts(list, (value) => {
+    const { parts, failed } = await this._loadImageParts(list, (value) => {
       // 每张成功下载的图：先生成短 token（同步、不 await），再 fire-and-forget 把
       // **原始字节**转交给 qq-sticker 的原始图池（GIF 动画保真，见 _relayRawImage）。
       // token 先落进 markers，POST 失败只是插件那边 peek 不到 → 自然回落到附件路径。
@@ -2737,7 +3165,12 @@ export class Bridge {
       rawRelays.push(this._relayRawImage(token, value))
     })
     if (parts.length === 0) {
-      const fallbackText = note('（对方发来图片，但下载或解码失败，你看不到图片内容，别编造。）')
+      // 全部失败（多半是腾讯临时签名过期）：把文本里的占位改写成「链接已过期」，
+      // 别让模型对着一堆 `［图片］` 猜图里是什么（2026-10-27 真机踩过）。
+      const marked = this._markExpiredImagePlaceholders(plain, { allFailed: true })
+      const fallbackText = marked
+        ? `${marked}\n\n（图片链接已过期或下载失败，你看不到图片内容，别编造。）`
+        : '（对方发来图片，但下载或解码失败，你看不到图片内容，别编造。）'
       return { content: [{ type: 'text', text: fallbackText }], fallbackText, images: 0 }
     }
     // 等 POST 落定（每张上限 RAW_IMAGE_TIMEOUT_MS、并发发出）：插件只认池子里**真的存在**
@@ -2752,7 +3185,12 @@ export class Bridge {
     // 图片已经作为 image part 附上了，文本里的 [图片] 占位就没必要再给模型看，
     // 免得它把占位符当成「看不到」的证据。纯图片消息则补一句中性说明。
     const cleaned = plain.replace(/\[图片\]/gu, '').trim()
-    const head = cleaned || '（对方只发了图片，没有文字）'
+    // 部分失败：逐张替换对不上号（文本占位与 images 数组不是严格同序），
+    // 改成在正文末尾如实说还有几张看不到。
+    const head = (cleaned || '（对方只发了图片，没有文字）')
+      + (failed.length > 0
+        ? `\n（另有 ${failed.length} 张图片链接已过期或下载失败，你看不到）`
+        : '')
     // 标记只进**发给 DSH 的 prompt content**（插件按文本顺序对齐 image 块），
     // 不影响 QQ 里显示的文本（那是消息本身，不经这里）。
     const headWithMarkers = keepMarkers.length > 0
@@ -2905,8 +3343,12 @@ export class Bridge {
    */
   async _loadImageParts(images, onLoaded) {
     const parts = []
+    /** 下载/解码失败的图（index 是传入数组里的位置，用于回写占位说明）。 */
+    const failed = []
     const seen = new Set()
-    for (const image of images.slice(0, IMAGE_MAX_COUNT)) {
+    const list = images.slice(0, IMAGE_MAX_COUNT)
+    for (let index = 0; index < list.length; index++) {
+      const image = list[index]
       const ref = String(image?.url || image?.file || '').trim()
       if (!ref || seen.has(ref)) continue
       seen.add(ref)
@@ -2917,10 +3359,30 @@ export class Bridge {
         // 回调自己不许抛：转交是可选增强，坏了也不能挡住这一轮聊天。
         try { onLoaded?.(result.value) } catch { /* 忽略 */ }
       } else if (result && result.ok === false) {
+        // 2026-10-27：失败要记下来，调用方会把文本里的占位改写成「链接已过期」，
+        // 免得模型对着一堆 `［图片］` 猜内容。
+        failed.push({ index, ref })
         this.logger.warn?.(`图片下载失败（跳过）：${result.error?.message ?? result.error}`)
       }
     }
-    return parts
+    return { parts, failed }
+  }
+
+  /**
+   * 把文本里的图片占位改写成「链接已过期」。
+   *
+   * 只在**全部图片都失败**时改写（allFailed=true）：部分失败时逐张替换对不上号
+   * （文本占位和 images 数组不是严格同序的），改成在正文末尾追加一句「另有 N 张」。
+   * @param {string} text
+   * @param {{allFailed:boolean}} options
+   * @returns {string}
+   */
+  _markExpiredImagePlaceholders(text, { allFailed }) {
+    const source = String(text ?? '')
+    if (!allFailed) return source
+    return source
+      .replace(/［图片］/gu, '［图片(链接已过期，无法查看)］')
+      .replace(/\[图片\]/gu, '[图片(链接已过期，无法查看)]')
   }
 
   /**
@@ -3151,6 +3613,93 @@ export class Bridge {
   }
 
   /**
+   * 现读「聊天记录解析」配置（`quote`）。
+   * @returns {{forwardMaxImages:number}} 0~10；0 = 只留文本占位不读图
+   */
+  _quoteConfig() {
+    const hot = this.live?.quote
+    const source = hot && typeof hot === 'object' && !Array.isArray(hot) ? hot : (this.config?.quote ?? {})
+    const raw = Number(source?.forwardMaxImages)
+    const value = Number.isFinite(raw) ? Math.round(raw) : QUOTE_FORWARD_IMAGE_DEFAULT
+    return {
+      forwardMaxImages: Math.min(QUOTE_FORWARD_IMAGE_CAP, Math.max(0, value)),
+    }
+  }
+
+  /**
+   * 现读「上下文感知」配置（`contextAware`）。
+   * @returns {{enabled:boolean, turns:number, smartMatch:boolean}}
+   *   turns = 注入的最近聊天条数（0~50；0 = 关闭）
+   *   smartMatch = 只取最近一段连续对话（5 分钟内有来有回的部分）
+   */
+  _contextAwareConfig() {
+    const hot = this.live?.contextAware
+    const source = hot && typeof hot === 'object' && !Array.isArray(hot) ? hot : (this.config?.contextAware ?? {})
+    const raw = Number(source?.turns)
+    return {
+      enabled: source?.enabled !== false,
+      turns: Number.isFinite(raw) ? Math.min(50, Math.max(0, Math.round(raw))) : 15,
+      smartMatch: source?.smartMatch !== false,
+    }
+  }
+
+  /**
+   * 现读「B 站解析」开关（2026-10-27）。
+   *
+   * 默认开：这是纯增益的上下文补充，失败也只是少一段标题；关掉走配置
+   * `bilibili.enabled=false`（桥接 config.json，或 DSH 设置页热配置）。
+   * @returns {{enabled:boolean}}
+   */
+  _bilibiliConfig() {
+    const hot = this.live?.bilibili
+    const source = hot && typeof hot === 'object' && !Array.isArray(hot) ? hot : (this.config?.bilibili ?? {})
+    return { enabled: source?.enabled !== false }
+  }
+
+  /**
+   * 把消息里的 B 站链接补成「标题 + 简介」再交给模型（2026-10-27）。
+   *
+   * 失败/超时/没链接都原样返回，绝不因为解析拖慢或打断正常聊天。
+   * 同一条消息最多解析 {@link BILIBILI_LINK_MAX} 个，同一 BV 号 10 分钟内不重复请求。
+   *
+   * @param {string} text
+   * @returns {Promise<string>}
+   */
+  async _enrichBilibiliLinks(text) {
+    const source = String(text ?? '')
+    if (!source) return source
+    if (this._bilibiliConfig().enabled === false) return source
+    const refs = extractBilibiliRefs(source)
+    if (refs.length === 0) return source
+    const blocks = []
+    for (const ref of refs) {
+      try {
+        const cacheKey = ref.bvid || ref.url
+        const hit = this._biliCache.get(cacheKey)
+        let info = null
+        if (hit && Date.now() - hit.at < BILIBILI_CACHE_TTL_MS) {
+          info = hit.info
+        } else {
+          info = await fetchBilibiliInfo(ref, { fetchImpl: this.fetchImpl, timeoutMs: BILIBILI_TIMEOUT_MS })
+          if (info) {
+            this._biliCache.set(cacheKey, { at: Date.now(), info })
+            if (this._biliCache.size > BILIBILI_CACHE_MAX) {
+              const oldest = this._biliCache.keys().next().value
+              this._biliCache.delete(oldest)
+            }
+          }
+        }
+        const block = formatBilibiliContext(info)
+        if (block) blocks.push(block)
+      } catch (error) {
+        this.logger.debug?.(`B 站链接解析失败（忽略）：${error?.message ?? error}`)
+      }
+    }
+    if (blocks.length === 0) return source
+    return `${source}\n\n${blocks.join('\n\n')}`
+  }
+
+  /**
    * 从固定文本回复里随机挑一条。
    *
    * 列表为空 → 退回老的单条 `replyText`（老配置不迁移也能用）。
@@ -3162,12 +3711,159 @@ export class Bridge {
   _pickPokeReply(key, poke) {
     const list = poke.replies
     if (list.length === 0) return { text: poke.replyText, image: '' }
-    if (list.length === 1) return list[0]
+    // priority_image（2026-10-27）：只要列表里有带图的候选，就只从带图的里抽。
+    // 用户反馈「图片触发率低」——纯随机时 3 条里 1 条有图，戳十次可能一次都看不到。
+    let pool = list
+    if (poke.replyMode === 'priority_image') {
+      const withImage = list.filter((row) => row.image)
+      if (withImage.length > 0) pool = withImage
+    }
+    return this._randomAvoidRepeat(key, pool)
+  }
+
+  /**
+   * 从候选里随机抽一条，并避开上一次抽中的那条。
+   *
+   * 比较用的是内容（text|image）而不是下标：priority_image 的候选池每次可能不同，
+   * 下标跨池比较会错位。
+   */
+  _randomAvoidRepeat(key, pool) {
+    if (!Array.isArray(pool) || pool.length === 0) return { text: '', image: '' }
+    if (pool.length === 1) return pool[0]
     const last = this._pokeLastPick.get(key)
-    let index = Math.floor(Math.random() * list.length)
-    if (index === last) index = (index + 1) % list.length
-    this._pokeLastPick.set(key, index)
-    return list[index]
+    const lastRef = last ? `${last.text}|${last.image}` : ''
+    let index = Math.floor(Math.random() * pool.length)
+    const refOf = (row) => `${row.text}|${row.image}`
+    if (refOf(pool[index]) === lastRef) index = (index + 1) % pool.length
+    const picked = pool[index]
+    this._pokeLastPick.set(key, picked)
+    return picked
+  }
+
+  /**
+   * 取本会话最近的聊天记录（按会话 key 严格隔离）。
+   *
+   * 数据源是 `_chatLog`（每小时人设归纳也用它）：1 小时窗口、每会话最多 80 条。
+   * 只收群聊正文，`/` 指令和纯空消息本来就没进缓冲。
+   *
+   * 智能匹配（2026-10-27）：开启后从最后一条往前扫，只保留「连续对话」那一段
+   * （相邻两条间隔 ≤ 5 分钟），避免把半小时前的另一段闲聊也带进来；关闭则纯取最近 N 条。
+   *
+   * @param {string} key `g:<群号>` / `u:<QQ号>`
+   * @param {number} turns 取多少条（0 = 不取）
+   * @param {{smartMatch?:boolean}} [options]
+   * @returns {string[]} 已格式化成 `[群友 昵称(QQ)]: 内容`
+   */
+  _recentChatLines(key, turns, options = {}) {
+    const limit = Math.min(50, Math.max(0, Math.round(Number(turns) || 0)))
+    if (limit === 0) return []
+    const now = Date.now()
+    let list = (this._chatLog.get(key) ?? []).filter((item) => now - item.at < CHAT_LOG_WINDOW_MS)
+    if (options.smartMatch === true && list.length > 1) {
+      let start = list.length - 1
+      while (start > 0 && list[start].at - list[start - 1].at <= CONTEXT_SMART_GAP_MS) start -= 1
+      list = list.slice(start)
+    }
+    return list.slice(-limit).map((item) => {
+      const name = String(item.name ?? '').trim() || '群友'
+      const qq = String(item.qq ?? '').trim()
+      return qq ? `[群友 ${name}(${qq})]: ${item.text}` : `[群友 ${name}]: ${item.text}`
+    })
+  }
+
+  /**
+   * 戳一戳「模型回复」：把本会话最近聊天记录注入，让模型回一句（2026-10-27）。
+   *
+   * 和 text 模式的取舍：
+   *   · 走真实 DSH 会话（`ensureSession` + `promptAndWait`），会消耗 token；
+   *   · 上下文感知关掉 / turns=0 时退化成「有人戳了你，回一句」，不注入记录；
+   *   · 模型失败/超时 → 退回 `poke.replyText` 固定文案，绝不让一次戳一戳静默。
+   *
+   * @param {{kind:'private'|'group', groupId?:string|null, userId:string}} scope
+   * @param {string} poker 戳的人 QQ
+   * @param {string} key 会话 key
+   * @param {{replyText:string}} poke
+   * @returns {Promise<{ok:boolean}>}
+   */
+  async _pokeModelReply(scope, poker, key, poke) {
+    const nick = String(this.qq?.nameOf?.(key, poker) ?? '').trim() || poker
+    const aware = this._contextAwareConfig()
+    // 私聊没有群聊缓冲（_chatLog 只记群聊），turns 给了也拿不到东西。
+    const lines = aware.enabled && scope.kind === 'group'
+      ? this._recentChatLines(key, aware.turns, { smartMatch: aware.smartMatch })
+      : []
+    const prompt = lines.length > 0
+      ? `【戳一戳】${nick} 戳了你一下。下面是这个会话最近 ${lines.length} 条聊天记录（按时间顺序）：\n`
+        + `${lines.join('\n')}\n\n`
+        + '请用一句话回应这次戳一戳，语气自然。不要复述聊天记录，也不要提「聊天记录」这个词。'
+      : `${nick} 戳了你一下，回一句。`
+    if (lines.length > 0) {
+      this.logger.info?.(`戳一戳模型回复：注入 ${lines.length} 条聊天记录（${key}）`)
+    }
+    let reply = ''
+    try {
+      const msg = { ...scope, senderName: nick }
+      const sessionId = await this.ensureSession(key, msg)
+      reply = String(await this.dsh.promptAndWait(sessionId, prompt, {
+        timeoutMs: Number(this.live?.replyTimeoutMs ?? this.config.replyTimeoutMs ?? 20000),
+        slowHintMs: Number(this.live?.modelWatchdogMs ?? this.config.modelWatchdogMs ?? 8000),
+      }) ?? '').trim()
+    } catch (error) {
+      this.logger.warn?.(`戳一戳模型回复失败，退回固定文案（${key}）：${error?.message ?? error}`)
+      reply = ''
+    }
+    // 清洗模型爱写的「[无文字回复]」这类内部说明（和正常回复同一条规则）。
+    const cleaned = stripMetaNotes(reply)
+    if (cleaned) {
+      const sent = await this._send(scope, cleaned)
+      return { ok: !(sent && sent.ok === false) }
+    }
+    // 模型没给可用内容 → 固定文案兜底（绝不静默）。
+    const fallback = String(poke.replyText ?? '')
+      .replace(/\{nick\}/gu, nick)
+      .replace(/\{qq\}/gu, poker)
+      .trim()
+    if (!fallback) return { ok: false }
+    const sent = await this._send(scope, fallback)
+    return { ok: !(sent && sent.ok === false) }
+  }
+
+  /**
+   * 在配置区间里取一个随机延迟（2026-10-27）。
+   *
+   * 废弃固定延迟：真人被戳不会每次都精确等 300ms。上下限相等时退化成固定值，
+   * 方便想「完全不延迟」的人把两个都填 0。
+   * @param {{delayMinMs?:number, delayMaxMs?:number}} poke
+   * @returns {number} 毫秒
+   */
+  _pokeDelay(poke) {
+    const min = Math.max(0, Number(poke?.delayMinMs) || 0)
+    const max = Math.max(min, Number(poke?.delayMaxMs) || 0)
+    if (max <= 0) return 0
+    return min + Math.floor(Math.random() * (max - min + 1))
+  }
+
+  /**
+   * 真实回戳（2026-10-27）。
+   *
+   * 抽出来是因为它现在有两个调用点：`mode=poke` 的唯一下发动作，以及
+   * `mode=text` + `withAction` 时「先戳一下再发图文」。失败只 warn，绝不影响后续。
+   * @returns {Promise<object>} 原样返回 onebot.sendPoke 的结果
+   */
+  async _sendPokeBack(scope, poker, key) {
+    const target = scope.kind === 'group' ? scope.groupId : poker
+    if (typeof this.qq?.sendPoke !== 'function') {
+      this.logger.warn?.('OneBot 客户端没有 sendPoke（版本过旧），跳过回戳')
+      return { ok: false, reason: 'no-send-poke' }
+    }
+    const result = await this.qq.sendPoke(scope.kind, target, { userId: poker })
+    if (result?.ok) {
+      this.logger.info?.(`被 ${poker} 戳了一下（${key}），已回戳（${result.action}）`)
+    } else {
+      // 回戳失败只告警：某些 NapCat 版本没有 poke action，不该因此报错刷屏。
+      this.logger.warn?.(`回戳失败（${key}）：${result?.error ?? '未知原因'}`)
+    }
+    return result
   }
 
   /**
@@ -3175,20 +3871,31 @@ export class Bridge {
    *
    * 为什么转 file:/// 而不是直接给 Windows 路径：NapCat 对裸盘符路径的解析
    * 各版本不一致，file URL 是 OneBot 里最稳的本地引用形态。
-   * 文件不存在/超过 5MB → 返回空串，调用方据此只发文字。
+   *
+   * 2026-10-27 改：失败时不再只返回空串，而是带上**具体原因**（文件不存在 /
+   * 超过 5MB / 不是文件），调用方直接把它写进日志——用户反馈「图片发不出来」，
+   * 以前所有失败都长一个样，根本没法判断是路径、大小还是 NapCat 那边的问题。
+   *
    * @param {string} image
-   * @returns {string}
+   * @returns {{ref:string, reason:string, bytes?:number}}
    */
   _pokeImageRef(image) {
     const raw = String(image ?? '').trim()
-    if (!raw) return ''
-    if (/^(https?:|base64:|file:)/iu.test(raw)) return raw
+    if (!raw) return { ref: '', reason: '图片字段为空' }
+    if (/^(https?:|base64:|file:)/iu.test(raw)) return { ref: raw, reason: '' }
     try {
       const stat = fs.statSync(raw)
-      if (!stat.isFile() || stat.size > POKE_IMAGE_MAX_BYTES) return ''
-      return pathToFileURL(raw).href
-    } catch {
-      return ''
+      if (!stat.isFile()) return { ref: '', reason: `不是普通文件：${raw}` }
+      if (stat.size <= 0) return { ref: '', reason: `文件是空的：${raw}` }
+      if (stat.size > POKE_IMAGE_MAX_BYTES) {
+        return {
+          ref: '',
+          reason: `图片 ${(stat.size / 1048576).toFixed(2)}MB，超过 ${POKE_IMAGE_MAX_BYTES / 1048576}MB 上限：${raw}`,
+        }
+      }
+      return { ref: pathToFileURL(raw).href, reason: '', bytes: stat.size }
+    } catch (error) {
+      return { ref: '', reason: `文件读不到（${error?.code ?? '未知错误'}）：${raw}` }
     }
   }
 
@@ -3212,26 +3919,56 @@ export class Bridge {
    *   ① 本地文件先走 `file:///`（不占内存）；
    *   ② 被 NapCat 拒（读不到文件/跨用户权限）→ 同一个文件读成 `base64://` 再试。
    * 永不抛，失败返回 `{ok:false, error}`，由 handleNotice 只记 warn。
+   *
+   * 每一步都写日志（2026-10-27）：哪一级失败、失败原因、retcode、via 都记下来，
+   * 真机上「发了但没显示」才能定位到底卡在路径、大小还是 NapCat 风控。
+   *
    * @param {{kind:'private'|'group', groupId?:string|null, userId:string}} scope
    * @param {string} image
    * @returns {Promise<{ok:boolean, via?:string, error?:string}>}
    */
   async _sendPokeImage(scope, image) {
     if (typeof this.qq?.sendImage !== 'function') {
+      this.logger.warn?.('OneBot 客户端没有 sendImage（版本过旧），跳过表情发送')
       return { ok: false, error: 'OneBot 客户端没有 sendImage（版本过旧）' }
     }
     const target = scope.kind === 'group' ? scope.groupId : scope.userId
-    const ref = this._pokeImageRef(image)
-    if (!ref) return { ok: false, error: `图片不可用：${String(image).slice(0, 80)}` }
-    const first = await this.qq.sendImage(scope.kind, target, ref, { subType: 1 })
-    if (first?.ok) return first
-    if (/^file:/iu.test(ref)) {
+    const info = this._pokeImageRef(image)
+    if (!info.ref) {
+      this.logger.warn?.(`戳一戳表情不可用：${info.reason}`)
+      return { ok: false, error: info.reason }
+    }
+    if (info.bytes) {
+      this.logger.info?.(`戳一戳表情准备发送：${info.bytes} 字节，ref=${info.ref.slice(0, 90)}`)
+    }
+    const first = await this.qq.sendImage(scope.kind, target, info.ref, { subType: 1 })
+    if (first?.ok) {
+      this.logger.info?.(`戳一戳表情发送成功（via=${first.via ?? 'file'}，retcode=${first.retcode ?? '-'}）`)
+      return first
+    }
+    this.logger.warn?.(
+      `戳一戳表情发送失败（via=${first?.via ?? 'file'}，retcode=${first?.retcode ?? '-'}）：`
+      + `${first?.error ?? '未知原因'}`,
+    )
+    // file:/// 失败时再试 base64://：多半是 NapCat 读不到那个路径（跨用户/沙箱/中文路径）。
+    if (/^file:/iu.test(info.ref)) {
       const base64 = this._pokeImageBase64(image)
-      if (base64) {
-        const second = await this.qq.sendImage(scope.kind, target, base64, { subType: 1 })
-        if (second?.ok) return second
-        return second
+      if (!base64) {
+        this.logger.warn?.(
+          `戳一戳表情 base64 降级不可用（读文件失败或超过 ${POKE_IMAGE_MAX_BYTES / 1048576}MB）`,
+        )
+        return first
       }
+      this.logger.info?.('戳一戳表情改用 base64:// 重试一次')
+      const second = await this.qq.sendImage(scope.kind, target, base64, { subType: 1 })
+      if (second?.ok) {
+        this.logger.info?.(`戳一戳表情 base64 重试成功（retcode=${second.retcode ?? '-'}）`)
+      } else {
+        this.logger.warn?.(
+          `戳一戳表情 base64 重试仍失败（retcode=${second?.retcode ?? '-'}）：${second?.error ?? '未知原因'}`,
+        )
+      }
+      return second
     }
     return first
   }
@@ -3276,10 +4013,26 @@ export class Bridge {
       const now = Date.now()
       if (now - (this._pokeAt.get(key) ?? 0) < POKE_THROTTLE_MS) return
       this._pokeAt.set(key, now)
+      // 随机延迟（2026-10-27）：任何响应动作之前都先等一个随机区间，模拟真人反应。
+      const delay = this._pokeDelay(poke)
+      if (delay > 0) {
+        this.logger.debug?.(`戳一戳响应延迟 ${delay}ms（${key}）`)
+        await sleep(delay)
+      }
+      if (poke.mode === 'model') {
+        // 模型回复（2026-10-27）：注入本会话最近聊天记录，让模型回一句。
+        // withAction 在这个模式下也认（先戳再让模型说话）。
+        if (poke.withAction) await this._sendPokeBack(scope, poker, key)
+        const result = await this._pokeModelReply(scope, poker, key, poke)
+        if (result?.ok) this._noteReplied(key)
+        return
+      }
       if (poke.mode === 'text') {
         // {nick} 取群成员/好友昵称缓存；取不到用 QQ 号（别在文案里留空）。
         const nick = String(this.qq?.nameOf?.(key, poker) ?? '').trim() || poker
         const reply = this._pickPokeReply(key, poke)
+        // withAction：延迟后**先真实回戳**，紧接着再发图文（不互斥，失败不影响发消息）。
+        if (poke.withAction) await this._sendPokeBack(scope, poker, key)
         const text = String(reply.text ?? '')
           .replace(/\{nick\}/gu, nick)
           .replace(/\{qq\}/gu, poker)
@@ -3305,18 +4058,7 @@ export class Bridge {
         }
         return
       }
-      const target = scope.kind === 'group' ? scope.groupId : poker
-      if (typeof this.qq.sendPoke !== 'function') {
-        this.logger.warn?.('OneBot 客户端没有 sendPoke（版本过旧），跳过回戳')
-        return
-      }
-      const result = await this.qq.sendPoke(scope.kind, target, { userId: poker })
-      if (result?.ok) {
-        this.logger.info?.(`被 ${poker} 戳了一下（${key}），已回戳（${result.action}）`)
-      } else {
-        // 回戳失败只告警：某些 NapCat 版本没有 poke action，不该因此报错刷屏。
-        this.logger.warn?.(`回戳失败（${key}）：${result?.error ?? '未知原因'}`)
-      }
+      await this._sendPokeBack(scope, poker, key)
     } catch (error) {
       this.logger.warn?.(`处理戳一戳失败（忽略）：${error?.message ?? error}`)
     }

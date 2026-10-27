@@ -1,0 +1,9 @@
+# 依赖
+node_modules/
+
+# 历史备份文件（重构时留的，不参与构建）
+client.js.bak-*
+index.js.bak-*
+
+# 离线测试写的临时模块（test-*.mjs 跑完一般会自己删，异常退出会残留）
+.tmp-*
