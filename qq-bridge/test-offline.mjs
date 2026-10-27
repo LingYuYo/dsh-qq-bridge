@@ -1139,6 +1139,15 @@ function makeBridge({ rhythm, dsh: dshCfg, stateFile, allow, personaDefault, cap
     groupName: '',      // get_group_info 返回的群名
     privateName: '',    // get_stranger_info 返回的昵称
     reply: '好',
+    // 上下文自动清理（2026-10-27）：
+    // outline = turnOutline 返回的数组（默认 0 轮，老用例不受自动清理影响）；
+    // outlineCalls / compacts 记录调用，用来断言有没有多打 RPC、有没有真走压缩；
+    // compactFails：非空 = compactSession 抛这个错误消息；**数组** = 每次调用按顺序取一条
+    // （空位表示这次成功），用来模拟「第一次 busy、第二次成功」。
+    outline: [],
+    outlineCalls: [],
+    compacts: [],
+    compactFails: null,
   }
   b.dsh = {
     sessionExists: async (id) => { calls.existChecks.push(id); return calls.exists },
@@ -1155,6 +1164,16 @@ function makeBridge({ rhythm, dsh: dshCfg, stateFile, allow, personaDefault, cap
     sessionTitle: async () => null,
     setSessionPersona: async (payload) => { calls.personas.push(payload); return { ok: true } },
     promptAndWait: async (sid, text, opts) => { calls.prompts.push({ sid, text, opts }); return calls.reply },
+    // 自动清理要读的轮数：假 DSH 直接回放预设数组（真实实现在 dsh.mjs 走 session/projections）。
+    turnOutline: async (sid) => { calls.outlineCalls.push(sid); return calls.outline },
+    // 原生压缩：真实实现是 commands/execute 投递 /compact，这里只要成败可控。
+    compactSession: async (sid) => {
+      calls.compacts.push(sid)
+      // 数组 = 按次取（shift 掉一条），用来模拟 busy → 重试成功；字符串 = 每次都抛。
+      const fail = Array.isArray(calls.compactFails) ? calls.compactFails.shift() : calls.compactFails
+      if (fail) throw new Error(fail)
+      return { kind: 'success', text: '已压缩' }
+    },
   }
   // NapCat 侧：真实 Bridge 会调 get_group_info / get_stranger_info 取名字。
   b.qq.call = async (action, params) => {
@@ -1654,6 +1673,287 @@ await check('空 persona op = 清除单人设', async () => {
   entry.persona = '旧人设'
   await b.applySessionOp({ op: 'persona', key: 'g:123456', text: '' })
   assert.equal(b.state.sessions['g:123456'].persona, '')
+})
+
+console.log('\n— 群聊上下文自动清理（2026-10-27）—')
+/** 造一份「已有映射」的 state，让用例能直接指定起始轮数与基线。 */
+function seedCtxState(tag, sessions) {
+  const file = path.join(os.tmpdir(), `qq-bridge-ctx-${process.pid}-${tag}.json`)
+  fs.writeFileSync(file, JSON.stringify({ sessions }))
+  return file
+}
+/**
+ * 自动清理专用 Bridge：节奏拉到 3 档 + 不限频，群消息能真的走到投递那一步；
+ * `outline` = turnOutline 返回的数组长度（也就是 DSH 侧的当前轮数）。
+ */
+function ctxBridge({ tag, sessions = {}, outline = 0 } = {}) {
+  const stateFile = seedCtxState(tag, sessions)
+  const made = makeBridge({
+    stateFile,
+    rhythm: {
+      activityLevel: 3, debounceWindowMs: 0,
+      rateLimit: { perMin: 1000, burst: 0, silent: true },
+    },
+  })
+  made.calls.outline = Array.from({ length: outline }, (_, i) => ({
+    turn: i + 1, seq: i + 1, prompt: `p${i + 1}`, response: `r${i + 1}`,
+  }))
+  return { ...made, stateFile }
+}
+
+await check('_contextPolicy：默认 compact/30，热配置优先，非法值回退默认', () => {
+  const { b } = makeBridge({})
+  assert.deepEqual(b._contextPolicy(), { strategy: 'compact', turns: 30 })
+  b.live.contextClearStrategy = 'clear'
+  b.live.maxContextTurns = 7
+  assert.deepEqual(b._contextPolicy(), { strategy: 'clear', turns: 7 }, '设置页热改立即生效')
+  b.live.contextClearStrategy = 'nonsense'
+  b.live.maxContextTurns = -3
+  assert.deepEqual(b._contextPolicy(), { strategy: 'compact', turns: 0 }, '非法策略回默认，负数夹到 0')
+})
+
+await check('热配置白名单放行这两个键（漏加 = 设置页白存、桥接永远收不到）', () => {
+  const hot = pickHotConfig({ maxContextTurns: 12, contextClearStrategy: 'clear' })
+  assert.equal(hot.maxContextTurns, 12)
+  assert.equal(hot.contextClearStrategy, 'clear')
+})
+
+await check('私聊超阈值也不清理（长期记忆）：会话不变、不归档、连轮数都不查', async () => {
+  const { b, calls, stateFile } = ctxBridge({
+    tag: 'ctx-priv', outline: 50,
+    sessions: { 'u:1000000001': { sessionId: 'priv-s', ctxBaseSessionId: 'priv-s', ctxBaseTurns: 0 } },
+  })
+  b.live.maxContextTurns = 5
+  await b.handleMessage(privMsg('聊了五十来回了', 'cp1'))
+  assert.equal(calls.prompts.length, 1)
+  assert.equal(calls.prompts[0].sid, 'priv-s', '★ 私聊会话 id 不变')
+  assert.equal(b.state.sessions['u:1000000001'].sessionId, 'priv-s')
+  assert.deepEqual(calls.archived, [], '★ 不归档私聊会话')
+  assert.equal(calls.created, 0, '★ 不新建会话')
+  assert.deepEqual(calls.compacts, [], '★ 不压缩')
+  assert.deepEqual(calls.outlineCalls, [], '★ 私聊连 turnOutline 都不查（零多余 RPC）')
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check('群聊超阈值 + compact：调原生压缩，会话不变，基线推到当前轮数', async () => {
+  const { b, calls, stateFile } = ctxBridge({
+    tag: 'ctx-compact', outline: 12,
+    sessions: { 'g:123456': { sessionId: 'g-s', ctxBaseSessionId: 'g-s', ctxBaseTurns: 2 } },
+  })
+  b.live.maxContextTurns = 5
+  b.live.contextClearStrategy = 'compact'
+  await b.handleMessage(groupMsg('也就聊了十轮', { id: 'cc1' }))
+  assert.deepEqual(calls.compacts, ['g-s'], '★ 走原生压缩，不换会话')
+  assert.equal(calls.prompts[0].sid, 'g-s', '压缩后仍在同一会话里回')
+  assert.deepEqual(calls.archived, [], '压缩成功就不该归档')
+  assert.equal(calls.created, 0)
+  assert.equal(b.state.sessions['g:123456'].ctxBaseTurns, 12, '基线推到压缩时的轮数')
+  assert.equal(b.state.sessions['g:123456'].ctxBaseSessionId, 'g-s')
+  assert.equal(b.state.contextCompacts, 1)
+  assert.equal(b.state.contextResets, 0)
+  assert.equal(calls.sent.length, 1, '只有这一轮的正常回复')
+  assert.equal(calls.sent[0].text, '好')
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check('压缩成功后基线前移：turnOutline 长度不变也不会每条都压一次', async () => {
+  const { b, calls, stateFile } = ctxBridge({
+    tag: 'ctx-once', outline: 12,
+    sessions: { 'g:123456': { sessionId: 'g-s', ctxBaseSessionId: 'g-s', ctxBaseTurns: 2 } },
+  })
+  b.live.maxContextTurns = 5
+  await b.handleMessage(groupMsg('第一句', { id: 'co1' }))
+  assert.equal(calls.compacts.length, 1, '超阈值先压一次')
+  await b.handleMessage(groupMsg('第二句', { id: 'co2' }))
+  await b.handleMessage(groupMsg('第三句', { id: 'co3' }))
+  assert.equal(calls.prompts.length, 3)
+  assert.equal(calls.compacts.length, 1, '★ DSH 日志不删事件（轮数不变），靠基线相减避免反复压缩')
+  assert.equal(b.state.contextCompacts, 1)
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check('阈值边界：差值正好等于阈值也触发（>= 语义）', async () => {
+  const { b, calls, stateFile } = ctxBridge({
+    tag: 'ctx-edge', outline: 10,
+    sessions: { 'g:123456': { sessionId: 'g-s', ctxBaseSessionId: 'g-s', ctxBaseTurns: 5 } },
+  })
+  b.live.maxContextTurns = 5
+  await b.handleMessage(groupMsg('刚好五轮', { id: 'ce1' }))
+  assert.equal(calls.compacts.length, 1)
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check('compact 抛错（unknown command）：静默降级归档+新建，清理路径一条消息都不发', async () => {
+  const { b, calls, stateFile } = ctxBridge({
+    tag: 'ctx-fallback', outline: 20,
+    sessions: {
+      'g:123456': {
+        sessionId: 'old-g', ctxBaseSessionId: 'old-g', ctxBaseTurns: 0, persona: '群专属人设',
+      },
+    },
+  })
+  b.live.maxContextTurns = 5
+  calls.compactFails = 'unknown method commands/execute'
+  const next = await b._maybeRecycleContext('g:123456', groupMsg('超了', { id: 'cf1' }), 'old-g')
+  assert.equal(next, 's1', '返回可用的新会话 id')
+  assert.deepEqual(calls.compacts, ['old-g'])
+  assert.deepEqual(calls.archived, ['old-g'])
+  assert.equal(calls.archiveOpts[0].stopActivity, true, '旧会话可能还在跑，归档必须带 stopActivity')
+  assert.equal(b.state.sessions['g:123456'].sessionId, 's1')
+  assert.equal(b.state.sessions['g:123456'].ctxBaseTurns, 0, '新会话基线归零，不会立刻又清一次')
+  assert.equal(b.state.sessions['g:123456'].ctxBaseSessionId, 's1')
+  assert.equal(b.state.sessions['g:123456'].persona, '群专属人设', '人设在 state 上，重建不丢')
+  assert.equal(b.state.contextResets, 1)
+  assert.equal(b._compactSupported, false, '命令不存在要记住，之后不再白试')
+  assert.deepEqual(calls.sent, [], '★ 静默红线：清理路径绝不给群里发提示')
+  assert.deepEqual(calls.prompts, [], '★ 也没投递任何 prompt')
+  fs.rmSync(stateFile, { force: true })
+})
+
+/** 真实 DSH 在 agent 未 idle 时回的错误文本（用来命中 busy 分支）。 */
+const COMPACT_BUSY_TEXT = 'compaction 失败：busy — Compaction is unavailable because this process '
+  + 'has an active compaction, or the agent is not idle.'
+
+await check('compact busy（agent 未 idle）：等 _compactRetryMs 重试一次即成功，会话不变', async () => {
+  const { b, calls, stateFile } = ctxBridge({
+    tag: 'ctx-busy', outline: 20,
+    sessions: { 'g:123456': { sessionId: 'g-s', ctxBaseSessionId: 'g-s', ctxBaseTurns: 0 } },
+  })
+  b.live.maxContextTurns = 5
+  b._compactRetryMs = 1 // 真跑 busy 重试分支，但不等实现里的 1.5s
+  calls.compactFails = [COMPACT_BUSY_TEXT] // 第一次 busy，第二次（重试）成功
+  await b.handleMessage(groupMsg('超了', { id: 'cb1' }))
+  assert.equal(calls.compacts.length, 2, '★ 第一次 busy 抛错、第二次成功')
+  assert.equal(b.state.contextCompacts, 1, '只记一次成功压缩')
+  assert.equal(calls.prompts[0].sid, 'g-s', '会话不变（压缩不换会话）')
+  assert.deepEqual(calls.archived, [], '重试成功就不该降级归档')
+  assert.equal(calls.created, 0)
+  assert.equal(b.state.sessions['g:123456'].ctxBaseTurns, 20, '基线推到压缩时的轮数')
+  assert.equal(calls.sent.length, 1, '只有这一轮的正常回复')
+  assert.equal(calls.sent[0].text, '好')
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check('compact 连续两次 busy：降级归档+新建，全程仍只有正常回复', async () => {
+  const { b, calls, stateFile } = ctxBridge({
+    tag: 'ctx-busy2', outline: 20,
+    sessions: { 'g:123456': { sessionId: 'old-g', ctxBaseSessionId: 'old-g', ctxBaseTurns: 0 } },
+  })
+  b.live.maxContextTurns = 5
+  b._compactRetryMs = 1
+  calls.compactFails = [COMPACT_BUSY_TEXT, COMPACT_BUSY_TEXT]
+  await b.handleMessage(groupMsg('超了', { id: 'cb2' }))
+  assert.equal(calls.compacts.length, 2, '只重试一次，不会无限重试')
+  assert.deepEqual(calls.archived, ['old-g'], '两次都 busy → 静默降级为归档重建')
+  assert.equal(calls.archiveOpts[0].stopActivity, true)
+  assert.equal(calls.prompts[0].sid, 's1', '回复落到新会话上')
+  assert.equal(b.state.contextResets, 1)
+  assert.equal(b.state.contextCompacts, 0, '没压成功就不该记成功数')
+  assert.equal(b._compactSupported, undefined, 'busy 不代表没压缩能力，别记成 false')
+  assert.equal(calls.sent.length, 1, '★ 仍然只有一条正常回复，没有清理提示')
+  assert.equal(calls.sent[0].text, '好')
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check('全链路：压缩失败降级重建后照常回复，且只发一条（无「已清理」类提示）', async () => {
+  const { b, calls, stateFile } = ctxBridge({
+    tag: 'ctx-full', outline: 20,
+    sessions: { 'g:123456': { sessionId: 'old-g', ctxBaseSessionId: 'old-g', ctxBaseTurns: 0 } },
+  })
+  b.live.maxContextTurns = 5
+  calls.compactFails = 'compact exploded'
+  await b.handleMessage(groupMsg('超了', { id: 'cg1' }))
+  assert.equal(calls.prompts.length, 1)
+  assert.equal(calls.prompts[0].sid, 's1', '回复落在新会话上')
+  assert.equal(calls.sent.length, 1, '★ 只有一条正常回复，没有清理提示')
+  assert.equal(calls.sent[0].text, '好')
+  assert.deepEqual(calls.archived, ['old-g'])
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check("strategy='off'：不压缩不归档，连轮数都不查", async () => {
+  const { b, calls, stateFile } = ctxBridge({
+    tag: 'ctx-off', outline: 40,
+    sessions: { 'g:123456': { sessionId: 'g-s', ctxBaseSessionId: 'g-s', ctxBaseTurns: 0 } },
+  })
+  b.live.contextClearStrategy = 'off'
+  b.live.maxContextTurns = 5
+  await b.handleMessage(groupMsg('聊很久了', { id: 'cx1' }))
+  assert.equal(calls.prompts[0].sid, 'g-s')
+  assert.deepEqual(calls.compacts, [])
+  assert.deepEqual(calls.archived, [])
+  assert.deepEqual(calls.outlineCalls, [], 'off 时不该多打 RPC')
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check('maxContextTurns=0（不限制）：不触发任何清理', async () => {
+  const { b, calls, stateFile } = ctxBridge({
+    tag: 'ctx-zero', outline: 40,
+    sessions: { 'g:123456': { sessionId: 'g-s', ctxBaseSessionId: 'g-s', ctxBaseTurns: 0 } },
+  })
+  b.live.maxContextTurns = 0
+  await b.handleMessage(groupMsg('聊很久了', { id: 'cz1' }))
+  assert.equal(calls.prompts[0].sid, 'g-s')
+  assert.deepEqual(calls.compacts, [])
+  assert.deepEqual(calls.archived, [])
+  assert.equal(calls.created, 0)
+  assert.deepEqual(calls.outlineCalls, [])
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check('旧 state 没有 ctxBase* 字段：补默认，且第一条消息只建基线不清上下文', async () => {
+  const { b, calls, stateFile } = ctxBridge({
+    tag: 'ctx-legacy', outline: 88,
+    sessions: { 'g:123456': { sessionId: 'old-s' } },
+  })
+  assert.equal(b.state.sessions['g:123456'].ctxBaseTurns, 0, '缺字段补 0')
+  assert.equal(b.state.sessions['g:123456'].ctxBaseSessionId, '', '缺字段补空串')
+  b.live.maxContextTurns = 5
+  await b.handleMessage(groupMsg('历史很长但刚升级', { id: 'cl1' }))
+  assert.equal(calls.prompts[0].sid, 'old-s', '★ 不会因为「历史本来就长」立刻清一次')
+  assert.deepEqual(calls.compacts, [])
+  assert.deepEqual(calls.archived, [])
+  assert.equal(b.state.sessions['g:123456'].ctxBaseTurns, 88, '基线初始化为当前轮数')
+  assert.equal(b.state.sessions['g:123456'].ctxBaseSessionId, 'old-s')
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check('normalizeSessionEntry：ctxBaseTurns / ctxBaseSessionId 默认值与脏值兜底', () => {
+  const blank = normalizeSessionEntry('g:1', { sessionId: 's' })
+  assert.equal(blank.ctxBaseTurns, 0)
+  assert.equal(blank.ctxBaseSessionId, '')
+  const dirty = normalizeSessionEntry('g:1', { sessionId: 's', ctxBaseTurns: -9, ctxBaseSessionId: 42 })
+  assert.equal(dirty.ctxBaseTurns, 0, '负数归 0')
+  assert.equal(dirty.ctxBaseSessionId, '', '非字符串归空串')
+  const okEntry = normalizeSessionEntry('g:1', { sessionId: 's', ctxBaseTurns: 7.8, ctxBaseSessionId: 's7' })
+  assert.equal(okEntry.ctxBaseTurns, 7, '取整')
+  assert.equal(okEntry.ctxBaseSessionId, 's7')
+})
+
+await check("applySessionOp('clear') 复用 _rebuildSessionContext：ctxBase 归零、计数+1", async () => {
+  const { b, calls, stateFile } = ctxBridge({
+    tag: 'ctx-clear', sessions: { 'g:123456': { sessionId: 'old-g', ctxBaseSessionId: 'old-g', ctxBaseTurns: 9 } },
+  })
+  const result = await b.applySessionOp({ op: 'clear', key: 'g:123456' })
+  assert.equal(result.ok, true)
+  assert.equal(result.action, 'clear')
+  assert.equal(result.sessionId, 's1')
+  assert.equal(result.archived, true)
+  assert.deepEqual(calls.archived, ['old-g'])
+  assert.equal(b.state.sessions['g:123456'].ctxBaseTurns, 0)
+  assert.equal(b.state.sessions['g:123456'].ctxBaseSessionId, 's1')
+  assert.equal(b.state.contextResets, 1)
+  assert.equal(b.chatKeyForSession('s1'), 'g:123456', 'sessionId → key 反查表跟着换')
+  fs.rmSync(stateFile, { force: true })
+})
+
+await check("applySessionOp('clear') 无会话时仍回 no-session（老行为不变）", async () => {
+  const { b, calls, stateFile } = ctxBridge({ tag: 'ctx-clear-none' })
+  const result = await b.applySessionOp({ op: 'clear', key: 'g:123456' })
+  assert.deepEqual(result, { ok: false, error: 'no-session', action: 'clear', key: 'g:123456' })
+  assert.equal(calls.created, 0, '不许因为 clear 白建会话')
+  assert.deepEqual(calls.archived, [])
+  fs.rmSync(stateFile, { force: true })
 })
 
 console.log('\n— 批量改名计划 —')

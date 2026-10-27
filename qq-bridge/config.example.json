@@ -21,6 +21,8 @@
     "allowAllWhenEmpty": false
   },
   "replyTimeoutMs": 20000,
+  "maxContextTurns": 30,
+  "contextClearStrategy": "compact",
   "sendDelayMs": 400,
   "chunkSize": 1000,
   "bubbleMaxChars": 30,

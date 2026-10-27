@@ -64,6 +64,10 @@ const HOT_KEYS = [
   'replyTimeoutMs',
   'modelWatchdogMs',
   'antiDebounceMs',
+  // 上下文自动清理（2026-10-27）：阈值与策略，设置页改完下一条群消息就按新值判定。
+  // ⚠️ 漏加进白名单 = 设置页能存、日志不报错、桥接永远收不到（pickHotConfig 静默丢键）。
+  'maxContextTurns',
+  'contextClearStrategy',
   // 2026-10-26 体验升级：超时文案 / 人设锁定 / 每小时归纳 / 戳一戳都要热更新
   // （用户在设置页点完开关，不该还要重启桥接才生效）。
   'timeoutReplyText',

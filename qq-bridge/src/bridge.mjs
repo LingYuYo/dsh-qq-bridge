@@ -300,6 +300,23 @@ const PREVIEW_MAX = 80
 /** 上报给设置页的会话行上限（多余的不展示，也不会无限撑大 POST 体积）。 */
 const SESSION_VIEW_CAP = 100
 
+// ── 2026-10-27 群聊上下文自动清理 ────────────────────────────────────────
+
+/**
+ * 默认阈值（轮）：从上次清理算起，累计超过这么多轮就触发。
+ * 只对群聊生效；私聊永不清理（长期记忆）。
+ */
+const DEFAULT_MAX_CONTEXT_TURNS = 30
+/**
+ * 默认策略：`compact`（DSH 原生总结压缩）> 失败时静默降级成归档重建。
+ * 另外两个取值：`clear`（直接归档 + 新建同名会话）、`off`（关闭）。
+ */
+const DEFAULT_CONTEXT_STRATEGY = 'compact'
+/** 压缩遇到 busy（上一条 turn 还没收尾）时的重试等待。 */
+const COMPACT_BUSY_RETRY_MS = 1500
+/** 合法的上下文清理策略（与插件 Schema 的 union 保持一致）。 */
+const CONTEXT_CLEAR_STRATEGIES = Object.freeze(['compact', 'clear', 'off'])
+
 // ── 2026-10-26 体验升级：人设动态补充 / 每小时归纳 / 戳一戳 ──────────────
 
 /** 人设动态补充（`personaDelta`）的容量上限：超了截掉**最旧**的段落（新设定优先）。 */
@@ -439,6 +456,14 @@ export function normalizeSessionEntry(key, raw) {
     activityLevel: normalizeActivityLevel(value.activityLevel),
     // 建这条会话时的工具能力版本（v0.5.1）：空串 = 旧版本建的，下次消息会触发一次上下文重建。
     toolEpoch: typeof value.toolEpoch === 'string' ? value.toolEpoch : '',
+    // 上下文自动清理的基线（2026-10-27）：从哪一轮开始重新计数。
+    // 为什么不是「绝对轮数」：DSH 压缩只 shadow prompt surface，日志与 turnOutline 的
+    // 轮数**都不会变短**，所以阈值必须拿「上次清理时的轮数快照」相减才算得准。
+    // 旧 state 没有这两个字段 → 补 0 / 空串，下一条消息只做一次初始化，不触发清理。
+    ctxBaseTurns: Number.isFinite(Number(value.ctxBaseTurns)) && Number(value.ctxBaseTurns) >= 0
+      ? Math.floor(Number(value.ctxBaseTurns))
+      : 0,
+    ctxBaseSessionId: typeof value.ctxBaseSessionId === 'string' ? value.ctxBaseSessionId : '',
   }
 }
 
@@ -626,6 +651,10 @@ export class Bridge {
       // 工具能力版本（v0.5.1）：Host 的 /config 下发。
       // 与 state.sessions[key].toolEpoch 不一致 = 该会话建于旧工具基线，需要重建一次上下文。
       toolEpoch: String(config.toolEpoch ?? ''),
+      // 群聊上下文自动清理（2026-10-27）：阈值（轮）与策略，设置页热改、每条消息现读。
+      // 缺省不写死成关闭：DSH 支持压缩，默认就该开（0 = 不限制，见 _contextPolicy）。
+      maxContextTurns: config.maxContextTurns ?? DEFAULT_MAX_CONTEXT_TURNS,
+      contextClearStrategy: config.contextClearStrategy ?? DEFAULT_CONTEXT_STRATEGY,
     }
     this.dsh = new DshClient({ baseUrl: config.dsh.baseUrl, logger: this.logger })
     // 外部插件 hook 客户端（P2）：best-effort，没装插件 / DSH 不可达都不影响聊天。
@@ -641,6 +670,11 @@ export class Bridge {
     this.tts = { synthesize: (text, voiceConfig) => synthesize(text, voiceConfig) }
     // 多模态能力探测缓存：模型是否声明支持图片输入（60 秒一次，失败不阻塞聊天）。
     this._visionProbe = null
+    // 原生压缩能力探测（2026-10-27）：undefined = 还没试过；false = 本机 DSH 没有 /compact，
+    // 之后直接走归档重建，不再每次白试一遍。true = 可用。
+    this._compactSupported = undefined
+    // busy 重试等待：默认 1.5s；测试可以调小避免死等。
+    this._compactRetryMs = COMPACT_BUSY_RETRY_MS
     this.qq = new OneBotClient({
       wsUrl: config.onebot.wsUrl,
       accessToken: config.onebot.accessToken,
@@ -783,6 +817,30 @@ export class Bridge {
   }
 
   /**
+   * 现读「群聊上下文自动清理」策略（2026-10-27）。
+   *
+   * 优先级：设置页热配置 `live` > config.json > 内置默认（30 轮 / compact）。
+   * ⚠️ 必须每次现读：设置页改完 2 秒内轮询就会覆盖 live，缓存副本会永远用旧值。
+   *
+   * @returns {{strategy:'compact'|'clear'|'off', turns:number}} turns = 0 表示不限制
+   */
+  _contextPolicy() {
+    const rawStrategy = String(
+      this.live?.contextClearStrategy
+      ?? this.config?.contextClearStrategy
+      ?? DEFAULT_CONTEXT_STRATEGY,
+    ).trim().toLowerCase()
+    const strategy = CONTEXT_CLEAR_STRATEGIES.includes(rawStrategy) ? rawStrategy : DEFAULT_CONTEXT_STRATEGY
+    const turns = clampInt(
+      this.live?.maxContextTurns ?? this.config?.maxContextTurns,
+      0,
+      500,
+      DEFAULT_MAX_CONTEXT_TURNS,
+    )
+    return { strategy, turns }
+  }
+
+  /**
    * 该会话**实际生效**的活跃档位：单群独立档位 > 全局 rhythm.activityLevel。
    *
    * 单群档位存在 `state.sessions[key].activityLevel`（null = 跟随全局）。
@@ -847,8 +905,21 @@ export class Bridge {
         capabilityRefreshes: Number.isFinite(Number(parsed.capabilityRefreshes))
           ? Number(parsed.capabilityRefreshes)
           : 0,
+        // 上下文自动清理次数（2026-10-27，排障用）：压缩成功 / 归档重建各记一份。
+        contextCompacts: Number.isFinite(Number(parsed.contextCompacts)) ? Number(parsed.contextCompacts) : 0,
+        contextResets: Number.isFinite(Number(parsed.contextResets)) ? Number(parsed.contextResets) : 0,
       }
-    } catch { return { sessions: {}, generation: 0, stale: [], rebuilds: 0, capabilityRefreshes: 0 } }
+    } catch {
+      return {
+        sessions: {},
+        generation: 0,
+        stale: [],
+        rebuilds: 0,
+        capabilityRefreshes: 0,
+        contextCompacts: 0,
+        contextResets: 0,
+      }
+    }
   }
 
   _saveState() {
@@ -1260,6 +1331,172 @@ export class Bridge {
     this._saveState()
   }
 
+  // ── 群聊上下文自动清理（2026-10-27）────────────────────────────────
+
+  /**
+   * 归档旧会话 + 在同一工作区新建同名会话，返回新 sessionId。
+   *
+   * 语义与设置页「清空上下文」完全一致（历史只归档不删），这里抽成方法是因为
+   * 自动清理也要用：`applySessionOp('clear')` 与「超阈值兜底」共用同一条路径。
+   * 继承是天然的：人设 / 单群活跃系数 / 群友动态设定都在 `state.sessions[key]` 上，
+   * 不在 DSH 会话里；模型与人设随后由 `_applyModel` / `_applyPersona` 重推。
+   *
+   * ⚠️ 归档失败**不阻塞**（旧会话留成孤儿，由 cleanupStale 兜底），否则用户还在等回复。
+   *
+   * @param {string} key QQ 会话 key
+   * @param {object} entry state.sessions[key]
+   * @param {{reason?:string}} [opts] reason 只用于日志（manual / context-limit / compact-fallback）
+   * @returns {Promise<{sessionId:string, oldId:string, archived:boolean}>}
+   */
+  async _rebuildSessionContext(key, entry, { reason = 'manual' } = {}) {
+    const oldId = String(entry.sessionId ?? '').trim()
+    let archived = false
+    if (oldId) {
+      this._forgetSessionCaches(oldId)
+      try {
+        await this.dsh.archiveSession(oldId, { stopActivity: true })
+        archived = true
+      } catch (error) {
+        this.logger.warn?.(`重建会话时归档旧会话失败（继续建新会话）：${error?.message ?? error}`)
+        this._noteStale(oldId)
+      }
+    }
+    const { sessionCwd, workspaceTitle } = this.config.dsh
+    fs.mkdirSync(sessionCwd, { recursive: true })
+    const workspaceId = await this.dsh.ensureWorkspace(sessionCwd, workspaceTitle)
+    const sessionId = await this.dsh.createSession(workspaceId, this.config.dsh.agentPreset)
+    entry.sessionId = sessionId
+    // 新建即当前工具基线，记下 epoch（否则下一条消息会再触发一次「能力升级重建」）。
+    entry.toolEpoch = String(this.live?.toolEpoch ?? '')
+    entry.title = ''
+    entry.unread = 0
+    entry.lastAt = 0
+    entry.lastText = ''
+    // 新会话轮数从 0 起算：基线跟着换会话 id 归零，避免下一条消息又判超阈值。
+    entry.ctxBaseSessionId = sessionId
+    entry.ctxBaseTurns = 0
+    this._saveState()
+    // 会话 id 换了：插件工具靠这个反查表把 chatKey 注入到正确的会话，旧 id 必须清掉。
+    if (oldId) this._sessionKeys.delete(oldId)
+    this._sessionKeys.set(sessionId, key)
+    await this._applyModel(sessionId)
+    await this._ensureSessionTitle(key, undefined, { force: true })
+    this.state.contextResets = (Number(this.state.contextResets) || 0) + 1
+    this.logger.info?.(
+      `上下文已重建（${reason}）：${key} ${oldId || '(无映射)'} -> ${sessionId}（归档=${archived}）`,
+    )
+    return { sessionId, oldId, archived }
+  }
+
+  /**
+   * 群聊上下文超阈值时**静默**清理。返回本轮可继续使用的 sessionId。
+   *
+   * 只在「收到新消息、准备发给模型之前」调用（不设后台定时器）。
+   *
+   * 补充条件落实：
+   *   · 一：私聊直接原样返回，永不清理；
+   *   · 二：全程 try/catch，失败只写日志——绝不 `_send` 任何提示，也不把异常抛给
+   *     `_processBatch` 的 catch（否则会变成群里一句「（这次处理出错了）」）；
+   *   · 三：先试 DSH 原生压缩（同一会话内总结前情）；不支持/失败就归档 + 新建同名会话，
+   *     人设 / 模型 / 单群配置由随后的 `_applyModel` / `_applyPersona` 无缝接上；
+   *   · 四：检查点就是这里——新消息进来才查，没有定时器。
+   *
+   * @param {string} key QQ 会话 key
+   * @param {object} msg 入站消息（用 kind 判群聊）
+   * @param {string} sessionId 当前会话 id
+   * @returns {Promise<string>} 可用的 sessionId（压缩时不变，清空时是新的）
+   */
+  async _maybeRecycleContext(key, msg, sessionId) {
+    try {
+      // 补充条件一：只对群聊生效，私聊必须保留长期记忆。
+      const kind = msg?.kind === 'group' ? 'group' : parseSessionKey(key).kind
+      if (kind !== 'group') return sessionId
+      const { strategy, turns: limit } = this._contextPolicy()
+      if (strategy === 'off' || limit <= 0) return sessionId
+      const entry = this._entryOf(key)
+      const currentId = String(entry.sessionId ?? '').trim()
+      if (!currentId) return sessionId
+      const outline = await this.dsh.turnOutline(currentId)
+      const current = Array.isArray(outline) ? outline.length : 0
+      // 基线：换过会话 / 老 state 没记过 → 只初始化，绝不因为「历史很长」立刻清一次。
+      if (entry.ctxBaseSessionId !== currentId || !Number.isFinite(Number(entry.ctxBaseTurns))) {
+        entry.ctxBaseSessionId = currentId
+        entry.ctxBaseTurns = current
+        this._saveState()
+        return sessionId
+      }
+      const used = current - Number(entry.ctxBaseTurns)
+      if (used < limit) return sessionId
+      this.logger.info?.(
+        `会话 ${key} 距上次清理已 ${used} 轮（阈值 ${limit}），按「${strategy}」清理上下文`,
+      )
+      if (strategy === 'compact' && await this._compactContext(key, entry, current)) {
+        return entry.sessionId
+      }
+      if (strategy === 'compact') {
+        this.logger.warn?.(`会话 ${key} 原生压缩不可用，静默降级为「归档 + 新建会话」`)
+      }
+      const next = await this._rebuildSessionContext(key, entry, {
+        reason: strategy === 'compact' ? 'compact-fallback' : 'context-limit',
+      })
+      return next?.sessionId || sessionId
+    } catch (error) {
+      // 补充条件二：清理失败绝不影响这一轮回复，也绝不给群里发提示。
+      this.logger.warn?.(`上下文自动清理失败（本轮照常回复，保持原会话）：${error?.message ?? error}`)
+      return sessionId
+    }
+  }
+
+  /**
+   * 让 DSH 把当前会话的历史总结压缩掉（`/compact`）。
+   *
+   * 成功返回 true，并把基线推到「压缩时的轮数」（压缩不会缩短 turnOutline 的轮数）。
+   * 失败返回 false，由调用方降级成归档重建 —— 本方法自己不抛错。
+   *
+   * @param {string} key
+   * @param {object} entry
+   * @param {number} currentTurns 压缩前的轮数
+   * @returns {Promise<boolean>}
+   */
+  async _compactContext(key, entry, currentTurns) {
+    const sessionId = String(entry.sessionId ?? '').trim()
+    if (!sessionId) return false
+    // 老版本 DSH 没有 command-compact：记忆里记一次不可用，之后不再白试。
+    if (this._compactSupported === false) return false
+    // busy（上一条 turn 刚结束、agent 还没回到 idle）很常见：重试一次即可。
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const started = Date.now()
+      try {
+        const result = await this.dsh.compactSession(sessionId)
+        this._compactSupported = true
+        entry.ctxBaseSessionId = sessionId
+        entry.ctxBaseTurns = currentTurns
+        this.state.contextCompacts = (Number(this.state.contextCompacts) || 0) + 1
+        this._saveState()
+        const text = typeof result?.text === 'string' && result.text.trim() !== '' ? `（${result.text.trim()}）` : ''
+        this.logger.info?.(`已压缩上下文：${key} ${sessionId}${text}，耗时 ${Date.now() - started}ms`)
+        return true
+      } catch (error) {
+        const message = String(error?.message ?? error)
+        // 命令不存在 / 网关不认这个方法：这个 DSH 版本没有压缩能力，别再试。
+        if (/unknown|not.?found|404|未产生结果/i.test(message)) {
+          this._compactSupported = false
+          this.logger.warn?.(`本机 DSH 不支持 /compact（${message}），改用归档重建`)
+          return false
+        }
+        if (attempt === 0 && /busy|not idle|active compaction|unavailable/i.test(message)) {
+          const waitMs = Number.isFinite(Number(this._compactRetryMs)) ? Number(this._compactRetryMs) : COMPACT_BUSY_RETRY_MS
+          this.logger.info?.(`压缩暂不可用（${message}），${waitMs}ms 后重试一次`)
+          await new Promise((resolve) => setTimeout(resolve, waitMs))
+          continue
+        }
+        this.logger.warn?.(`压缩失败：${message}`)
+        return false
+      }
+    }
+    return false
+  }
+
   /**
    * 把当前模型配置下发给 qq-guard 插件（幂等，每条消息前调用）。
    *
@@ -1432,32 +1669,9 @@ export class Bridge {
     }
 
     if (action === 'clear') {
-      const oldId = entry.sessionId
-      if (!oldId) return { ok: false, error: 'no-session', action: 'clear', key }
-      this._forgetSessionCaches(oldId)
-      let archived = false
-      try {
-        await this.dsh.archiveSession(oldId, { stopActivity: true })
-        archived = true
-      } catch (error) {
-        this.logger.warn?.(`清空时归档旧会话失败（继续建新会话）：${error?.message ?? error}`)
-        this._noteStale(oldId)
-      }
-      const { sessionCwd, workspaceTitle } = this.config.dsh
-      fs.mkdirSync(sessionCwd, { recursive: true })
-      const workspaceId = await this.dsh.ensureWorkspace(sessionCwd, workspaceTitle)
-      const sessionId = await this.dsh.createSession(workspaceId, this.config.dsh.agentPreset)
-      entry.sessionId = sessionId
-      // 新建即当前工具基线，记下 epoch（否则下一条消息会再触发一次「能力升级重建」）。
-      entry.toolEpoch = String(this.live?.toolEpoch ?? '')
-      entry.title = ''
-      entry.unread = 0
-      entry.lastAt = 0
-      entry.lastText = ''
-      this._saveState()
-      await this._applyModel(sessionId)
-      await this._ensureSessionTitle(key, undefined, { force: true })
-      this.logger.info?.(`清空上下文：${key} ${oldId} -> ${sessionId}（归档=${archived}）`)
+      if (!entry.sessionId) return { ok: false, error: 'no-session', action: 'clear', key }
+      // 归档 + 新建同名会话的实体在 _rebuildSessionContext 里（自动清理也走它）。
+      const { sessionId, archived } = await this._rebuildSessionContext(key, entry, { reason: 'manual' })
       return { ok: true, action: 'clear', key, sessionId, archived }
     }
 
@@ -2182,7 +2396,13 @@ export class Bridge {
           if (!(sent && sent.ok === false)) this._noteReplied(key)
           return
         }
-        const sessionId = await this.ensureSession(key, msg)
+        const ensuredSessionId = await this.ensureSession(key, msg)
+        // 群聊上下文自动清理（2026-10-27）：超阈值先压缩（或归档重建），再喂模型。
+        // 为什么就放这儿：① 这是唯一的模型出口；② 已在 queues.run 串行区内；
+        // ③ 在限频之后（被丢掉的消息不会触发清理）；④ 紧接着下面两行会把
+        //    模型与人设重推到「可能刚新建」的会话上，天然无缝继承。
+        // 全程静默：失败只写日志，绝不往群里发提示（见 _maybeRecycleContext）。
+        const sessionId = await this._maybeRecycleContext(key, msg, ensuredSessionId)
         // 每条消息前重新下发一次模型偏好：设置页改完下一条即生效（幂等，不阻塞）。
         await this._applyModel(sessionId)
         // 人设 section 每轮组装现读：单人设 > 全局；非管理员追加越权拒绝提示。

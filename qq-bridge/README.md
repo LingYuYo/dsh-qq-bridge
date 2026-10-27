@@ -448,6 +448,44 @@ node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔�
 | `modelWatchdogMs` | 只用于**日志提示**：等待超过它就打 `⏳ 等待回复已超 N 秒，可能正在触发看门狗降级…`（真正的切断在 Host 插件里） | 设置页 > `config.json` > 8000 |
 | `antiDebounceMs` | 防抖合并窗口；0 = 沿用 `rhythm.debounceWindowMs` | 高级参数 > 节奏参数 |
 | `timeoutReplyText` | 超时/看门狗类失败发给 QQ 的文案（默认「（模型脑子卡住了，稍后再试）」）；留空按默认 | 设置页 > `config.json` > 内置默认 |
+| `maxContextTurns` | **群聊**上下文自动清理阈值（轮，默认 30）。从上次清理算起累计超过就触发；`0` = 不限制。私聊永不清理 | 设置页 > `config.json` > 30 |
+| `contextClearStrategy` | 超阈值怎么处理：`compact` = DSH 原生总结压缩（推荐）/ `clear` = 归档旧会话 + 新建同名会话 / `off` = 关闭 | 设置页 > `config.json` > `compact` |
+
+### 上下文自动清理（2026-10-27）
+
+**为什么**：群聊会话攒到 150 轮以上（累计近 4M token）时，模型回复延迟会飙到 20s+。
+桥接层加一道**轮数闸门**，在「记忆力」和「响应速度」之间取平衡。
+
+**怎么判**（`Bridge._maybeRecycleContext`，只在 `_processBatch` 里、发给模型之前跑）：
+
+1. **只认群聊**：`g:<群号>` 才判；`u:<QQ号>` 私聊直接跳过，长期记忆绝不清；
+2. `contextClearStrategy=off` 或 `maxContextTurns=0` → 不动作；
+3. 取权威轮数：`session/projections` 的 `turnOutline.length`（一次本地 RPC，毫秒级）；
+4. 与 `state.sessions[key].ctxBaseTurns` 相减，差值 < 阈值就放行；
+5. 超阈值 → 按策略清理，清完把基线推到当前轮数，**紧接着的 `_applyModel` / `_applyPersona`
+   会把模型与人设重推到（可能刚新建的）会话上**。
+
+**两种策略**：
+
+- `compact`（默认）：调 DSH 原生命令 `/compact`（走 `commands/execute`；RPC `session/compact`
+  并不存在）。DSH 会把能压的历史折成一条摘要，**同一会话继续聊** —— 标题 / 模型 / 人设 /
+  单群配置一样都不用搬，群友完全无感。压缩要跑一轮模型总结，那一条回复会慢几秒到几十秒
+  （上限 90s，超时即放弃并降级）。实测 6 轮 / 约 1200 token 的历史压一次 33s，
+  30 轮会更久，所以那一条回复确实会明显变慢。
+- `clear`：归档旧会话（带 `stopActivity`）+ 同一工作区新建同名会话，人设 / 模型 / 单群活跃
+  配置照旧继承。零延迟、零额外 token，代价是记忆断档。
+
+**为什么阈值不是「绝对轮数」**：DSH 的压缩只 shadow prompt surface，会话日志与 `turnOutline`
+的轮数**都不会变短**，所以必须用 `ctxBaseTurns` 快照相减；否则压缩完下一句消息又会判超阈值、
+每句话都清一次。基线存在 `state/sessions.json`，旧文件缺字段会自动补默认、只初始化不触发。
+
+**静默红线**：整条清理路径不碰 `_send` / `qq.send*`；任何异常都被 `_maybeRecycleContext`
+自己吞掉（只写 `logger.warn`），绝不让它冒到 `_processBatch` 的 catch 变成群里一句
+「（这次处理出错了，稍后再试）」，也不发任何「我重置了记忆」之类的提示。
+
+**可观测**：日志会写「距上次清理已 N 轮（阈值 M），按 X 清理上下文」/「已压缩上下文…」/
+「上下文已重建（reason）：old -> new（归档=ok）」；`state.contextCompacts` 与
+`state.contextResets` 两个计数便于事后排查。
 
 **超时不再把英文报错发给群友**（2026-10-26）：`_isTimeoutish()` 认三类失败
 （桥接自己的 `code=TIMEOUT`、Host 看门狗切断后回来的 `WATCHDOG_TIMEOUT`、

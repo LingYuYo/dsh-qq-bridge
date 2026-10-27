@@ -27,6 +27,15 @@ const COOKIE_REFRESH_MARGIN_MS = 5 * 60 * 1000
  * 多留 10s 余量，让 Host 的 `{ok:false, reason}` 先回来。
  */
 const SUMMARIZE_TIMEOUT_MS = 70 * 1000
+/**
+ * 原生 `/compact` 的等待上限（2026-10-27）。
+ *
+ * 压缩本身要跑一轮模型总结（DSH 内部 selectCompactableRange → 摘要 → 替换 surface）。
+ * 实测：6 轮、约 1200 token 的历史，压缩耗时 33s（走 deepseek-v4.1-flash + high effort）。
+ * 30 轮的群聊会更久，所以给 90s —— 超过就放弃压缩、静默降级成「归档 + 新建会话」，
+ * 不让群友无限等下去。注意超时只是本地不等了，DSH 侧那次压缩可能仍在收尾。
+ */
+const COMPACT_TIMEOUT_MS = 90 * 1000
 /** 与 plugins/dsh-qq-guard/index.js 的 SUMMARIZE_ROUTE_PATH 一致（规格 §3）。 */
 const PERSONA_SUMMARIZE_PATH = '/dsh-qq-guard/persona-summarize'
 
@@ -250,20 +259,29 @@ export class DshClient {
 
   /**
    * 调一次一元 RPC。
+   *
+   * @param {string} method
+   * @param {object} [args]
+   * @param {{flat?:boolean, timeoutMs?:number}} [opts]
+   *   `flat`：args **平铺**直接在 `payload.args` 上（`commands/*` 这类方法就是这样，
+   *   套 `{request:{...}}` 会被网关报 `missing "agentId"; unexpected "request"`）。
+   *   `timeoutMs`：单次调用的超时（压缩要跑模型，比普通 RPC 慢得多）。
    * @returns {Promise<unknown>} 解包后的 value
    * @throws 当结果是 `{ok:false}` 或 HTTP 非 2xx 时抛错，错误上带 code。
    */
-  async call(method, args = {}) {
+  async call(method, args = {}, { flat = false, timeoutMs = this.timeoutMs } = {}) {
     await this.ensureBaseUrl()
     const wrapKey = Object.hasOwn(METHOD_ARG_WRAPPERS, method) ? METHOD_ARG_WRAPPERS[method] : 'request'
-    const payload = wrapKey === null ? { args: {} } : { args: { [wrapKey]: args } }
+    const payload = flat
+      ? { args }
+      : (wrapKey === null ? { args: {} } : { args: { [wrapKey]: args } })
 
     /** 用当前 baseUrl 发一次；返回 Response。 */
     const send = () => fetch(`${this.baseUrl}/api/${method}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', cookie: this.ensureCookie() },
       body: JSON.stringify({ type: 'client-request', rpcId: randomUUID(), method, payload }),
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: AbortSignal.timeout(timeoutMs),
     })
 
     let res
@@ -482,6 +500,69 @@ export class DshClient {
     const value = await this.call('session/projections', { sessionId, keys: ['turnOutline'] })
     const outline = value?.values?.turnOutline
     return Array.isArray(outline) ? outline : []
+  }
+
+  /**
+   * 列出该会话当前可用的 slash 命令（`commands/list`）。
+   *
+   * 用途：探测 DSH 版本有没有 `command-compact`（老版本没有 `/compact`）。
+   * 注意 args 是**平铺**的 `{agentId}`，agentId 就是 sessionId（实测同一值）。
+   *
+   * @param {string} sessionId
+   * @param {{timeoutMs?:number}} [opts]
+   * @returns {Promise<Array<{name:string, description?:string}>>}
+   */
+  async listCommands(sessionId, { timeoutMs = this.timeoutMs } = {}) {
+    const value = await this.call('commands/list', { agentId: sessionId }, { flat: true, timeoutMs })
+    if (Array.isArray(value)) return value
+    if (Array.isArray(value?.commands)) return value.commands
+    if (Array.isArray(value?.items)) return value.items
+    return []
+  }
+
+  /**
+   * 触发 DSH 原生「上下文压缩」（`/compact` 命令）。
+   *
+   * 为什么走命令而不是专门 RPC：DSH 没有 `session/compact`（探针实测 404 unknown method），
+   * 压缩能力的公开入口只有 `command-compact` 注册的 `/compact` 命令，而命令可以经
+   * `commands/execute` 从外部投递（args 同样**平铺**，`submittedAttachments` 必填且必须为空数组）。
+   *
+   * 语义（2026-10-27 按 dsh-compaction-basic 源码确认）：
+   *   · 手动压缩走 `selectCompactableRange(..., 0)` → **能压多少压多少**，
+   *     除 system prompt 外把历史折成一条摘要（不是「保留最近 N 轮」）；
+   *   · 只在 agent 空闲时可跑，否则报 busy；
+   *   · 压缩只 shadow surface，会话日志与 `turnOutline` 轮数**都不变**。
+   *
+   * @param {string} sessionId
+   * @param {{timeoutMs?:number}} [opts]
+   * @returns {Promise<{kind?:string, text?:string, sourceEventSeq?:number}>}
+   * @throws 命令返回 `kind:'error'`（busy / 无可压历史 / 没模型可总结）时抛错，code=COMPACT_FAILED。
+   */
+  async compactSession(sessionId, { timeoutMs = COMPACT_TIMEOUT_MS } = {}) {
+    const value = await this.call('commands/execute', {
+      agentId: sessionId,
+      line: '/compact',
+      submittedAttachments: [],
+    }, { flat: true, timeoutMs })
+    // 返回结构（2026-10-27 实测）：`{commandId, result:{kind,text,sourceEventSeq?}}`。
+    // 早先按裸 `{kind,text}` 写的判断会误判成「没有结果」，这里两种形态都认。
+    const outcome = (value && typeof value === 'object' && value.result && typeof value.result === 'object')
+      ? value.result
+      : value
+    const kind = typeof outcome?.kind === 'string' ? outcome.kind : ''
+    if (kind === 'error') {
+      const error = new Error(`compact 失败：${String(outcome?.text ?? '未知原因')}`)
+      error.code = 'COMPACT_FAILED'
+      throw error
+    }
+    // 命令名不在注册表里时网关不回错误、只给 admission miss（value 为空），
+    // 这里也当失败处理：让调用方降级成归档重建，而不是误以为压过了。
+    if (kind !== 'success') {
+      const error = new Error('compact 未产生结果（命令可能不存在或未执行）')
+      error.code = 'COMPACT_FAILED'
+      throw error
+    }
+    return { ...outcome, commandId: value?.commandId }
   }
 
   /**
