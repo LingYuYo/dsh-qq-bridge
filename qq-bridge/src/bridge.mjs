@@ -2356,22 +2356,58 @@ export class Bridge {
     const windowMs = advanced > 0 ? advanced : this._rhythm().debounceWindowMs
     // 0 = 关闭防抖，或「防抖合并」插件被关掉：立即投递（保持旧行为，也让测试可控）。
     if (!(windowMs > 0) || !this._features().debounce) {
-      return await this._processBatch(key, msg, [labelled], images)
+      // 快照本轮身份：一轮只会引用**这条消息**的 message_id。
+      return await this._processBatch(key, { ...msg }, [labelled], images)
     }
 
     const prev = this._debounce.get(key)
-    const entry = prev ?? { texts: [], images: [], msg, timer: null }
+    // ── 并发隔离（2026-10-27 真机 Bug）──────────────────────────────
+    // 群里 A 说一句、B 紧接着说一句时，旧逻辑会把两条并进同一轮；而一轮回复只能挂
+    // 一个 `reply` 段 —— 结果就是「引用了 B 的原消息，回答的却是 A 那句」，分片里
+    // 后续气泡又只挂第一片，看着就像「引用串台 + 干脆没引用」。
+    // 修法：**不同发送者的消息绝不合并**。换人就先把上一批立刻投递，再开新的一批。
+    // 同一个人连发多条仍然合并（那本来就是他一个人的一轮），引用他最后那条。
+    if (prev && prev.msg && String(prev.msg.userId ?? '') !== String(msg.userId ?? '')) {
+      void this._flushDebounce(key)
+        .catch((e) => this.logger.error?.(`处理 ${key} 失败：${e?.message ?? e}`))
+    }
+    const entry = this._debounce.get(key) ?? { texts: [], images: [], msg: null, timer: null }
     if (labelled) entry.texts.push(labelled)
     if (images.length > 0) entry.images.push(...images)
-    entry.msg = msg // 以最后一条消息为回复目标（群聊 @ 最后说话的人）
+    entry.msg = msg // 同一发送者的最后一条：引用 / @ 都指向它
     if (entry.timer) clearTimeout(entry.timer)
     entry.timer = setTimeout(() => {
-      this._debounce.delete(key)
-      void this._processBatch(key, entry.msg, entry.texts, entry.images)
+      void this._flushDebounce(key)
         .catch((e) => this.logger.error?.(`处理 ${key} 失败：${e?.message ?? e}`))
     }, windowMs)
     if (typeof entry.timer.unref === 'function') entry.timer.unref()
     this._debounce.set(key, entry)
+  }
+
+  /**
+   * 立刻投递该会话攒着的防抖批次（不等窗口到点）。
+   *
+   * 两处调用：① 窗口到点（原来的行为）；② 换发送者时（并发隔离，见 {@link _enqueue}）。
+   *
+   * 关键：投递前把 `msg` / `texts` / `images` **各拷一份**再交给 `_processBatch`。
+   * 之后同一会话再进新消息只会写进新的 entry，绝不可能改到这一轮已经捕获的原消息 id；
+   * 引用段因此永远绑在本轮真正的那条消息上，不会被并发消息抢占（超时/报错提示同理）。
+   *
+   * @param {string} key
+   * @returns {Promise<void>}
+   */
+  async _flushDebounce(key) {
+    const entry = this._debounce.get(key)
+    if (!entry) return
+    // 先摘掉再投递：本轮处理期间到达的新消息会开新 entry，不污染这一批。
+    this._debounce.delete(key)
+    if (entry.timer) clearTimeout(entry.timer)
+    entry.timer = null
+    if (!entry.msg) return
+    const turnMsg = { ...entry.msg }
+    const texts = [...entry.texts]
+    const images = [...entry.images]
+    return await this._processBatch(key, turnMsg, texts, images)
   }
 
   /**

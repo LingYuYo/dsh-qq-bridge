@@ -1181,6 +1181,7 @@ function makeBridge({ rhythm, dsh: dshCfg, stateFile, allow, personaDefault, cap
     outlineCalls: [],
     compacts: [],
     compactFails: null,
+    promptFails: null,
   }
   b.dsh = {
     sessionExists: async (id) => { calls.existChecks.push(id); return calls.exists },
@@ -1196,7 +1197,17 @@ function makeBridge({ rhythm, dsh: dshCfg, stateFile, allow, personaDefault, cap
     renameSession: async (sid, title) => { calls.renamed.push({ sid, title }); return title },
     sessionTitle: async () => null,
     setSessionPersona: async (payload) => { calls.personas.push(payload); return { ok: true } },
-    promptAndWait: async (sid, text, opts) => { calls.prompts.push({ sid, text, opts }); return calls.reply },
+    promptAndWait: async (sid, text, opts) => {
+      calls.prompts.push({ sid, text, opts })
+      // promptFails：数组 = 按次取（shift 掉一条）；字符串 = 每次都抛。用来模拟超时/看门狗。
+      const fail = Array.isArray(calls.promptFails) ? calls.promptFails.shift() : calls.promptFails
+      if (fail) {
+        const err = new Error(fail)
+        err.code = /TIMEOUT/i.test(fail) ? 'TIMEOUT' : 'ERR'
+        throw err
+      }
+      return calls.reply
+    },
     // 自动清理要读的轮数：假 DSH 直接回放预设数组（真实实现在 dsh.mjs 走 session/projections）。
     turnOutline: async (sid) => { calls.outlineCalls.push(sid); return calls.outline },
     // 原生压缩：真实实现是 commands/execute 投递 /compact，这里只要成败可控。
@@ -1746,6 +1757,60 @@ await check('入站没有 message_id 时退回 @（不生成空引用段）', as
   await b._send({ kind: 'group', userId: '1000000001', groupId: '123456', messageId: '' }, '你好')
   assert.equal(calls.sent[0].opts?.replyTo, undefined)
   assert.equal(calls.sent[0].opts?.atUserId, '1000000001')
+})
+
+console.log('\n— 并发隔离：A/B 同时说话不许串台（2026-10-27 真机 Bug）—')
+/** 指定发送者的群消息（groupMsg 固定了 userId，这里需要两个人）。 */
+const gm = (text, id, userId) => ({
+  kind: 'group', userId, groupId: '123456', text, messageId: id,
+  raw: { message: [{ type: 'text', data: { text } }] },
+})
+const sentQuotes = (calls) => calls.sent.map((s) => s.opts?.replyTo)
+
+await check('★ A、B 几乎同时说话：两轮各回各的，引用各自的原消息 id', async () => {
+  const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 40 } })
+  await b.handleMessage(gm('你知不知道主人是谁', 'A-id', '1001'))
+  await b.handleMessage(gm('甩不了', 'B-id', '1002'))
+  await sleep(120)
+  assert.equal(calls.prompts.length, 2, `★ 应各成一轮，实际 ${calls.prompts.length}`)
+  assert.equal(calls.sent.length, 2)
+  assert.deepEqual(sentQuotes(calls), ['A-id', 'B-id'], '★ A 的回 A，B 的回 B')
+})
+
+await check('同一个人连发多条仍合并成一轮，引用他最后那条', async () => {
+  const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 40 } })
+  await b.handleMessage(gm('在吗', 'A1', '1001'))
+  await b.handleMessage(gm('帮我看个东西', 'A2', '1001'))
+  await sleep(120)
+  assert.equal(calls.prompts.length, 1, '同一个人连发应合并')
+  assert.equal(calls.sent.length, 1)
+  assert.equal(sentQuotes(calls)[0], 'A2', '引用该发送者最后一条')
+  assert.match(calls.prompts[0].text, /在吗[\s\S]*帮我看个东西/, '两条都进了模型正文')
+})
+
+await check('★ 上一轮超时：错误提示仍引用本轮原消息，不被下一条抢占', async () => {
+  const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 40 } })
+  calls.promptFails = ['TIMEOUT 等待回复超时（20s）']
+  await b.handleMessage(gm('你知不知道主人是谁', 'A-id', '1001'))
+  await b.handleMessage(gm('甩不了', 'B-id', '1002'))
+  await sleep(120)
+  assert.equal(calls.sent.length, 2)
+  assert.deepEqual(sentQuotes(calls), ['A-id', 'B-id'], '★ 超时那轮的错误提示也得引用 A 自己的消息')
+  assert.match(calls.sent[0].text, /卡住|稍后再试/, '第一条是超时提示')
+  assert.equal(calls.sent[1].text, calls.reply, '第二条才是正常回复')
+})
+
+await check('不同群同时说话：各自引用各自的原消息（跨 key 也不串）', async () => {
+  const { b, calls } = makeBridge({
+    rhythm: { activityLevel: 3, debounceWindowMs: 0 },
+    allow: { groups: ['123456', '654321'] },
+  })
+  await Promise.all([
+    b.handleMessage({ kind: 'group', userId: '1001', groupId: '123456', text: '甲群的问题', messageId: 'G1-id', raw: {} }),
+    b.handleMessage({ kind: 'group', userId: '1002', groupId: '654321', text: '乙群的问题', messageId: 'G2-id', raw: {} }),
+  ])
+  assert.equal(calls.sent.length, 2)
+  assert.deepEqual(sentQuotes(calls), ['G1-id', 'G2-id'])
 })
 
 console.log('\n— 群聊上下文自动清理（2026-10-27）—')
