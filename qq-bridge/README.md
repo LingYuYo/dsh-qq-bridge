@@ -343,14 +343,27 @@ provider（opencode-go）也不会覆盖 system 提示词（直连 API 注入人
 监听 OneBot 的 `notice` 事件（`notice_type=notify`、`sub_type=poke`），被戳的是机器人自己时按配置回应：
 
 - `poke.enabled`（默认开）：总开关，关了完全不响应；
-- `poke.mode`：`poke` = 回戳对方（默认）；`text` = 用模板发一句文字；
-- `poke.replyText`（默认 `（被戳了一下，戳回去）`）：文字模式模板，支持 `{nick}` / `{qq}`，
+- `poke.mode`：`poke` = 回戳对方（默认）；`text`（别名叫 `fixed_text`）= 从回复列表随机挑一条：
+  **先发文字，再单独发表情包**；
+- `poke.replies`：`{ text, image }` 数组（最多 30 条，2026-10-27 起支持图文混合）。
+  空数组合法 —— 退回 `poke.replyText`，老配置不用迁移；
+- `poke.replyText`（默认 `（被戳了一下，戳回去）`）：列表为空时的兜底文字，支持 `{nick}` / `{qq}`，
   昵称取群成员/好友缓存（`onebot.nameOf`），取不到退回 QQ 号。
+
+图文混合的发送规则（2026-10-27 定）：
+
+- 只有文字 → 走正常发送链路；
+- 只有图 → 只发表情包；
+- 图文都有 → 文字先发，`POKE_IMAGE_GAP_MS`（350ms）后单独发表情包，**不做混排**；
+- 表情包强制 `sub_type: 1`（QQ 里按表情而不是普通图片渲染）；GIF 再补 `summary: '[动画表情]'`；
+- 图片引用：本地路径先转 `file:///`，NapCat 拒了就同文件读成 `base64://` 再试一次；
+  文件不存在/超过 5MB 只 warn —— 有文字就发文字，绝不静默失败；
+- poke 的 notice 事件没有 `message_id`，所以文字那条**引用不到原消息**（引用只在正常消息回复时生效）。
 
 细节：
 
 - 白名单照旧（群聊按群号、私聊按 QQ 号），名单外不回应；
-- 同一会话 **3 秒内最多回一次**，防戳一戳刷屏；
+- 同一会话 **3 秒内最多回一次**，防戳一戳刷屏；多条回复时不会连续两次抽中同一条；
 - 回戳依次尝试 `group_poke` / `friend_poke`，失败再兜底 `send_poke`（NapCat 各版本 action 名不统一），
   全失败只 warn、绝不影响聊天；文字模式走正常发送链路（分片、打字延时都生效）；
 - 事件里 `user_id` 是戳的人、`target_id` 是被戳的人；缺 `target_id` 时直接忽略（不猜），

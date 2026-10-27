@@ -578,7 +578,27 @@ QQ 会话切模型，**不能**走 `session/selectModel` —— 它会顺带 `ag
 |---|---|---|
 | `personaLocked` | `true` | 锁定人设：群友在群里 `@bot 你要改成…` 被拒；解锁后才会把这句话追加成本群动态设定（存 `state/sessions.json` 的 `personaDelta`，不改主设定） |
 | `personaAutoUpdate` | `true` | 每小时把本群聊天记录交给模型归纳、自动补充设定；**仍受 `personaLocked` 约束** |
-| `poke.enabled` / `poke.mode` / `poke.replyText` | 开 / `poke` / `（被戳了一下，戳回去）` | 被戳一戳时：回戳 or 文字回复（模板支持 `{nick}` / `{qq}`） |
+| `poke.enabled` / `poke.mode` / `poke.replies` | 开 / `poke` / `[]` | 被戳一戳时：回戳 or 从回复列表随机挑一条（图文混合，见下） |
+
+#### 戳一戳回复列表（2026-10-27）
+
+`poke.replies` 是 `[{ text, image }]`，在「技能与插件 → 戳一戳回复」卡片的齿轮弹窗里增删改
+（设置页的「戳一戳」分组只留总开关与回应方式，避免两处双写）。空数组 = 退回 `poke.replyText`。
+
+图片走 **Host 落盘**，配置里只存绝对路径：
+
+```
+POST /dsh-qq-guard/poke-image        （body = 图片二进制，≤5MB，按魔数校验 PNG/GIF/JPEG/WebP）
+  → { ok, path: "C:\\…\\poke-images\\<sha1>.gif", name, bytes, mime }
+GET  /dsh-qq-guard/poke-image?name=<sha1>.<ext>   → 原图（弹窗缩略图预览）
+```
+
+- 为什么不存 base64：桥接每 2 秒轮询 `GET /dsh-qq-guard/config` 拿整包 config，
+  一张 5MB 图转 base64 是 6.7MB，等于每 2 秒传一次 6.7MB；而且配置最终写进
+  `cordis.patch.yml`，多几张图就把文件撑到几十 MB。
+- 存储目录 `~/.dsh/qq-guard/poke-images/`，文件名 = 内容 sha1（同图重复上传只落一份）；
+  启动 5 秒后清一次「没被任何回复引用 + 超过 24 小时」的孤儿文件。
+- 发送侧：文字先发，350ms 后单独发表情包，强制 `sub_type: 1`；不做图文混排。
 
 归纳本身需要模型，而桥接是独立进程调不到 `ctx.llm`，所以加了一条 Host 路由：
 

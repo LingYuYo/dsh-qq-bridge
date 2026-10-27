@@ -640,7 +640,53 @@ check('切「发图片」开关 → 写回整数组（含 sk-image，enabled=fal
   const sk = written.find((x) => x.id === 'sk-image')
   if (!sk) throw new Error('写回的数组里没有 sk-image（老配置点一下就丢了默认项）')
   eq(sk.enabled, false, '写回的 sk-image.enabled')
-  eq(written.length, CONFIG_CATALOG.skills.length + 1, '写回的是合并后的整数组')
+  // 2026-10-27：默认技能多了 sk-poke（戳一戳回复），合并后是 catalog + 2。
+  eq(written.length, CONFIG_CATALOG.skills.length + 2, '写回的是合并后的整数组（补 sk-image + sk-poke）')
+  if (!written.find((x) => x.id === 'sk-poke')) throw new Error('写回的数组里没有 sk-poke（新默认项丢了）')
+})
+
+check('老配置里没有 sk-poke → 面板补出「戳一戳回复」卡片', () => {
+  VALUE.skills = CONFIG_CATALOG.skills.map((x) => ({ ...x }))
+  const tree = resetSkills()
+  if (!tileNames(tree).includes('戳一戳回复')) throw new Error('没有合并默认技能「戳一戳回复」')
+  const tile = tileOf(tree, '戳一戳回复')
+  const pill = findAll(tile, (n) => typeof n.props?.className === 'string'
+    && n.props.className.split(' ').includes('qqg-pill'))[0]
+  eq(textOf(pill), '已接入', 'sk-poke 应标为已接入')
+})
+
+check('戳一戳回复：齿轮弹窗 → 列表可增删，保存写回 poke.replies', () => {
+  VALUE.skills = [
+    ...CONFIG_CATALOG.skills.map((x) => ({ ...x })),
+    { id: 'sk-poke', name: '戳一戳回复', icon: 'activity', tag: '内置', ver: '1.0.0',
+      enabled: true, desc: '被戳时回一条' },
+  ]
+  VALUE.poke = { enabled: true, mode: 'text', replyText: '兜底一句', replies: [] }
+  let tree = resetSkills()
+  btn(tree, '戳一戳回复 设置').props.onClick({ stopPropagation() {} })
+  tree = renderSkills()
+  // mode=text 才显示列表；空列表给「没有回复」的提示。
+  const action = btnByText(tree, '+ 添加一条回复')
+  if (!action) throw new Error('弹窗里没有「+ 添加一条回复」')
+  action.props.onClick()
+  tree = renderSkills()
+  if (!btnByText(tree, '删除')) throw new Error('加了一条之后没有「删除」按钮')
+  // 保存 → 整数组写回 poke.replies（草稿是空图文条目）。
+  btnByText(tree, '保存').props.onClick()
+  eq(VALUE.poke.replies, [{ text: '', image: '' }], '保存应写回整数组')
+})
+
+check('戳一戳回复：mode=poke 时列表字段隐藏（回戳用不上）', () => {
+  VALUE.skills = [
+    ...CONFIG_CATALOG.skills.map((x) => ({ ...x })),
+    { id: 'sk-poke', name: '戳一戳回复', icon: 'activity', tag: '内置', ver: '1.0.0',
+      enabled: true, desc: '被戳时回一条' },
+  ]
+  VALUE.poke = { enabled: true, mode: 'poke', replyText: '兜底一句', replies: [] }
+  let tree = resetSkills()
+  btn(tree, '戳一戳回复 设置').props.onClick({ stopPropagation() {} })
+  tree = renderSkills()
+  if (btnByText(tree, '+ 添加一条回复')) throw new Error('mode=poke 不该显示回复列表')
 })
 
 check('配置里已有 sk-image → 不重复追加', () => {

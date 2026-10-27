@@ -20,7 +20,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { OneBotClient, normalizeTypingCharTiers, normalizeTypingMsTiers } from './onebot.mjs'
 import { DshClient } from './dsh.mjs'
 import { synthesize, TTS_MAX_CHARS, DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER } from './tts.mjs'
@@ -343,6 +343,12 @@ const POKE_THROTTLE_MS = 3 * 1000
 const DEFAULT_TIMEOUT_REPLY_TEXT = '（模型脑子卡住了，稍后再试）'
 /** 戳一戳「文字回复」模式的默认模板，支持 {nick} / {qq} 占位。 */
 const DEFAULT_POKE_REPLY_TEXT = '（被戳了一下，戳回去）'
+/** 固定文本回复列表最多认多少条：UI 同值，防止配置被塞爆。 */
+const POKE_REPLY_MAX = 30
+/** 文字与表情包之间留的间隔：太近 QQ 会把两条合成一条通知。 */
+const POKE_IMAGE_GAP_MS = 350
+/** 表情包单张上限（与 UI 的 5MB 提示一致）；超了不发，只 warn。 */
+const POKE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 
 /**
  * 把 `personaDelta` 截到容量上限内（**保留最新**的段落，旧的先丢）。
@@ -372,19 +378,34 @@ function trimPersonaDelta(text) {
  *
  * 单独抽函数是因为它有两个读取点（`handleNotice` 与热配置初值），
  * 而热配置是**整对象替换**，缺键会变 undefined——必须每次现算一份完整的。
+ *
+ * 2026-10-27 升级：`replies` 是 `{ text, image }` 数组，随机挑一条。
+ * 空数组合法（= 退回老的单条 `replyText`），老配置不需要迁移。
+ *
  * @param {unknown} source
- * @returns {{enabled:boolean, mode:'poke'|'text', replyText:string}}
+ * @returns {{enabled:boolean, mode:'poke'|'text', replyText:string,
+ *   replies:Array<{text:string, image:string}>}}
  */
 function normalizePoke(source) {
   const raw = source && typeof source === 'object' && !Array.isArray(source) ? source : {}
   const replyText = typeof raw.replyText === 'string' && raw.replyText.trim() !== ''
     ? raw.replyText
     : DEFAULT_POKE_REPLY_TEXT
+  // 顺序保留（UI 里就是显示顺序），脏条目直接丢：两个字段都空的条目发不出去。
+  const replies = (Array.isArray(raw.replies) ? raw.replies : [])
+    .map((row) => ({
+      text: typeof row?.text === 'string' ? row.text : '',
+      image: typeof row?.image === 'string' ? row.image.trim() : '',
+    }))
+    .filter((row) => row.text.trim() !== '' || row.image !== '')
+    .slice(0, POKE_REPLY_MAX)
+  const mode = String(raw.mode ?? '').trim()
   return {
     enabled: raw.enabled !== false,
-    // 只认 'text'，其它（含脏数据）一律按默认「回戳」。
-    mode: raw.mode === 'text' ? 'text' : 'poke',
+    // 只认 'text' / 'fixed_text'（后者是 UI 说法），其它（含脏数据）一律按默认「回戳」。
+    mode: mode === 'text' || mode === 'fixed_text' ? 'text' : 'poke',
     replyText,
+    replies,
   }
 }
 
@@ -573,6 +594,8 @@ export class Bridge {
     // 2026-10-26 体验升级的运行时状态（全是内存态，不落盘）：
     // 戳一戳节流：同一会话 3 秒内最多回一次。
     this._pokeAt = new Map()   // key -> 上次回戳时间戳（ms）
+    // 戳一戳回复列表上次抽中的下标：避免连续两次挑到同一条（只有 1 条时无所谓）。
+    this._pokeLastPick = new Map() // key -> 上次下标
     // 每小时归纳的聊天记录缓冲：key -> [{ name, qq, text, at }]（群聊才有）。
     this._chatLog = new Map()
     // 归纳定时器（start 里建、stop 里清）与并发保护（一轮 60s 超时内不叠第二轮）。
@@ -2999,6 +3022,92 @@ export class Bridge {
   }
 
   /**
+   * 从固定文本回复里随机挑一条。
+   *
+   * 列表为空 → 退回老的单条 `replyText`（老配置不迁移也能用）。
+   * 多条时避开「上一次刚抽中的那条」：连戳两次发同一句会显得像卡住了。
+   * @param {string} key 会话 key（`g:xxx` / `u:xxx`）
+   * @param {{replyText:string, replies:Array<{text:string,image:string}>}} poke
+   * @returns {{text:string, image:string}}
+   */
+  _pickPokeReply(key, poke) {
+    const list = poke.replies
+    if (list.length === 0) return { text: poke.replyText, image: '' }
+    if (list.length === 1) return list[0]
+    const last = this._pokeLastPick.get(key)
+    let index = Math.floor(Math.random() * list.length)
+    if (index === last) index = (index + 1) % list.length
+    this._pokeLastPick.set(key, index)
+    return list[index]
+  }
+
+  /**
+   * 戳一戳的图片引用：本地路径转 `file:///`，其余（http/base64:/file:）原样返回。
+   *
+   * 为什么转 file:/// 而不是直接给 Windows 路径：NapCat 对裸盘符路径的解析
+   * 各版本不一致，file URL 是 OneBot 里最稳的本地引用形态。
+   * 文件不存在/超过 5MB → 返回空串，调用方据此只发文字。
+   * @param {string} image
+   * @returns {string}
+   */
+  _pokeImageRef(image) {
+    const raw = String(image ?? '').trim()
+    if (!raw) return ''
+    if (/^(https?:|base64:|file:)/iu.test(raw)) return raw
+    try {
+      const stat = fs.statSync(raw)
+      if (!stat.isFile() || stat.size > POKE_IMAGE_MAX_BYTES) return ''
+      return pathToFileURL(raw).href
+    } catch {
+      return ''
+    }
+  }
+
+  /** 本地文件读成 `base64://`（file:/// 被 NapCat 拒时的兜底）；读不到返回空串。 */
+  _pokeImageBase64(image) {
+    try {
+      const raw = String(image ?? '').trim()
+      const file = raw.startsWith('file:') ? fileURLToPath(raw) : raw
+      const buf = fs.readFileSync(file)
+      if (buf.length > POKE_IMAGE_MAX_BYTES) return ''
+      return `base64://${buf.toString('base64')}`
+    } catch {
+      return ''
+    }
+  }
+
+  /**
+   * 发一条戳一戳表情包：强制 `sub_type: 1`，让 QQ 按表情而不是普通图片渲染。
+   *
+   * 两级降级：
+   *   ① 本地文件先走 `file:///`（不占内存）；
+   *   ② 被 NapCat 拒（读不到文件/跨用户权限）→ 同一个文件读成 `base64://` 再试。
+   * 永不抛，失败返回 `{ok:false, error}`，由 handleNotice 只记 warn。
+   * @param {{kind:'private'|'group', groupId?:string|null, userId:string}} scope
+   * @param {string} image
+   * @returns {Promise<{ok:boolean, via?:string, error?:string}>}
+   */
+  async _sendPokeImage(scope, image) {
+    if (typeof this.qq?.sendImage !== 'function') {
+      return { ok: false, error: 'OneBot 客户端没有 sendImage（版本过旧）' }
+    }
+    const target = scope.kind === 'group' ? scope.groupId : scope.userId
+    const ref = this._pokeImageRef(image)
+    if (!ref) return { ok: false, error: `图片不可用：${String(image).slice(0, 80)}` }
+    const first = await this.qq.sendImage(scope.kind, target, ref, { subType: 1 })
+    if (first?.ok) return first
+    if (/^file:/iu.test(ref)) {
+      const base64 = this._pokeImageBase64(image)
+      if (base64) {
+        const second = await this.qq.sendImage(scope.kind, target, base64, { subType: 1 })
+        if (second?.ok) return second
+        return second
+      }
+    }
+    return first
+  }
+
+  /**
    * notice 事件入口（2026-10-26，目前只有戳一戳）。
    *
    * 规则（规格 §5.3）：
@@ -3006,8 +3115,9 @@ export class Bridge {
    *   · 白名单沿用 isAllowed（群聊按群号、私聊按 QQ 号），名单外不回复；
    *   · 同一会话 3 秒内最多回一次（防戳一戳刷屏）；
    *   · `poke.enabled === false` → 完全忽略；
-   *   · `mode: 'poke'` → 回戳（失败只 warn，绝不影响聊天）；`mode: 'text'` → 发模板，
-   *     支持 `{nick}`（取 this.qq.nameOf，取不到退回 QQ 号）与 `{qq}`。
+   *   · `mode: 'poke'` → 回戳（失败只 warn，绝不影响聊天）；`mode: 'text'` → 从 `replies`
+   *     随机挑一条，先发文字（支持 `{nick}` / `{qq}`），再单独发表情包（`sub_type: 1`）；
+   *     `replies` 为空时退回老的单条 `replyText`。
    *
    * 永不抛：notice 是旁路事件，处理失败不该污染消息主链路。
    * @param {{kind?:string, userId?:string, targetId?:string, groupId?:string|null,
@@ -3040,10 +3150,30 @@ export class Bridge {
       if (poke.mode === 'text') {
         // {nick} 取群成员/好友昵称缓存；取不到用 QQ 号（别在文案里留空）。
         const nick = String(this.qq?.nameOf?.(key, poker) ?? '').trim() || poker
-        const text = poke.replyText.replace(/\{nick\}/gu, nick).replace(/\{qq\}/gu, poker)
-        const sent = await this._send(scope, text)
-        if (!(sent && sent.ok === false)) this._noteReplied(key)
-        this.logger.info?.(`被 ${poker} 戳了一下（${key}），文字回复：${text.slice(0, 40)}`)
+        const reply = this._pickPokeReply(key, poke)
+        const text = String(reply.text ?? '')
+          .replace(/\{nick\}/gu, nick)
+          .replace(/\{qq\}/gu, poker)
+          .trim()
+        // 文字先发。poke notice 没有 message_id，`_send` 拿不到引用目标，
+        // 所以走不到「引用气泡」分支（引用只在正常消息回复时生效）。
+        if (text) {
+          const sent = await this._send(scope, text)
+          if (!(sent && sent.ok === false)) this._noteReplied(key)
+          this.logger.info?.(`被 ${poker} 戳了一下（${key}），文字回复：${text.slice(0, 40)}`)
+        }
+        // 表情包单独一条：不跟文字混排（QQ 各版本对混排渲染不一致）。
+        // 中间留一点间隔，免得两条挤成同一条通知。
+        if (reply.image) {
+          if (text) await sleep(POKE_IMAGE_GAP_MS)
+          const imageResult = await this._sendPokeImage(scope, reply.image)
+          if (imageResult?.ok) {
+            if (!text) this._noteReplied(key)
+            this.logger.info?.(`被 ${poker} 戳了一下（${key}），已发表情（${imageResult.via || 'file'}）`)
+          } else {
+            this.logger.warn?.(`戳一戳表情发送失败（${key}）：${imageResult?.error ?? '未知原因'}`)
+          }
+        }
         return
       }
       const target = scope.kind === 'group' ? scope.groupId : poker

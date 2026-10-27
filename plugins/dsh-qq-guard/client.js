@@ -53,6 +53,17 @@ window.__ModuleLoader__.load({
   white-space: pre-wrap; overflow-wrap: anywhere; }
 .qqg-hint { font-size: 11.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary);
   background: var(--dsw-alias-bg-layer-2); border-radius: 6px; padding: 7px 10px; }
+/* 戳一戳回复列表（「戳一戳回复」技能卡片弹窗）：一行 = 缩略图 + 文字 + 操作 */
+.qqg-poke-list { display: flex; flex-direction: column; gap: 8px; }
+.qqg-poke-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px;
+  border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; background: var(--dsw-alias-bg-layer-2); }
+.qqg-poke-thumb { flex: 0 0 44px; width: 44px; height: 44px; border-radius: 6px; object-fit: cover;
+  background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l1); }
+.qqg-poke-thumb-empty { display: flex; align-items: center; justify-content: center;
+  font-size: 10px; color: var(--dsw-alias-label-secondary); }
+.qqg-poke-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.qqg-poke-ops { display: flex; flex-wrap: wrap; gap: 6px; }
+.qqg-poke-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 /* 模型配置卡：备用模型行 + 能力警告 */
 .qqg-hint-warn { color: #b4690e; background: rgba(255, 176, 32, 0.12); }
 .qqg-fb-list { display: flex; flex-direction: column; gap: 8px; align-items: stretch; }
@@ -786,6 +797,8 @@ window.__ModuleLoader__.load({
       'poke.enabled': true,
       'poke.mode': 'poke',
       'poke.replyText': '（被戳了一下，戳回去）',
+      // 图文混合回复列表（2026-10-27）：每条 { text, image }，image 是 Host 落盘后的绝对路径。
+      'poke.replies': [],
       // 语音合成（「发语音」技能的后端）默认值：Edge 免 Key，音色用晓伊。
       'voice.provider': 'edge',
       'voice.baseUrl': '',
@@ -831,11 +844,25 @@ window.__ModuleLoader__.load({
       desc: '把图片或表情包发到 QQ（网页地址或本地文件），模型可通过 qq_send_image 调用。',
     }
 
-    /** 合并默认技能项：已有 sk-image 原样返回，没有就补在末尾（不打断老配置的排序）。 */
+    /**
+     * 内置「戳一戳回复」技能（2026-10-27）。
+     *
+     * 同样必须与 index.js 的 DEFAULT_SKILLS 逐字一致；老配置里没有它就补上，
+     * 否则用户升完版本根本看不到这张卡，回复列表也就没地方配。
+     */
+    const DEFAULT_POKE_SKILL = {
+      id: 'sk-poke', name: '戳一戳回复', icon: 'activity', tag: '内置', ver: '1.0.0', enabled: true,
+      desc: '被戳时从回复列表随机挑一条：先发文字，再单独发表情包（sub_type:1）；也可以选回戳对方。',
+    }
+
+    /** 内置技能的新增项：配置里缺哪个补哪个，已有条目原样保留（不打断排序）。 */
+    const DEFAULT_SKILLS_LOCAL = [DEFAULT_IMAGE_SKILL, DEFAULT_POKE_SKILL]
+
+    /** 合并默认技能项：已有 sk-image / sk-poke 原样返回，缺的补在末尾。 */
     function mergeDefaultSkills(list) {
       const rows = Array.isArray(list) ? list : []
-      if (rows.some((item) => item && item.id === DEFAULT_IMAGE_SKILL.id)) return rows
-      return [...rows, DEFAULT_IMAGE_SKILL]
+      const missing = DEFAULT_SKILLS_LOCAL.filter((item) => !rows.some((row) => row && row.id === item.id))
+      return missing.length === 0 ? rows : [...rows, ...missing]
     }
 
     /** 值相等判断（配置值都是 JSON 可序列化的纯对象/数组）。 */
@@ -1896,13 +1923,16 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 戳一戳（群聊互动）配置卡。
+     * 戳一戳（群聊互动）配置卡：只留总开关与回应方式。
      *
-     * 群友双击头像 / 拍一拍 bot 时怎么回：总开关 + 回戳或文字回复 + 文字模板。
+     * 回复内容（文字 + 表情包列表）已经收进「技能与插件 → 戳一戳回复」卡片的弹窗
+     * （2026-10-27）：两处都放编辑器会出现「这边改完那边又写回去」的双写问题，
+     * 所以这里只给入口提示，不再直接编辑 replyText。
      * 具体响应在桥接进程里做（节流 3 秒、白名单外不回应），这里只负责写配置。
      */
     function PokeSection({ get, write, writable }) {
       const mode = String(get('poke.mode') ?? 'poke')
+      const replies = Array.isArray(get('poke.replies')) ? get('poke.replies') : []
       return h('div', { className: 'qqg-group' },
         h('div', { className: 'qqg-group-title' }, '戳一戳（群聊互动）'),
         h(Field, { label: '响应戳一戳', desc: '群友戳 bot 时回一下。关闭 = 完全不响应。' },
@@ -1910,26 +1940,133 @@ window.__ModuleLoader__.load({
             checked: get('poke.enabled') !== false, disabled: !writable,
             ariaLabel: '响应戳一戳', onChange: (v) => write('poke.enabled', v),
           })),
-        h(Field, { label: '回应方式', desc: '回戳 = 戳回去；文字回复 = 用下面的模板回一条。' },
+        h(Field, { label: '回应方式', desc: '回戳 = 戳回去；回复 = 从「戳一戳回复」卡片的列表里随机挑一条。' },
           h('select', {
             className: 'qqg-input', value: mode, disabled: !writable,
             'aria-label': '回应方式',
             onChange: (e) => write('poke.mode', e.target.value),
           },
           h('option', { value: 'poke' }, '回戳对方'),
-          h('option', { value: 'text' }, '文字回复'))),
-        h(Field, {
-          label: '文字回复模板',
-          desc: '仅「文字回复」模式生效。占位符：{nick} = 对方昵称，{qq} = 对方 QQ 号。',
-        },
-          h(TextInput, {
-            value: String(get('poke.replyText') ?? ''),
-            placeholder: '（被戳了一下，戳回去）', disabled: !writable,
-            ariaLabel: '文字回复模板',
-            onCommit: (v) => write('poke.replyText', v),
-          })),
+          h('option', { value: 'text' }, '文字 / 表情回复'))),
         h('div', { className: 'qqg-hint' },
+          mode === 'text'
+            ? `回复列表在「技能与插件 → 戳一戳回复」卡片里配置，当前 ${replies.length} 条`
+              + '（每条可选一张表情包）。列表为空时退回默认的一句话。'
+            : '选「文字 / 表情回复」后，去「技能与插件 → 戳一戳回复」卡片里配回复列表。',
+          h('br'),
           '同一会话 3 秒内最多回一次，防戳一戳刷屏；白名单外的会话不回应。'))
+    }
+
+    /**
+     * 戳一戳回复列表编辑器（2026-10-27）。
+     *
+     * 一条 = 一个文字框 + 一张可选表情图。图片点上传就落盘：File 直接 POST 成二进制
+     * 给 Host（不走 base64），Host 校验魔数后返回本机路径，配置里只留这个路径
+     * —— 理由是配置每 2 秒被桥接整包轮询，塞 base64 会把 config.json 和
+     * cordis.patch.yml 一起撑爆（见 index.js 的 POKE_IMAGE_DIR 注释）。
+     *
+     * 列表本身不自己落盘：改完由调用方整数组写回 `poke.replies`。
+     */
+    function PokeReplyList({ value, onChange, disabled }) {
+      const rows = Array.isArray(value) ? value : []
+      const [busyIndex, setBusyIndex] = React.useState(-1)
+      const [error, setError] = React.useState('')
+      const fileRef = React.useRef(null)
+      const pendingIndex = React.useRef(-1)
+
+      const patch = (i, next) => onChange(rows.map((row, j) => (j === i ? { ...row, ...next } : row)))
+      const remove = (i) => onChange(rows.filter((_, j) => j !== i))
+      const add = () => onChange([...rows, { text: '', image: '' }])
+      const pick = (i) => {
+        if (disabled) return
+        pendingIndex.current = i
+        fileRef.current?.click()
+      }
+
+      // 预览走 Host 的回读路由：浏览器不允许 <img src="file:///...">，直读路径不现实。
+      const imageUrl = (image) => {
+        const name = String(image ?? '').split(/[\\/]/u).pop()
+        return `/dsh-qq-guard/poke-image?name=${encodeURIComponent(name)}`
+      }
+
+      const upload = async (i, file) => {
+        setError('')
+        if (!/^image\/(png|gif|jpeg|webp)$/u.test(file.type)) {
+          setError('只支持 PNG / GIF / JPEG / WebP')
+          return
+        }
+        if (file.size > 5 * 1024 * 1024) {
+          setError(`图片 ${(file.size / 1048576).toFixed(1)}MB，超过 5MB 上限`)
+          return
+        }
+        setBusyIndex(i)
+        try {
+          const res = await fetch('/dsh-qq-guard/poke-image', {
+            method: 'POST', body: file, credentials: 'include',
+          })
+          const body = await res.json().catch(() => ({}))
+          if (!res.ok || !body.ok) { setError(body.reason ?? `HTTP ${res.status}`); return }
+          patch(i, { image: body.path })
+        } catch (e) {
+          setError(e?.message ?? String(e))
+        } finally {
+          setBusyIndex(-1)
+        }
+      }
+
+      return h('div', { className: 'qqg-poke-list' },
+        h('input', {
+          ref: fileRef, type: 'file', style: { display: 'none' },
+          accept: 'image/png,image/gif,image/jpeg,image/webp',
+          onChange: (e) => {
+            const file = e.target.files?.[0]
+            const i = pendingIndex.current
+            // 清空 value：同一个文件改了内容之后还能再选一次。
+            e.target.value = ''
+            if (file && i >= 0) void upload(i, file)
+          },
+        }),
+        rows.length === 0
+          ? h('div', { className: 'qqg-hint' },
+            '列表为空时退回默认的一句话。点下面「添加一条回复」开始配。')
+          : null,
+        rows.map((row, i) => h('div', { key: i, className: 'qqg-poke-row' },
+          row.image
+            ? h('img', { className: 'qqg-poke-thumb', alt: '表情预览', src: imageUrl(row.image) })
+            : h('div', { className: 'qqg-poke-thumb qqg-poke-thumb-empty' }, '无图'),
+          h('div', { className: 'qqg-poke-main' },
+            h(TextInput, {
+              className: 'qqg-input qqg-input-grow',
+              value: String(row.text ?? ''), disabled,
+              placeholder: '文字（可留空 = 只发表情；支持 {nick} / {qq}）',
+              ariaLabel: '回复文字',
+              onCommit: (next) => patch(i, { text: next }),
+            }),
+            h('div', { className: 'qqg-poke-ops' },
+              h('button', {
+                type: 'button', className: 'qqg-btn', disabled,
+                onClick: () => pick(i),
+              }, row.image ? '换图' : '上传图片'),
+              row.image
+                ? h('button', {
+                  type: 'button', className: 'qqg-btn', disabled,
+                  onClick: () => patch(i, { image: '' }),
+                }, '去掉图')
+                : null,
+              h('button', {
+                type: 'button', className: 'qqg-btn qqg-btn-danger', disabled,
+                onClick: () => remove(i),
+              }, '删除'))),
+          busyIndex === i ? h(Spinner, null) : null)),
+        h('div', { className: 'qqg-poke-actions' },
+          h('button', {
+            type: 'button', className: 'qqg-btn',
+            disabled: disabled || rows.length >= 30,
+            onClick: add,
+          }, '+ 添加一条回复'),
+          h('span', { className: 'qqg-field-hint' },
+            '建议用 GIF（静态图在部分客户端会按普通图片显示），单张 ≤ 5MB。')),
+        error ? h('div', { className: 'qqg-status qqg-status-err', style: { marginTop: 6 } }, error) : null)
     }
 
     /**
@@ -3197,7 +3334,7 @@ window.__ModuleLoader__.load({
 
     /** 已真实接入桥接 / Host 的条目 id；其余只加「开发中」标签，不动配置。 */
     const IMPLEMENTED_IDS = {
-      skill: ['sk-voice', 'sk-vision', 'sk-search', 'sk-image'],
+      skill: ['sk-voice', 'sk-vision', 'sk-search', 'sk-image', 'sk-poke'],
       plugin: ['pl-guard', 'pl-debounce', 'pl-ratelimit'],
     }
 
@@ -3227,6 +3364,29 @@ window.__ModuleLoader__.load({
      *   · when(valueOf) 返回 false 时该字段不渲染、也不参与保存
      */
     const TILE_FIELDS = {
+      // 戳一戳回复（2026-10-27）：开关 + 回应方式 + 图文回复列表。
+      // 列表用自定义 type 'replies'（见 TileSettingsModal.control 的对应分支）。
+      'sk-poke': [
+        {
+          path: 'poke.enabled', type: 'switch', label: '响应戳一戳',
+          hint: '关闭 = 群友戳 bot 完全不响应。',
+        },
+        {
+          path: 'poke.mode', type: 'select', label: '回应方式',
+          options: [
+            { value: 'poke', label: '回戳对方' },
+            { value: 'text', label: '文字 / 表情回复（按列表随机）' },
+          ],
+          hint: '选「回戳」时，下面的回复列表不生效。',
+        },
+        {
+          path: 'poke.replies', type: 'replies', label: '回复列表',
+          // 回戳模式下列表用不上，隐藏掉免得用户白配一场。
+          when: (valueOf) => valueOf('poke.mode') === 'text',
+          hint: '命中时随机挑一条：先发文字（能引用就带引用），再单独发表情包（sub_type:1）。'
+            + '文字支持 {nick} / {qq}；图片存本机，单张 ≤ 5MB。',
+        },
+      ],
       'sk-voice': [
         {
           path: 'voice.provider', type: 'select', label: '语音后端',
@@ -3319,6 +3479,13 @@ window.__ModuleLoader__.load({
      * 看的是「当前草稿或已存值」：用户一旦开始填 Key 提示就消失，不用等到保存。
      */
     const TILE_ALERTS = {
+      'sk-poke': (valueOf) => {
+        if (valueOf('poke.mode') !== 'text') return null
+        const rows = Array.isArray(valueOf('poke.replies')) ? valueOf('poke.replies') : []
+        if (rows.length > 0) return null
+        return '回复列表还是空的：被戳时会退回默认的一句话（（被戳了一下，戳回去））。'
+          + '想回复文字或表情包，先在下面加一条。'
+      },
       'sk-search': (valueOf) => (String(valueOf('webSearch.apiKey') ?? '').trim() === ''
         ? '未配置 Key：QQ 会话里调 web_search 会直接报错（WEB_PROVIDER_CREDENTIAL_MISSING）；'
           + '填入 DeepSeek Platform 的 Key 并保存后生效。'
@@ -3438,6 +3605,17 @@ window.__ModuleLoader__.load({
 
       const control = (field) => {
         const value = valueOf(field.path)
+        if (field.type === 'replies') {
+          return h('label', { key: field.path, className: 'qqg-field' },
+            h('span', { className: 'qqg-field-label' }, field.label),
+            h(PokeReplyList, {
+              value: Array.isArray(value) ? value : [],
+              disabled: !writable,
+              // 只改草稿，「保存」时才整数组写回 poke.replies（与其它字段一致）。
+              onChange: (next) => setField(field.path, next),
+            }),
+            field.hint ? h('span', { className: 'qqg-field-hint' }, field.hint) : null)
+        }
         if (field.type === 'switch') {
           return h(SwitchField, {
             key: field.path, label: field.label, hint: field.hint,

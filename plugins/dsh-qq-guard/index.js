@@ -93,7 +93,8 @@ import {
   handleUsageBackfillRoute,
   handleUsageRoute,
 } from './usage-stats.mjs'
-import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, realpathSync } from 'node:fs'
+import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, realpathSync, promises as fsp } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { builtinModules } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
@@ -277,6 +278,9 @@ const DEFAULT_SKILLS = [
   // 对象内容与 p2-contract.md §3.1 逐字一致（client.js 的合并默认值也用同一份）。
   { id: 'sk-image', name: '发图片', icon: 'image', tag: '内置', ver: '1.0.0', enabled: true,
     desc: '把图片或表情包发到 QQ（网页地址或本地文件），模型可通过 qq_send_image 调用。' },
+  // 2026-10-27「戳一戳回复」：回复列表（文字 + 可选表情包）在齿轮弹窗里增删改。
+  { id: 'sk-poke', name: '戳一戳回复', icon: 'activity', tag: '内置', ver: '1.0.0', enabled: true,
+    desc: '被戳时从回复列表随机挑一条：先发文字，再单独发表情包（sub_type:1）；也可以选回戳对方。' },
   { id: 'sk-vision', name: '图片理解', icon: 'image', tag: '内置', ver: '1.3.2', enabled: true,
     desc: '识别聊天里发的截图与照片，提取文字、报错信息和界面元素。' },
   { id: 'sk-search', name: '网页搜索', icon: 'search', tag: '内置', ver: '1.0.4', enabled: true,
@@ -626,17 +630,29 @@ const Config = Schema.object({
   personaAutoUpdate: Schema.boolean()
     .description('每小时把本群聊天记录交给模型归纳、自动补充人设（仍受「锁定人设」约束）。')
     .default(true).volatile(),
-  // 戳一戳：回戳还是发一句文字，由桥接侧的 notice 处理决定（这里只是开关与文案）。
+  // 戳一戳：回戳还是发文字/表情，由桥接侧的 notice 处理决定（这里只是开关与文案）。
   poke: Schema.object({
     enabled: Schema.boolean()
       .description('戳一戳响应总开关。')
       .default(true).volatile(),
     mode: Schema.union(['poke', 'text'])
-      .description('回复方式：poke = 回戳；text = 发一句文字。')
+      .description('回复方式：poke = 回戳；text = 按下面的回复列表随机回一条。')
       .default('poke').volatile(),
     replyText: Schema.string()
-      .description('文字回复模板，支持 {nick} / {qq} 占位。')
+      .description('文字回复模板，支持 {nick} / {qq} 占位。回复列表为空时兜底用它。')
       .default('（被戳了一下，戳回去）').volatile(),
+    // 图文混合回复（2026-10-27）：一条 = 文字 + 可选图片。
+    // image 存**本机绝对路径**（Host 落盘后返回），不存 base64 —— 配置每 2 秒被桥接
+    // 整包轮询一次，塞 base64 等于每 2 秒传几 MB，还会把 cordis.patch.yml 撑爆。
+    replies: Schema.array(Schema.object({
+      text: Schema.string()
+        .description('文字内容，支持 {nick} / {qq}；留空 = 只发表情。')
+        .default(''),
+      image: Schema.string()
+        .description('表情图：本机绝对路径 / base64:// / http(s)；留空 = 只发文字。')
+        .default(''),
+    })).description('固定文本回复候选（随机挑一条）。空 = 退回 replyText。最多 30 条。')
+      .default([]).volatile(),
   }).description('戳一戳').default({}),
   antiDebounceMs: Schema.number()
     .description('消息防抖合并窗口（毫秒）。0 = 沿用「活跃设置」里的 debounceWindowMs（默认 800）。')
@@ -2519,6 +2535,174 @@ function readJsonBody(req, { maxBytes = 8 * 1024 } = {}) {
   })
 }
 
+/* ── 戳一戳表情图存储（2026-10-27）──────────────────────────────
+ *
+ * 为什么落盘而不是把 base64 写进配置：
+ *   · 桥接每 2 秒轮询 `GET /dsh-qq-guard/config`，那条路由返回**整包** config；
+ *     一张 5MB 图转 base64 是 6.7MB，等于每 2 秒传一次 6.7MB JSON。
+ *   · 配置最终写进 profile 的 cordis.patch.yml，多几张图就把文件撑到几十 MB，
+ *     DSH 每次启动都要解析它。
+ * ⇒ 前端把 File 直接 POST 成二进制，Host 校验魔数后落盘，配置里只留绝对路径。
+ *
+ * 存储目录固定 `~/.dsh/qq-guard/poke-images/`（与 bili-whale 等自建插件同一习惯）：
+ * 换 profile 不丢图，桥接进程同用户同机，`file:///` 能被 NapCat 读到。
+ */
+const POKE_IMAGE_ROUTE_PATH = '/dsh-qq-guard/poke-image'
+// 测试用 QQG_POKE_IMAGE_DIR 指到临时目录，避免离线用例往真实 ~/.dsh 里写图；
+// 生产环境不设它，永远落在默认位置。
+const POKE_IMAGE_DIR = process.env.QQG_POKE_IMAGE_DIR
+  ? path.resolve(process.env.QQG_POKE_IMAGE_DIR)
+  : path.join(os.homedir(), '.dsh', 'qq-guard', 'poke-images')
+const POKE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+/** 未被配置引用、且超过这个时间的文件才清：避免刚传完还没来得及保存就被删。 */
+const POKE_IMAGE_ORPHAN_TTL_MS = 24 * 60 * 60 * 1000
+/** 回读只认 sha1 + 白名单扩展名：彻底杜绝望目录穿越。 */
+const POKE_IMAGE_NAME_RE = /^[a-f0-9]{40}\.(?:png|gif|jpg|webp)$/u
+
+/** 只认这四种位图；扩展名一律按魔数决定，不信客户端给的文件名。 */
+const POKE_IMAGE_TYPES = [
+  { mime: 'image/png', ext: 'png', hit: (b) => b.length > 8 && b[0] === 0x89 && b[1] === 0x50 },
+  { mime: 'image/gif', ext: 'gif', hit: (b) => b.length > 6 && b.subarray(0, 3).toString('ascii') === 'GIF' },
+  { mime: 'image/jpeg', ext: 'jpg', hit: (b) => b.length > 3 && b[0] === 0xff && b[1] === 0xd8 },
+  { mime: 'image/webp', ext: 'webp', hit: (b) => b.length > 12 && b.subarray(8, 12).toString('ascii') === 'WEBP' },
+]
+
+/** 表情图目录（导出给测试用，生产代码不要改它）。 */
+export function pokeImageDir() {
+  return POKE_IMAGE_DIR
+}
+
+/**
+ * 按魔数认图片类型；不认识的返回 null。
+ * @param {Buffer} buffer
+ * @returns {{mime:string, ext:string}|null}
+ */
+export function sniffPokeImage(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) return null
+  const type = POKE_IMAGE_TYPES.find((item) => item.hit(buffer))
+  return type ? { mime: type.mime, ext: type.ext } : null
+}
+
+/**
+ * 读原始二进制请求体（图片上传用，上限 5MB）。
+ * 与 readJsonBody 分开：这里不做 JSON 解析，超限直接 413 并断流。
+ * @param {import('node:http').IncomingMessage} req
+ * @param {number} maxBytes
+ * @returns {Promise<Buffer>}
+ */
+function readRawBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let size = 0
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > maxBytes) {
+        reject(Object.assign(new Error(`图片超过 ${Math.floor(maxBytes / 1048576)}MB 上限`), { statusCode: 413 }))
+        req.destroy?.()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    req.on('error', (error) => reject(error))
+  })
+}
+
+/**
+ * 表情图的上传 / 回读路由。
+ *
+ *   `POST` 二进制 body → 落盘，返回 `{ ok, path, name, bytes, mime }`
+ *   `GET  ?name=<sha1>.<ext>` → 回读原图（UI 预览用）
+ *
+ * 只允许同源请求（与其它写路由同一套 sec-fetch-site 校验）：
+ * 上传会写本机磁盘，不能被任意网页借用户浏览器塞文件。
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ */
+export async function handlePokeImageRoute(req, res) {
+  const fetchSite = req.headers['sec-fetch-site']
+  if (typeof fetchSite === 'string' && fetchSite !== 'same-origin' && fetchSite !== 'none') {
+    sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
+    return
+  }
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    const name = String(new URL(req.url ?? '/', 'http://localhost').searchParams.get('name') ?? '')
+    if (!POKE_IMAGE_NAME_RE.test(name)) {
+      sendJson(res, 400, { ok: false, reason: '非法的图片名' })
+      return
+    }
+    const file = path.join(POKE_IMAGE_DIR, name)
+    if (!existsSync(file)) {
+      sendJson(res, 404, { ok: false, reason: '图片不存在' })
+      return
+    }
+    const ext = name.split('.').pop()
+    const mime = POKE_IMAGE_TYPES.find((item) => item.ext === ext)?.mime ?? 'application/octet-stream'
+    res.writeHead(200, {
+      'content-type': mime,
+      'content-length': statSync(file).size,
+      // 文件名是内容 sha1，可以放心长缓存；换图必然换名。
+      'cache-control': 'private, max-age=86400',
+    })
+    res.end(req.method === 'HEAD' ? undefined : readFileSync(file))
+    return
+  }
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { ok: false, reason: 'method not allowed' })
+    return
+  }
+  const buffer = await readRawBody(req, POKE_IMAGE_MAX_BYTES)
+  if (buffer.length === 0) {
+    sendJson(res, 400, { ok: false, reason: '空请求体' })
+    return
+  }
+  const type = sniffPokeImage(buffer)
+  if (!type) {
+    sendJson(res, 415, { ok: false, reason: '只支持 PNG / GIF / JPEG / WebP' })
+    return
+  }
+  await fsp.mkdir(POKE_IMAGE_DIR, { recursive: true })
+  // 文件名 = 内容 sha1：同一张图重复上传不会产生第二份。
+  const name = `${createHash('sha1').update(buffer).digest('hex')}.${type.ext}`
+  const file = path.join(POKE_IMAGE_DIR, name)
+  if (!existsSync(file)) await fsp.writeFile(file, buffer)
+  sendJson(res, 200, { ok: true, path: file, name, bytes: buffer.length, mime: type.mime })
+}
+
+/**
+ * 清掉没被任何回复引用的旧图（启动后跑一次即可，不做定时）。
+ *
+ * 只删「超过 24 小时」的孤儿：用户传完图还没点保存时文件已经在盘上，
+ * 立刻清理会把刚选好的图删掉。取消弹窗留下的残留交给下一次启动。
+ * @param {object} config 插件 Config（读 `poke.replies[].image`）
+ */
+export async function cleanupOrphanPokeImages(config) {
+  let names = []
+  try {
+    names = await fsp.readdir(POKE_IMAGE_DIR)
+  } catch {
+    return { ok: true, removed: 0 }   // 目录还不存在 = 没上传过，什么都不用做
+  }
+  const cfg = plainConfig(config) ?? {}
+  const keep = new Set()
+  for (const row of Array.isArray(cfg.poke?.replies) ? cfg.poke.replies : []) {
+    const image = typeof row?.image === 'string' ? row.image.trim() : ''
+    if (image) keep.add(path.basename(image))
+  }
+  let removed = 0
+  for (const name of names) {
+    if (!POKE_IMAGE_NAME_RE.test(name) || keep.has(name)) continue
+    const file = path.join(POKE_IMAGE_DIR, name)
+    try {
+      const stat = await fsp.stat(file)
+      if (Date.now() - stat.mtimeMs < POKE_IMAGE_ORPHAN_TTL_MS) continue
+      await fsp.unlink(file)
+      removed++
+    } catch { /* 单个文件清不掉不影响其余，下次再试 */ }
+  }
+  return { ok: true, removed }
+}
+
 /**
  * 收敛桥接上报的单条会话数据。
  *
@@ -3442,6 +3626,14 @@ async function syncWebSearchCredential(cfg) {
 let webSearchSyncTarget
 
 /**
+ * 表情图孤儿清理的「每 ctx 只跑一次」标记。
+ *
+ * 为什么不能每次 applySettings 都扫：配置保存会热重载本 entry，
+ * 反复 `readdir + stat` 一整目录没必要，而且没必要在用户每次改设置时都扫盘。
+ */
+const POKE_IMAGE_CLEANED = new WeakSet()
+
+/**
  * 桥接运行时配置（profile 顶层行）。
  * 只在有 webServer 的顶层 ctx 上跑：注册只读配置路由 + 声明自管设置页。
  */
@@ -3538,6 +3730,36 @@ function applySettings(ctx, config) {
     }),
     'qq-guard: persona route',
   )
+
+  // ── 戳一戳表情图：上传落盘 + 回读预览（2026-10-27）──────────────
+  //
+  // 前端把 File 直接 POST 成二进制（不走 base64），Host 校验魔数后写盘，
+  // 配置里只存返回的绝对路径。理由见 POKE_IMAGE_DIR 上方那段注释。
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: POKE_IMAGE_ROUTE_PATH,
+      handler: (req, res) => {
+        handlePokeImageRoute(req, res).catch((error) => {
+          sendJson(res, error?.statusCode ?? 500, { ok: false, reason: error?.message ?? String(error) })
+        })
+      },
+    }),
+    'qq-guard: poke image route',
+  )
+  // 启动后清一次「没被任何回复引用」的旧图。延迟 5 秒，别跟启动抢 IO；
+  // 用 WeakSet 标记，配置热重载会重复调 applySettings，不能每次都扫盘。
+  if (!POKE_IMAGE_CLEANED.has(ctx)) {
+    POKE_IMAGE_CLEANED.add(ctx)
+    const timer = setTimeout(() => {
+      void cleanupOrphanPokeImages(config)
+        .then((r) => {
+          if (r?.removed > 0) ctx.logger?.info?.(`戳一戳表情图清理：删除 ${r.removed} 个未引用的旧文件`)
+        })
+        .catch(() => { /* 清理失败不影响任何功能 */ })
+    }, 5000)
+    if (typeof timer.unref === 'function') timer.unref()
+  }
 
   // ── 人设归纳（每小时动态人设）：桥接 POST 群聊记录，Host 侧调模型归纳 ──────
   //
