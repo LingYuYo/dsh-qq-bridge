@@ -361,6 +361,8 @@ NapCat 的**启停按钮和进程状态只在「运行状态」页**（紧接「
 
 - **分片节奏**：`chunkSize`、`bubbleMaxChars`、`mergeMaxChars`、`sendIntervalMs`、`typingDelay`、`flypitDelayTiers`
 - **群聊 @**：`groupAtReply`、`groupAtPosition`
+- **引用回复**：`replyQuoteMode`（`quote` = 引用原消息气泡，默认；`at` = 仅 @ 对方）。
+  `quote` 时不再重复 @，且一条回复分成多个气泡时只有第一片带引用。
 - **标点处理**：`trimEndPunctuation`
 - **白名单**：`allow.private` / `allow.groups` / `deny` / `allowAllWhenEmpty`
 - **人设**：`personaText`（角色设定，留空用 preset 内置人设）、`personaBotName`（机器人名字）、

@@ -1029,6 +1029,8 @@ export class OneBotClient {
    * @param {object} [opts]
    * @param {string} [opts.atUserId] 要 @ 的 QQ 号（发送者）；不传则不 @
    * @param {'first'|'last'} [opts.atPosition='last'] 只在哪一片 @（一条回复可能多片，全 @ 会刷屏）
+   * @param {string} [opts.replyTo] 要引用的原消息 `message_id`（群聊）；
+   *   只挂在第一片，且排在 at 之前（NapCat 要求 reply 段在最前面）
    */
   async sendGroup(groupId, text, opts = {}) {
     // 总开关兜底：即使调用方传了 atUserId，groupAtReply=false 也一律不带 @。
@@ -1281,19 +1283,26 @@ export class OneBotClient {
    *   `[CQ:` 转义问题影响，也不用手工拼 `&#91;` 之类的实体）。
    * @returns {string|Array<object>}
    */
-  _buildSegments(kind, text, { atUserId, atPosition } = {}) {
+  _buildSegments(kind, text, { atUserId, atPosition, replyTo } = {}) {
     const needAt = kind === 'group'
       && atUserId !== undefined && atUserId !== null
       && /^\d+$/.test(String(atUserId).trim())
-    if (!needAt) return escapeCqText(text)
+    // 引用回复（2026-10-27）：`reply` 段必须挂在**段数组最前面**（at 之前），
+    // 否则 QQ 客户端认不出来；只对群聊生效（私聊没有「引用」这一说）。
+    // id 用入站事件的 message_id 原值，NapCat 侧按它找回原消息。
+    const replyId = kind === 'group' && replyTo !== undefined && replyTo !== null
+      ? String(replyTo).trim()
+      : ''
+    if (!needAt && !replyId) return escapeCqText(text)
     // at 放文本**前面**：QQ 客户端里 @ 会高亮成「@昵称」，正文跟在其后读起来自然。
     // at 与正文之间必须有一个空格（2026-10-23 修）：OneBot 的 at 段本身不负责空白，
     // 两个段紧挨着渲染出来就是「@群友你好」，模型和群友都会看错。
     const body = escapeCqText(String(text ?? '').replace(/^[ \t]+/u, ''))
-    return [
-      { type: 'at', data: { qq: String(atUserId).trim() } },
-      { type: 'text', data: { text: ' ' + body } },
-    ]
+    const segments = []
+    if (replyId) segments.push({ type: 'reply', data: { id: replyId } })
+    if (needAt) segments.push({ type: 'at', data: { qq: String(atUserId).trim() } })
+    segments.push({ type: 'text', data: { text: needAt ? ' ' + body : body } })
+    return segments
   }
 
   /** 决定第 index 片是否要挂 @。 */
@@ -1304,7 +1313,7 @@ export class OneBotClient {
     return pos === 'first' ? index === 0 : index === total - 1
   }
 
-  async _sendText(kind, targetId, text, { atUserId, atPosition = 'last' } = {}) {
+  async _sendText(kind, targetId, text, { atUserId, atPosition = 'last', replyTo } = {}) {
     const id = String(targetId ?? '').trim()
     if (!/^\d+$/.test(id) || id === '0') {
       return { ok: false, messageIds: [], error: `${kind === 'private' ? 'user_id' : 'group_id'} 必须是正整数：${targetId}` }
@@ -1332,7 +1341,15 @@ export class OneBotClient {
     for (let i = 0; i < chunks.length; i++) {
       // @ 只挂一片（first/last），避免多个气泡全 @ 刷屏。
       const withAt = this._shouldAt(kind, i, chunks.length, atUserId, atPosition)
-      const message = this._buildSegments(kind, chunks[i], withAt ? { atUserId, atPosition } : {})
+      // 引用也只挂**第一片**：分片回复后面几条纯文本，不然每个气泡都顶着一个引用很刷屏。
+      const withReply = kind === 'group' && i === 0 && replyTo !== undefined && replyTo !== null
+        && String(replyTo).trim() !== ''
+        ? String(replyTo).trim()
+        : ''
+      const message = this._buildSegments(kind, chunks[i], {
+        ...(withAt ? { atUserId, atPosition } : {}),
+        ...(withReply ? { replyTo: withReply } : {}),
+      })
       const params = kind === 'private'
         ? { user_id: Number(id), message }
         : { group_id: Number(id), message }

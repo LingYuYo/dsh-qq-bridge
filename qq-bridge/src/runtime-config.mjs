@@ -23,6 +23,8 @@ const HOT_KEYS = [
   'sendIntervalMs',
   'groupAtReply',
   'groupAtPosition',
+  // 群聊引用回复（2026-10-27）：quote = 挂原消息引用气泡，at = 只 @ 对方。
+  'replyQuoteMode',
   'typingDelay',
   'flypitDelayTiers',
   // 打字延时的字数档位（2026-10-23）：短句上限 / 中等上限 / 长句触发。

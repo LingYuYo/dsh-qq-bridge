@@ -79,6 +79,7 @@ copy config.example.json config.json
 | `typingDelay.enabled` | 打字延时总开关，默认 `true`。见下面「分片与打字延时」。 |
 | `trimEndPunctuation.enabled` / `.keep` | 是否裁片尾标点（默认 `true`）；`keep` 默认 `["？","！"]`。 |
 | `groupAtReply` | 群聊回复是否 @ 发送者，默认 `true`（私聊永不 @）。 |
+| `replyQuoteMode` | 群聊回复方式：`quote` = 引用原消息气泡（默认），`at` = 仅 @ 对方。见「群聊引用回复」。 |
 | `groupAtPosition` | @ 挂在哪一片：`"last"`（默认）或 `"first"`。 |
 | `dsh.archiveStaleSessions` | 会话在 DSH 侧失效时是否自动归档旧会话，默认 `true`。见下面「会话失效自动归档」。 |
 | `rhythm.activityLevel` | 响应档位 `0..3`，默认 `1`。`0`=仅 @/私聊，`1`=+关键词，`2`=+随机(0.15)，`3`=全响应。见「响应节奏」。 |
@@ -635,6 +636,32 @@ node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔�
 两个段紧挨着会渲染成「@群友收到」，模型和群友都会看错。
 
 不带 @ 的分片仍是纯文本字符串。代码块 / URL 作为原子块原样放进 `text` 段，不被破坏。
+
+### 群聊引用回复（2026-10-27）
+
+QQ 的「引用」气泡是在消息段数组最前面加一个 `reply` 段（`id` = 被引用消息的
+`message_id`）。桥接把它做成了一个开关：
+
+- `replyQuoteMode`（默认 `"quote"`，可选 `"at"`）：
+  - `"quote"`：第一条回复挂 `reply` 段，气泡上方带原消息；**同时不再 @**（引用已经指回
+    原消息，再 @ 一次很吵）；
+  - `"at"`：保持老行为，只 @ 发送者（`groupAtReply` / `groupAtPosition` 生效）。
+- 只对**群聊**生效，私聊没有引用这回事；
+- 一条回复分成多个气泡时，**只有第一片**挂 `reply`，后面几片纯文本（跟 @ 的规则一致）；
+- 入站消息的 `message_id` 由 `onebot.mjs` 的 `_parseMessageEvent` 一并取出，
+  `bridge._send` 判断开关后透传给 `sendGroup({ replyTo })`；拿不到 `message_id`
+  （极少数协议端）就自动退回 @。
+
+段数组长这样：
+
+```json
+[
+  { "type": "reply", "data": { "id": "原消息message_id" } },
+  { "type": "text",  "data": { "text": "这一片的正文" } }
+]
+```
+
+（若同时要求 @，顺序是 `reply` → `at` → `text`，`reply` 必须在最前面。）
 
 **入站 @**（也是 2026-10-23 修）：收到群消息时，`at` 段转成 `@昵称 `（拿不到昵称就
 `@QQ号 `，`@all` → `@全体成员 `），与后面的正文之间一定有空格。昵称来源是

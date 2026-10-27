@@ -749,6 +749,8 @@ window.__ModuleLoader__.load({
       sendIntervalMs: 500,
       groupAtReply: true,
       groupAtPosition: 'last',
+      // 群聊回复方式：quote = 引用原消息气泡；at = 仅 @ 对方（2026-10-27，默认引用）。
+      replyQuoteMode: 'quote',
       'typingDelay.enabled': true,
       'flypitDelayTiers.short': 200,
       'flypitDelayTiers.medium': 450,
@@ -2277,6 +2279,14 @@ window.__ModuleLoader__.load({
               'aria-label': '@ 位置',
               onChange: (e) => write('groupAtPosition', e.target.value),
             }, h('option', { value: 'last' }, '最后一片'), h('option', { value: 'first' }, '第一片'))),
+          h(Field, { label: '群聊引用回复', desc: '开启后，机器人的回复将带有原消息引用气泡；关闭则仅 @ 对方。' },
+            h('select', {
+              className: 'qqg-input', value: get('replyQuoteMode'), disabled: !writable,
+              'aria-label': '群聊引用回复',
+              onChange: (e) => write('replyQuoteMode', e.target.value),
+            },
+            h('option', { value: 'quote' }, '引用原消息（默认）'),
+            h('option', { value: 'at' }, '仅 @ 对方'))),
           h(Field, { label: '裁掉片尾标点', desc: '代码块与链接例外，永不裁。' },
             h(Switch, {
               checked: get('trimEndPunctuation.enabled') !== false, disabled: !writable,

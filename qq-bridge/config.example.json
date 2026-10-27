@@ -37,6 +37,7 @@
   },
   "groupAtReply": true,
   "groupAtPosition": "last",
+  "replyQuoteMode": "quote",
   "personaBotName": "",
   "personaGroupName": "",
   "personaParticipation": "normal",

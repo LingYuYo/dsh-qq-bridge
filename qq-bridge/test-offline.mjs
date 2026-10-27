@@ -485,6 +485,35 @@ await check('文本里的 [CQ: 仍被转义（段数组内也转义）', async (
   assert.equal(last[1].data.text.includes('[CQ：'), true, '应为全角冒号')
 })
 
+console.log('\n— 批次3+：群聊引用回复（reply 段，2026-10-27）—')
+const segReply = (id) => ({ type: 'reply', data: { id: String(id) } })
+
+await check('引用：第一片最前面是 reply 段，后续片纯文本', async () => {
+  const sent = await captureSend((c) => c.sendGroup('123456', TWO, { replyTo: '778899' }))
+  assert.equal(sent.length, 2, `实际 ${sent.length} 条`)
+  assert.deepEqual(sent[0].message, [segReply('778899'), segText('收到')])
+  assert.equal(typeof sent[1].message, 'string', '★ 第二片不再挂引用')
+  assert.equal(sent[1].message, '马上来')
+})
+
+await check('引用 + at：reply 段排在 at 之前', async () => {
+  const sent = await captureSend((c) => c.sendGroup('123456', '收到', {
+    replyTo: '778899', atUserId: '1000000001', atPosition: 'first',
+  }))
+  assert.deepEqual(sent[0].message, [segReply('778899'), segAt('1000000001'), segTextAfterAt('收到')])
+})
+
+await check('私聊忽略 replyTo（私聊没有引用气泡）', async () => {
+  const sent = await captureSend((c) => c.sendPrivate('1000000001', '收到', { replyTo: '778899' }))
+  assert.equal(typeof sent[0].message, 'string')
+})
+
+await check('replyTo 为空 / 空白时不生成 reply 段', () => {
+  const c = new OneBotClient({ logger: undefined })
+  assert.equal(typeof c._buildSegments('group', '你好', { replyTo: '' }), 'string')
+  assert.equal(typeof c._buildSegments('group', '你好', { replyTo: '   ' }), 'string')
+})
+
 console.log('\n— 批次4A：DSH 设置热同步 —')
 await check('pickHotConfig 只取白名单键', () => {
   const hot = pickHotConfig({
@@ -502,6 +531,10 @@ await check('pickHotConfig 深拷贝，外部改动不影响源', () => {
   const hot = pickHotConfig(src)
   hot.typingDelay.enabled = true
   assert.equal(src.typingDelay.enabled, false, '应为深拷贝')
+})
+await check('热配置白名单放行 replyQuoteMode（漏加 = 设置页白存）', () => {
+  const hot = pickHotConfig({ replyQuoteMode: 'at' })
+  assert.equal(hot.replyQuoteMode, 'at')
 })
 await check('applyHotConfig 原地更新并报告变化键', () => {
   const target = { bubbleMaxChars: 30, groupAtReply: true }
@@ -1182,8 +1215,8 @@ function makeBridge({ rhythm, dsh: dshCfg, stateFile, allow, personaDefault, cap
     if (action === 'get_stranger_info') return { status: 'ok', data: { nickname: calls.privateName } }
     return { status: 'ok', data: {} }
   }
-  b.qq.sendPrivate = async (uid, text) => { calls.sent.push({ kind: 'private', uid, text }); return { ok: true, messageIds: ['1'] } }
-  b.qq.sendGroup = async (gid, text) => { calls.sent.push({ kind: 'group', gid, text }); return { ok: true, messageIds: ['1'] } }
+  b.qq.sendPrivate = async (uid, text, opts) => { calls.sent.push({ kind: 'private', uid, text, opts }); return { ok: true, messageIds: ['1'] } }
+  b.qq.sendGroup = async (gid, text, opts) => { calls.sent.push({ kind: 'group', gid, text, opts }); return { ok: true, messageIds: ['1'] } }
   b.qq._selfId = '999' // 假装登录的是 999，用于 @ 判定
   return { b, calls }
 }
@@ -1673,6 +1706,46 @@ await check('空 persona op = 清除单人设', async () => {
   entry.persona = '旧人设'
   await b.applySessionOp({ op: 'persona', key: 'g:123456', text: '' })
   assert.equal(b.state.sessions['g:123456'].persona, '')
+})
+
+console.log('\n— 群聊引用回复：桥接侧开关（2026-10-27）—')
+await check('默认开启：群聊回复带原消息 id（引用气泡），且不再重复 @', async () => {
+  const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 0 } })
+  await b.handleMessage(groupMsg('在吗', { at: true, id: '778899' }))
+  assert.equal(calls.sent.length, 1, '应该只回一条')
+  assert.equal(calls.sent[0].opts?.replyTo, '778899', '★ 带原消息 id')
+  assert.equal(calls.sent[0].opts?.atUserId, undefined, '★ 引用时不再 @')
+})
+
+await check("replyQuoteMode='at'：不引用，沿用 @ 发送者（老行为）", async () => {
+  const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 0 } })
+  b.live.replyQuoteMode = 'at'
+  await b.handleMessage(groupMsg('在吗', { at: true, id: '778899' }))
+  assert.equal(calls.sent[0].opts?.replyTo, undefined, '★ 关闭引用')
+  assert.equal(calls.sent[0].opts?.atUserId, '1000000001')
+  assert.equal(calls.sent[0].opts?.atPosition, 'last')
+})
+
+await check('私聊永不引用（引用只对群聊）', async () => {
+  const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 0 } })
+  await b.handleMessage(privMsg('在吗', 'p9'))
+  assert.equal(calls.sent.length, 1)
+  assert.equal(calls.sent[0].kind, 'private')
+  assert.equal(calls.sent[0].opts, undefined, '★ 私聊发送不带任何附加段')
+})
+
+await check('at:false（插件通道发送）不引用别人的原消息', async () => {
+  const { b, calls } = makeBridge({})
+  await b._send(groupMsg('x', { id: '778899' }), '插件消息', { at: false })
+  assert.equal(calls.sent[0].text, '插件消息')
+  assert.equal(calls.sent[0].opts?.replyTo, undefined)
+})
+
+await check('入站没有 message_id 时退回 @（不生成空引用段）', async () => {
+  const { b, calls } = makeBridge({})
+  await b._send({ kind: 'group', userId: '1000000001', groupId: '123456', messageId: '' }, '你好')
+  assert.equal(calls.sent[0].opts?.replyTo, undefined)
+  assert.equal(calls.sent[0].opts?.atUserId, '1000000001')
 })
 
 console.log('\n— 群聊上下文自动清理（2026-10-27）—')

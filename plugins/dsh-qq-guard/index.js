@@ -454,6 +454,12 @@ const Config = Schema.object({
   groupAtPosition: Schema.union(['last', 'first'])
     .description('@ 挂在哪一片：last = 最后一片，first = 第一片。')
     .default('last').volatile(),
+  // 引用回复（2026-10-27）：群聊里用 QQ 的「引用原消息」气泡，还是沿用普通 @。
+  // 开启引用后不再 @（引用气泡已经指回原消息，再 @ 一次很吵）。
+  replyQuoteMode: Schema.union(['quote', 'at'])
+    .description('群聊回复方式：quote = 引用原消息（气泡上方带原消息）；at = 仅 @ 对方。'
+      + '开启引用后不再重复 @。私聊不受影响。')
+    .default('quote').volatile(),
   trimEndPunctuation: Schema.object({
     enabled: Schema.boolean()
       .description('是否裁掉每片末尾的空白与标点。')

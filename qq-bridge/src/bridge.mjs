@@ -603,6 +603,9 @@ export class Bridge {
       },
       groupAtReply: config.groupAtReply !== false,
       groupAtPosition: config.groupAtPosition === 'first' ? 'first' : 'last',
+      // 群聊引用回复（2026-10-27）：'quote' = 回复挂原消息引用气泡；'at' = 只 @ 对方。
+      // 默认 'quote'（设置页默认同）；两者互斥，引用时不再重复 @。
+      replyQuoteMode: config.replyQuoteMode === 'at' ? 'at' : 'quote',
       // 节奏参数（Phase 4）：每次判定现读 this.live.rhythm（见 _rhythm）。
       // 这里只给初值/兜底；热同步把它整对象替换掉，字段缺失由 normalizeRhythm 补。
       rhythm: normalizeRhythm(config.rhythm),
@@ -3025,6 +3028,21 @@ export class Bridge {
   }
 
   /**
+   * 群聊回复是否用「引用气泡」而不是「@ 对方」（2026-10-27）。
+   *
+   * 现读热配置：设置页 `replyQuoteMode` = `quote`（默认，引用原消息）/ `at`（只 @）。
+   * 也认 true/false，方便老配置直接写布尔值。
+   * 跟 `groupAtReply` 的关系：引用优先——开了引用就不再 @，避免一条回复既 @ 又引用。
+   */
+  _quoteReplyEnabled() {
+    const raw = this.live?.replyQuoteMode ?? this.config?.replyQuoteMode
+    if (raw === false) return false
+    if (raw === true) return true
+    const mode = String(raw ?? 'quote').trim().toLowerCase()
+    return mode !== 'at' && mode !== 'off' && mode !== 'false'
+  }
+
+  /**
    * 发一条文本（日志 / 延迟 / 失败统计的统一出口）。
    *
    * @param {object} msg 至少要有 kind 与对应目标（userId / groupId）
@@ -3034,13 +3052,20 @@ export class Bridge {
   async _send(msg, text, { at = true } = {}) {
     const delay = this.config.sendDelayMs ?? 400
     const key = this.keyOf(msg)
+    // 群聊引用（2026-10-27）：拿得到入站 message_id 就挂 `reply` 段，否则退回 @。
+    // 只对群聊生效、只对「正常回复」生效（at:false 的插件通道发送不引用别人的原消息）。
+    const quoteId = (at && msg.kind === 'group' && this._quoteReplyEnabled())
+      ? String(msg.messageId ?? '').trim()
+      : ''
     // 群聊 @ 发送者：按 groupAtReply / groupAtPosition 决定，私聊一律不带 @。
-    const atOpts = (at && this.qq.groupAtReply && msg.kind === 'group')
+    // 走引用时不再 @（引用气泡本身已经指回原消息，再 @ 一次很吵）。
+    const atOpts = (!quoteId && at && this.qq.groupAtReply && msg.kind === 'group')
       ? { atUserId: msg.userId, atPosition: this.qq.groupAtPosition }
       : {}
+    const sendOpts = quoteId ? { ...atOpts, replyTo: quoteId } : atOpts
     const result = msg.kind === 'private'
       ? await this.qq.sendPrivate(msg.userId, text)
-      : await this.qq.sendGroup(msg.groupId, text, atOpts)
+      : await this.qq.sendGroup(msg.groupId, text, sendOpts)
     // 分片级失败：已成功的分片不重复发送，这里只如实上报，不整条重试。
     if (result && result.ok === false) {
       this.stats.failed++
