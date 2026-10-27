@@ -635,6 +635,16 @@ const Config = Schema.object({
   antiDebounceMs: Schema.number()
     .description('消息防抖合并窗口（毫秒）。0 = 沿用「活跃设置」里的 debounceWindowMs（默认 800）。')
     .default(0).min(0).max(60000).volatile(),
+  // ── 上下文自动清理（2026-10-27）──────────────────────────────
+  // 群聊聊久了上下文会一直涨，这里按「轮数」给一个阈值；私聊永不清理。
+  // 桥接侧热读这两个键（见 qq-bridge/src/runtime-config.mjs 的 HOT_KEYS）。
+  maxContextTurns: Schema.number()
+    .description('群聊上下文自动清理阈值（轮）。0 = 不限制；私聊永不清理。默认 30。')
+    .default(30).min(0).max(500).volatile(),
+  contextClearStrategy: Schema.union(['compact', 'clear', 'off'])
+    .description('超限后的处理方式：compact = DSH 总结压缩后继续同一会话；'
+      + 'clear = 归档旧会话并新建同名会话；off = 关闭自动清理。默认 compact。')
+    .default('compact').volatile(),
   debugPrompt: Schema.boolean()
     .description('人设诊断日志：开启后每步打印 system sections / runtime contexts 的名字与字数'
       + '（只在内容变化时打，用于排查「人设没生效」）。默认关。')

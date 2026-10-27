@@ -392,12 +392,12 @@ check('运行状态页有「系统底层事件」折叠面板', () => {
 })
 
 const advTree = await renderTab('settings')
-check('全局设置有「高级参数」折叠卡，含三个数值输入', () => {
+check('全局设置有「高级参数」折叠卡，含四个数值输入 + 一个下拉', () => {
   const card = findAll(advTree, (n) => typeof n.props?.className === 'string'
     && n.props.className.split(/\s+/).includes('qqg-advanced'))[0]
   assert(card, '找不到 .qqg-advanced 折叠卡')
   assert(textOf(card).includes('高级参数'), '标题不对')
-  for (const label of ['等待回复上限', '看门狗切断时间', '防抖合并窗口']) {
+  for (const label of ['等待回复上限', '看门狗切断时间', '防抖合并窗口', '最大对话轮数', '超限处理方式']) {
     const input = findAll(card, (n) => n.props?.['aria-label'] === label)[0]
     assert(input, `缺少输入框「${label}」`)
   }

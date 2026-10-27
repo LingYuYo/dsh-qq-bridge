@@ -772,6 +772,9 @@ window.__ModuleLoader__.load({
       replyTimeoutMs: 20000,
       modelWatchdogMs: 8000,
       antiDebounceMs: 0,
+      // 上下文自动清理（2026-10-27）：默认 30 轮、超限自动总结压缩。
+      maxContextTurns: 30,
+      contextClearStrategy: 'compact',
       // 超时兜底文案：空串按默认处理，绝不把英文报错发到 QQ。
       timeoutReplyText: '（模型脑子卡住了，稍后再试）',
       // 人设锁定 / 每小时自动归纳：默认都开（与 Host 侧 Config 一致）。
@@ -2113,6 +2116,20 @@ window.__ModuleLoader__.load({
               value: get('antiDebounceMs'), min: 0, max: 60000, disabled: !writable,
               ariaLabel: '防抖合并窗口', onCommit: (n) => write('antiDebounceMs', n),
             })),
+          h(Field, { label: '最大对话轮数', desc: '轮。群聊上下文超过这么多轮就触发自动清理。0 = 不限制；私聊永不清理。默认 30。' },
+            h(NumberField, {
+              value: get('maxContextTurns'), min: 0, max: 500, disabled: !writable,
+              ariaLabel: '最大对话轮数', onCommit: (n) => write('maxContextTurns', n),
+            })),
+          h(Field, { label: '超限处理方式', desc: 'compact = DSH 总结压缩后继续同一会话；clear = 归档旧会话并新建同名会话；off = 关闭自动清理。' },
+            h('select', {
+              className: 'qqg-input', value: get('contextClearStrategy'), disabled: !writable,
+              'aria-label': '超限处理方式',
+              onChange: (e) => write('contextClearStrategy', e.target.value),
+            },
+            h('option', { value: 'compact' }, '自动总结压缩（推荐）'),
+            h('option', { value: 'clear' }, '自动清空上下文'),
+            h('option', { value: 'off' }, '关闭'))),
           h(Field, {
             label: '超时回复文案',
             desc: '看门狗触发且备用模型也失败时发到 QQ 的中文提示。留空 = 用默认「（模型脑子卡住了，稍后再试）」；英文报错永远不会发出去。',

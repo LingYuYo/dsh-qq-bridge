@@ -561,8 +561,10 @@ QQ 会话切模型，**不能**走 `session/selectModel` —— 它会顺带 `ag
 | `modelWatchdogMs` | 8000 | 看门狗切断时间（0=关）；只作用于 QQ 会话下发的路由 |
 | `antiDebounceMs` | 0 | 防抖窗口；0 = 沿用「活跃设置」里的 `debounceWindowMs`（默认 800） |
 | `timeoutReplyText` | （模型脑子卡住了，稍后再试） | 看门狗触发且备用模型也失败时发给 QQ 的文案；留空按默认，**英文报错绝不外发** |
+| `maxContextTurns` | 30 | 群聊上下文自动清理阈值（轮）；0 = 不限制，**私聊永不清理** |
+| `contextClearStrategy` | `compact` | 超限处理：`compact` = DSH 总结压缩后继续同一会话；`clear` = 归档旧会话并新建同名会话；`off` = 关闭自动清理 |
 
-四个都进了 Config（`.volatile()`）、面板「全局设置 → 高级参数」有输入框，
+六个都进了 Config（`.volatile()`）、面板「全局设置 → 高级参数」有输入框，
 桥接侧通过 `runtime-config.mjs` 的 `HOT_KEYS` 热读 —— 改完保存，下一条消息生效，不用重启桥接。
 等待超过看门狗时间还没回复时，桥接日志会打一条 `⏳ 等待回复已超 N 秒，可能正在触发看门狗降级…`。
 
