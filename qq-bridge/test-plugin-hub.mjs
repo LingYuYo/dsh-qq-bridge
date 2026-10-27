@@ -746,6 +746,94 @@ await check('超过 maxBytes：不落盘（失败只 warn）', async () => {
   assert.equal(calls.prompts[0].text, '[视频]')
 })
 
+// ── 视频抽帧（2026-10-27 真机 Bug：发 MP4 模型只看到「[视频]」）────────────────
+console.log('\n— 视频抽帧（video-frames 微服务）—')
+
+/** 造一个「抽帧成功」的假 video-frames：返回 1 条 text + N 个 image block。 */
+const framesPlugin = (frames) => ({
+  tools: [{ name: 'read_video', title: '看视频（抽帧）', parameters: { type: 'object', properties: {} } }],
+  execute: (body) => ({
+    ok: true,
+    content: [
+      { type: 'text', text: `已抽 ${frames.length} 帧` },
+      ...frames.map((buf) => ({ type: 'image', data: buf.toString('base64'), mimeType: 'image/jpeg' })),
+    ],
+  }),
+})
+
+await check('★ 下载成功后把本地路径交给抽帧服务，帧以 image part 塞进 prompt content', async () => {
+  const frames = [Buffer.alloc(64, 1), Buffer.alloc(64, 2), Buffer.alloc(64, 3)]
+  const fake = await startFakePlugin(framesPlugin(frames))
+  const sourceDir = tmpDir('video-frame-src')
+  const sourceFile = path.join(sourceDir, 'clip.mp4')
+  fs.writeFileSync(sourceFile, Buffer.alloc(2048, 7))
+  const { b, calls } = makeBridge({ stateFile: path.join(tmpDir('video-frame-state'), 'sessions.json') })
+  await attachHub(b, {
+    enabled: false,
+    port: 0,
+    plugins: [{ id: 'video-frames', url: fake.url, timeoutMs: 5000 }],
+    video: { enabled: true, maxBytes: 1024 * 1024, timeoutMs: 5000 },
+  })
+  await b.handleMessage(privMsg('[视频]', { videos: [{ url: sourceFile, file: 'clip.mp4' }] }))
+
+  // 1）抽帧请求打的是 POST /tools，名字与参数都对
+  const execute = fake.state.lastExecute
+  assert.equal(execute?.name, 'read_video', '应调用抽帧工具')
+  assert.ok(path.isAbsolute(String(execute.args?.filePath)), '参数应是桥接下载后的本地绝对路径')
+  assert.ok(fs.existsSync(execute.args.filePath), '交给服务前文件必须已落盘')
+
+  // 2）帧变成了 prompt 里的 image part（底座是 data URL → 解码成纯 base64）
+  const prompt = calls.prompts[0]
+  assert.ok(prompt.text.includes('[视频]（本地文件：'), '原占位与本地路径都保留')
+  assert.ok(prompt.text.includes('已抽成 3 张截图'), `正文应说明给的是截图，实际：${prompt.text}`)
+  const parts = Array.isArray(prompt.opts?.content) ? prompt.opts.content : []
+  const images = parts.filter((part) => part?.type === 'image')
+  assert.equal(images.length, 3, `应有 3 张截图，实际 ${images.length}`)
+  assert.equal(images[0].data, frames[0].toString('base64'), '第 1 帧内容要对得上')
+  assert.equal(images[0].mediaType, 'image/jpeg')
+  assert.equal(parts[0].type, 'text', '文本段在最前面')
+})
+
+await check('抽帧服务不可达：只 warn，保留 [视频] 纯文本占位（不抛）', async () => {
+  const logs = quietLogger()
+  const sourceDir = tmpDir('video-frame-down-src')
+  const sourceFile = path.join(sourceDir, 'clip.mp4')
+  fs.writeFileSync(sourceFile, Buffer.alloc(1024, 5))
+  const { b, calls } = makeBridge({ stateFile: path.join(tmpDir('video-frame-down-state'), 'sessions.json') })
+  await attachHub(b, {
+    enabled: false,
+    port: 0,
+    plugins: [{ id: 'video-frames', url: 'http://127.0.0.1:1', timeoutMs: 300 }],
+    video: { enabled: true, maxBytes: 1024 * 1024, timeoutMs: 3000 },
+  }, { logger: logs.logger })
+  await b.handleMessage(privMsg('[视频]', { videos: [{ url: sourceFile }] }))
+  const prompt = calls.prompts[0]
+  assert.ok(prompt.text.includes('[视频]'), '原占位保留')
+  assert.ok(!prompt.opts?.content, '没有帧就不该有 image part')
+  assert.ok(logs.logs.warns.some((line) => line.includes('视频抽帧')), '应留下一条可读的 warn')
+})
+
+await check('抽帧服务报错（ok:false）：正文补一句「看不到画面」，不编造', async () => {
+  const fake = await startFakePlugin({
+    tools: [{ name: 'read_video', parameters: { type: 'object', properties: {} } }],
+    execute: () => ({ ok: false, error: '未找到 ffmpeg（抽帧需要它）' }),
+  })
+  const sourceDir = tmpDir('video-frame-err-src')
+  const sourceFile = path.join(sourceDir, 'clip.mp4')
+  fs.writeFileSync(sourceFile, Buffer.alloc(512, 9))
+  const { b, calls } = makeBridge({ stateFile: path.join(tmpDir('video-frame-err-state'), 'sessions.json') })
+  await attachHub(b, {
+    enabled: false,
+    port: 0,
+    plugins: [{ id: 'video-frames', url: fake.url, timeoutMs: 5000 }],
+    video: { enabled: true, maxBytes: 1024 * 1024, timeoutMs: 5000 },
+  })
+  await b.handleMessage(privMsg('[视频]', { videos: [{ url: sourceFile }] }))
+  const prompt = calls.prompts[0]
+  assert.ok(prompt.text.includes('没能抽帧'), `应如实说明抽帧失败，实际：${prompt.text}`)
+  assert.ok(!prompt.opts?.content, '没有帧就不该有 image part')
+})
+
 // ── sessionId → chatKey 反查（ensureSession 时记录） ─────────────────────
 console.log('\n— sessionId→chatKey 反查表 —')
 

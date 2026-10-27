@@ -684,6 +684,11 @@ node tools/rename-sessions.mjs --apply    # 真改（逐条串行 + 80ms 间隔�
   命中「无文字回复 / 已发图 / 已发表情包 / 图片已发送 …」就整行删，行内这类括号说明
   也抠掉。清洗后为空 = 本轮没有文字，**不补任何占位提示**，图片照发。
   普通方括号内容（`[CQ:...]`、`【公告】`）不受影响。
+- **DSH 面板侧兜底**（2026-10-27 追加）：上面这条只管「发往 QQ 的那份」，
+  DSH 面板显示的是模型**原始输出**，那行照样挂在会话里（看着丑，还会被下一轮学舌）。
+  所以 guard 插件在 `llm/stream` 里对**被桥接接管的 QQ 会话**做了同样的清洗
+  （`plugins/dsh-qq-guard/meta-notes.js`，流式逐 delta 处理、跨 chunk 的括号也能整组删，
+  `block-end` 的最终正文一并清）。用户自己在浏览器里的会话完全不动。
 
 **② 图文顺序。** 模型是在一轮「进行到一半」时调 `qq_send_image` 的，工具只入队，
 桥接旧逻辑会立刻发 —— 于是 QQ 上先弹表情包、后弹这一轮的文字。现在：
@@ -927,12 +932,19 @@ video-frames）和 DSH 内的 guard 用的一小块**本地 HTTP**。契约见
   静音与响应档位之前（插件是「有人问就答」，不受节奏设置影响；`/` 指令不拦）。
   命中就 `_send` 发出、`stats.autoReplies++`、清未读、**不进 DSH**；未命中 / 超时 /
   插件不可达照常往下走，失败 30 秒负缓存 + 只 warn 一次。
-- **视频落盘**（`video.enabled`）：`onebot.mjs` 把 video 段解成 `msg.videos`
+- **视频落盘 + 抽帧**（`video.enabled`）：`onebot.mjs` 把 video 段解成 `msg.videos`
   （`{url,file,fileSize}`）；消息进来就后台下载到 `state/media/video-<ts>-<n>.mp4`
   （并发 ≤2、限大小/超时），成功后在送模型的正文末尾追加一行
   `[视频]（本地文件：<绝对路径>）`（原 `[视频]` 占位保留），失败只 warn。
+- **视频抽帧**（2026-10-27 真机 Bug：发 MP4 模型只看到「[视频]」）：下载成功后紧接着把
+  本地路径交给插件通道里的 `video-frames`（缺省 `127.0.0.1:39413`，工具 `read_video`）——
+  `plugin-hub.mjs` 的 `readVideoFrames()` 把返回的 image block 拼成
+  `data:image/jpeg;base64,…`，`bridge.mjs` 的 `_startVideoNote()` 把这些帧并进 `images`，
+  和普通图片走同一条多模态通路。正文补一句「已抽成 N 张截图，帧与帧之间看不到」。
+  抽帧失败 / 服务不可达 / 没装 ffmpeg → 只 warn，保留纯文本占位，聊天不受影响。
+  扩展点：`GET /tools` 拉不到时工具名兜底成 `read_video`（兼容老口径 `qq_ext_read_video`）。
 - 生命周期：`start.mjs` 在 `bridge.start()` 之后起 hub，退出时关闭；起不来只 warn。
-  auto-reply / 视频下载是**桥接出站**调用，不依赖监听端口成功。
+  auto-reply / 视频下载 / 抽帧是**桥接出站**调用，不依赖监听端口成功。
 
 ## 桥接性能（P2，2026-10-24）
 

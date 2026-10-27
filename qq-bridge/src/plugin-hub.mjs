@@ -54,6 +54,9 @@ const TOOL_NAME_RE = /^[A-Za-z0-9_]{1,64}$/
 /** 单条消息最多下载几个视频 / 并发几个（防止一条消息塞十个大文件）。 */
 const MAX_VIDEO_COUNT = 4
 const VIDEO_CONCURRENCY = 2
+/** 抽帧服务的插件 id 与工具名（契约 §4；工具名以插件清单为准，这里是兜底）。 */
+const VIDEO_FRAMES_PLUGIN_ID = 'video-frames'
+const VIDEO_FRAMES_TOOL_FALLBACK = 'read_video'
 
 /** 契约 §2.3 的默认块：全部关闭，不配置时行为与现在完全一致。 */
 export const DEFAULT_PLUGIN_HUB = Object.freeze({
@@ -738,5 +741,111 @@ export class PluginHub {
       this.logger?.warn?.(`视频下载失败（保持原 [视频] 占位，不影响聊天）：${reason}`)
       return { ok: false, error: reason }
     }
+  }
+
+  // ── 出站：视频抽帧（契约 §6 扩展，2026-10-27） ───────────────────────────
+
+  /**
+   * 把落盘的视频交给 `video-frames` 微服务抽帧，拿回一组能直接塞进 `images` 的图片。
+   *
+   * 为什么在 hub 里做：抽帧本来就是契约 §4 的插件能力（`read_video` 工具），
+   * 桥接不该自己拼 ffmpeg 命令行。这里只做「本地路径进、data URL 出」的搬运：
+   *
+   *   POST {plugin}/tools {name:'read_video', args:{filePath, count?, maxWidth?}}
+   *     → {ok:true, content:[{type:'text'}, {type:'image', data:<纯 base64>, mimeType}]}
+   *   → 每张图拼成 `data:<mimeType>;base64,<data>`
+   *
+   * 拼 data URL 而不是先落盘：bridge 的 `_downloadImage` 天然认 `data:` 形态
+   * （见 bridge.mjs 的 `_downloadImage`），少一次磁盘往返，也不用管帧文件的清理。
+   *
+   * **永不抛**：没配 video-frames / 不可达 / 超时 / 抽帧失败都返回
+   * `{ok:false, images:[], text:'', error}`，调用方保持原 `[视频]` 占位继续聊天。
+   *
+   * @param {string} filePath 桥接已经下载到本机的视频绝对路径（服务只认本地文件）
+   * @param {{count?:number, maxWidth?:number}} [options]
+   *   `count`：抽几帧（1~12；不传 = 用插件自己的设置）
+   *   `maxWidth`：帧宽上限（像素；不传 = 用插件自己的设置）
+   * @returns {Promise<{ok:boolean, images:Array<{url:string}>, text:string, error?:string}>}
+   */
+  async readVideoFrames(filePath, { count, maxWidth } = {}) {
+    const file = String(filePath ?? '').trim()
+    if (!file) return { ok: false, images: [], text: '', error: '空文件路径' }
+    const plugin = this.config.plugins.find((item) => item.id === VIDEO_FRAMES_PLUGIN_ID)
+    if (!plugin) {
+      return { ok: false, images: [], text: '', error: 'pluginHub.plugins 里没有 video-frames' }
+    }
+    const args = { filePath: file }
+    const wantCount = clampInt(count, 1, 12, 0)
+    if (wantCount > 0) args.count = wantCount
+    const wantWidth = clampInt(maxWidth, 0, 4096, 0)
+    if (wantWidth > 0) args.maxWidth = wantWidth
+
+    const tool = await this._videoFramesToolName(plugin)
+    if (!tool) return { ok: false, images: [], text: '', error: 'video-frames 没有注册抽帧工具' }
+    const timeout = clampInt(plugin.timeoutMs, 100, 300_000, DEFAULT_TOOL_TIMEOUT_MS)
+
+    let res
+    try {
+      res = await this.fetchImpl(`${plugin.url}/tools`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({ name: tool, args }),
+        signal: AbortSignal.timeout(timeout),
+      })
+    } catch (error) {
+      const reason = isTimeoutError(error) ? `抽帧超时（${timeout}ms）` : `不可达：${errorText(error)}`
+      this.logger?.warn?.(`视频抽帧失败（保持纯文本占位，不影响聊天）：${reason}`)
+      return { ok: false, images: [], text: '', error: reason }
+    }
+    const payload = await res.json().catch(() => null)
+    if (!res?.ok) {
+      const reason = `video-frames 返回 HTTP ${res?.status ?? '?'}`
+      this.logger?.warn?.(`视频抽帧失败（保持纯文本占位，不影响聊天）：${reason}`)
+      return { ok: false, images: [], text: '', error: reason }
+    }
+    if (!payload || payload.ok !== true) {
+      const reason = String(payload?.error ?? '响应格式不符')
+      this.logger?.warn?.(`视频抽帧未成功（保持纯文本占位，不影响聊天）：${reason}`)
+      return { ok: false, images: [], text: '', error: reason }
+    }
+
+    const images = []
+    const texts = []
+    for (const block of Array.isArray(payload.content) ? payload.content : []) {
+      if (!block || typeof block !== 'object') continue
+      if (block.type === 'image') {
+        const data = String(block.data ?? '').trim()
+        if (!data) continue
+        const mime = String(block.mimeType ?? '').trim().toLowerCase() || 'image/jpeg'
+        images.push({ url: `data:${mime};base64,${data}` })
+      } else if (block.type === 'text' && typeof block.text === 'string' && block.text.trim() !== '') {
+        texts.push(block.text.trim())
+      }
+    }
+    const text = texts.join('\n')
+    if (images.length === 0) {
+      return { ok: false, images: [], text, error: text || '抽帧没有返回图片' }
+    }
+    return { ok: true, images, text }
+  }
+
+  /**
+   * 抽帧工具名：先问插件的 `GET /tools`（清单才是权威），拉不到就退回默认 `read_video`。
+   *
+   * 为什么不用写死：插件清单里可能叫 `qq_ext_read_video`（老口径），
+   * 也可能将来改名；按清单取第一个名字带 video/frame 的，兼容两套写法。
+   *
+   * @param {{id:string, url:string}} plugin
+   * @returns {Promise<string>}
+   */
+  async _videoFramesToolName(plugin) {
+    try {
+      const manifest = await this._fetchPluginTools(plugin)
+      const list = manifest?.ok === true && Array.isArray(manifest.tools) ? manifest.tools : []
+      const hit = list.find((item) => /video|frame/iu.test(String(item?.name ?? ''))) ?? list[0]
+      const name = String(hit?.name ?? '').trim()
+      if (TOOL_NAME_RE.test(name)) return name
+    } catch { /* 退回兜底名 */ }
+    return VIDEO_FRAMES_TOOL_FALLBACK
   }
 }

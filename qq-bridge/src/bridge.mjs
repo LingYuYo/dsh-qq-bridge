@@ -2405,25 +2405,61 @@ export class Bridge {
   }
 
   /**
-   * 视频落盘（契约 §6）：消息一进来就在后台下载，返回**永不 reject** 的 Promise。
+   * 视频落盘 + 抽帧（契约 §6）：消息一进来就在后台跑，返回**永不 reject** 的 Promise。
    *
-   * 成功 resolve 要追加到送模型正文末尾的行（每个视频一行
-   * `[视频]（本地文件：<绝对路径>）`，原 `[视频]` 占位保留）；失败/关闭 resolve 空串。
-   * 下载逻辑、大小/超时/并发限制都在 plugin-hub.mjs。
+   * 2026-10-27 修「直接发视频文件无法抽帧」（真机 Bug）：以前只把视频下载到本地、
+   * 在正文里写一行 `[视频]（本地文件：…）`，模型收到的仍然只有文字，画面完全看不到。
+   * 现在下载成功后紧接着把本地路径交给 `video-frames` 微服务（插件通道 §4 的
+   * `read_video` 工具，缺省 127.0.0.1:39413）抽帧，把返回的 base64 帧转成 data URL
+   * 塞进 `images`，和普通图片走同一条多模态通路（`_buildPromptContent`）。
+   *
+   * 返回 `{note, images, frames}`：
+   *   · `note`：要追加到正文末尾的行（每个视频一行本地路径；真抽到帧再补一句说明）；
+   *   · `images`：抽到的帧（`{url:'data:image/jpeg;base64,…'}`），调用方并进 images；
+   *   · `frames`：帧数（日志/统计用）。
+   *
+   * 下载失败 / 抽帧失败 / 关闭视频技能一律降级成空结果：原 `[视频]` 占位保持原样，
+   * 绝不影响聊天。抽帧是**锦上添花**，不是主链路的必要条件。
    *
    * @param {object} msg
-   * @returns {Promise<string>}
+   * @returns {Promise<{note:string, images:Array<{url:string}>, frames:number}>}
    */
   _startVideoNote(msg) {
+    const empty = { note: '', images: [], frames: 0 }
     const videos = Array.isArray(msg?.videos) ? msg.videos : []
     const hub = this.pluginHub
-    if (videos.length === 0 || !hub || typeof hub.downloadVideos !== 'function') return Promise.resolve('')
-    if (hub.config?.video?.enabled !== true) return Promise.resolve('')
+    if (videos.length === 0 || !hub || typeof hub.downloadVideos !== 'function') return Promise.resolve(empty)
+    if (hub.config?.video?.enabled !== true) return Promise.resolve(empty)
+    const canFrames = typeof hub.readVideoFrames === 'function'
     return hub.downloadVideos(videos)
-      .then((result) => (Array.isArray(result?.paths) ? result.paths : [])
-        .map((file) => `[视频]（本地文件：${file}）`)
-        .join('\n'))
-      .catch(() => '')
+      .then(async (result) => {
+        const files = (Array.isArray(result?.paths) ? result.paths : []).filter(Boolean)
+        if (files.length === 0) return empty
+        const images = []
+        let frameFailures = 0
+        if (canFrames) {
+          for (const file of files) {
+            // 单个视频抽帧失败不影响其它视频，也不影响聊天主链路。
+            const frames = await hub.readVideoFrames(file).catch(() => null)
+            if (frames?.ok && Array.isArray(frames.images) && frames.images.length > 0) {
+              images.push(...frames.images)
+              this.logger.info?.(`视频抽帧成功：${frames.images.length} 张（${path.basename(String(file))}）`)
+            } else if (frames) {
+              frameFailures++
+              this.logger.warn?.(`视频抽帧失败（该视频只有文字占位）：${frames.error ?? '未知原因'}`)
+            }
+          }
+        }
+        const lines = files.map((file) => `[视频]（本地文件：${file}）`)
+        if (images.length > 0) {
+          // 明确告诉模型「给你的是截图」：否则它会把几帧当成完整视频，编造中间的连续过程。
+          lines.push(`（这段视频已抽成 ${images.length} 张截图，随本条消息附上；帧与帧之间发生的事情看不到。）`)
+        } else if (frameFailures > 0) {
+          lines.push('（这段视频没能抽帧，你看不到画面内容，别编造。）')
+        }
+        return { note: lines.join('\n'), images, frames: images.length }
+      })
+      .catch(() => empty)
   }
 
   /* ── 引用消息深度解析（2026-10-27）────────────────────────────
@@ -2796,8 +2832,16 @@ export class Bridge {
       this._prefetchImages(quoted.images)
     }
     if (quoted.videos.length > 0) {
-      const quotedVideoNote = await this._startVideoNote({ videos: quoted.videos })
-      if (quotedVideoNote) text = text ? `${text}\n${quotedVideoNote}` : quotedVideoNote
+      const quotedVideo = await this._startVideoNote({ videos: quoted.videos })
+      if (quotedVideo.note) text = text ? `${text}\n${quotedVideo.note}` : quotedVideo.note
+      if (quotedVideo.images.length > 0) {
+        // 图片总数有上限（IMAGE_MAX_COUNT），别把本轮已有的图挤掉。
+        const room = Math.max(0, IMAGE_MAX_COUNT - images.length)
+        if (room > 0) {
+          images.push(...quotedVideo.images.slice(0, room))
+          this._prefetchImages(quotedVideo.images.slice(0, room))
+        }
+      }
     }
     // 既没有文字也没有图片（纯表情 / 空消息）：没有可投递的内容，跳过。
     if (!text && images.length === 0) {
@@ -2855,9 +2899,21 @@ export class Bridge {
       return
     }
     // 5) 同会话防抖合并：窗口内没有新消息才真正投递（见 _enqueue）。
-    //    视频本地路径追加在正文末尾（契约 §6）：原 `[视频]` 占位保留，成功才加这一行。
-    const note = await videoNote
-    if (note) text = text ? `${text}\n${note}` : note
+    //    视频：本地路径追加在正文末尾，抽到的帧并进 images（契约 §6 + 2026-10-27 抽帧修复）。
+    const video = await videoNote
+    if (video.note) text = text ? `${text}\n${video.note}` : video.note
+    if (video.images.length > 0) {
+      const room = Math.max(0, IMAGE_MAX_COUNT - images.length)
+      if (room > 0) {
+        const frames = video.images.slice(0, room)
+        images.push(...frames)
+        this._prefetchImages(frames)
+      } else {
+        this.logger.warn?.(
+          `视频抽到 ${video.images.length} 张截图，但本轮图片已满（${images.length} 张），这次不带画面`,
+        )
+      }
+    }
     await this._enqueue(key, msg, text, images)
   }
 
