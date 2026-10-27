@@ -12,6 +12,7 @@
  */
 import assert from 'node:assert/strict'
 import { installModelOverride, MODEL_ROUTE_PATH, MODELS_ROUTE_PATH, SYSTEM_EVENTS_ROUTE_PATH } from './model-override.js'
+import { stripMetaNotes, stripMetaNotesInBlock, createMetaNoteStreamFilter } from './meta-notes.js'
 
 let pass = 0
 let fail = 0
@@ -494,6 +495,109 @@ await check('没有 webServer：钩子仍然装上（桥接拿不到路由，走
   const { ctx, listeners } = makeCtx({ withWebServer: false })
   installModelOverride(ctx, { logger: { warn() {}, info() {} } })
   assert.ok(listeners.has('agent/request'), '钩子必须不依赖 webServer')
+})
+
+// ── 2026-10-27 真机 Bug：DSH 面板里的「幽灵提示」────────────────────────
+// 模型发完图会自己补一句 `[无文字回复，已在同一条里发了表情包]`。
+// 桥接只清洗发往 QQ 的那份，DSH 面板显示的是原始输出 → 在 llm/stream 里摘掉。
+
+await check('stripMetaNotes：整行括号说明删掉，正常正文保留', () => {
+  assert.equal(stripMetaNotes('[无文字回复，已在同一条里发了表情包]'), '')
+  assert.equal(stripMetaNotes('在吗\n[无文字回复，已在同一条里发了表情包]'), '在吗')
+  assert.equal(stripMetaNotes('好（已发图）'), '好')
+  assert.equal(stripMetaNotes('[CQ:at,qq=999] 你谁'), '[CQ:at,qq=999] 你谁', '普通方括号不能误伤')
+})
+
+await check('流式过滤器：提示被拆成多个 delta 也能整组删掉', () => {
+  const filter = createMetaNoteStreamFilter()
+  let out = ''
+  out += filter.push('[无文字')
+  out += filter.push('回复，已在同一条里')
+  out += filter.push('发了表情包]')
+  out += filter.flush()
+  assert.equal(out, '', `整条提示应被吞掉，实际：${JSON.stringify(out)}`)
+  assert.equal(filter.didStrip, true)
+})
+
+await check('流式过滤器：正常文本零延迟透传，不扣字', () => {
+  const filter = createMetaNoteStreamFilter()
+  assert.equal(filter.push('你好'), '你好', '不带括号的文本必须立刻放行')
+  assert.equal(filter.push('啊'), '啊')
+  assert.equal(filter.push('（这是括号里的普通内容）'), '（这是括号里的普通内容）')
+  assert.equal(filter.push('完'), '完')
+  assert.equal(filter.flush(), '')
+})
+
+await check('流式过滤器：句子里夹的提示只抠掉括号那一段', () => {
+  const filter = createMetaNoteStreamFilter()
+  let out = ''
+  for (const piece of ['给', '你', '[已发图]', '，收']) out += filter.push(piece)
+  out += filter.flush()
+  assert.equal(out, '给你，收')
+})
+
+await check('流式过滤器：一直等不到闭括号也不无限扣字（超长放行）', () => {
+  const filter = createMetaNoteStreamFilter()
+  const long = '[' + 'あ'.repeat(400)
+  const out = filter.push(long) + filter.flush()
+  assert.equal(out, long, '不是提示的长括号内容必须原样放出去')
+})
+
+await check('流式过滤器：括号跨 chunk 时先扣住、闭括号到了再决定', () => {
+  const filter = createMetaNoteStreamFilter()
+  assert.equal(filter.push('好的['), '好的', '开括号之前的内容立刻放行')
+  assert.equal(filter.pending, 1, '只扣住开括号本身')
+  assert.equal(filter.push('图片]'), '[图片]', '普通括号组随后原样吐出')
+})
+
+await check('stripMetaNotesInBlock：整行提示连同换行一起删，原生换行不合并', () => {
+  assert.equal(stripMetaNotesInBlock('在的\n[无文字回复，已在同一条里发了表情包]\n图给你了'), '在的\n图给你了')
+  assert.equal(stripMetaNotesInBlock('第一行\n\n第二行'), '第一行\n\n第二行', '空行是原生格式，不许合并')
+  assert.equal(stripMetaNotesInBlock('好（已发图）'), '好')
+  assert.equal(stripMetaNotesInBlock('[图片] 看图'), '[图片] 看图', '普通占位不误伤')
+})
+
+await check('★ llm/stream：被接管会话的文本流里，幽灵提示不再出现（面板修的就是这里）', async () => {
+  const { ctx, listeners, routes } = makeCtx()
+  installModelOverride(ctx, { logger: { warn() {}, info() {} }, config: { modelWatchdogMs: 8000 } })
+  await callRoute(routes[0], { method: 'POST', body: { sessionId: 's-ghost', provider: 'workbuddy', model: 'deepseek-v4.1-flash' } })
+  async function* ghost() {
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text: '在的' }
+    yield { type: 'text-delta', index: 0, text: '[无文字回复' }
+    yield { type: 'text-delta', index: 0, text: '，已在同一条里' }
+    yield { type: 'text-delta', index: 0, text: '发了表情包]' }
+    yield { type: 'text-delta', index: 0, text: '，图给你了' }
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: '在的[无文字回复，已在同一条里发了表情包]，图给你了' } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  const stream = hookOf(listeners, 'llm/stream').fn(
+    { provider: 'workbuddy', model: 'deepseek-v4.1-flash', sessionId: 's-ghost' },
+    () => ghost(),
+  )
+  const chunks = []
+  for await (const chunk of stream) chunks.push(chunk)
+  const text = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+  assert.equal(text, '在的，图给你了', `面板文本里不该再有幽灵提示，实际：${text}`)
+  assert.equal(chunks.at(-1).type, 'finish', '终态 chunk 必须原样保留')
+  const blockEnd = chunks.find((c) => c.type === 'block-end')
+  assert.equal(blockEnd.block.text, '在的，图给你了', 'block-end 里的最终正文也要清（落库的就是它）')
+})
+
+await check('llm/stream：没被接管的会话不做任何清洗（原样透传）', async () => {
+  const { ctx, listeners } = makeCtx()
+  installModelOverride(ctx, { logger: { warn() {}, info() {} }, config: { modelWatchdogMs: 8000 } })
+  async function* other() {
+    yield { type: 'text-delta', index: 0, text: '[无文字回复，已在同一条里发了表情包]' }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  const stream = hookOf(listeners, 'llm/stream').fn(
+    { provider: 'workbuddy', model: 'deepseek-v4.1-flash', sessionId: 's-browser' },
+    () => other(),
+  )
+  const chunks = []
+  for await (const chunk of stream) chunks.push(chunk)
+  assert.equal(chunks[0].text, '[无文字回复，已在同一条里发了表情包]', '浏览器里自己的会话不许被动')
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

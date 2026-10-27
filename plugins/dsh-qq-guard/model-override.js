@@ -45,6 +45,8 @@
  *   图片会被放行然后被上游拒绝。面板侧要在切模型时自己校验 `input` 能力。
  */
 
+import { withMetaNoteFilter } from './meta-notes.js'
+
 /** 桥接进程读写模型偏好的路由。和 CONFIG_ROUTE_PATH / STATUS_ROUTE_PATH 同一套风格。 */
 export const MODEL_ROUTE_PATH = '/dsh-qq-guard/model'
 
@@ -55,9 +57,7 @@ export const MODELS_ROUTE_PATH = '/dsh-qq-guard/models'
 export const SYSTEM_EVENTS_ROUTE_PATH = '/dsh-qq-guard/system-events'
 
 /** 事件环形队列长度。 */
-const SYSTEM_EVENT_LIMIT = 20
-
-/**
+const SYSTEM_EVENT_LIMIT = 20/**
  * 系统底层事件环形队列。
  *
  * 为什么需要：看门狗切断、切备用、取消这一串动作全发生在 Host 进程内，
@@ -410,24 +410,30 @@ export function installModelOverride(ctx, { logger = console, config } = {}) {
     })
   }, { prepend: true })
 
-  // 4c. 静默看门狗：把「模型挂着不返回」翻成终态 finish(error)，好让上面的降级链接管。
-  //     只包「该 sessionId 自己登记过的主模型/备用路由」，其它会话的流原样透传
+  // 4c. 静默看门狗 + 舞台提示清洗。
+  //     看门狗：把「模型挂着不返回」翻成终态 finish(error)，好让上面的降级链接管。
+  //     清洗：把模型自己编的 `[无文字回复，已在同一条里发了表情包]` 从文本流里摘掉
+  //     （桥接只清洗了发往 QQ 的那份，DSH 面板显示的是原始输出，见 meta-notes.js）。
+  //     两件事都只包「该 sessionId 自己登记过的主模型/备用路由」，其它会话的流原样透传
   //     （按 sessionId 判断，不按路由集合——见 managedEntryFor 的注释）。
   const disposeWatchdog = ctx.on('llm/stream', (options, next) => {
-    const idleMs = Number(readVolatile(config?.modelWatchdogMs) ?? 0)
-    if (!Number.isFinite(idleMs) || idleMs <= 0) return next()
     const route = `${options?.provider ?? ''}/${options?.model ?? ''}`
     if (managedEntryFor(options?.sessionId, route) === undefined) return next()
-    const inner = next()
-    // 防御：waterfall 下游正常返回 AsyncIterable；不是流就不碰。
-    if (inner === null || typeof inner?.[Symbol.asyncIterator] !== 'function') return inner
-    return withIdleWatchdog(inner, idleMs, route, () => {
-      logger.warn?.(`[qq-guard] 看门狗触发：${route} ${idleMs}ms 无响应`)
-      pushSystemEvent('error', 'watchdog', `触发看门狗：${route} ${Math.round(idleMs / 1000)}s 无响应，强制中断`, {
-        route,
-        idleMs,
+    let stream = next()
+    // 防御：waterfall 下游正常返回 AsyncIterable；不是流就原样返回（含 null/undefined）。
+    if (stream === null || stream === undefined || typeof stream[Symbol.asyncIterator] !== 'function') return stream
+    const idleMs = Number(readVolatile(config?.modelWatchdogMs) ?? 0)
+    if (Number.isFinite(idleMs) && idleMs > 0) {
+      stream = withIdleWatchdog(stream, idleMs, route, () => {
+        logger.warn?.(`[qq-guard] 看门狗触发：${route} ${idleMs}ms 无响应`)
+        pushSystemEvent('error', 'watchdog', `触发看门狗：${route} ${Math.round(idleMs / 1000)}s 无响应，强制中断`, {
+          route,
+          idleMs,
+        })
       })
-    })
+    }
+    // 清洗挂在最外层：看门狗产出的 finish chunk 原样透传，不经过文本过滤器。
+    return withMetaNoteFilter(stream)
   }, { prepend: true })
 
   // ── 5. 桥接通道：一条写偏好、一条读、一条清；另一条给面板读模型目录 ──

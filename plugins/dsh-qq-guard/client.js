@@ -2870,8 +2870,16 @@ window.__ModuleLoader__.load({
      * 关闭方式三种：右上角 ×、点遮罩、按 Esc。
      * `size='sm'` 用于确认框（窄版）。
      * `footer` 传 null 表示不渲染按钮区。
+     *
+     * 遮罩关闭的判定（2026-10-27 真机 Bug）：必须 **mousedown 与 mouseup 都落在遮罩本体**。
+     * 只判 click 的 target 不够 —— 在输入框里按住鼠标拖到弹窗外松手时，浏览器把 click
+     * 派发到两者的共同祖先（也就是遮罩），`e.target === e.currentTarget` 会成立，
+     * 于是「长按拖拽选字」把弹窗拖没了。这里分别记下两个事件真正的 target，都对上才关。
      */
     function Modal({ open, title, desc, size, onClose, footer, children }) {
+      // mousedown / mouseup 的原始 target（只在同一次点击内有效）。
+      const downOnMask = React.useRef(null)
+      const upOnMask = React.useRef(null)
       // Esc 关闭。挂 window 而不是元素，否则焦点不在弹窗里就收不到按键。
       React.useEffect(() => {
         if (!open) return undefined
@@ -2879,12 +2887,26 @@ window.__ModuleLoader__.load({
         window.addEventListener('keydown', onKey)
         return () => window.removeEventListener('keydown', onKey)
       }, [open, onClose])
+      // 关掉时清掉半截状态：下次打开不能继承上一次的「从遮罩按下」。
+      React.useEffect(() => {
+        if (open) return
+        downOnMask.current = null
+        upOnMask.current = null
+      }, [open])
       if (!open) return null
       return h('div', {
         className: 'qqg-mask',
         role: 'presentation',
-        // 只在点遮罩本体时关闭；点弹窗内部会冒泡上来，用 target 判断拦住。
-        onClick: (e) => { if (e.target === e.currentTarget) onClose() },
+        // 点遮罩本体才关：按下 / 松开都必须发生在遮罩上（内部元素会冒泡上来，用 target 判断）。
+        onMouseDown: (e) => { downOnMask.current = e.target },
+        onMouseUp: (e) => { upOnMask.current = e.target },
+        onClick: (e) => {
+          const down = downOnMask.current
+          const up = upOnMask.current
+          downOnMask.current = null
+          upOnMask.current = null
+          if (down && up && down === e.currentTarget && up === e.currentTarget) onClose()
+        },
       },
       h('div', {
         className: 'qqg-modal' + (size === 'sm' ? ' qqg-modal-sm' : ''),

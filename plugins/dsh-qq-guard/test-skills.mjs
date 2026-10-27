@@ -741,6 +741,50 @@ check('Esc 关闭弹窗（模拟 keydown）', () => {
   eq(findAll(tree, (n) => n.props?.className === 'qqg-mask').length, 0, 'Esc 后弹窗关闭')
 })
 
+// ── 2026-10-27 真机 Bug：在输入框里长按拖拽、滑到弹窗外松手，弹窗被误关 ──
+check('★ 遮罩只在「按下 + 松开都在遮罩上」时才关闭（拖拽误关回归）', () => {
+  VALUE.skills = [
+    ...CONFIG_CATALOG.skills.map((x) => ({ ...x })),
+    { id: 'sk-quote', name: '聊天记录解析', icon: 'search', tag: '内置', ver: '1.0.0',
+      enabled: true, desc: '合并转发读图' },
+  ]
+  VALUE.quote = { forwardMaxImages: 3 }
+  const maskOf = (t) => findAll(t, (n) => n.props?.className === 'qqg-mask')[0]
+  let tree = resetSkills()
+  btn(tree, '聊天记录解析 设置').props.onClick({ stopPropagation() {} })
+  tree = renderSkills()
+  let mask = maskOf(tree)
+  eq(Boolean(mask), true, '齿轮弹窗应已打开')
+  const input = findAll(mask, (n) => n.tag === 'input')[0]
+  if (!input) throw new Error('弹窗里没有输入框')
+
+  // ① 输入框里按下 → 拖到遮罩上松手：浏览器会把 click 派发到共同祖先（遮罩），
+  //    旧实现只看 click.target 就直接关了 → 必须不关。
+  mask.props.onMouseDown({ target: input, currentTarget: mask })
+  mask.props.onMouseUp({ target: mask, currentTarget: mask })
+  mask.props.onClick({ target: mask, currentTarget: mask })
+  tree = renderSkills()
+  eq(findAll(tree, (n) => n.props?.className === 'qqg-mask').length, 1,
+    '输入框拖到遮罩松手不能关弹窗')
+
+  // ② 反过来：遮罩上按下 → 拖进弹窗内容里松手，click 仍落在遮罩 → 也不该关。
+  mask = maskOf(tree)
+  mask.props.onMouseDown({ target: mask, currentTarget: mask })
+  mask.props.onMouseUp({ target: input, currentTarget: mask })
+  mask.props.onClick({ target: mask, currentTarget: mask })
+  tree = renderSkills()
+  eq(findAll(tree, (n) => n.props?.className === 'qqg-mask').length, 1,
+    '遮罩按下、内容里松手也不该关')
+
+  // ③ 按下和松开都在遮罩上 → 正常关闭。
+  mask = maskOf(tree)
+  mask.props.onMouseDown({ target: mask, currentTarget: mask })
+  mask.props.onMouseUp({ target: mask, currentTarget: mask })
+  mask.props.onClick({ target: mask, currentTarget: mask })
+  tree = renderSkills()
+  eq(findAll(tree, (n) => n.props?.className === 'qqg-mask').length, 0, '正常点遮罩应关闭')
+})
+
 /* ── 全局设置：bridge.autoStart 开关 ────────────────────────── */
 console.log('\n全局设置 · 自动拉起桥接：')
 
