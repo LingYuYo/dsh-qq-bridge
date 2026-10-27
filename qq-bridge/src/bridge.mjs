@@ -241,7 +241,9 @@ export function capabilityLines(features) {
   if (f.voice) lines.push('如果一句话适合用语音说，可以调用 qq_send_voice 把它变成 QQ 语音条发出去。')
   if (f.image) {
     lines.push('想发图片或表情包时，可以调用 qq_send_image，用 url（http/https 图片地址）或 file（本地绝对路径 / file:// / base64://）二选一。'
-      + '对方要图/表情包时直接调用它；没有可用的图片地址就如实说「给我个图片链接」或「我这儿没有图」，不要回答「没有发图工具」。')
+      + '对方要图/表情包时直接调用它；没有可用的图片地址就如实说「给我个图片链接」或「我这儿没有图」，不要回答「没有发图工具」。'
+      + '调用完之后不要在正文里写「已发图」「[无文字回复」「（已在同一条里发了表情包）」这类说明——'
+      + '图会自己发出去（排在你的文字后面）；没别的话要说就直接不输出正文，不要补占位提示。')
   }
   return lines
 }
@@ -349,6 +351,56 @@ const POKE_REPLY_MAX = 30
 const POKE_IMAGE_GAP_MS = 350
 /** 表情包单张上限（与 UI 的 5MB 提示一致）；超了不发，只 warn。 */
 const POKE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+/** 模型中途发的图排在本轮文字之后：间隔与戳一戳一致（太近会被合成一条通知）。 */
+const IMAGE_AFTER_TEXT_GAP_MS = 350
+/**
+ * 模型偶尔会把「内部说明」写进正文（2026-10-27 真机：`[无文字回复，已在同一条里发了表情包]`）。
+ *
+ * 这句话不是我们发出去的文案，是模型自己编的舞台提示 —— 但发到群里就是丢人。
+ * 这里按关键词做**发送前兜底清洗**：整行只是括号说明就整行删，行内的括号说明也抠掉。
+ * 只认这些与「发图 / 无文字」有关的词，普通方括号内容（[CQ:...]、[图片] 之类）一律不动。
+ */
+const META_NOTE_KEYWORDS = Object.freeze([
+  '无文字回复',
+  '已在同一条',
+  '已发到 QQ',
+  '已发到QQ',
+  '已发表情包',
+  '已发送表情包',
+  '表情包已发送',
+  '已发图片',
+  '已发送图片',
+  '图片已发送',
+  '已发图',
+])
+/** 括号说明的两种外形：半角/全角方括号与圆括号。 */
+const BRACKET_GROUP_RE = /[\[【（(][^\[\]【】（）()]*[\]】）)]/gu
+const WHOLE_BRACKET_RE = /^[\[【（(][\s\S]*[\]】）)]$/u
+const looksLikeMetaNote = (text) => META_NOTE_KEYWORDS.some((word) => String(text ?? '').includes(word))
+
+/**
+ * 清洗模型回复里的「内部说明」：`[无文字回复，已在同一条里发了表情包]`、`（已发图）` 这类。
+ *
+ * 规则（宁窄勿宽，绝不误删正常内容）：
+ *   · 整行只有一对括号、且括号里命中 {@link META_NOTE_KEYWORDS} → 整行丢弃；
+ *   · 行内出现的这类括号说明 → 只抠掉括号本身，其余文字保留；
+ *   · 清洗后为空 = 本轮没有可发的文字（只发了图），调用方不要再补任何提示。
+ *
+ * @param {unknown} text
+ * @returns {string}
+ */
+export function stripMetaNotes(text) {
+  const lines = String(text ?? '').split(/\r?\n/u)
+  const kept = []
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (trimmed === '') { kept.push(''); continue }
+    if (WHOLE_BRACKET_RE.test(trimmed) && looksLikeMetaNote(trimmed)) continue
+    const cleaned = line.replace(BRACKET_GROUP_RE, (group) => (looksLikeMetaNote(group) ? '' : group))
+    if (cleaned.trim() !== '') kept.push(cleaned)
+  }
+  return kept.join('\n').replace(/\n{3,}/gu, '\n\n').trim()
+}
 
 /**
  * 把 `personaDelta` 截到容量上限内（**保留最新**的段落，旧的先丢）。
@@ -596,6 +648,11 @@ export class Bridge {
     this._pokeAt = new Map()   // key -> 上次回戳时间戳（ms）
     // 戳一戳回复列表上次抽中的下标：避免连续两次挑到同一条（只有 1 条时无所谓）。
     this._pokeLastPick = new Map() // key -> 上次下标
+    // 图文顺序（2026-10-27）：正在跑模型的那一轮会把 key 记在这里。
+    // 模型在思考途中调 qq_send_image 时，图片先排队，等本轮文字发完再发 ——
+    // 否则 QQ 上会先弹表情包、后弹文字，看着像发错顺序。
+    this._turnActive = new Set()        // key
+    this._pendingImages = new Map()     // key -> [{ source, subType, position, kind, target }]
     // 每小时归纳的聊天记录缓冲：key -> [{ name, qq, text, at }]（群聊才有）。
     this._chatLog = new Map()
     // 归纳定时器（start 里建、stop 里清）与并发保护（一轮 60s 超时内不叠第二轮）。
@@ -1931,6 +1988,22 @@ export class Bridge {
     // subType 只认 0/1（guard 已校验过；这里再兜一层，脏数据按缺省处理）。
     const subType = op?.subType === 0 || op?.subType === 1 ? op.subType : undefined
     const position = op?.position === 'before' || op?.position === 'after' ? op.position : undefined
+
+    // ── 图文顺序（2026-10-27）──────────────────────────────────────
+    // 模型是在「本轮还没结束时」调 qq_send_image 的，工具只入队、桥接立刻发 ——
+    // 于是 QQ 上先弹表情包、后弹这一轮的文字，看着像发错顺序。
+    // 修法：本轮进行中就先把图排队，等文字发出（或本轮结束）后再按 350ms 间隔发。
+    if (this._turnActive.has(key)) {
+      const queue = this._pendingImages.get(key) ?? []
+      queue.push({ source, subType, position, kind, target })
+      this._pendingImages.set(key, queue)
+      this.logger.info?.(`模型在本轮中途发了图，已排队等文字先发（${key}，队列 ${queue.length} 条）`)
+      return {
+        ok: true, queued: true, action: 'image', key,
+        detail: '图片已排队：会在本轮文字之后自动发出（约 0.35 秒），不用再复述发图这件事。',
+      }
+    }
+
     const sent = await this.qq.sendImage(kind, target, source, { atUserId: undefined, subType, position })
     const via = sent?.via ?? ''
     // position 只进 detail：这一版不按它改发送顺序（避免引入等待/队列逻辑，风险高）。
@@ -1953,6 +2026,40 @@ export class Bridge {
     return {
       ok: true, action: 'image', key, sent: true,
       via, retcode, status: sent?.status ?? '', detail,
+    }
+  }
+
+  /**
+   * 把本轮排队等着的图片发出去（{@link _processBatch} 收尾时调用）。
+   *
+   * 顺序保证：文字先发 → 至少 {@link IMAGE_AFTER_TEXT_GAP_MS} → 图。
+   * 本轮本来就没有文字（模型只发了图）时同样走这里，只是前面没有文字气泡；
+   * **绝不补任何占位提示**（清洗过的空回复直接跳过，见 {@link stripMetaNotes}）。
+   *
+   * 永不抛：一张图失败只 warn，不连累后面的图，也不影响已经发出去的文字。
+   *
+   * @param {string} key
+   * @returns {Promise<void>}
+   */
+  async _flushPendingImages(key) {
+    const queue = this._pendingImages.get(key)
+    if (!queue || queue.length === 0) return
+    this._pendingImages.delete(key)
+    await sleep(IMAGE_AFTER_TEXT_GAP_MS)
+    for (const item of queue) {
+      try {
+        const sent = await this.qq.sendImage(item.kind, item.target, item.source, {
+          atUserId: undefined, subType: item.subType, position: item.position,
+        })
+        if (sent?.ok === false) {
+          this.logger.warn?.(`排队图片发送失败（${key}）：${sent.error ?? '未知原因'}`)
+          continue
+        }
+        this.stats.images++
+        this.logger.info?.(`已补发本轮图片 ${key}（via=${sent?.via || 'file'}）`)
+      } catch (error) {
+        this.logger.warn?.(`排队图片发送异常（${key}）：${error?.message ?? error}`)
+      }
     }
   }
 
@@ -2442,6 +2549,8 @@ export class Bridge {
     if (!text && images.length === 0) return
     return await this.queues.run(key, async () => {
       const started = Date.now()
+      // 图文顺序：本轮进行中，模型中途发的图先排队（见 _applyImageOp）。
+      this._turnActive.add(key)
       try {
         const rhythm = this._rhythm()
         const features = this._features()
@@ -2525,6 +2634,21 @@ export class Bridge {
             throw error
           }
         }
+        // 发送前清洗模型自己编的「内部说明」（2026-10-27）：
+        // 例如 `[无文字回复，已在同一条里发了表情包]` —— 那是模型学舌，不是我们要发的话。
+        // 清洗后为空 = 这一轮只发了图，**不补任何占位文案**（用户明确要求）。
+        const cleaned = stripMetaNotes(reply)
+        if (cleaned === '') {
+          this.logger.info?.(`本轮没有可发送的文字（清洗后为空，模型只发了图/空回复）：${key}`)
+          this._noteReplied(key)
+          this._rateRecord(key)
+          this.stats.replied++
+          return
+        }
+        if (cleaned !== String(reply ?? '').trim()) {
+          this.logger.warn?.(`回复里的内部说明已剔除：${String(reply ?? '').slice(0, 60)}`)
+        }
+        reply = cleaned
         const audit = auditReply(reply, [this.config.onebot?.accessToken])
         if (!audit.ok) {
           this.stats.blocked++
@@ -2558,6 +2682,11 @@ export class Bridge {
         const sent = await this._send(msg, line).catch(() => undefined)
         // 出错时也回了一句提示：用户已经被「回应」过，红点不该一直挂着。
         if (sent && sent.ok !== false) this._noteReplied(key)
+      } finally {
+        // 本轮结束：解除「进行中」，把模型中途发的图补发出去（文字已经先发了）。
+        this._turnActive.delete(key)
+        await this._flushPendingImages(key).catch((e) =>
+          this.logger.warn?.(`补发排队图片失败（${key}）：${e?.message ?? e}`))
       }
     })
   }

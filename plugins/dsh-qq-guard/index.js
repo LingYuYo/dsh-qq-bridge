@@ -3446,7 +3446,9 @@ function applyImageTool(ctx) {
         + '两个都给时用 url。对方要图片或表情包时**直接调用本工具**，不要回答「没有发图工具」；'
         + '没有可用的图片地址就如实说「给我个图片链接」，不要编造。'
         + 'subType=1 时按表情发（QQ 里是小表情，可长按收藏），缺省按普通图片发。'
-        + '**发送失败会抛错**（下载失败或 NapCat 拒收时），失败原因要如实告诉对方。',
+        + '**发送失败会抛错**（下载失败或 NapCat 拒收时），失败原因要如实告诉对方。'
+        + '调用后**不要**在正文里复述「已发图」「已发表情包」或写方括号说明；'
+        + '没有别的话要说就不用输出正文（图片会自动排在文字后面发出去）。',
       parameters: {
         url: {
           type: 'string',
@@ -3475,9 +3477,10 @@ function applyImageTool(ctx) {
         },
         render: (_args, value) => [{
           type: 'text',
-          text: value?.sent === true
-            ? `图片已发到 QQ：${String(value?.detail ?? '')}`
-            : `图片没有发出去：${String(value?.detail ?? '')}`,
+          text: (value?.sent === true
+            ? `图片已处理：${String(value?.detail ?? '')}`
+            : `图片没有发出去：${String(value?.detail ?? '')}`)
+            + '（不要在正文里复述发图或写「[已发图]」这类说明。）',
         }],
       },
       execute: async (args, exec) => {

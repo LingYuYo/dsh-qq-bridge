@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 import {
   auditReply, Bridge, matchActivityKeyword, normalizeRhythm,
   normalizeSessionEntry, parseSessionKey, sessionTitleFor, ADMIN_GUARD_NOTE,
-  normalizeFeatures, featuresFromManifests, capabilityLines,
+  normalizeFeatures, featuresFromManifests, capabilityLines, stripMetaNotes,
 } from './src/bridge.mjs'
 import { planRenames } from './src/rename-plan.mjs'
 import {
@@ -1811,6 +1811,63 @@ await check('不同群同时说话：各自引用各自的原消息（跨 key �
   ])
   assert.equal(calls.sent.length, 2)
   assert.deepEqual(sentQuotes(calls), ['G1-id', 'G2-id'])
+})
+
+console.log('\n— 占位符清洗 + 图文顺序（2026-10-27 真机 Bug）—')
+await check('stripMetaNotes：整行括号说明被删，正常正文保留', () => {
+  assert.equal(stripMetaNotes('[无文字回复，已在同一条里发了表情包]'), '')
+  assert.equal(stripMetaNotes('在吗\n[无文字回复，已在同一条里发了表情包]'), '在吗')
+  assert.equal(stripMetaNotes('好（已发图）'), '好')
+  assert.equal(stripMetaNotes('哈\n\n[已发送表情包]\n'), '哈')
+})
+await check('stripMetaNotes：不误伤普通方括号内容', () => {
+  assert.equal(stripMetaNotes('[CQ:at,qq=999] 你谁'), '[CQ:at,qq=999] 你谁')
+  assert.equal(stripMetaNotes('【公告】今晚八点开会'), '【公告】今晚八点开会')
+  assert.equal(stripMetaNotes('正常的一句话'), '正常的一句话')
+})
+
+await check('★ 文本+图：文字先发（带引用），350ms 后才是图', async () => {
+  const { b } = makeBridge({})
+  const order = []
+  b.qq.sendGroup = async (gid, text, opts) => { order.push(['text', Date.now(), text, opts?.replyTo]); return { ok: true, messageIds: ['1'] } }
+  b.qq.sendImage = async () => { order.push(['image', Date.now()]); return { ok: true, via: 'file' } }
+  const entry = b._entryOf('g:123456')
+  entry.sessionId = 's1'
+  let queuedResult
+  b.dsh.promptAndWait = async () => {
+    queuedResult = await b.applySessionOp({ op: 'image', sessionId: 's1', url: 'http://x/1.png' })
+    return '给'
+  }
+  await b._processBatch('g:123456', gm('来张图', 'Q1', '1001'), ['来张图'], [])
+  assert.equal(queuedResult?.queued, true, '★ 模型中途发的图先排队，不抢跑')
+  assert.deepEqual(order.map((o) => o[0]), ['text', 'image'], '★ 先文字后图片')
+  assert.equal(order[0][2], '给')
+  assert.equal(order[0][3], 'Q1', '文字仍带引用')
+  assert.ok(order[1][1] - order[0][1] >= 300, `间隔应 ≥300ms，实际 ${order[1][1] - order[0][1]}`)
+})
+
+await check('★ 只有图没有文字：不补占位提示，图片照发', async () => {
+  const { b } = makeBridge({})
+  const order = []
+  b.qq.sendGroup = async (gid, text) => { order.push(['text', text]); return { ok: true, messageIds: ['1'] } }
+  b.qq.sendImage = async () => { order.push(['image']); return { ok: true, via: 'file' } }
+  const entry = b._entryOf('g:123456')
+  entry.sessionId = 's1'
+  b.dsh.promptAndWait = async () => {
+    await b.applySessionOp({ op: 'image', sessionId: 's1', url: 'http://x/2.png' })
+    return '[无文字回复，已在同一条里发了表情包]'
+  }
+  await b._processBatch('g:123456', gm('发个表情', 'Q2', '1001'), ['发个表情'], [])
+  assert.deepEqual(order, [['image']], '★ 只有图，没有文字气泡，也没有中括号提示')
+})
+
+await check('本轮既没开图、正文清洗后也空：什么都不发（回归）', async () => {
+  const { b, calls } = makeBridge({})
+  const entry = b._entryOf('g:123456')
+  entry.sessionId = 's1'
+  b.dsh.promptAndWait = async () => '（已发图）'
+  await b._processBatch('g:123456', gm('嗯', 'Q3', '1001'), ['嗯'], [])
+  assert.deepEqual(calls.sent, [], '清洗后为空 → 不发任何文字')
 })
 
 console.log('\n— 群聊上下文自动清理（2026-10-27）—')
