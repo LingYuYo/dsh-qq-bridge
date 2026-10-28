@@ -21,6 +21,8 @@ import {
   SUMMARY_FOOTER,
   SUMMARY_HARD_LIMIT,
   SUMMARY_NODE_NAME,
+  SUMMARY_OVERRIDE_NOTE,
+  SUMMARY_PERSONA,
   buildForwardNodes,
   buildSummaryPrompt,
   formatTranscript,
@@ -31,6 +33,7 @@ import {
   parseSummaryCommand,
   parseStructuredSummary,
   pickUnread,
+  sanitizeSummaryTone,
   splitSummaryNodes,
 } from './src/unread-summary.mjs'
 
@@ -77,6 +80,9 @@ function fakeRuntime(bridge, {
   const privates = []
   const forwards = []
   const archive = []
+  // v2.0 第三步：记录临时会话的人设推送与调用顺序（断言「先换人设再提问」）。
+  const personas = []
+  const events = []
   bridge.qq = {
     selfId: SELF,
     groupAtReply: false,
@@ -91,6 +97,7 @@ function fakeRuntime(bridge, {
     async sendPrivate(userId, text) { privates.push({ userId, text }); return { ok: true } },
     async sendGroupForward(groupId, nodes) {
       forwards.push({ groupId, nodes })
+      events.push(['forward', groupId])
       return forwardOk ? { ok: true, messageId: 'fwd-1' } : { ok: false, reason: 'retcode=100 mock' }
     },
   }
@@ -98,15 +105,21 @@ function fakeRuntime(bridge, {
     async ensureWorkspace() { return 'ws-1' },
     async createSession() { return 'sess-summary-1' },
     async setSessionModel() { return { ok: true } },
+    async setSessionPersona({ sessionId, text }) {
+      personas.push({ sessionId, text })
+      events.push(['persona', sessionId])
+      return { ok: true }
+    },
     async promptAndWait(sessionId, prompt, opts) {
       bridge._lastPrompt = prompt
       bridge._lastPromptOpts = opts
+      events.push(['prompt', sessionId])
       if (promptError) throw promptError
       return reply
     },
-    async archiveSession(id) { archive.push(id) },
+    async archiveSession(id) { archive.push(id); events.push(['archive', id]) },
   }
-  return { sent, privates, forwards, archive }
+  return { sent, privates, forwards, archive, personas, events }
 }
 
 /** 一条主人发的群指令消息（Bridge 内部看的那套字段）。 */
@@ -505,6 +518,83 @@ await check('端到端：模型返回结构化 → 合并转发多段且带时�
   assert.match(joined, /🕒 时间：/u)
   assert.match(joined, /【Apex/u)
   assert.equal(b._summaryState(`g:${GROUP}`).lastSummarySeq, 12, '多段也要正常推水位')
+})
+
+console.log('\n— 「群聊管家」独立人设（v2.0 第三步，2026-10-28）—')
+
+await check('人设与 Prompt 都带覆写句', () => {
+  assert.match(SUMMARY_PERSONA, /群聊管家/u)
+  assert.ok(SUMMARY_PERSONA.includes(SUMMARY_OVERRIDE_NOTE), '人设里要原样带上覆写句')
+  assert.match(SUMMARY_PERSONA, /忽略之前设定的所有暴躁\/傲娇规则/u)
+  const prompt = buildSummaryPrompt({ groupName: '鱼塘', total: 10, transcript: 'A: 1' })
+  assert.ok(prompt.trimEnd().endsWith(SUMMARY_OVERRIDE_NOTE), '★ Prompt 末尾必须压覆写句')
+})
+
+await check('临时会话创建后先推管家人生设，再提问', async () => {
+  const b = makeBridge()
+  const fake = fakeRuntime(b, {
+    history: [rawMsg({ id: 21, text: '上号', time: 6000 })],
+    reply: STRUCTURED_REPLY,
+  })
+  await b._runUnreadSummary({ msg: ownerMsg(), key: `g:${GROUP}`, count: 50, conf: b._summaryConfig() })
+  const pushed = fake.personas.filter((p) => p.sessionId === 'sess-summary-1' && p.text !== '')
+  assert.equal(pushed.length, 1, '应推一次非空人设')
+  assert.match(pushed[0].text, /群聊管家/u)
+  const personaAt = fake.events.findIndex((e) => e[0] === 'persona' && e[1] === 'sess-summary-1')
+  const promptAt = fake.events.findIndex((e) => e[0] === 'prompt')
+  assert.ok(personaAt >= 0 && personaAt < promptAt, '★ 必须先换人设再提问')
+  // QQ 群会话自己的单人设不能被写坏（管家只作用在临时会话上）。
+  assert.equal(String(b.state.sessions[`g:${GROUP}`]?.persona ?? ''), '')
+})
+
+await check('临时会话归档后人设条目被清掉（不堆内存）', async () => {
+  const b = makeBridge()
+  const fake = fakeRuntime(b, { history: [rawMsg({ id: 22, text: '在', time: 7000 })] })
+  await b._runUnreadSummary({ msg: ownerMsg(), key: `g:${GROUP}`, count: 50, conf: b._summaryConfig() })
+  await new Promise((r) => setImmediate(r))
+  assert.ok(fake.personas.some((p) => p.sessionId === 'sess-summary-1' && p.text === ''),
+    '归档后应推空串清掉人设')
+})
+
+await check('输出清洗：脏话打码、口癖去掉、整段拒答丢弃', () => {
+  assert.equal(sanitizeSummaryTone(''), '')
+  assert.equal(sanitizeSummaryTone('我拒绝总结这段记录'), '', '整段拒答 → 丢弃')
+  const masked = sanitizeSummaryTone('小明说：傻逼才三排')
+  assert.ok(!masked.includes('傻逼'), '★ 生殖器谩骂必须打码')
+  assert.match(masked, /\*\*\*/u)
+  const toned = sanitizeSummaryTone('哼，这群人又在熬夜~\n切、明天还要上班')
+  assert.ok(!/哼/u.test(toned) && !/切、/u.test(toned), `口癖要去掉：${toned}`)
+  assert.ok(!toned.includes('~'), '行尾波浪号要去掉')
+  // 锐评里引用「关我什么事」不该被误判成拒答（整段以 【 开头）。
+  const quoted = sanitizeSummaryTone('【晚饭】\n💬 锐评/金句：阿强：「关我什么事」')
+  assert.ok(quoted.includes('关我什么事'), '引用里的短语不能被误杀')
+})
+
+await check('端到端：模型带脏话/口癖 → 合并转发内容干净', async () => {
+  const b = makeBridge()
+  const dirty = [
+    '哼，128 条消息，群里全是废话~',
+    '【Apex 排位】',
+    '🕒 时间：20:15 - 21:40',
+    '👥 参与人：小明、小红',
+    '📝 总结：傻逼才三排，但最后还是上了分。',
+    '💬 锐评/金句：切、小明又说「关我什么事」。',
+  ].join('\n')
+  const fake = fakeRuntime(b, { history: [rawMsg({ id: 23, text: '上号', time: 8000 })], reply: dirty })
+  await b._runUnreadSummary({ msg: ownerMsg(), key: `g:${GROUP}`, count: 50, conf: b._summaryConfig() })
+  const joined = fake.forwards[0].nodes.map((node) => forwardNodeText(node)).join('\n')
+  assert.ok(!joined.includes('傻逼'), '★ 发出去的内容里不能有生殖器谩骂')
+  assert.ok(!joined.includes('哼，') && !joined.includes('切、'), '★ 不能有傲娇口癖')
+  assert.match(joined, /群聊总结报告/u)
+})
+
+await check('端到端：模型直接拒答 → 不发内容、走失败兜底', async () => {
+  const b = makeBridge()
+  const fake = fakeRuntime(b, { history: [rawMsg({ id: 24, text: '在', time: 9000 })], reply: '我拒绝总结，自己看记录。' })
+  await b._runUnreadSummary({ msg: ownerMsg(), key: `g:${GROUP}`, count: 50, conf: b._summaryConfig() })
+  assert.equal(fake.forwards.length, 0, '拒答不能当总结发出去')
+  assert.equal(b._summaryState(`g:${GROUP}`).lastSummarySeq, 0, '失败不推水位')
+  assert.match(fake.sent.at(-1).text, /没跑成功/u)
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

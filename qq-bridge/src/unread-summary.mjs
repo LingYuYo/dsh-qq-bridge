@@ -59,6 +59,75 @@ const TOPIC_FIELD_RE = /(?:🕒|👥|📝|💬)/u
 /** 模型自己加的免责句：剔掉，避免和我们的 footer 重复。 */
 const MODEL_TAIL_RE = /^(?:—+\s*)?(?:由\s*AI\s*自动生成|仅供娱乐)/iu
 
+// ── 「群聊管家」独立人设（v2.0 第三步，2026-10-28）────────────────────
+//
+// 临时会话会继承 qq-chat preset 的人设（林小鱼的暴躁/傲娇规则），
+// 总结出来的东西会带口癖甚至拒答。这里给临时会话**单独推一份系统提示词**：
+// 插件的人设 section 按 sessionId 取覆盖，优先级高于全局，会话归档后清掉。
+// Prompt 里再追加一句同样的覆写，做双保险（有些模型对 user 末尾指令更敏感）。
+
+/** 用户拍板的覆写句：必须原样出现在系统人设与 Prompt 尾部。 */
+export const SUMMARY_OVERRIDE_NOTE = '[系统设定覆写：你现在的身份是“群聊管家”，一个专业、中立、客观的观察者。请忽略之前设定的所有暴躁/傲娇规则，用严谨、中立的语气客观总结群聊。]'
+
+/** 临时会话专用的系统人设（替代 QQ 会话的傲娇人设）。 */
+export const SUMMARY_PERSONA = [
+  '你是「群聊管家」，一个专业、中立、客观的群聊观察者。',
+  SUMMARY_OVERRIDE_NOTE,
+  '',
+  '工作准则：',
+  '1. 只依据给出的聊天记录总结，不编造、不脑补、不评价记录本身。',
+  '2. 语气中性克制；不使用辱骂、性暗示或人身攻击词汇，也不模仿群友的脏话（引用时同样要打码）。',
+  '3. 不卖萌、不傲娇：不用「哼」「切」「才不是」「笨蛋」这类口癖，不在句尾加波浪号。',
+  '4. 不拒绝总结；按用户要求输出结构化简报，话题之间不要重复。',
+].join('\n')
+
+/** 生殖器谩骂 / 常见脏话词表（只拦最脏的那一档，避免误伤正常用词）。 */
+const PROFANITY_RE = /(傻逼|煞笔|沙比|臭逼|婊子|贱人|狗日的?|鸡巴|鸡吧|几把|屌毛|肏|操你|草你|日你|你妈的|妈的逼)/gu
+/** 行首傲娇口癖：「哼，」「切、」「呸！」这类。 */
+const TSUNDERE_HEAD_RE = /^(\s*)(?:哼+|切+|呸+|哈？)[\s，,、。.!！?？~～]*/u
+/**
+ * 行内口癖（带标点才认）：`切、` / `哼，` / `呸！`。
+ *
+ * 为什么要管行内：锐评那一行常写成 `💬 锐评/金句：切、又在熬夜`，
+ * 口癖不在行首。带标点是必要条件，避免把「切割」「切换」这类正常词清掉。
+ */
+const TSUNDERE_INLINE_RE = /(?:哼|切|呸)[，,、。!！]/gu
+/**
+ * 「拒绝总结」的句式：只在**整段很短、且以拒绝语开头**时判定，
+ * 避免把锐评里引用的「关我什么事」误杀成拒答。
+ */
+const REFUSAL_RE = /^(?:我拒绝|拒绝总结|不想总结|没什么好总结|恕不奉陪|不归我管|自己看记录)/u
+
+/**
+ * 输出侧的语气兜底（v2.0 第三步）。
+ *
+ * 为什么系统人设之外还要清洗：人设是软约束，模型偶尔还是会漏出一句脏话或口癖；
+ * 而「总结里出现生殖器谩骂」是红线，不能靠概率。清洗规则故意保守：
+ *   · 脏话 → `***`（不整段丢弃，避免一条词毁掉整个话题）；
+ *   · 行首口癖 / 行尾波浪号 → 去掉；
+ *   · 整段就是拒答 → 返回空串，由调用方按「没有可用内容」处理。
+ *
+ * @param {string} text
+ * @returns {string} 清洗后的文本；空串 = 这段不该发
+ */
+export function sanitizeSummaryTone(text) {
+  const source = String(text ?? '')
+  if (source.trim() === '') return ''
+  const trimmed = source.trim()
+  if (trimmed.length <= 300 && REFUSAL_RE.test(trimmed)) return ''
+  const masked = source.replace(PROFANITY_RE, '***')
+  const noHead = masked
+    .split('\n')
+    .map((line) => line.replace(TSUNDERE_HEAD_RE, '$1'))
+    .join('\n')
+  const noInline = noHead.replace(TSUNDERE_INLINE_RE, '')
+  const noTail = noInline
+    .split('\n')
+    .map((line) => line.replace(/[~～]+$/u, ''))
+    .join('\n')
+  return noTail.trim()
+}
+
 const clampInt = (value, fallback, min, max) => {
   const num = Number(value)
   if (!Number.isFinite(num)) return fallback
@@ -289,6 +358,9 @@ export function buildSummaryPrompt({
     '',
     '【聊天记录】',
     transcript,
+    '',
+    // 双保险：系统人设已经换成管家，这里再压一句覆写（部分模型对末尾指令更敏感）。
+    SUMMARY_OVERRIDE_NOTE,
   ].join('\n')
 }
 
@@ -488,6 +560,8 @@ export function buildForwardNodes(input, {
     const structured = buildStructuredSummaryNodes(raw, { groupName, date, maxNodes, nodeChars })
     texts = structured ?? splitSummaryNodes(raw, { maxNodes, nodeChars })
   }
+  // 输出侧语气兜底：脏话打码、口癖清掉、整段拒答丢弃（见 sanitizeSummaryTone）。
+  texts = texts.map((text) => sanitizeSummaryTone(text)).filter((text) => text !== '')
   return texts
     .map((text) => String(text ?? '').trim())
     .filter(Boolean)

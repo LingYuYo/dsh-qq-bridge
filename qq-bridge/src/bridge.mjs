@@ -30,6 +30,7 @@ import { estimateTokens, truncateChatLine } from './tokens.mjs'
 import {
   SUMMARY_HARD_LIMIT,
   SUMMARY_NODE_NAME,
+  SUMMARY_PERSONA,
   buildForwardNodes,
   buildSummaryPrompt,
   formatTranscript,
@@ -5159,6 +5160,18 @@ export class Bridge {
         await this.dsh.setSessionModel({ sessionId, provider: conf.provider, model: conf.model })
           .catch((error) => this.logger.warn?.(`未读归纳：摘要模型下发失败（继续用会话默认）：${error?.message ?? error}`))
       }
+      // 「群聊管家」独立人设（v2.0 第三步，2026-10-28）：临时会话默认会继承
+      // qq-chat preset 的人设（暴躁 / 傲娇），总结会带口癖甚至拒答。
+      // 这里按 sessionId 推一份管家系统提示词，插件的人设 section 会优先取它；
+      // 失败不影响流程 —— Prompt 尾部还有一句同样的覆写兜底。
+      if (typeof this.dsh.setSessionPersona === 'function') {
+        try {
+          await this.dsh.setSessionPersona({ sessionId, text: SUMMARY_PERSONA })
+          this.logger.info?.('未读归纳：临时会话已切换为「群聊管家」人设')
+        } catch (error) {
+          this.logger.warn?.(`未读归纳：管家人生设下发失败（继续用 Prompt 里的覆写）：${error?.message ?? error}`)
+        }
+      }
       let reply = ''
       try {
         reply = await this.dsh.promptAndWait(sessionId, prompt, { timeoutMs: conf.timeoutMs, content })
@@ -5232,6 +5245,12 @@ export class Bridge {
           await this.dsh.archiveSession(sessionId, { stopActivity: true })
         } catch (error) {
           this.logger.warn?.(`未读归纳：临时会话归档失败（可手动清理）：${error?.message ?? error}`)
+        }
+        // 人设覆盖是按 sessionId 存在 Host 内存里的，归档后顺手删掉，
+        // 否则长跑进程里会堆一堆再也不会用到的临时人设（Map 上限 500）。
+        if (typeof this.dsh.setSessionPersona === 'function') {
+          void this.dsh.setSessionPersona({ sessionId, text: '' })
+            .catch(() => { /* 清理失败不影响任何功能 */ })
         }
       }
     }
