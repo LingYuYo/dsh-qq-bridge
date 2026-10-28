@@ -21,7 +21,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { OneBotClient, normalizeTypingCharTiers, normalizeTypingMsTiers, normalizeForwardNode } from './onebot.mjs'
+import {
+  OneBotClient, normalizeTypingCharTiers, normalizeTypingMsTiers, normalizeForwardNode,
+  stripLeadingMentions,
+} from './onebot.mjs'
 import { DshClient } from './dsh.mjs'
 import { synthesize, TTS_MAX_CHARS, DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER } from './tts.mjs'
 import { ExternalHooksClient } from './external-hooks.mjs'
@@ -4152,19 +4155,22 @@ export class Bridge {
     // 1) `/` 开头的指令：只有 allow.admins 里的人能执行。
     //    非管理员直接回一句提示并丢弃，**不投递 DSH**（省 token，也不给模型被诱导的机会）。
     //    管理员指令不过响应档位（私聊/群聊都算），但白名单仍然有效——见 isAllowed。
-    const isCommand = chatText.startsWith('/')
+    // v2.0 第十九步：群里先 @bot 再发指令时文本是「@小鱼 /归纳」，
+    // 直接用 startsWith('/') 会漏判。这里剥掉开头的 @ 再判定，原文仍留给 L1 / 展示。
+    const commandText = stripLeadingMentions(chatText)
+    const isCommand = commandText.startsWith('/')
     if (isCommand) {
       if (!this.isAdmin(msg)) {
         this.stats.commandsBlocked++
-        this.logger.warn?.(`非管理员指令被拦下：${key} sender=${msg.userId} text=${chatText.slice(0, 40)}`)
+        this.logger.warn?.(`非管理员指令被拦下：${key} sender=${msg.userId} text=${commandText.slice(0, 40)}`)
         const sent = await this._send(msg, '⚠️ 权限不足，只有管理员才能执行此指令。')
         if (!(sent && sent.ok === false)) this._noteReplied(key)
         return
       }
-      this.logger.info?.(`管理员指令放行：${key} text=${chatText.slice(0, 60)}`)
+      this.logger.info?.(`管理员指令放行：${key} text=${commandText.slice(0, 60)}`)
       // 未读归纳（v2.0 第一步，2026-10-28）：主人专属。命中即异步开跑并 return，
       // 不阻塞后面的消息，也不进 DSH 会话（归纳走的是旁路临时会话）。
-      if (await this._handleUnreadSummaryCommand(msg, chatText, key)) return
+      if (await this._handleUnreadSummaryCommand(msg, commandText, key)) return
     }
     // 2) 禁言指令：命中即静音该会话，自己也不回复（否则「闭嘴」还在说话）。
     if (this._handleMuteCommand(key, chatText)) return
@@ -6108,8 +6114,11 @@ export class Bridge {
       let delivered = forward.ok === true
       let via = delivered ? `合并转发 ${nodes.length} 段` : `合并转发失败（${forward.reason ?? '未知原因'}）`
       if (!delivered) {
-        // 降级：纯文本一次性发（照走原有分片 / 打字延时）。不带引用、不 @ 任何人。
-        const sent = await this._send(msg, `【群聊归纳】\n${nodeTexts.join('\n\n')}`, { at: false })
+        // 降级：纯文本**整条一次发**（singleBubble，不再分片刷屏）。不带引用、不 @ 任何人。
+        const sent = await this._send(msg, `【群聊归纳】\n${nodeTexts.join('\n\n')}`, {
+          at: false,
+          singleBubble: true,
+        })
         delivered = !(sent && sent.ok === false)
         if (!delivered) throw summaryError('SEND_FAILED', sent?.error ?? '合并转发与纯文本都没发出去')
         via = `${via} → 已降级纯文本`
@@ -6295,7 +6304,7 @@ export class Bridge {
     }
   }
 
-  async _send(msg, text, { at = true } = {}) {
+  async _send(msg, text, { at = true, singleBubble = false } = {}) {
     const delay = this.config.sendDelayMs ?? 400
     // v2.0 第十六步：发送入口统一兜底清洗 <silent>。
     // 主路径已经在 _processBatch 拦过一次；这里兜住 poke / 工具回执等旁路，
@@ -6323,8 +6332,9 @@ export class Bridge {
       ? { atUserId: msg.userId, atPosition: this.qq.groupAtPosition }
       : {}
     const sendOpts = quoteId ? { ...atOpts, replyTo: quoteId } : atOpts
+    if (singleBubble) sendOpts.singleBubble = true
     const result = msg.kind === 'private'
-      ? await this.qq.sendPrivate(msg.userId, text)
+      ? await this.qq.sendPrivate(msg.userId, text, singleBubble ? { singleBubble: true } : undefined)
       : await this.qq.sendGroup(msg.groupId, text, sendOpts)
     // 分片级失败：已成功的分片不重复发送，这里只如实上报，不整条重试。
     if (result && result.ok === false) {

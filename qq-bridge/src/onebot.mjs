@@ -330,8 +330,7 @@ export function normalizeForwardNode(node) {
 }
 
 /** 字符串格式消息里的 CQ 码转纯文本（array 格式不走这里）。 */
-export function cqToText(text) {  return String(text ?? '')
-    // @ 后面必须留一个空格：否则「@123你好」会被模型当成一个整体。
+export function cqToText(text) {  return String(text ?? '')    // @ 后面必须留一个空格：否则「@123你好」会被模型当成一个整体。
     .replace(/\[CQ:at,[^\]]*qq=([^,\]]+)[^\]]*\]/gi, (_, qq) => (String(qq) === 'all' ? '@全体成员 ' : `@${qq} `))
     .replace(/\[CQ:image[^\]]*\]/gi, '[图片]')
     .replace(/\[CQ:(?:m?face|sface)[^\]]*\]/gi, '[表情]')
@@ -510,6 +509,26 @@ export function formatCardSegment(segment) {
  * @param {{resolveAtName?: (qq:string) => string|undefined}} [options]
  *   昵称解析器：由 OneBotClient 用「群成员发言缓存」实现（不额外打 API）。
  */
+/**
+ * 剥掉消息**开头**的连续 @（v2.0 第十九步）。
+ *
+ * 群里先 @bot 再发指令时，`parseMessage` 会把 at 段转成 `@小鱼 `，
+ * 文本变成 `@小鱼 /归纳` → `startsWith('/')` 判定失败，指令被当普通聊天。
+ * 这里只剥开头、不碰正文里的 @；@ 昵称遇到 `/` 即停，兼容 `@小鱼/归纳` 无空格写法。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripLeadingMentions(text) {
+  let out = String(text ?? '')
+  for (;;) {
+    const next = out.replace(/^\s*@[^\s@/]+\s*/u, '')
+    if (next === out) break
+    out = next
+  }
+  return out.trim()
+}
+
 export function parseMessage(message, rawMessage = '', options = {}) {
   const resolveAtName = typeof options?.resolveAtName === 'function' ? options.resolveAtName : null
   if (Array.isArray(message)) {
@@ -883,6 +902,75 @@ export function normalizeTypingMsTiers(source) {
  * @param {object|number} [opts]
  * @returns {string[]}
  */
+/** 极短气泡阈值（v2.0 第十九步）：单个泡小于这个码点数时，尝试与相邻行合并。 */
+export const MIN_BUBBLE_CHARS = 4
+
+/** 独立应答词：即使是极短行也**不合并**（模型可能就是想单发一个「嗯」）。 */
+const STANDALONE_SHORT = new Set([
+  '嗯', '嗯嗯', '哦', '噢', '好', '好的', '行', '行吧', '对', '是', '在', '在的', '收到', '知道了', '明白',
+  '哈哈', '哈', '嘿', '嗨', '诶', '欸', '草', '来了', '？', '！', '…',
+])
+
+/** 极短行只有和「下一行的长句」组合时才合并（2~3 字话题标签 + 正文），下一行至少这么长。 */
+const NEXT_LINE_MIN_CHARS = 6
+
+/** 片头标点：出现时并入上一泡（去掉标点），避免「，继续」单独成泡。 */
+const LEADING_PUNCT = /^[，,、；;：:]+/u
+
+/**
+ * 跨行后处理（v2.0 第十九步）：**只处理「明显不该断开」的相邻行**，
+ * 原生换行仍是强边界。
+ *
+ *   ① 下一行以逗号类标点开头 → 去标点并入上一行（「收到\n，马上来」→「收到马上来」）；
+ *   ② 某行只有一个极短片段（< MIN_BUBBLE_CHARS）且不是独立应答词 →
+ *      优先并入上一行；没有上一行则前置到下一行（「帽子\n今天天气不错」→ 一个泡）；
+ *   ③ 上一行以句末标点结尾时不合并（尊重刻意断句）。
+ *
+ * @param {string[][]} groups 每行的片段数组
+ * @param {{bubbleMax:number, minBubble:number}} opts
+ * @returns {string[]}
+ */
+function mergeAcrossLines(groups, { bubbleMax, minBubble }) {
+  const list = groups.map((pieces) => [...pieces])
+  const endsSentence = (text) => /[。！？!?…]$/u.test(text)
+
+  // 第一轮：片头标点 → 并入上一行
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].length === 0) continue
+    const raw = list[i][0]
+    const stripped = raw.replace(LEADING_PUNCT, '')
+    if (stripped === raw) continue
+    const prev = i > 0 ? list[i - 1] : null
+    const prevLast = prev?.[prev.length - 1]
+    if (prevLast && !endsSentence(prevLast)
+      && charCount(prevLast) + charCount(stripped) <= bubbleMax) {
+      prev[prev.length - 1] = prevLast + stripped
+      list[i].shift()
+    } else {
+      list[i][0] = stripped
+    }
+  }
+
+  // 第二轮：极短行（2~3 字）后面紧跟长句 → 视为「话题标签 + 正文」，前置合并。
+  // 刻意断开的短句（「收到」「嗯」「第一句」这类）保持独立：
+  //   · 1 字不参与；独立应答词不参与；下一行太短（< NEXT_LINE_MIN_CHARS）不参与。
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].length !== 1) continue
+    const short = list[i][0]
+    const shortChars = charCount(short)
+    if (shortChars < 2 || shortChars >= minBubble) continue
+    if (STANDALONE_SHORT.has(short.trim())) continue
+    const next = i + 1 < list.length ? list[i + 1] : null
+    if (!next || next.length === 0) continue
+    if (charCount(next[0]) < NEXT_LINE_MIN_CHARS) continue
+    if (shortChars + charCount(next[0]) > bubbleMax) continue
+    next[0] = short + next[0]
+    list[i] = []
+  }
+
+  return list.flat().filter((x) => x.length > 0)
+}
+
 export function splitBubbles(text, opts = {}) {
   const o = typeof opts === 'number' ? { chunkSize: opts } : (opts ?? {})
   const hard = Number.isFinite(o.chunkSize) && o.chunkSize >= 1 ? Math.floor(o.chunkSize) : DEFAULT_CHUNK_SIZE
@@ -908,16 +996,21 @@ export function splitBubbles(text, opts = {}) {
     }
     // 关键：seg.lines 是**模型原生换行**，每一行都是强边界 → 各自独立成泡。
     // 逐行处理，绝不跨行合并（模型写 `收到\n马上来` 就是想发两条）。
+    // v2.0 第十九步：只对「明显不该断开」的相邻行做后处理（见 mergeAcrossLines）。
+    const lineGroups = []
     for (const line of seg.lines) {
       // 桥接硬切出的碎片允许合并，防止「短。短。短。」刷屏
       const pieces = mergeFragments(splitLineSemantic(line, bubbleMax, MIN_FIRST_PIECE_CHARS), bubbleMax, mergeMax)
+      const cleaned = []
       for (const piece of pieces) {
         if (doTrim) {
           const t = trimEndPunctuation(piece, keep, false)
-          if (t) out.push(t)
-        } else if (piece) out.push(piece)
+          if (t) cleaned.push(t)
+        } else if (piece) cleaned.push(piece)
       }
+      if (cleaned.length > 0) lineGroups.push(cleaned)
     }
+    out.push(...mergeAcrossLines(lineGroups, { bubbleMax, minBubble: MIN_BUBBLE_CHARS }))
   }
   return out.filter((x) => x.length > 0)
 }
@@ -1364,7 +1457,8 @@ export class OneBotClient {
   }
 
   /** 私聊发送（自动分片，逐条，固定 sendIntervalMs 兜底）。 */
-  async sendPrivate(userId, text) {    return await this._sendText('private', userId, text)
+  async sendPrivate(userId, text, opts = {}) {
+    return await this._sendText('private', userId, text, opts)
   }
 
   /**
@@ -1658,7 +1752,7 @@ export class OneBotClient {
     return pos === 'first' ? index === 0 : index === total - 1
   }
 
-  async _sendText(kind, targetId, text, { atUserId, atPosition = 'last', replyTo } = {}) {
+  async _sendText(kind, targetId, text, { atUserId, atPosition = 'last', replyTo, singleBubble = false } = {}) {
     const id = String(targetId ?? '').trim()
     if (!/^\d+$/.test(id) || id === '0') {
       return { ok: false, messageIds: [], error: `${kind === 'private' ? 'user_id' : 'group_id'} 必须是正整数：${targetId}` }
@@ -1666,9 +1760,9 @@ export class OneBotClient {
     const body = String(text ?? '').trim()
     if (!body) return { ok: false, messageIds: [], error: '消息内容为空' }
 
-    // 总开关关闭：不分片、不延时、整条合并发送
+    // 总开关关闭 / 调用方要求整条：不分片、不延时、整条合并发送
     //（审计仍在上游对全文做，顺序不变）。
-    const chunks = this.typingDelayEnabled
+    const chunks = (this.typingDelayEnabled && singleBubble !== true)
       ? splitBubbles(body, {
         chunkSize: this.chunkSize,
         bubbleMaxChars: this.bubbleMaxChars,

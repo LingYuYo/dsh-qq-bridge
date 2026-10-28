@@ -154,6 +154,20 @@ await check('带条数：取数字，0 视作「用配置默认」', () => {
   assert.equal(parseSummaryCommand('/总结 0').count, 0)
 })
 
+// v2.0 第十九步：群里先 @bot 再发指令、或 /归纳50 无空格写法都要认。
+await check('指令前带 @ 也认（@bot /归纳、@bot/归纳）', () => {
+  assert.equal(parseSummaryCommand('@小鱼 /归纳').matched, true)
+  assert.equal(parseSummaryCommand('@小鱼/归纳').matched, true)
+  assert.equal(parseSummaryCommand('@全体成员  /归纳 1h').windowMinutes, 60)
+  assert.equal(parseSummaryCommand('@123456 /归纳 50').count, 50)
+})
+
+await check('/归纳50 无空格写法也认', () => {
+  assert.equal(parseSummaryCommand('/归纳50').matched, true)
+  assert.equal(parseSummaryCommand('/归纳50').count, 50)
+  assert.equal(parseSummaryCommand('/归纳1h').windowMinutes, 60)
+})
+
 await check('超过硬上限钳到 500', () => {
   assert.equal(parseSummaryCommand('/归纳 9999').count, SUMMARY_HARD_LIMIT)
   assert.equal(SUMMARY_HARD_LIMIT, 500)
@@ -332,6 +346,16 @@ await check('主人自动算管理员；管理员不是主人', () => {
   assert.equal(b.isAdmin({ userId: ADMIN }), true)
   assert.equal(b.isOwner({ userId: ADMIN }), false)
   assert.equal(b.isOwner({ userId: '999' }), false)
+})
+
+await check('handleMessage：@bot /归纳 走指令分支，不当普通聊天', async () => {
+  const b = makeBridge()
+  const fake = fakeRuntime(b)
+  let seen = ''
+  b._handleUnreadSummaryCommand = async (msg, text) => { seen = text; return true }
+  await b.handleMessage(ownerMsg({ text: '@小鱼 /归纳', messageId: 'm-at' }))
+  assert.equal(seen, '/归纳', '传给归纳的应是剥离 @ 后的文本')
+  assert.equal(fake.sent.length, 0, '★ 不能投递给 DSH 当普通聊天')
 })
 
 await check('管理员发 /归纳 被拒，且不跑归纳', async () => {

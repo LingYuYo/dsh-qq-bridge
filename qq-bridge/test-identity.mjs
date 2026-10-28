@@ -295,6 +295,20 @@ await check('_send 兜底：纯 <silent> 不发 QQ，混入则清洗后发送', 
   assert.deepEqual(sent, ['好的'])
 })
 
+await check('_send singleBubble：透传给 qq.sendGroup（归纳降级不分片）', async () => {
+  const b = makeBridge()
+  const calls = []
+  b.qq = {
+    groupAtReply: false,
+    async sendGroup(groupId, text, opts) { calls.push({ text, opts }); return { ok: true } },
+  }
+  await b._send({ kind: 'group', groupId: '1', userId: '2', messageId: '' }, '很长的一段归纳结果', {
+    singleBubble: true,
+  })
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].opts.singleBubble, true, '★ 必须透传到 sendGroup，否则会重新分片')
+})
+
 await check('冒充识别：普通群友自称主人', () => {
   assert.equal(IMPERSONATION_RE.test('我是你主人'), true)
   assert.equal(IMPERSONATION_RE.test('主人权限在我这'), true)

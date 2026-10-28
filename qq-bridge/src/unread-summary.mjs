@@ -170,7 +170,18 @@ export const SUMMARY_TIME_LIMIT_MINUTES = 24 * 60
  * 时间窗是给「机器人停机两小时、群里积压几百条」准备的：按条数只能取到最新几十条，
  * 按时间窗会一直翻页到起点（硬上限仍是 {@link SUMMARY_HARD_LIMIT}）。
  */
-const SUMMARY_COMMANDS = /^\/(归纳|总结|未读|summary|unread)(?:\s+(\d{1,4})(?:\s*条)?|\s+(\d{1,3})\s*(h|小时|hours?|m|分钟|minutes?))?\s*$/iu
+const SUMMARY_COMMANDS = /^\/(归纳|总结|未读|summary|unread)(?:\s*(\d{1,4})(?:\s*条)?|\s*(\d{1,3})\s*(h|小时|hours?|m|分钟|minutes?))?\s*$/iu
+
+/** 剥掉开头的连续 @（与 onebot.stripLeadingMentions 同一语义，保持本模块零依赖）。 */
+function stripMentions(text) {
+  let out = String(text ?? '')
+  for (;;) {
+    const next = out.replace(/^\s*@[^\s@/]+\s*/u, '')
+    if (next === out) break
+    out = next
+  }
+  return out.trim()
+}
 
 /**
  * 解析 `/归纳 [N | 1h]`。只认**整条消息就是指令**，后面带闲聊不算（避免误触发）。
@@ -180,7 +191,7 @@ const SUMMARY_COMMANDS = /^\/(归纳|总结|未读|summary|unread)(?:\s+(\d{1,4}
  *   count=0 表示用配置里的默认条数；windowMinutes=0 表示不是时间窗模式
  */
 export function parseSummaryCommand(text) {
-  const source = String(text ?? '').trim()
+  const source = stripMentions(String(text ?? ''))
   if (!source.startsWith('/')) return { matched: false, count: 0, windowMinutes: 0 }
   const hit = SUMMARY_COMMANDS.exec(source)
   if (!hit) return { matched: false, count: 0, windowMinutes: 0 }

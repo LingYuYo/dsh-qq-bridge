@@ -315,6 +315,19 @@ await check('连续 3 条 8 字短行 → 仍 3 条（原生换行不合并）',
   assert.deepEqual(splitBubbles('八个字的一句话\n八个字的二句话\n八个字的三句话'),
     ['八个字的一句话', '八个字的二句话', '八个字的三句话'])
 })
+// v2.0 第十九步：只合并「明显不该断开」的极短行，其余原生换行仍是强边界。
+await check('2~3 字话题标签 + 长句 → 合并成一个泡（帽子/今天天气不错）', () => {
+  assert.deepEqual(splitBubbles('帽子\n今天天气不错'), ['帽子今天天气不错'])
+})
+await check('下一行以逗号开头 → 去标点并入上一行（收到/，马上来）', () => {
+  assert.deepEqual(splitBubbles('收到\n，马上来'), ['收到马上来'])
+})
+await check('刻意断开的应答词 / 短句 / 1 字不合并', () => {
+  assert.deepEqual(splitBubbles('嗯\n好'), ['嗯', '好'])
+  assert.deepEqual(splitBubbles('收到\n马上来'), ['收到', '马上来'])
+  assert.deepEqual(splitBubbles('第一句\n第二句\n第三句'), ['第一句', '第二句', '第三句'])
+  assert.deepEqual(splitBubbles('甲\r\n乙\r丙'), ['甲', '乙', '丙'])
+})
 await check('超过 15 字的长行不参与合并', () => {
   const a = '这句话已经超过十五个字了真的超了'
   const b = '这句同样超过十五个字了吧确实超了'
