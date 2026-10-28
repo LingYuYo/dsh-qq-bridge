@@ -74,6 +74,16 @@
     "style": ""
   },
   "personaText": "",
+  "slangGlobal": [
+    {
+      "_comment": "v2.0 第十一步：全局黑话词条。命中 term 时才拼进当轮 Prompt；单群同名 term 覆盖这里。字段：term / meaning / reply / image / allowSearch。",
+      "term": "",
+      "meaning": "",
+      "reply": "",
+      "image": "",
+      "allowSearch": true
+    }
+  ],
   "personaExtraRules": "",
   "personaSystemPrompt": "",
   "rhythm": {

@@ -260,11 +260,11 @@ await check('解锁 + ≥5 条 → 调用一次，黑话/群友特征写进动�
   assert.equal(req.currentPersona, '')
   assert.equal(req.messages.length, 6, `应带 6 条上下文，实际 ${req.messages.length}`)
   // v2.0 第十步：不再写 personaDelta，改为 slang + 群友 tags。
-  assert.deepEqual(b.state.sessions['g:123456'].slang, ['喜欢被叫小鱼'])
+  assert.deepEqual(b.state.sessions['g:123456'].slang.map((item) => item.term), ['喜欢被叫小鱼'])
   assert.deepEqual(b.state.sessions['g:123456'].userProfiles['1000000001'].tags, ['爱开玩笑'])
   assert.equal(b.state.sessions['g:123456'].personaDelta, '', '小时任务不再改人设')
   const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
-  assert.deepEqual(saved.sessions['g:123456'].slang, ['喜欢被叫小鱼'])
+  assert.deepEqual(saved.sessions['g:123456'].slang.map((item) => item.term), ['喜欢被叫小鱼'])
   assert.deepEqual(saved.sessions['g:123456'].userProfiles['1000000001'].tags, ['爱开玩笑'])
   // 成功后清空该群缓冲
   assert.equal(b._chatLog.has('g:123456'), false)
@@ -303,7 +303,7 @@ await check('已有 delta 时：currentPersona 仍传现值，但小时任务不
   await b._summarizePersonas()
   assert.equal(calls.summarizeCalls[0].currentPersona, '旧设定', '现值仍传给模型做参考')
   assert.equal(b.state.sessions['g:123456'].personaDelta, '旧设定', '★ 不再往人设里追加内容')
-  assert.deepEqual(b.state.sessions['g:123456'].slang, ['喜欢被叫小鱼'], '黑话写进动态记忆')
+  assert.deepEqual(b.state.sessions['g:123456'].slang.map((item) => item.term), ['喜欢被叫小鱼'], '黑话写进动态记忆')
 })
 
 await check('_summarizing 并发保护：上一轮没跑完就跳过本轮', async () => {

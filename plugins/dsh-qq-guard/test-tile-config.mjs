@@ -548,7 +548,8 @@ await check('详情头下方有四个分页，默认停在「基础配置」', (
   eq(labels, ['基础配置', '记忆与摘要', '特权与权限', '调试信息'], '四个分页顺序')
   truthy(levelSelect(tree), '基础配置应包含响应档位')
   truthy(btnAnywhere(tree, '保存静态核心'), '基础配置应包含静态核心保存')
-  truthy(btnAnywhere(tree, '保存动态记忆'), '基础配置应包含动态记忆保存')
+  // v2.0 第十一步：黑话改为标签 + 弹窗编辑，不再有「保存动态记忆」大按钮。
+  truthy(btnAnywhere(tree, '+ 添加词条'), '基础配置应包含黑话添加入口')
   eq(btnAnywhere(tree, '生成未读归纳'), undefined, '默认不该渲染记忆 Tab')
 })
 

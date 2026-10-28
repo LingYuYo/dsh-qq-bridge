@@ -100,6 +100,8 @@ const HOT_KEYS = [
   'onebot',
   // v2.0 第十步（2026-10-28）：三段式静态核心人设（全局底座）。
   'personaCore',
+  // v2.0 第十一步：全局黑话词条（单群同名覆盖）。
+  'slangGlobal',
 ]
 
 /**

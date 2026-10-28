@@ -916,10 +916,8 @@ export function normalizeSessionEntry(key, raw) {
     core: normalizeCore(value.core),
     // 结构化群友档案：QQ -> { nickname, lastNickname, role, tags }，仅本群。
     userProfiles: normalizeUserProfiles(value.userProfiles),
-    // 本群黑话 / 梗（小时任务自动沉淀，也可手动增删）。
-    slang: Array.isArray(value.slang)
-      ? [...new Set(value.slang.map((item) => String(item ?? '').trim()).filter(Boolean))].slice(-50)
-      : [],
+    // 本群黑话词条（v2.0 第十一步）：对象数组，单群同名 term 覆盖全局。
+    slang: normalizeSlangList(value.slang),
   }
 }
 
@@ -951,6 +949,45 @@ function normalizeUserProfiles(value) {
     if (count >= 200) break
   }
   return out
+}
+
+/**
+ * 归一化一条黑话词条（v2.0 第十一步，2026-10-28）。
+ *
+ * 兼容旧数据：上一版 `slang` 是字符串数组，这里按「只有 term」升级成对象，
+ * 用户升级后不用手动迁移 state。
+ * @param {unknown} input
+ * @returns {{term:string, meaning:string, reply:string, image:string, allowSearch:boolean}|null}
+ */
+export function normalizeSlangEntry(input) {
+  if (typeof input === 'string') {
+    const term = input.trim().slice(0, 60)
+    return term === '' ? null : { term, meaning: '', reply: '', image: '', allowSearch: true }
+  }
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null
+  const str = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '')
+  const term = str(input.term, 60)
+  if (term === '') return null
+  return {
+    term,
+    meaning: str(input.meaning, 500),
+    reply: str(input.reply, 1000),
+    image: str(input.image, 1000),
+    allowSearch: input.allowSearch !== false,
+  }
+}
+
+/**
+ * 归一化黑话列表：按 term 去重（后出现的覆盖前面的），最多 100 条。
+ * @param {unknown} value
+ */
+export function normalizeSlangList(value) {
+  const map = new Map()
+  for (const raw of Array.isArray(value) ? value : []) {
+    const item = normalizeSlangEntry(raw)
+    if (item) map.set(item.term.toLowerCase(), item)
+  }
+  return [...map.values()].slice(0, 100)
 }
 
 /**
@@ -1197,6 +1234,8 @@ export class Bridge {
       personaCore: config.personaCore && typeof config.personaCore === 'object' && !Array.isArray(config.personaCore)
         ? { ...config.personaCore }
         : {},
+      // 全局黑话词条（v2.0 第十一步）：单群同名 term 覆盖，其余继承。
+      slangGlobal: normalizeSlangList(config.slangGlobal),
       // 戳一戳响应：enabled / mode('poke'|'text') / replyText。
       poke: normalizePoke(config.poke),
       // OneBot 连接信息（只读展示用；改它要重启桥接）。
@@ -2013,20 +2052,64 @@ export class Bridge {
     const entry = this.state.sessions?.[key]
     if (!entry || typeof entry !== 'object') return ''
     const profiles = Object.entries(entry.userProfiles ?? {}).slice(0, 20)
-    const slang = Array.isArray(entry.slang) ? entry.slang.slice(0, 20) : []
-    if (profiles.length === 0 && slang.length === 0) return ''
+    if (profiles.length === 0) return ''
+    // 黑话**不再常驻**（v2.0 第十一步）：命中时才由 _slangTriggerSection 追加。
     const lines = ['【本群动态记忆（仅限本群，勿跨群引用）】']
-    if (profiles.length > 0) {
-      lines.push('群友档案：')
-      for (const [qq, profile] of profiles) {
-        const role = profile?.role === 'owner' ? '群主' : profile?.role === 'admin' ? '管理员' : '群员'
-        const name = String(profile?.nickname ?? '').trim() || qq
-        const tags = Array.isArray(profile?.tags) ? profile.tags.filter(Boolean).slice(0, 5) : []
-        lines.push(`- ${role} ${name}(${qq})${tags.length > 0 ? `：${tags.join('；')}` : ''}`)
-      }
+    lines.push('群友档案：')
+    for (const [qq, profile] of profiles) {
+      const role = profile?.role === 'owner' ? '群主' : profile?.role === 'admin' ? '管理员' : '群员'
+      const name = String(profile?.nickname ?? '').trim() || qq
+      const tags = Array.isArray(profile?.tags) ? profile.tags.filter(Boolean).slice(0, 5) : []
+      lines.push(`- ${role} ${name}(${qq})${tags.length > 0 ? `：${tags.join('；')}` : ''}`)
     }
-    if (slang.length > 0) lines.push(`本群黑话/梗：${slang.join('；')}`)
     return lines.join('\n')
+  }
+
+  /**
+   * 合并全局 / 单群黑话（v2.0 第十一步）：单群同名 term 覆盖全局，其余继承。
+   * @param {string} key
+   * @returns {Array<{term:string, meaning:string, reply:string, image:string, allowSearch:boolean, scope:'group'|'global'}>}
+   */
+  _mergedSlang(key) {
+    const globalList = normalizeSlangList(this.live?.slangGlobal ?? this.config?.slangGlobal)
+    const localList = normalizeSlangList(this.state.sessions?.[key]?.slang)
+    const map = new Map()
+    for (const item of globalList) map.set(item.term.toLowerCase(), { ...item, scope: 'global' })
+    for (const item of localList) map.set(item.term.toLowerCase(), { ...item, scope: 'group' })
+    return [...map.values()]
+  }
+
+  /**
+   * 用当前消息文本匹配黑话 term（按需触发，v2.0 第十一步）。
+   * @param {string} key
+   * @param {string} text
+   * @returns {Array<object>} 命中的词条（可能为空）
+   */
+  _matchSlangHits(key, text) {
+    const body = String(text ?? '').trim().toLowerCase()
+    if (body === '') return []
+    return this._mergedSlang(key).filter((item) => body.includes(item.term.toLowerCase()))
+  }
+
+  /**
+   * 命中词条的触发宏（只在本轮 Prompt 尾部出现，省 Token）。
+   * @param {Array<object>} hits
+   * @returns {string}
+   */
+  _slangTriggerSection(hits) {
+    const list = Array.isArray(hits) ? hits : []
+    if (list.length === 0) return ''
+    const blocks = list.map((item) => {
+      const lines = [`【触发宏：${item.term}】`]
+      if (item.meaning !== '') lines.push(`含义：${item.meaning}`)
+      lines.push(item.reply !== ''
+        ? `预设回复：${item.reply}`
+        : '无预设回复动作，请根据上下文自行回复。')
+      if (item.image !== '') lines.push(`预设图片：${item.image}`)
+      if (item.allowSearch) lines.push('如果仍不确定这个词的含义，你可以调用联网搜索工具查明。')
+      return lines.join('\n')
+    })
+    return `【本群黑话触发（仅本轮）】\n${blocks.join('\n\n')}`
   }
 
   /**
@@ -2153,7 +2236,9 @@ export class Bridge {
           role: profile?.role === 'owner' || profile?.role === 'admin' ? profile.role : 'member',
           tags: Array.isArray(profile?.tags) ? profile.tags.slice(0, 5) : [],
         })),
-        slang: Array.isArray(entry.slang) ? entry.slang.slice(-50) : [],
+        // v2.0 第十一步：黑话词条（对象数组，单群）与合并视图（UI 标签展示用）。
+        slang: normalizeSlangList(entry.slang),
+        mergedSlang: this._mergedSlang(key),
         // L2 摘要：手动截断留下的前情提要（UI 用名册美化展示）。
         contextBriefing: typeof entry.contextBriefing?.text === 'string' ? entry.contextBriefing.text.slice(0, 4000) : '',
         _heavy: {
@@ -2675,7 +2760,7 @@ export class Bridge {
         entry.core = normalizeCore(op.core)
       }
       if (Array.isArray(op?.slang)) {
-        entry.slang = [...new Set(op.slang.map((item) => String(item ?? '').trim()).filter(Boolean))].slice(-50)
+        entry.slang = normalizeSlangList(op.slang)
       }
       const removeProfile = String(op?.removeProfile ?? '').trim()
       if (removeProfile !== '' && entry.userProfiles && entry.userProfiles[removeProfile]) {
@@ -3633,12 +3718,13 @@ export class Bridge {
         // v2.0 第十步：小时任务不再写人设，改为沉淀「本群黑话 + 群友特征」。
         // 只更新已知群友（档案由消息自动建立），不凭空造人。
         let changed = 0
-        const slang = Array.isArray(result.slang) ? result.slang : []
-        if (slang.length > 0) {
-          const merged = [...new Set([
-            ...(Array.isArray(entry.slang) ? entry.slang : []),
-            ...slang.map((item) => String(item ?? '').trim()).filter(Boolean),
-          ])].slice(-20)
+        // 模型只吐 term 字符串 → 升级成完整词条对象（含义留给以后手动补）。
+        const slangEntries = (Array.isArray(result.slang) ? result.slang : [])
+          .map((item) => normalizeSlangEntry(item))
+          .filter(Boolean)
+        if (slangEntries.length > 0) {
+          const merged = normalizeSlangList([...(Array.isArray(entry.slang) ? entry.slang : []), ...slangEntries])
+            .slice(-100)
           if (JSON.stringify(merged) !== JSON.stringify(entry.slang ?? [])) {
             entry.slang = merged
             changed += 1
@@ -3708,6 +3794,9 @@ export class Bridge {
     // 每会话只留最近一条、截断 2000 字、**不落盘**（进程重启即清空）。
     if (this._developerConfig().debugPayload) this._noteRawInbound(key, msg)
     let text = (msg.text ?? '').trim()
+    // 黑话按需触发（v2.0 第十一步）：只有当前消息命中 term 时，才把触发宏塞进本轮 Prompt。
+    // 必须放在 text 初始化之后：上面 _noteProfiles 之前 text 还在 TDZ。
+    const slangHits = this._matchSlangHits(key, text)
     // 图片段（2026-10-23）：纯图片消息也要能进模型，不再因为 text 为空直接丢弃。
     const images = Array.isArray(msg.images) ? msg.images : []
     // 图片预取（P2）：消息一进来就在后台开始下载，不阻塞后面的判定 / 入队。
@@ -3867,6 +3956,7 @@ export class Bridge {
       beforeSeq: logSince,
       devPrompt,
       renameEvents: renameEvent === '' ? [] : [renameEvent],
+      slangHits,
     })
   }
 
@@ -3941,7 +4031,7 @@ export class Bridge {
     }
     const entry = this._debounce.get(key) ?? {
       texts: [], images: [], msg: null, timer: null, beforeSeq: undefined, devPrompt: '',
-      renameEvents: [],
+      renameEvents: [], slangHits: [],
     }
     // 一轮里只认**第一条**消息的序号上界：后面同批的消息本来就该被当前 prompt 覆盖。
     if (entry.beforeSeq === undefined && Number.isFinite(Number(options?.beforeSeq))) {
@@ -3954,6 +4044,16 @@ export class Bridge {
     if (options?.devPrompt) entry.devPrompt = String(options.devPrompt)
     // 改名事件是一轮性的：同一批里可能有多个人改名，全部攒着，本轮一起告诉模型。
     if (Array.isArray(options?.renameEvents)) entry.renameEvents.push(...options.renameEvents)
+    // 黑话命中同理：同一批多条消息可能触发多个词条，按 term 去重后本轮一起给。
+    if (Array.isArray(options?.slangHits)) {
+      const seen = new Set(entry.slangHits.map((item) => String(item?.term ?? '').toLowerCase()))
+      for (const hit of options.slangHits) {
+        const key2 = String(hit?.term ?? '').toLowerCase()
+        if (key2 === '' || seen.has(key2)) continue
+        seen.add(key2)
+        entry.slangHits.push(hit)
+      }
+    }
     entry.msg = msg // 同一发送者的最后一条：引用 / @ 都指向它
     if (entry.timer) clearTimeout(entry.timer)
     entry.timer = setTimeout(() => {
@@ -3991,6 +4091,7 @@ export class Bridge {
       beforeSeq: entry.beforeSeq,
       devPrompt: entry.devPrompt,
       renameEvents: entry.renameEvents,
+      slangHits: entry.slangHits,
     })
   }
 
@@ -4070,6 +4171,7 @@ export class Bridge {
         const contextSections = this._contextSections(key, {
           beforeSeq: options?.beforeSeq,
           renameEvents: options?.renameEvents,
+          slangHits: options?.slangHits,
         })
         if (contextSections.length > 0) {
           promptText = `${promptText}\n\n${contextSections.join('\n\n')}`
@@ -5164,6 +5266,9 @@ export class Bridge {
     // 改名事件（仅本轮）：客观事实，放在所有上下文之后，让模型自己决定怎么回应。
     const renameEvents = Array.isArray(options.renameEvents) ? options.renameEvents : []
     if (renameEvents.length > 0) sections.push(renameEvents.join('\n'))
+    // 黑话触发宏（仅本轮，命中才追加）：平时一条都不带，省 Token。
+    const slangTrigger = this._slangTriggerSection(options.slangHits)
+    if (slangTrigger !== '') sections.push(slangTrigger)
     return sections
   }
 

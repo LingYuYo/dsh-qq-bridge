@@ -482,7 +482,7 @@ await check('sanitizeSessionRow：core / userProfiles / slang / contextBriefing 
       { qq: '123', nickname: ' 小明 ', lastNickname: '旧名', role: 'owner', tags: [' 爱开玩笑 ', '话多', '', 'x', 'y', 'z'] },
       { qq: 'abc', nickname: '非法QQ' },
     ],
-    slang: [' 上车 ', '', '润了'],
+    slang: [{ term: ' 上车 ' }, { term: '' }, { term: '润了', meaning: '跑了' }],
     contextBriefing: '前情提要正文',
   })
   assert.equal(row.core.identity, '本群身份')
@@ -490,7 +490,9 @@ await check('sanitizeSessionRow：core / userProfiles / slang / contextBriefing 
   assert.equal(row.userProfiles[0].nickname, '小明')
   assert.equal(row.userProfiles[0].role, 'owner')
   assert.equal(row.userProfiles[0].tags.length, 5, 'tags 最多 5 条')
-  assert.deepEqual(row.slang, ['上车', '润了'])
+  assert.deepEqual(row.slang.map((item) => item.term), ['上车', '润了'])
+  assert.equal(row.slang[1].meaning, '跑了')
+  assert.equal(row.slang[0].allowSearch, true)
   assert.equal(row.contextBriefing, '前情提要正文')
 })
 
@@ -502,7 +504,7 @@ await check('session-ops：放行 dynamic，core/slang/removeProfile 能下发',
     op: 'dynamic',
     key: 'g:123456',
     core: { identity: '本群身份', boundary: '边界', style: '' },
-    slang: ['上车'],
+    slang: [{ term: '上车', meaning: '上车走' }],
     removeProfile: '123',
   })
   const req = {
@@ -521,7 +523,8 @@ await check('session-ops：放行 dynamic，core/slang/removeProfile 能下发',
   const hit = JSON.parse(getRes.body).ops.find((op) => op.op === 'dynamic')
   assert.ok(hit, 'GET 应能取到 dynamic 指令')
   assert.equal(hit.core.identity, '本群身份')
-  assert.deepEqual(hit.slang, ['上车'])
+  assert.deepEqual(hit.slang.map((item) => item.term), ['上车'])
+  assert.equal(hit.slang[0].meaning, '上车走')
   assert.equal(hit.removeProfile, '123')
 })
 

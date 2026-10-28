@@ -84,13 +84,13 @@ await check('动态记忆按群隔离，且只列本群档案', () => {
   const b = makeBridge()
   b._noteProfiles('g:111', groupMsg('在吗', { senderName: '甲' }))
   b._noteProfiles('g:222', groupMsg('在吗', { userId: '2002', senderName: '乙' }))
-  b.state.sessions['g:111'].slang = ['上车']
   const one = b._dynamicMemorySection('g:111')
   const two = b._dynamicMemorySection('g:222')
   assert.match(one, /群员 甲\(1001\)/u)
-  assert.match(one, /上车/u)
   assert.ok(!two.includes('甲'), '★ 另一个群不能看到甲的档案')
-  assert.ok(!two.includes('上车'), '★ 黑话不能跨群')
+  // v2.0 第十一步：黑话不再常驻动态记忆（只在命中时由触发宏注入）。
+  b.state.sessions['g:111'].slang = [{ term: '上车' }]
+  assert.ok(!b._dynamicMemorySection('g:111').includes('上车'), '★ 黑话不能常驻')
 })
 
 await check('_contextSections：动态记忆在最后，改名事件更靠后', () => {
@@ -102,8 +102,52 @@ await check('_contextSections：动态记忆在最后，改名事件更靠后', 
   assert.equal(sections.at(-1), '[系统事件：改名了]')
 })
 
+console.log('\n— 黑话触发宏（v2.0 第十一步）—')
+await check('命中才生成触发宏：reply 空 → 让模型自由发挥；allowSearch → 允许联网', () => {
+  const b = makeBridge()
+  const key = 'g:1'
+  b.state.sessions[key] = normalizeSessionEntry(key, {
+    slang: [{ term: '何意味', meaning: '什么意思', reply: '', image: '', allowSearch: true }],
+  })
+  const hits = b._matchSlangHits(key, '你说的「何意味」啊')
+  assert.equal(hits.length, 1)
+  const section = b._slangTriggerSection(hits)
+  assert.match(section, /【触发宏：何意味】/u)
+  assert.match(section, /含义：什么意思/u)
+  assert.match(section, /无预设回复动作/u)
+  assert.match(section, /联网搜索/u)
+  assert.equal(b._matchSlangHits(key, '今天天气不错').length, 0, '★ 没命中就什么都不加')
+})
+
+await check('全局词条 + 单群同名覆盖（单群优先）', () => {
+  const b = makeBridge()
+  b.live.slangGlobal = [{ term: '何意味', meaning: '全局含义', allowSearch: true }]
+  const key = 'g:2'
+  b.state.sessions[key] = normalizeSessionEntry(key, {
+    slang: [{ term: '何意味', meaning: '本群含义', reply: '就是「什么意思」' }],
+  })
+  const hits = b._matchSlangHits(key, '何意味')
+  assert.equal(hits.length, 1)
+  assert.equal(hits[0].meaning, '本群含义')
+  assert.equal(hits[0].scope, 'group')
+  assert.match(b._slangTriggerSection(hits), /预设回复：就是「什么意思」/u)
+  // 只有全局的群里，同名也能命中
+  const other = 'g:3'
+  b.state.sessions[other] = normalizeSessionEntry(other, {})
+  assert.equal(b._matchSlangHits(other, '何意味')[0].meaning, '全局含义')
+})
+
+await check('_contextSections：未命中不追加；命中追加在最末尾', () => {
+  const b = makeBridge()
+  const key = 'g:4'
+  b.state.sessions[key] = normalizeSessionEntry(key, { slang: [{ term: '润了' }] })
+  assert.ok(!b._contextSections(key, {}).join('\n').includes('触发宏'), '★ 平时不带黑话列表')
+  const sections = b._contextSections(key, { slangHits: b._matchSlangHits(key, '我先润了') })
+  assert.match(sections.at(-1), /【触发宏：润了】/u)
+})
+
 console.log('\n— dynamic 指令 —')
-await check('保存三段核心 / 黑话 / 删除档案', async () => {
+await check('保存三段核心 / 黑话词条 / 删除档案', async () => {
   const b = makeBridge()
   const key = 'g:123456'
   b.state.sessions[key] = normalizeSessionEntry(key, {
@@ -113,11 +157,13 @@ await check('保存三段核心 / 黑话 / 删除档案', async () => {
   const saved = await b.applySessionOp({
     op: 'dynamic', key,
     core: { identity: '本群身份', boundary: '本群边界', style: '' },
-    slang: ['上车', '上车', '润了'],
+    slang: [{ term: '上车' }, { term: '上车', meaning: '重复覆盖' }, { term: '润了', allowSearch: false }],
   })
   assert.equal(saved.ok, true)
   assert.equal(b.state.sessions[key].core.identity, '本群身份')
-  assert.deepEqual(b.state.sessions[key].slang, ['上车', '润了'])
+  assert.deepEqual(b.state.sessions[key].slang.map((item) => item.term), ['上车', '润了'])
+  assert.equal(b.state.sessions[key].slang[0].meaning, '重复覆盖')
+  assert.equal(b.state.sessions[key].slang[1].allowSearch, false)
   const removed = await b.applySessionOp({ op: 'dynamic', key, removeProfile: '1001' })
   assert.equal(removed.ok, true)
   assert.equal(b.state.sessions[key].userProfiles['1001'], undefined)

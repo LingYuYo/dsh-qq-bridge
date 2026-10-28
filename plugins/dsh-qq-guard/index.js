@@ -540,6 +540,14 @@ const Config = Schema.object({
       .description('交互策略与应对模式：被问到什么、被挑衅、冷场时分别怎么处理。')
       .default('').volatile(),
   }).description('三段式静态核心人设（全局默认底座）').default({}),
+  // 全局黑话词条（v2.0 第十一步）：按需触发，平时不进 Prompt。
+  slangGlobal: Schema.array(Schema.object({
+    term: Schema.string().description('词条（必填）。').default(''),
+    meaning: Schema.string().description('含义解释。').default(''),
+    reply: Schema.string().description('预设回复；留空则由模型根据上下文自由发挥。').default(''),
+    image: Schema.string().description('预设图片（URL 或本地路径，可选）。').default(''),
+    allowSearch: Schema.boolean().description('命中且含义不明时，允许模型联网搜索含义。').default(true),
+  })).description('全局黑话词条；单群同名 term 会覆盖这里').default([]).volatile(),
   personaSystemPrompt: Schema.string()
     .description('完整系统提示词覆盖。非空时完全替换内置人设（名字/参与度/附加规则都不再追加）。')
     .default('').volatile(),
@@ -3083,13 +3091,31 @@ function sanitizeSessionRow(row) {
     userProfiles: Array.isArray(row.userProfiles)
       ? row.userProfiles.slice(0, 50).map(sanitizeUserProfile).filter(Boolean)
       : [],
-    slang: Array.isArray(row.slang)
-      ? [...new Set(row.slang
-        .map((item) => (typeof item === 'string' ? item.replace(/\s+/gu, ' ').trim().slice(0, 60) : ''))
-        .filter(Boolean))].slice(0, 50)
-      : [],
+    // v2.0 第十一步：黑话词条（对象数组）+ 合并视图（全局 + 单群，单群覆盖）。
+    slang: sanitizeSlang(row.slang),
+    mergedSlang: sanitizeSlang(row.mergedSlang),
     contextBriefing: typeof row.contextBriefing === 'string' ? row.contextBriefing.slice(0, 4000) : '',
   }
+}
+
+/** 收敛黑话词条数组（v2.0 第十一步）。 */
+function sanitizeSlang(value) {
+  if (!Array.isArray(value)) return []
+  const out = []
+  for (const item of value.slice(0, 100)) {
+    const src = item && typeof item === 'object' && !Array.isArray(item) ? item : {}
+    const term = typeof src.term === 'string' ? src.term.replace(/\s+/gu, ' ').trim().slice(0, 60) : ''
+    if (term === '') continue
+    out.push({
+      term,
+      meaning: typeof src.meaning === 'string' ? src.meaning.trim().slice(0, 500) : '',
+      reply: typeof src.reply === 'string' ? src.reply.trim().slice(0, 1000) : '',
+      image: typeof src.image === 'string' ? src.image.trim().slice(0, 1000) : '',
+      allowSearch: src.allowSearch !== false,
+      scope: src.scope === 'group' ? 'group' : 'global',
+    })
+  }
+  return out
 }
 
 /** 收敛单群静态核心（三段，纯文本展示 / 编辑回填）。 */
@@ -4341,9 +4367,8 @@ function applySettings(ctx, config) {
             }
           }
           if (Array.isArray(body?.slang)) {
-            extra.slang = body.slang.slice(0, 50)
-              .map((item) => (typeof item === 'string' ? item.trim().slice(0, 60) : ''))
-              .filter(Boolean)
+            // v2.0 第十一步：对象数组（term/meaning/reply/image/allowSearch），交给 Host 统一收敛。
+            extra.slang = sanitizeSlang(body.slang)
           }
           if (typeof body?.removeProfile === 'string' && /^\d{1,20}$/u.test(body.removeProfile.trim())) {
             extra.removeProfile = body.removeProfile.trim()

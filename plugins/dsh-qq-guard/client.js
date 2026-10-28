@@ -751,6 +751,13 @@ window.__ModuleLoader__.load({
 .qqg-l2-text { flex: 1 1 auto; min-width: 0; word-break: break-word; white-space: pre-wrap; }
 .qqg-l2-line { font-size: 12px; line-height: 1.55; color: var(--dsw-alias-label-secondary);
   white-space: pre-wrap; word-break: break-word; }
+/* 黑话标签（v2.0 第十一步）：按钮式 chip，全局词条带「全局」小标。 */
+.qqg-chip-btn { font: inherit; color: inherit; cursor: pointer; }
+.qqg-chip-btn:hover { border-color: var(--qqg-accent); }
+.qqg-chip-global { opacity: .82; }
+.qqg-chip-scope { flex: 0 0 auto; font-size: 9.5px; line-height: 1.4; padding: 0 4px;
+  border-radius: 4px; color: var(--dsw-alias-label-secondary);
+  background: var(--dsw-alias-bg-layer-3, var(--dsw-alias-bg-layer-2)); }
 .qqg-codebox { margin: 0; padding: 10px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2);
   border: 1px solid var(--dsw-alias-border-l1);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -3925,6 +3932,7 @@ window.__ModuleLoader__.load({
                     key: cur.key,
                     session: cur,
                     busy,
+                    get, write, writable,
                     persona: {
                       draft: draftPersona,
                       saved: savedPersona,
@@ -3969,19 +3977,114 @@ window.__ModuleLoader__.load({
     // React 会整棵卸载重建 —— 单人设输入框会丢焦点、记忆 Tab 的「已提交」提示会闪没。
     // 定义在闭包层（组件外）身份稳定，切 Tab 只影响自己这棵子树。
 
-    /** Tab 1 · 基础配置：响应档位 + 单人设覆盖（原「会话信息」挪去调试信息）。 */
-    function SessionBasicTab({ session, persona, level, busy }) {
+    /**
+     * 黑话词条编辑弹窗（v2.0 第十一步）。
+     *
+     * 默认值按需求：词条占位「何意味」、含义占位「什么意思」、预设回复留空
+     * （= 由模型自由发挥）、允许联网搜索默认开。
+     */
+    function SlangModal({ initial, writable, busy, onClose, onSaveGroup, onSaveGlobal, onDelete }) {
+      const [draft, setDraft] = React.useState(() => ({
+        term: String(initial?.term ?? ''),
+        meaning: String(initial?.meaning ?? ''),
+        reply: String(initial?.reply ?? ''),
+        image: String(initial?.image ?? ''),
+        allowSearch: initial?.allowSearch !== false,
+        scope: initial?.scope === 'global' ? 'global' : 'group',
+      }))
+      const set = (key, value) => setDraft((prev) => ({ ...prev, [key]: value }))
+      const term = draft.term.trim()
+      const isEdit = String(initial?.term ?? '').trim() !== ''
+      const payload = () => ({
+        term,
+        meaning: draft.meaning.trim(),
+        reply: draft.reply.trim(),
+        image: draft.image.trim(),
+        allowSearch: draft.allowSearch,
+      })
+      return h(Modal, {
+        open: true,
+        title: isEdit ? '编辑词条' : '添加词条',
+        desc: '只有群友说到这个词时，才会把这条配置拼进当轮 Prompt；平时不占 Token。',
+        onClose,
+        footer: [
+          h('button', { key: 'c', type: 'button', className: 'qqg-btn', onClick: onClose }, '取消'),
+          isEdit
+            ? h('button', {
+              key: 'd', type: 'button', className: 'qqg-btn',
+              disabled: !writable || busy,
+              onClick: () => onDelete({ ...payload(), scope: draft.scope }),
+            }, '删除')
+            : null,
+          h('button', {
+            key: 'g', type: 'button', className: 'qqg-btn',
+            disabled: !writable || busy || term === '',
+            onClick: () => onSaveGroup(payload()),
+          }, '保存到当前群'),
+          h('button', {
+            key: 'a', type: 'button', className: 'qqg-btn qqg-btn-primary',
+            disabled: !writable || busy || term === '',
+            onClick: () => onSaveGlobal(payload()),
+          }, '保存到全局'),
+        ].filter(Boolean),
+      },
+      h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, '词条（必填）'),
+        h('input', {
+          className: 'qqg-input', value: draft.term, placeholder: '何意味',
+          'aria-label': '词条', disabled: busy,
+          onChange: (e) => set('term', e.target.value),
+        })),
+      h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, '含义解释'),
+        h('textarea', {
+          className: 'qqg-ai-input', rows: 2, value: draft.meaning, placeholder: '什么意思',
+          'aria-label': '含义解释', disabled: busy,
+          onChange: (e) => set('meaning', e.target.value),
+        })),
+      h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, '预设回复'),
+        h('textarea', {
+          className: 'qqg-ai-input', rows: 2, value: draft.reply,
+          placeholder: '选填，留空则由模型自由发挥',
+          'aria-label': '预设回复', disabled: busy,
+          onChange: (e) => set('reply', e.target.value),
+        })),
+      h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, '预设图片（可选）'),
+        h('input', {
+          className: 'qqg-input', value: draft.image, placeholder: '选填，图片 URL 或本地路径',
+          'aria-label': '预设图片', disabled: busy,
+          onChange: (e) => set('image', e.target.value),
+        })),
+      h(Field, {
+        label: '允许联网搜索含义',
+        desc: '命中且含义不明时，允许模型调用联网搜索查明；关掉就只按上面的解释与预设回复来。',
+      },
+        h(Switch, {
+          checked: draft.allowSearch,
+          disabled: busy,
+          ariaLabel: '允许联网搜索含义',
+          onChange: (next) => set('allowSearch', next),
+        })))
+    }
+
+    /** Tab 1 · 基础配置：响应档位 + 双轨制静态核心 + 动态记忆（档案 / 黑话标签）。 */
+    function SessionBasicTab({ session, persona, level, busy, get, write, writable }) {
       // 双轨制（v2.0 第十步）：静态核心三框（单群覆盖，留空继承全局）+ 动态记忆（本群专属）。
       const [coreDraft, setCoreDraft] = React.useState(() => ({
         identity: String(session.core?.identity ?? ''),
         boundary: String(session.core?.boundary ?? ''),
         style: String(session.core?.style ?? ''),
       }))
-      const [slangDraft, setSlangDraft] = React.useState(() => (Array.isArray(session.slang) ? [...session.slang] : []))
-      const [slangInput, setSlangInput] = React.useState('')
+      // 黑话（v2.0 第十一步）：标签展示；点标签或「添加」打开编辑弹窗。
+      const [slangEdit, setSlangEdit] = React.useState(null)
       const [dynBusy, setDynBusy] = React.useState(false)
       const [dynNote, setDynNote] = React.useState(null)
       const profiles = Array.isArray(session.userProfiles) ? session.userProfiles : []
+      const mergedSlang = Array.isArray(session.mergedSlang) ? session.mergedSlang : []
+      const localSlang = Array.isArray(session.slang) ? session.slang : []
+      const globalSlang = () => (Array.isArray(get?.('slangGlobal')) ? get('slangGlobal') : [])
       const roleLabel = (role) => (role === 'owner' ? '群主' : role === 'admin' ? '管理员' : '群员')
 
       const submitDynamic = async (body, label) => {
@@ -3997,8 +4100,38 @@ window.__ModuleLoader__.load({
         }
       }
       const saveCore = () => submitDynamic({ core: coreDraft }, '静态核心')
-      const saveSlang = () => submitDynamic({ core: coreDraft, slang: slangDraft }, '动态记忆')
       const removeProfile = (qq) => submitDynamic({ removeProfile: qq }, '删除群友档案')
+
+      /** 按 term（不区分大小写）upsert 一条词条。 */
+      const upsertSlang = (list, entry) => {
+        const next = Array.isArray(list) ? [...list] : []
+        const key = String(entry.term ?? '').toLowerCase()
+        const index = next.findIndex((item) => String(item?.term ?? '').toLowerCase() === key)
+        if (index >= 0) next[index] = entry
+        else next.push(entry)
+        return next
+      }
+      const saveSlangToGroup = async (draft) => {
+        await submitDynamic({ slang: upsertSlang(localSlang, draft) }, '词条（当前群）')
+        setSlangEdit(null)
+      }
+      const saveSlangToGlobal = (draft) => {
+        if (!writable || typeof write !== 'function') return
+        write('slangGlobal', upsertSlang(globalSlang(), draft))
+        setDynNote({ kind: 'ok', text: '已保存到全局词库。' })
+        setSlangEdit(null)
+      }
+      const deleteSlang = async (item) => {
+        const key = String(item?.term ?? '').toLowerCase()
+        if (item?.scope === 'group') {
+          await submitDynamic({ slang: localSlang.filter((entry) => String(entry?.term ?? '').toLowerCase() !== key) }, '删除词条')
+        } else {
+          if (!writable || typeof write !== 'function') return
+          write('slangGlobal', globalSlang().filter((entry) => String(entry?.term ?? '').toLowerCase() !== key))
+          setDynNote({ kind: 'ok', text: '已从全局词库删除。' })
+        }
+        setSlangEdit(null)
+      }
 
       const coreField = (label, key, rows, placeholder) => h('label', { className: 'qqg-field' },
         h('span', { className: 'qqg-field-label' }, label),
@@ -4063,7 +4196,7 @@ window.__ModuleLoader__.load({
         h(Panel, {
           title: '动态群聊记忆',
           desc: '只属于这个群：群友档案自动记录，黑话/梗可手动增删。拼在本轮 Prompt 最末尾，不进系统提示词。',
-          right: h('span', { className: 'qqg-pill' }, profiles.length + ' 人 / ' + slangDraft.length + ' 条黑话'),
+          right: h('span', { className: 'qqg-pill' }, profiles.length + ' 人 / ' + mergedSlang.length + ' 条词条'),
         },
           h('div', { className: 'qqg-group-title' }, '群友特征档案'),
           profiles.length === 0
@@ -4085,53 +4218,48 @@ window.__ModuleLoader__.load({
               disabled: dynBusy,
               onClick: () => removeProfile(profile.qq),
             }, '×')))),
-          h('div', { className: 'qqg-group-title' }, '群聊黑话 / 梗'),
-          slangDraft.length === 0
-            ? h('div', { className: 'qqg-hint' }, '还没有记录。每小时任务会自动提取，也可以手动加。')
-            : h('div', { className: 'qqg-chips' }, slangDraft.map((item, index) => h('span', {
-              key: item + index, className: 'qqg-chip',
-            },
-            h('span', { className: 'qqg-chip-text' }, item),
-            h('button', {
-              type: 'button', className: 'qqg-chip-x', disabled: dynBusy,
-              'aria-label': '删除黑话 ' + item,
-              onClick: () => setSlangDraft((prev) => prev.filter((_, i) => i !== index)),
-            }, '×')))),
-          h('div', { className: 'qqg-list-add' },
-            h('input', {
-              className: 'qqg-input qqg-input-grow',
-              value: slangInput,
+          h('div', { className: 'qqg-group-title' }, '群聊黑话 / 触发宏'),
+          mergedSlang.length === 0
+            ? h('div', { className: 'qqg-hint' },
+              '还没有词条。点「添加」建一条：只有群友真的说到这个词时，才把配置拼进当轮 Prompt。')
+            : h('div', { className: 'qqg-chips' }, mergedSlang.map((item) => h('button', {
+              key: item.term,
+              type: 'button',
+              className: 'qqg-chip qqg-chip-btn' + (item.scope === 'global' ? ' qqg-chip-global' : ''),
+              title: item.meaning || item.term,
+              'aria-label': '编辑词条 ' + item.term,
               disabled: dynBusy,
-              placeholder: '例如：上车 / 润了',
-              'aria-label': '新增黑话',
-              onChange: (e) => setSlangInput(e.target.value),
-              onKeyDown: (e) => {
-                if (e.key !== 'Enter') return
-                e.preventDefault()
-                const next = slangInput.trim()
-                if (next === '' || slangDraft.includes(next)) return
-                setSlangDraft((prev) => [...prev, next])
-                setSlangInput('')
-              },
-            }),
+              onClick: () => setSlangEdit({
+                term: item.term,
+                meaning: item.meaning ?? '',
+                reply: item.reply ?? '',
+                image: item.image ?? '',
+                allowSearch: item.allowSearch !== false,
+                scope: item.scope === 'group' ? 'group' : 'global',
+              }),
+            },
+            h('span', { className: 'qqg-chip-text' }, item.term),
+            item.scope === 'global' ? h('span', { className: 'qqg-chip-scope' }, '全局') : null))),
+          h('div', { className: 'qqg-list-add' },
             h('button', {
               type: 'button', className: 'qqg-btn',
-              disabled: dynBusy || slangInput.trim() === '',
-              onClick: () => {
-                const next = slangInput.trim()
-                if (next === '' || slangDraft.includes(next)) return
-                setSlangDraft((prev) => [...prev, next])
-                setSlangInput('')
-              },
-            }, '添加')),
-          h('div', { className: 'qqg-textarea-actions' },
-            h('button', {
-              type: 'button', className: 'qqg-btn qqg-btn-primary',
-              disabled: dynBusy || !session.sessionId,
-              onClick: saveSlang,
-            }, dynBusy ? h(React.Fragment, null, h(Spinner), '提交中…') : '保存动态记忆')),
+              disabled: dynBusy,
+              onClick: () => setSlangEdit({ term: '', meaning: '', reply: '', image: '', allowSearch: true, scope: 'group' }),
+            }, '+ 添加词条')),
           dynNote
             ? h('div', { className: 'qqg-status' + (dynNote.kind === 'err' ? ' qqg-status-err' : '') }, dynNote.text)
+            : null,
+          slangEdit
+            ? h(SlangModal, {
+              key: slangEdit.term || 'new',
+              initial: slangEdit,
+              writable,
+              busy: dynBusy,
+              onClose: () => setSlangEdit(null),
+              onSaveGroup: saveSlangToGroup,
+              onSaveGlobal: saveSlangToGlobal,
+              onDelete: deleteSlang,
+            })
             : null),
         h('div', { className: 'qqg-hint' },
           '静态核心走插件的人设 section（系统提示词层）；动态记忆与改名事件只追加在本轮 Prompt 尾部，',
