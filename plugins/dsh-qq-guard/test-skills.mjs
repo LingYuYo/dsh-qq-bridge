@@ -115,7 +115,7 @@ const CONFIG_CATALOG = {
     { id: 'sk-voice', name: '发语音', icon: 'send', tag: '内置', ver: '1.0.2', enabled: true, desc: '合成语音' },
     { id: 'sk-vision', name: '图片理解', icon: 'image', tag: '内置', ver: '1.3.2', enabled: true, desc: '识别图片' },
     { id: 'sk-search', name: '网页搜索', icon: 'search', tag: '内置', ver: '1.0.4', enabled: true, desc: '联网检索' },
-    { id: 'sk-memory', name: '记忆提取', icon: 'memory', tag: '内置', ver: '1.2.0', enabled: true, desc: '抽取长期事实' },
+    { id: 'sk-memory', name: '记忆与上下文', icon: 'memory', tag: '内置', ver: '2.0.0', enabled: true, desc: '注入聊天记录' },
   ],
   plugins: [
     { id: 'pl-debounce', name: '防抖合并', icon: 'activity', tag: '本地', ver: '1.4.0', enabled: true, desc: '合并短消息' },
@@ -138,9 +138,15 @@ const VALUE = {
   personaText: '', personaPresetDefault: '', allow: { private: [], groups: [], allowAllWhenEmpty: false },
   onebot: { wsUrl: '', accessToken: '' }, napcat: { dir: '', quickLoginQQ: '' },
   bridge: { dir: '', autoStart: false },
-  // 2026-10-27 新增两张卡用的配置块。
+  // 2026-10-27 新增三张卡用的配置块。
   quote: { forwardMaxImages: 3 },
-  contextAware: { enabled: true, turns: 15 },
+  contextAware: { enabled: true, pokeTurns: 15, messageTurns: 0, smartMatch: true },
+  memory: { enabled: true, pokeMaxTurns: 15, messageMaxTurns: 0, maxContextTokens: 128000, smartMatch: true },
+  timeAware: {
+    enabled: true,
+    silentMinutes: 30,
+    promptText: '[系统提示：群聊已经安静了 N 分钟，刚刚有人说话了，请表现得像刚回过神一样]',
+  },
 }
 const form = {
   getSnapshot: () => ({ status: 'ready', value: VALUE, writable: true, source: 'remote' }),
@@ -594,14 +600,18 @@ check('技能卡片：已实装显示「已接入」，其余显示「开发中�
   eq(textOfTag('发语音'), '已接入', 'sk-voice')
   eq(textOfTag('图片理解'), '已接入', 'sk-vision')
   eq(textOfTag('网页搜索'), '已接入', 'sk-search')
-  eq(textOfTag('记忆提取'), '开发中', 'sk-memory')
+  // 2026-10-27 合并：这张卡现在有真实字段（总闸 / 条数 / 容量 / 智能匹配），标「已接入」。
+  eq(textOfTag('记忆与上下文'), '已接入', 'sk-memory')
   eq(textOfTag('防抖合并'), '已接入', 'pl-debounce')
   eq(textOfTag('频率控制'), '已接入', 'pl-ratelimit')
   eq(textOfTag('上下文压缩'), '开发中', 'pl-compact')
   // 用 CSS class 区分状态：已接入带 qqg-pill-ok，开发中不带。
   const hasOkClass = (name) => tagOf(name).props.className.split(' ').includes('qqg-pill-ok')
   if (!hasOkClass('发语音')) throw new Error('「已接入」标签缺少 qqg-pill-ok')
-  if (hasOkClass('记忆提取')) throw new Error('「开发中」标签不该带 qqg-pill-ok')
+  if (!hasOkClass('记忆与上下文')) throw new Error('「记忆与上下文」应标为已接入')
+  if (hasOkClass('上下文压缩')) throw new Error('「开发中」标签不该带 qqg-pill-ok')
+  // 旧的「上下文感知」卡已合并，不应该再出现在列表里。
+  if (tileOf('上下文感知')) throw new Error('sk-context 应已合并进「记忆与上下文」，不该单独成卡')
 })
 
 /* ── P2：默认技能 sk-image（发图片）的合并与写回 ───────────── */
@@ -643,11 +653,15 @@ check('切「发图片」开关 → 写回整数组（含 sk-image，enabled=fal
   const sk = written.find((x) => x.id === 'sk-image')
   if (!sk) throw new Error('写回的数组里没有 sk-image（老配置点一下就丢了默认项）')
   eq(sk.enabled, false, '写回的 sk-image.enabled')
-  // 2026-10-27：默认技能补了 sk-poke / sk-quote / sk-context，合并后是 catalog + 4。
-  eq(written.length, CONFIG_CATALOG.skills.length + 4, '写回的是合并后的整数组（补 4 个内置技能）')
-  for (const id of ['sk-poke', 'sk-quote', 'sk-context']) {
+  // 2026-10-27 合并后：默认技能补 sk-poke / sk-quote / sk-memory / sk-time-aware；
+  // 2026-10-28（v2.0）再补 sk-unread，合并后是 catalog + 5。
+  // （夹具里本来就有 sk-memory 一条，所以只补 5 个。）
+  eq(written.length, CONFIG_CATALOG.skills.length + 5, '写回的是合并后的整数组（补 5 个内置技能）')
+  for (const id of ['sk-poke', 'sk-quote', 'sk-memory', 'sk-time-aware', 'sk-unread']) {
     if (!written.find((x) => x.id === id)) throw new Error(`写回的数组里没有 ${id}（新默认项丢了）`)
   }
+  // 合并迁移：写回的清单里不能再留着旧的 sk-context。
+  if (written.find((x) => x.id === 'sk-context')) throw new Error('写回的数组里不该再有 sk-context')
 })
 
 check('老配置里没有 sk-poke → 面板补出「戳一戳回复」卡片', () => {
@@ -658,6 +672,16 @@ check('老配置里没有 sk-poke → 面板补出「戳一戳回复」卡片', 
   const pill = findAll(tile, (n) => typeof n.props?.className === 'string'
     && n.props.className.split(' ').includes('qqg-pill'))[0]
   eq(textOf(pill), '已接入', 'sk-poke 应标为已接入')
+})
+
+check('老配置里没有 sk-time-aware → 面板补出「时间感知」卡片，且标为已接入', () => {
+  VALUE.skills = CONFIG_CATALOG.skills.map((x) => ({ ...x }))
+  const tree = resetSkills()
+  if (!tileNames(tree).includes('时间感知')) throw new Error('没有合并默认技能「时间感知」')
+  const tile = tileOf(tree, '时间感知')
+  const pill = findAll(tile, (n) => typeof n.props?.className === 'string'
+    && n.props.className.split(' ').includes('qqg-pill'))[0]
+  eq(textOf(pill), '已接入', 'sk-time-aware 应标为已接入')
 })
 
 check('戳一戳回复：齿轮弹窗 → 列表可增删，保存写回 poke.replies', () => {
@@ -838,31 +862,99 @@ check('聊天记录解析卡片：齿轮里能改「最大读取图片数」并�
   eq(VALUE.quote.forwardMaxImages, 5, '应写回 quote.forwardMaxImages')
 })
 
-check('上下文感知卡片：开关 + 读取条数都能写回', () => {
+check('记忆与上下文卡片：总闸 / 两个条数 / 智能匹配分别写回', () => {
   VALUE.skills = [
     ...CONFIG_CATALOG.skills.map((x) => ({ ...x })),
-    { id: 'sk-context', name: '上下文感知', icon: 'memory', tag: '内置', ver: '1.0.0',
-      enabled: true, desc: '注入最近聊天记录' },
   ]
-  VALUE.contextAware = { enabled: true, turns: 15, smartMatch: true }
+  VALUE.memory = { enabled: true, pokeMaxTurns: 15, messageMaxTurns: 0, maxContextTokens: 128000, smartMatch: true }
   let tree = resetSkills()
-  btn(tree, '上下文感知 设置').props.onClick({ stopPropagation() {} })
+  btn(tree, '记忆与上下文 设置').props.onClick({ stopPropagation() {} })
   tree = renderSkills()
-  const input = findAll(tree, (n) => n.tag === 'input'
-    && n.props?.['aria-label'] === '读取条数')[0]
-  if (!input) throw new Error('缺少「读取条数」输入框')
-  input.props.onChange({ target: { value: '8' } })
+  const pokeInput = findAll(tree, (n) => n.tag === 'input'
+    && n.props?.['aria-label'] === '戳一戳读取轮次')[0]
+  if (!pokeInput) throw new Error('缺少「戳一戳读取轮次」输入框')
+  pokeInput.props.onChange({ target: { value: '8' } })
   tree = renderSkills()
-  // 智能匹配开关：默认开 → 关掉后保存要写回 contextAware.smartMatch=false
+  const msgInput = findAll(tree, (n) => n.tag === 'input'
+    && n.props?.['aria-label'] === '普通消息读取轮次')[0]
+  if (!msgInput) throw new Error('缺少「普通消息读取轮次」输入框')
+  msgInput.props.onChange({ target: { value: '4' } })
+  tree = renderSkills()
+  // 智能匹配开关：默认开 → 关掉后保存要写回 memory.smartMatch=false
   const smart = switchByLabel(tree, '智能匹配')
   if (!smart) throw new Error('缺少「智能匹配」开关')
   eq(smart.props['aria-checked'], 'true', '智能匹配默认应为开启')
   smart.props.onClick()
   tree = renderSkills()
   btnByText(tree, '保存').props.onClick()
-  eq(VALUE.contextAware.turns, 8, '应写回 contextAware.turns')
-  eq(VALUE.contextAware.enabled, true, '开关保持开启')
-  eq(VALUE.contextAware.smartMatch, false, '应写回 contextAware.smartMatch')
+  eq(VALUE.memory.pokeMaxTurns, 8, '应写回 memory.pokeMaxTurns')
+  eq(VALUE.memory.messageMaxTurns, 4, '应写回 memory.messageMaxTurns')
+  eq(VALUE.memory.enabled, true, '开关保持开启')
+  eq(VALUE.memory.smartMatch, false, '应写回 memory.smartMatch')
+})
+
+check('记忆与上下文：容量滑条 128K~1M 共 8 档，拖动实时显示读数，松手才写回', () => {
+  VALUE.skills = CONFIG_CATALOG.skills.map((x) => ({ ...x }))
+  VALUE.memory = { enabled: true, pokeMaxTurns: 15, messageMaxTurns: 0, maxContextTokens: 128000, smartMatch: true }
+  let tree = resetSkills()
+  btn(tree, '记忆与上下文 设置').props.onClick({ stopPropagation() {} })
+  tree = renderSkills()
+  const slider = findAll(tree, (n) => n.tag === 'input'
+    && n.props?.type === 'range' && n.props?.['aria-label'] === '上下文容量')[0]
+  if (!slider) throw new Error('缺少「上下文容量」滑条')
+  eq([slider.props.min, slider.props.max, slider.props.step], [1, 8, 1], '滑条是 1~8 档')
+  // 默认 128000 落在第 1 档。
+  eq(slider.props.value, 1, '默认 128K 应对应第 1 档')
+  const tickText = textOf(findAll(tree, (n) => n.props?.className === 'qqg-slider-ticks-ends')[0])
+  if (!tickText.includes('128K') || !tickText.includes('1M')) {
+    throw new Error(`刻度两端应为 128K / 1M，实际：${tickText}`)
+  }
+  // 读数：未拖动时显示真实值的 K 记法。
+  const valueOf = () => textOf(findAll(tree, (n) => n.props?.className === 'qqg-slider-value')[0])
+  eq(valueOf(), '128K', '初始读数')
+  // 拖到第 4 档（512K）：拖动过程中只刷新读数，不写配置。
+  slider.props.onInput({ target: { value: '4' } })
+  tree = renderSkills()
+  eq(valueOf(), '512K', '拖动中读数应实时刷新')
+  eq(VALUE.memory.maxContextTokens, 128000, '拖动过程中不该写配置')
+  // 松手：同一实例上先 move 再 commit（重渲染会换实例，pending 归位）。
+  const slider2 = findAll(tree, (n) => n.tag === 'input'
+    && n.props?.type === 'range' && n.props?.['aria-label'] === '上下文容量')[0]
+  slider2.props.onInput({ target: { value: '4' } })
+  slider2.props.onPointerUp()
+  tree = renderSkills()
+  btnByText(tree, '保存').props.onClick()
+  eq(VALUE.memory.maxContextTokens, 512000, '松手后写回 512000（第 4 档）')
+})
+
+check('时间感知卡片：开关 + 静默阈值 + 多行提示词都能写回', () => {
+  VALUE.skills = [
+    ...CONFIG_CATALOG.skills.map((x) => ({ ...x })),
+    { id: 'sk-time-aware', name: '时间感知', icon: 'clock', tag: '内置', ver: '1.0.0',
+      enabled: true, desc: '静默提示' },
+  ]
+  VALUE.timeAware = {
+    enabled: true,
+    silentMinutes: 30,
+    promptText: '[系统提示：群聊已经安静了 N 分钟，刚刚有人说话了，请表现得像刚回过神一样]',
+  }
+  let tree = resetSkills()
+  btn(tree, '时间感知 设置').props.onClick({ stopPropagation() {} })
+  tree = renderSkills()
+  const minutes = findAll(tree, (n) => n.tag === 'input'
+    && n.props?.['aria-label'] === '静默阈值（分钟）')[0]
+  if (!minutes) throw new Error('缺少「静默阈值（分钟）」输入框')
+  minutes.props.onChange({ target: { value: '45' } })
+  tree = renderSkills()
+  const prompt = findAll(tree, (n) => n.tag === 'textarea'
+    && n.props?.['aria-label'] === '触发提示词')[0]
+  if (!prompt) throw new Error('缺少「触发提示词」多行输入框')
+  prompt.props.onChange({ target: { value: '醒了醒了，安静了 N 分钟了' } })
+  tree = renderSkills()
+  btnByText(tree, '保存').props.onClick()
+  eq(VALUE.timeAware.silentMinutes, 45, '应写回 timeAware.silentMinutes')
+  eq(VALUE.timeAware.promptText, '醒了醒了，安静了 N 分钟了', '应写回 timeAware.promptText')
+  eq(VALUE.timeAware.enabled, true, '开关保持开启')
 })
 
 console.log(`\n结果：${pass} 通过 / ${process.exitCode ? 1 : 0} 失败`)

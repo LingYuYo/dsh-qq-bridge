@@ -284,14 +284,22 @@ const DEFAULT_SKILLS = [
   // 2026-10-27 两张新卡：合并转发图片上限 / 戳一戳模型回复的上下文注入。
   { id: 'sk-quote', name: '聊天记录解析', icon: 'search', tag: '内置', ver: '1.0.0', enabled: true,
     desc: '合并转发里的图片会提取成多模态附件；这里控制最多读几张，避免 Token 爆炸。' },
-  { id: 'sk-context', name: '上下文感知', icon: 'memory', tag: '内置', ver: '1.0.0', enabled: true,
-    desc: '戳一戳选「模型回复」时，把本会话最近 N 条聊天记录注入给模型（按会话隔离）。' },
+  // 2026-10-27「时间感知」：会话静默超过阈值后再说话，给模型补一句「刚回过神」。
+  { id: 'sk-time-aware', name: '时间感知', icon: 'clock', tag: '内置', ver: '1.0.0', enabled: true,
+    desc: '记住每个会话的最后活跃时间；安静太久后有人说话时，在提示词里注入一句时间提示。' },
   { id: 'sk-vision', name: '图片理解', icon: 'image', tag: '内置', ver: '1.3.2', enabled: true,
     desc: '识别聊天里发的截图与照片，提取文字、报错信息和界面元素。' },
   { id: 'sk-search', name: '网页搜索', icon: 'search', tag: '内置', ver: '1.0.4', enabled: true,
     desc: '联网检索并把结果压缩成两三句话，用于回答时效性问题。' },
-  { id: 'sk-memory', name: '记忆提取', icon: 'memory', tag: '内置', ver: '1.2.0', enabled: true,
-    desc: '从会话里抽取长期事实（偏好、身份、约定），写进记忆空间供后续召回。' },
+  // 2026-10-27 合并：「上下文感知」并进这张卡，成为「记忆与上下文」。
+  // 老配置里同时存在 sk-context / sk-memory 时，client.js 的 mergeDefaultSkills
+  // 会把它们浓缩成这一条（见 client.js 的 consolidateContextSkill）。
+  { id: 'sk-memory', name: '记忆与上下文', icon: 'memory', tag: '内置', ver: '2.0.0', enabled: true,
+    desc: '注入本会话最近聊天记录（戳一戳 / 普通消息分别配条数），并按容量上限从最老的开始截断。' },
+  // 2026-10-28（v2.0 第一步）：未读归纳。主人在群里发 /归纳，旁路临时会话里的
+  // 廉价模型把这段时间的群聊整理成摘要，再用合并转发发回群里。
+  { id: 'sk-unread', name: '未读归纳', icon: 'search', tag: '内置', ver: '1.0.0', enabled: true,
+    desc: '主人发 /归纳 [条数]：拉群历史 → 廉价模型总结 → 合并转发发回群里（失败降级纯文本）。' },
   { id: 'sk-remind', name: '定时提醒', icon: 'clock', tag: '内置', ver: '1.1.0', enabled: false,
     desc: '按 cron 或「每天早上八点」这类自然语言创建提醒，到点私聊推送。' },
   { id: 'sk-weather', name: '天气查询', icon: 'spark', tag: '实验', ver: '0.9.3', enabled: false,
@@ -403,8 +411,15 @@ const SAFE_PREFIXES = ['mcp__', 'qq_ext_']
  * 为什么单独抽出来：闲时 / 忙时结构完全一样，抽一份既少重复，也保证两边字段不漂移
  * （少一个 cacheWrite，成本就会静默漏算缓存写入）。
  */
-const RateConfig = Schema.object({
-  input: Schema.number().default(0).min(0)
+/**
+ * 「时间感知」默认提示词（2026-10-27）。
+ *
+ * `N` 是占位符：桥接触发时会替换成实际静默的分钟数（也兼容 `{minutes}`）。
+ * 与 client.js 的 DEFAULTS 保持逐字一致，否则「恢复默认」会写下一个不同的值。
+ */
+const DEFAULT_TIME_AWARE_PROMPT = '[系统提示：群聊已经安静了 N 分钟，刚刚有人说话了，请表现得像刚回过神一样]'
+
+const RateConfig = Schema.object({  input: Schema.number().default(0).min(0)
     .description('未命中缓存的输入单价（元 / 百万 token）。'),
   output: Schema.number().default(0).min(0)
     .description('输出单价（元 / 百万 token；reasoning 已包含在 output 里）。'),
@@ -642,7 +657,7 @@ const Config = Schema.object({
       .default(true).volatile(),
     mode: Schema.union(['poke', 'text', 'model'])
       .description('回复方式：poke = 回戳；text = 按下面的回复列表随机回一条；'
-        + 'model = 让模型读本群最近聊天记录后回一句（依赖「上下文感知」卡片）。')
+        + 'model = 让模型读本群最近聊天记录后回一句（依赖「记忆与上下文」卡片）。')
       .default('poke').volatile(),
     replyText: Schema.string()
       .description('文字回复模板，支持 {nick} / {qq} 占位。回复列表为空时兜底用它。')
@@ -683,21 +698,81 @@ const Config = Schema.object({
       .description('合并转发里最多读取几张图片作为附件（0 = 只留文本占位；最多 10）。')
       .default(3).min(0).max(10).volatile(),
   }).description('聊天记录解析').default({}),
-  // ── 上下文感知（2026-10-27）──────────────────────────────────
-  // 戳一戳选「模型回复」时，把本会话最近 N 条聊天记录注入 prompt。
+  // ── 记忆与上下文（2026-10-27 合并）────────────────────────────
+  // 原「上下文感知」（contextAware）与「记忆提取」（sk-memory，无配置）合并成
+  // 一张卡；下面这组键是它唯一的配置面。
+  //   · pokeMaxTurns    —— 戳一戳「模型回复」注入几条（默认 15）；
+  //   · messageMaxTurns —— 普通消息额外注入几条（0 = 交给 DSH 原生上下文，默认）；
+  //   · maxContextTokens —— 两处共用的一次注入总预算，换算后从最老的记录开始砍。
   // 严格按会话 key（g:群号 / u:QQ号）隔离，两个群互不串。
-  contextAware: Schema.object({
+  memory: Schema.object({
     enabled: Schema.boolean()
-      .description('上下文感知总开关：关闭后「模型回复」不带本群聊天记录。')
+      .description('记忆与上下文总开关：关闭后戳一戳与普通消息都不注入聊天记录。')
       .default(true).volatile(),
-    turns: Schema.number()
-      .description('注入多少条最近聊天记录（0 = 关闭，只让模型回一句；最多 50）。')
+    pokeMaxTurns: Schema.number()
+      .description('戳一戳「模型回复」时注入多少条最近聊天记录（0 = 不注入；最多 50）。默认 15。')
       .default(15).min(0).max(50).volatile(),
+    messageMaxTurns: Schema.number()
+      .description('普通消息额外注入多少条最近聊天记录（0 = 交给 DSH 原生上下文管理；最多 50）。默认 0。')
+      .default(0).min(0).max(50).volatile(),
+    maxContextTokens: Schema.number()
+      .description('一次注入的容量上限（token）：与条数上限同时生效，超了从最老的记录开始截断。'
+        + '默认 128000（128K），范围 128000~1000000（1M）。')
+      .default(128000).min(128000).max(1000000).volatile(),
     smartMatch: Schema.boolean()
       .description('智能匹配：只带最近一段连续对话（相邻两条超过 5 分钟就断开），'
         + '避免把半小时前的闲聊也塞给模型；关闭则纯取最近 N 条。')
       .default(true).volatile(),
-  }).description('上下文感知').default({}),
+  }).description('记忆与上下文').default({}),
+  // ── 时间感知（2026-10-27）────────────────────────────────────
+  // 每个会话记住最后活跃时间；静默超过阈值后有人说话，就给模型补一句时间提示。
+  timeAware: Schema.object({
+    enabled: Schema.boolean()
+      .description('时间感知开关：关闭后不记录活跃时间、也不注入任何时间提示。')
+      .default(true).volatile(),
+    silentMinutes: Schema.number()
+      .description('静默阈值（分钟）：距离上次活跃超过这个时长才触发提示。默认 30。')
+      .default(30).min(1).max(1440).volatile(),
+    promptText: Schema.string()
+      .description('触发时注入的提示词；N 会被替换成实际静默分钟数。')
+      .default(DEFAULT_TIME_AWARE_PROMPT).volatile(),
+  }).description('时间感知').default({}),
+  // ── 未读归纳（v2.0 第一步，2026-10-28）──────────────────────────
+  // 主人在群里发 `/归纳 [条数]`：桥接拉群历史 → 按水位挑新消息 → 旁路临时会话
+  // 里的廉价模型总结 → 拼成多个 node 用合并转发发回群里（失败降级纯文本）。
+  unreadSummary: Schema.object({
+    enabled: Schema.boolean()
+      .description('未读归纳总开关：关闭后 `/归纳` 直接回提示，不拉历史也不花 token。')
+      .default(true).volatile(),
+    includeImages: Schema.boolean()
+      .description('图片检索：开启后把消息里的图片一起交给摘要模型（长截图会先切片）。'
+        + '默认关 —— 大多数廉价模型不吃图，硬塞只会白花 token。')
+      .default(false).volatile(),
+    maxMessages: Schema.number()
+      .description('一次最多拉取并归纳多少条历史。默认 200，硬上限 500。')
+      .default(200).min(10).max(500).volatile(),
+    maxImages: Schema.number()
+      .description('图片检索开启时，一次最多附几张图。默认 4。')
+      .default(4).min(0).max(10).volatile(),
+    budgetTokens: Schema.number()
+      .description('转写文本的 token 预算：超了从最老的记录开始省略。默认 24000。')
+      .default(24000).min(2000).max(200000).volatile(),
+    maxNodes: Schema.number()
+      .description('合并转发最多拆成几段（node）。默认 6。')
+      .default(6).min(1).max(20).volatile(),
+    nodeChars: Schema.number()
+      .description('每段最多多少字。默认 400。')
+      .default(400).min(50).max(2000).volatile(),
+    provider: Schema.string()
+      .description('摘要用的模型 provider。留空 = 跟随 DSH 全局默认（也可以在桥接 config.json 里配）。')
+      .default('').volatile(),
+    model: Schema.string()
+      .description('摘要用的模型名。留空 = 跟随 DSH 全局默认。')
+      .default('').volatile(),
+    notifyOwners: Schema.boolean()
+      .description('后台失败时私聊通知主人。默认开。')
+      .default(true).volatile(),
+  }).description('未读归纳').default({}),
   antiDebounceMs: Schema.number()
     .description('消息防抖合并窗口（毫秒）。0 = 沿用「活跃设置」里的 debounceWindowMs（默认 800）。')
     .default(0).min(0).max(60000).volatile(),
@@ -729,6 +804,12 @@ const Config = Schema.object({
     // 非管理员发指令会被桥接直接拦下并回提示，不会投递给 DSH（省 token）。
     admins: Schema.array(Schema.string())
       .description('管理员 QQ 号：只有这些人能执行 / 开头的指令。')
+      .default([]).volatile(),
+    // 主人（2026-10-28）：管理员之上再一阶。主人自动算管理员，
+    // 另加一项权限：能触发要花 token 的后台动作（`/归纳`）。
+    // 权限只认这里填的 QQ 号，不认昵称、消息文本或模型输出。
+    owners: Schema.array(Schema.string())
+      .description('主人 QQ 号：管理员全部权限 + 触发后台动作（/归纳）。')
       .default([]).volatile(),
     allowAllWhenEmpty: Schema.boolean()
       .description('白名单为空时是否放行所有人。默认 false（fail-closed，安全）。')
@@ -1070,6 +1151,26 @@ export function itemEnabledOr(config, id, fallback, kind = 'skill') {
 }
 
 /**
+ * 「记忆与上下文」卡片的总开关（2026-10-27 合并后）。
+ *
+ * 三档兼容，顺序不能换：
+ *   ① 清单里有 `sk-memory`（合并后的新卡，或老配置里的「记忆提取」）→ 看它的 enabled；
+ *   ② 只有老的 `sk-context`（升级前保存的清单）→ 沿用用户对「上下文感知」的选择；
+ *   ③ 两个都没有 → 按新卡默认开启（与 sk-image / sk-time-aware 同一条兼容规则，
+ *      不能因为「清单里缺项」就把功能关死）。
+ * @param {unknown} config
+ */
+function memoryFlag(config) {
+  const cfg = plainConfig(config) ?? {}
+  if (!Array.isArray(cfg.skills)) return true
+  const hit = cfg.skills.find((item) => item && item.id === 'sk-memory')
+  if (hit) return hit.enabled !== false
+  const legacy = cfg.skills.find((item) => item && item.id === 'sk-context')
+  if (legacy) return legacy.enabled !== false
+  return true
+}
+
+/**
  * 当前所有已实装开关的真实状态（guard 每次执行时现算，不缓存）。
  * @param {unknown} [config] 默认读 settings 实例的 Config；测试可注入。
  */
@@ -1079,6 +1180,14 @@ export function readFeatureFlags(config = featureState.source) {
     image: itemEnabledOr(config, 'sk-image', true),
     vision: itemEnabledIn(config, 'sk-vision'),
     search: itemEnabledIn(config, 'sk-search'),
+    // 新卡（2026-10-27）：老用户的 skills 数组里没有它，但默认是**开启**，
+    // 不能被当成「用户删了 = 关闭」（与 sk-image 同一条兼容规则）。
+    time: itemEnabledOr(config, 'sk-time-aware', true),
+    // 记忆与上下文（2026-10-27 合并）：卡片总开关关掉 = 两处注入全部停。
+    memory: memoryFlag(config),
+    // 未读归纳（2026-10-28）：老用户的 skills 数组里没有这张卡，但默认**开启**，
+    // 与 sk-time-aware / sk-image 同一条兼容规则（缺项不等于用户关掉了它）。
+    unread: itemEnabledOr(config, 'sk-unread', true),
     guard: itemEnabledIn(config, 'pl-guard', 'plugin'),
     debounce: itemEnabledIn(config, 'pl-debounce', 'plugin'),
     rateLimit: itemEnabledIn(config, 'pl-ratelimit', 'plugin'),

@@ -100,7 +100,7 @@ const CONFIG_CATALOG = {
     { id: 'sk-voice', name: '发语音', icon: 'send', tag: '内置', ver: '1.0.2', enabled: true, desc: '合成语音' },
     { id: 'sk-vision', name: '图片理解', icon: 'image', tag: '内置', ver: '1.3.2', enabled: true, desc: '识别图片' },
     { id: 'sk-search', name: '网页搜索', icon: 'search', tag: '内置', ver: '1.0.4', enabled: true, desc: '联网检索' },
-    { id: 'sk-memory', name: '记忆提取', icon: 'memory', tag: '内置', ver: '1.2.0', enabled: true, desc: '抽取长期事实' },
+    { id: 'sk-memory', name: '记忆与上下文', icon: 'memory', tag: '内置', ver: '2.0.0', enabled: true, desc: '注入聊天记录' },
   ],
   plugins: [
     { id: 'pl-debounce', name: '防抖合并', icon: 'activity', tag: '本地', ver: '1.4.0', enabled: true, desc: '合并短消息' },
@@ -179,7 +179,7 @@ for (const tab of ['status', 'sessions', 'skills', 'settings', 'usage']) {
     status: ['今日用量概览', 'AI 排障助手', '启动桥接'],
     // 会话管理已接真实数据：桥接未上报时渲染「等待上报」，不再有假会话。
     sessions: ['会话管理', '等待桥接上报', '运行状态'],
-    skills: ['技能（Skill）', '插件（Plugin）', '发语音', '图片理解', '网页搜索', '记忆提取',
+    skills: ['技能（Skill）', '插件（Plugin）', '发语音', '图片理解', '网页搜索', '记忆与上下文',
       '防抖合并', '频率控制', '上下文压缩', '+ 添加插件', '+ 添加技能'],
     // Phase 3：引导改成按钮+弹窗，分片/打字延时合并成「运行节奏」两个大按钮。
     settings: ['运行节奏', '信息发送配置', '活跃设置', '使用引导',

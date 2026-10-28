@@ -633,6 +633,41 @@ GET  /dsh-qq-guard/poke-image?name=<sha1>.<ext>   → 原图（弹窗缩略图�
   启动 5 秒后清一次「没被任何回复引用 + 超过 24 小时」的孤儿文件。
 - 发送侧：文字先发，350ms 后单独发表情包，强制 `sub_type: 1`；不做图文混排。
 
+#### 记忆与上下文 / 时间感知（2026-10-27）
+
+「记忆与上下文」是原「上下文感知」（`sk-context`）与「记忆提取」（`sk-memory`）**合并**后的
+一张卡（id 仍用 `sk-memory`，名字改「记忆与上下文」，`ver` 2.0.0）。老配置里同时有这两条时，
+客户端把它浓缩成一条（位置取 `sk-memory`，开关取两者任一），读清单时直接滤掉 `sk-context`，
+下次写盘才落成新清单 —— 不主动改用户配置，开关等级也不会丢。配置面从 `contextAware.*`
+收敛为 `memory.*`：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `memory.enabled` | `true` | 总开关（卡片自身也有 enabled，两者都开才生效） |
+| `memory.pokeMaxTurns` | `15` | 戳一戳「模型回复」时注入最近多少条记录；0 = 不注入 |
+| `memory.messageMaxTurns` | `0` | 普通消息额外注入多少条；0 = 交给 DSH 原生上下文（默认），>0 时桥接强注 |
+| `memory.maxContextTokens` | `128000` | 一次注入的 token 预算，**与条数同时生效**；超了从最老的记录开始截断 |
+| `memory.smartMatch` | `true` | 只取最近一段连续对话（间隔 > 5 分钟断开） |
+
+- 容量滑条（`slider` 字段类型，2026-10-27 新增）：**8 档，128K ~ 1M，每档 128K**
+  （128K / 256K / 384K … 1M）。滑条内部走「档位索引 1~8」，对外仍读写 token 数；
+  拖动时右侧读数实时刷新（`Slider` 的 `onDraft` 回调），**松手才写盘**。
+  老配置里的非档位值（如 200000）照实显示，滑条位置就近吸附，不做静默取整。
+- 旧的「上下文感知」卡不再单独出现；`readFeatureFlags` 新增 `memory`
+  （新卡优先、其次旧卡 `sk-context`、都缺项则按默认开启），桥接据此决定要不要注入。
+
+新增「时间感知」卡片（`sk-time-aware`，默认已接入）：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `timeAware.enabled` | `true` | 齿轮开关；与卡片总开关 `features.time` 同时为真才生效 |
+| `timeAware.silentMinutes` | `30` | 静默阈值（分钟）；超时后有人说话才触发 |
+| `timeAware.promptText` | `[系统提示：群聊已经安静了 N 分钟，…]` | 多行文本框；`N` / `{minutes}` 替换成实际分钟数 |
+
+- 老配置里没有 `sk-time-aware` 时，客户端会像 `sk-poke` 一样自动补出这张卡片；
+- 齿轮里的多行输入用新的 `textarea` 字段类型渲染，提示词可换行；
+- `features` 新增 `time`（由 `sk-time-aware` 的 enabled 派生），桥接据此决定要不要记时间。
+
 归纳本身需要模型，而桥接是独立进程调不到 `ctx.llm`，所以加了一条 Host 路由：
 
 ```
@@ -759,7 +794,7 @@ httpTools:
 ## 自测
 
 ```bash
-node test-guard-scope.mjs     # 门禁作用域 + preset 判定 + 上下文过滤 + 语音回执（38 例）
+node test-guard-scope.mjs     # 门禁作用域 + preset 判定 + 上下文过滤 + 语音回执（40 例）
 node test-preset-scope.mjs    # 真宿主：preset 内必须生效 / 顶层必须拒绝（31 例，缺 DSH 包时 SKIP）
 node test-model-override.mjs  # 模型无痕热切换 + 降级链 + 静默看门狗 + 系统事件 + 目录 join（假 ctx，23 例）
 node test-settings-data.mjs   # 设置页数据通路（remote / HTTP 兜底 / 错误可见）

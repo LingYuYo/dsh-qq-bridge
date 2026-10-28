@@ -48,7 +48,8 @@ function makeValue() {
     skills: [
       { id: 'sk-voice', name: '发语音', icon: 'send', tag: '内置', ver: '1.0.2', enabled: true, desc: '合成语音' },
       { id: 'sk-vision', name: '图片理解', icon: 'image', tag: '内置', ver: '1.3.2', enabled: true, desc: '识别图片' },
-      { id: 'sk-memory', name: '记忆提取', icon: 'memory', tag: '内置', ver: '1.2.0', enabled: true, desc: '抽取长期事实' },
+      { id: 'sk-memory', name: '记忆与上下文', icon: 'memory', tag: '内置', ver: '2.0.0', enabled: true, desc: '注入聊天记录' },
+      { id: 'sk-remind', name: '定时提醒', icon: 'clock', tag: '内置', ver: '1.1.0', enabled: false, desc: '到点提醒' },
       { id: 'custom-1700000000000', name: '手动技能', icon: 'spark', tag: '自定义', ver: '0.1.0', enabled: false, desc: '手动添加' },
     ],
     plugins: [
@@ -360,14 +361,25 @@ await check('恢复默认：后端/音色回默认，但不碰已保存的 API K
 })
 
 /* ── 用例：开发中 / 无可调配置 / 未知 id 兜底 ───────────────── */
-await check('未实装条目（记忆提取）：弹窗写「开发中」+ 原因，且没有任何表单控件', () => {
+await check('已实装条目（记忆与上下文）：齿轮里是真实表单，不再是「开发中」', () => {
   reset()
   let tree = resetSkills()
-  openGear(tree, '记忆提取')
+  openGear(tree, '记忆与上下文')
+  tree = render()
+  const joined = textOf(modalOf(tree))
+  if (joined.includes('开发中')) throw new Error('合并后的卡片已实装，不该再显示「开发中」')
+  truthy(joined.includes('启用记忆与上下文'), `缺少总闸开关，实际：${joined}`)
+  eq(btnByText(tree, '保存') !== undefined, true, '已实装条目应有「保存」按钮')
+})
+
+await check('未实装条目（定时提醒）：弹窗写「开发中」+ 原因，且没有任何表单控件', () => {
+  reset()
+  let tree = resetSkills()
+  openGear(tree, '定时提醒')
   tree = render()
   const joined = textOf(modalOf(tree))
   truthy(joined.includes('开发中'), '缺少「开发中」标签')
-  truthy(joined.includes('记忆面'), `缺少具体原因，实际文案：${joined}`)
+  truthy(joined.includes('定时提醒还没实装'), `缺少具体原因，实际文案：${joined}`)
   eq(findAll(modalOf(tree), (n) => n.tag === 'input' || n.tag === 'select').length, 0,
     '开发中条目不能出现假表单')
   eq(btnByText(tree, '保存'), undefined, '开发中条目不该有「保存」按钮')

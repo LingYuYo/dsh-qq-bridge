@@ -439,8 +439,86 @@ await check('readFeatureFlags：把开关聚合成桥接/guard 共用的布尔',
   const cfg = Config({ role: 'settings' })
   const flags = mod.readFeatureFlags(cfg)
   assert.deepEqual(flags, {
-    voice: true, image: true, vision: true, search: true, guard: true, debounce: true, rateLimit: true,
+    voice: true, image: true, vision: true, search: true, time: true, memory: true,
+    // 2026-10-28（v2.0 第一步）：未读归纳，老清单缺项按开启。
+    unread: true,
+    guard: true, debounce: true, rateLimit: true,
   })
+})
+await check('Config 默认值：三阶权限（owners）+ 未读归纳（sk-unread / unreadSummary）', () => {
+  const plain = mod.plainConfig(Config({ role: 'settings' })) ?? {}
+  // 主人这一阶（2026-10-28）：默认空数组，不能默认放行任何人。
+  assert.deepEqual(plain.allow.admins, [])
+  assert.deepEqual(plain.allow.owners, [])
+  const u = plain.unreadSummary ?? {}
+  assert.equal(u.enabled, true)
+  assert.equal(u.includeImages, false, '默认不检索图片')
+  assert.equal(u.maxMessages, 200)
+  assert.equal(u.maxNodes, 6)
+  assert.equal(u.notifyOwners, true)
+  assert.equal(u.provider, '', '留空 = 跟随全局默认模型')
+  // 清单里必须有这张卡，且默认开启；老用户清单缺项时按开启处理。
+  const card = (plain.skills ?? []).find((item) => item && item.id === 'sk-unread')
+  assert.ok(card, '默认技能清单里要有 sk-unread')
+  assert.equal(card.enabled, true)
+  assert.equal(mod.readFeatureFlags({ role: 'settings', skills: [] }).unread, true,
+    '老配置清单里没有 sk-unread → 按开启')
+  assert.equal(mod.readFeatureFlags({
+    role: 'settings',
+    skills: [{ id: 'sk-unread', enabled: false }],
+  }).unread, false, '明确关掉才算关')
+})
+
+await check('Config 默认值：memory 四件套（双条数 + 容量 + 智能匹配）+ timeAware 三件套', () => {
+  const plain = mod.plainConfig(Config({ role: 'settings' })) ?? {}
+  // 2026-10-27 合并：contextAware 整块删除，换成 memory.*
+  assert.equal(plain.contextAware, undefined, '旧的 contextAware 字段不应再留在 schema 里')
+  assert.equal(plain.memory.enabled, true, 'memory 默认开')
+  assert.equal(plain.memory.pokeMaxTurns, 15, 'pokeMaxTurns 默认 15')
+  assert.equal(plain.memory.messageMaxTurns, 0, 'messageMaxTurns 默认 0（交给 DSH 原生）')
+  assert.equal(plain.memory.maxContextTokens, 128000, 'maxContextTokens 默认 128000')
+  assert.equal(plain.memory.smartMatch, true)
+  assert.equal(plain.timeAware.enabled, true)
+  assert.equal(plain.timeAware.silentMinutes, 30)
+  assert.match(plain.timeAware.promptText, /安静了 N 分钟/u)
+  const skills = plain.skills || []
+  assert.ok(skills.some((x) => x.id === 'sk-time-aware'), '默认技能清单要带「时间感知」卡')
+  // 合并后只剩一张「记忆与上下文」卡，旧的「上下文感知」卡不再出现。
+  assert.ok(!skills.some((x) => x.id === 'sk-context'), 'sk-context 应已合并进 sk-memory')
+  const memoryCard = skills.find((x) => x.id === 'sk-memory')
+  assert.equal(memoryCard?.name, '记忆与上下文')
+  assert.equal(memoryCard?.enabled, true, '合并卡默认开启')
+})
+await check('readFeatureFlags：老配置的 skills 数组缺 sk-time-aware → time 仍按默认开启', () => {
+  const legacy = Config({
+    role: 'settings',
+    skills: [{ id: 'sk-voice', name: '发语音', enabled: true }],
+  })
+  assert.equal(mod.readFeatureFlags(legacy).time, true, '缺项 = 新卡的默认值（开）')
+  const off = Config({
+    role: 'settings',
+    skills: [{ id: 'sk-time-aware', name: '时间感知', enabled: false }],
+  })
+  assert.equal(mod.readFeatureFlags(off).time, false, '明确 enabled:false 才算关闭')
+})
+await check('readFeatureFlags.memory：新卡 / 旧卡 / 缺项三种清单都能算对', () => {
+  // 缺项：老清单里既没有 sk-memory 也没有 sk-context → 按默认开启。
+  const missing = Config({ role: 'settings', skills: [{ id: 'sk-voice', name: '发语音', enabled: true }] })
+  assert.equal(mod.readFeatureFlags(missing).memory, true, '缺项 = 合并卡的默认值（开）')
+  // 只有旧卡：沿用用户当时对「上下文感知」的开关。
+  const legacyOn = Config({ role: 'settings', skills: [{ id: 'sk-context', name: '上下文感知', enabled: true }] })
+  assert.equal(mod.readFeatureFlags(legacyOn).memory, true)
+  const legacyOff = Config({ role: 'settings', skills: [{ id: 'sk-context', name: '上下文感知', enabled: false }] })
+  assert.equal(mod.readFeatureFlags(legacyOff).memory, false, '旧卡明确关掉 = 合并卡关掉')
+  // 新卡优先：同时存在时以 sk-memory 为准。
+  const both = Config({
+    role: 'settings',
+    skills: [
+      { id: 'sk-context', name: '上下文感知', enabled: false },
+      { id: 'sk-memory', name: '记忆与上下文', enabled: true },
+    ],
+  })
+  assert.equal(mod.readFeatureFlags(both).memory, true, '新卡存在时以新卡为准')
 })
 await check('guard：网页搜索开启 → web_search 放行；关闭 → 执行期拒绝', () => {
   const { ctx, calls } = makeCtx({ presetId: 'qq-chat' })

@@ -589,6 +589,13 @@ window.__ModuleLoader__.load({
   font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
 .qqg-slider-ticks span { flex: 1 1 0; text-align: center; }
 .qqg-slider-ticks span.on { color: var(--qqg-accent); font-weight: 600; }
+/* 容量滑条（2026-10-27）：滑条 + 右侧实时读数。读数用等宽数字，拖动时宽度不跳。 */
+.qqg-slider-row { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; }
+.qqg-slider-row .qqg-slider { flex: 1 1 auto; width: auto; min-width: 0; }
+.qqg-slider-value { flex: 0 0 auto; min-width: 56px; text-align: right;
+  font-variant-numeric: tabular-nums; font-size: 12px; font-weight: 600; color: var(--qqg-accent); }
+.qqg-slider-ticks-ends { display: flex; justify-content: space-between; margin-top: 2px;
+  font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
 
 /* ── 设置弹窗：左表单 / 右说明 ────────────────────────────── */
 .qqg-setgrid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
@@ -804,10 +811,19 @@ window.__ModuleLoader__.load({
       'poke.delayMinMs': 200,
       'poke.delayMaxMs': 500,
       'poke.withAction': false,
-      // 聊天记录解析 / 上下文感知（2026-10-27）。
+      // 聊天记录解析 / 记忆与上下文（2026-10-27）。
       'quote.forwardMaxImages': 3,
-      'contextAware.enabled': true,
-      'contextAware.turns': 15,
+      'memory.enabled': true,
+      // 戳一戳与普通消息各用一个条数（普通消息 0 = 交给 DSH 原生上下文）。
+      'memory.pokeMaxTurns': 15,
+      'memory.messageMaxTurns': 0,
+      // 一次注入的总容量上限（token），与条数上限同时生效。
+      'memory.maxContextTokens': 128000,
+      'memory.smartMatch': true,
+      // 时间感知（2026-10-27）：静默阈值 + 注入的提示词（N = 分钟数）。
+      'timeAware.enabled': true,
+      'timeAware.silentMinutes': 30,
+      'timeAware.promptText': '[系统提示：群聊已经安静了 N 分钟，刚刚有人说话了，请表现得像刚回过神一样]',
       // 语音合成（「发语音」技能的后端）默认值：Edge 免 Key，音色用晓伊。
       'voice.provider': 'edge',
       'voice.baseUrl': '',
@@ -873,21 +889,83 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 内置「上下文感知」技能（2026-10-27）：戳一戳「模型回复」时注入最近聊天记录。
+     * 内置「记忆与上下文」技能（2026-10-27 合并版）。
+     *
+     * 由原来的「上下文感知」（sk-context，注入最近聊天记录）和「记忆提取」
+     * （sk-memory，没有可写配置）合并而来。合并后只留这一条，齿轮里配
+     * 总闸 / 两个条数 / 容量上限 / 智能匹配。
      */
-    const DEFAULT_CONTEXT_SKILL = {
-      id: 'sk-context', name: '上下文感知', icon: 'memory', tag: '内置', ver: '1.0.0', enabled: true,
-      desc: '戳一戳选「模型回复」时，把本会话最近 N 条聊天记录注入给模型（按会话隔离）。',
+    const DEFAULT_MEMORY_SKILL = {
+      id: 'sk-memory', name: '记忆与上下文', icon: 'memory', tag: '内置', ver: '2.0.0', enabled: true,
+      desc: '注入本会话最近聊天记录（戳一戳 / 普通消息分别配条数），并按容量上限从最老的开始截断。',
     }
+
+    /**
+     * 内置「时间感知」技能（2026-10-27）：静默超阈值后注入一句时间提示。
+     */
+    const DEFAULT_TIME_AWARE_SKILL = {
+      id: 'sk-time-aware', name: '时间感知', icon: 'clock', tag: '内置', ver: '1.0.0', enabled: true,
+      desc: '记住每个会话的最后活跃时间；安静太久后有人说话时，在提示词里注入一句时间提示。',
+    }
+
+    /**
+     * 内置「未读归纳」技能（v2.0 第一步，2026-10-28）。
+     *
+     * 只有主人能触发（`allow.owners`）：群里发 `/归纳 [条数]`，桥接拉群历史 →
+     * 旁路临时会话里的廉价模型总结 → 拼成多个 node 发合并转发；失败降级纯文本。
+     */
+    const DEFAULT_UNREAD_SKILL = {
+      id: 'sk-unread', name: '未读归纳', icon: 'search', tag: '内置', ver: '1.0.0', enabled: true,
+      desc: '主人发 /归纳 [条数]：拉群历史 → 廉价模型总结 → 合并转发发回群里（失败降级纯文本）。',
+    }
+
+    /** 合并目标 id：老配置里的 sk-context 会被并进这一条。 */
+    const MEMORY_SKILL_ID = 'sk-memory'
+    /** 已合并掉的旧 id：读清单时直接滤掉，不再当独立卡片渲染。 */
+    const MERGED_SKILL_IDS = ['sk-context']
 
     /** 内置技能的新增项：配置里缺哪个补哪个，已有条目原样保留（不打断排序）。 */
     const DEFAULT_SKILLS_LOCAL = [
-      DEFAULT_IMAGE_SKILL, DEFAULT_POKE_SKILL, DEFAULT_QUOTE_SKILL, DEFAULT_CONTEXT_SKILL,
+      DEFAULT_IMAGE_SKILL, DEFAULT_POKE_SKILL, DEFAULT_QUOTE_SKILL, DEFAULT_MEMORY_SKILL,
+      DEFAULT_TIME_AWARE_SKILL, DEFAULT_UNREAD_SKILL,
     ]
 
-    /** 合并默认技能项：已有同 id 的原样返回，缺的补在末尾。 */
+    /**
+     * 把老配置里的 `sk-context` 并进 `sk-memory`（2026-10-27 合并迁移）。
+     *
+     * 为什么要单独一步：直接滤掉 `sk-context` 会把用户当时**开/关**的选择一起丢掉。
+     * 规则：
+     *   · `sk-context` 存在 → 位置用它，`enabled` 取两者「任一开启」；名字 / 描述 / 版本
+     *     一律用新的（老条目里存的是旧文案）。
+     *   · `sk-context` 不在但 `sk-memory` 在 → 保留用户对 sk-memory 的位置与开关。
+     *   · 两个都没有 → 交给后面的补默认逻辑。
+     * 整个过程只在内存里算，用户下次动手写盘时才落成新清单（不主动改用户配置）。
+     */
+    function consolidateMemorySkill(rows) {
+      const list = Array.isArray(rows) ? rows.filter((row) => row && !MERGED_SKILL_IDS.includes(row.id)) : []
+      const legacy = (Array.isArray(rows) ? rows : []).find((row) => row && row.id === 'sk-context')
+      const index = list.findIndex((row) => row.id === MEMORY_SKILL_ID)
+      if (!legacy) {
+        if (index < 0) return list
+        // 位置与开关保留用户的，文案统一换成合并后的（老配置里 sk-memory 是「记忆提取」）。
+        const next = list.slice()
+        next[index] = { ...DEFAULT_MEMORY_SKILL, enabled: next[index].enabled !== false }
+        return next
+      }
+      const legacyIndex = (Array.isArray(rows) ? rows : []).indexOf(legacy)
+      if (index >= 0) {
+        const merged = { ...DEFAULT_MEMORY_SKILL, enabled: list[index].enabled !== false || legacy.enabled !== false }
+        return list.map((row, i) => (i === index ? merged : row))
+      }
+      // 只有 sk-context：把它原来的位置让给合并卡（尽量别让用户在列表里找不着）。
+      const at = Math.min(Math.max(legacyIndex, 0), list.length)
+      const merged = { ...DEFAULT_MEMORY_SKILL, enabled: legacy.enabled !== false }
+      return [...list.slice(0, at), merged, ...list.slice(at)]
+    }
+
+    /** 合并默认技能项：先做合并迁移，再补缺的默认项（已有条目原样保留）。 */
     function mergeDefaultSkills(list) {
-      const rows = Array.isArray(list) ? list : []
+      const rows = consolidateMemorySkill(list)
       const missing = DEFAULT_SKILLS_LOCAL.filter((item) => !rows.some((row) => row && row.id === item.id))
       return missing.length === 0 ? rows : [...rows, ...missing]
     }
@@ -1216,8 +1294,11 @@ window.__ModuleLoader__.load({
      * 为什么不能直接用受控 range：value 来自异步配置回读，拖动时 React 还按旧值
      * 重绘 thumb，看上去就是「拖不动」。这里先用本地 draft 跟手，
      * 松手（pointerup）或键盘抬起（keyup）才提交一次 onCommit(数字)。
+     *
+     * `onDraft`（2026-10-27 新增，可选）：拖动过程中每次取值都回调一次。
+     * 容量滑条要「拖的时候旁边数字跟着变」，而读数不能等写盘回来才更新。
      */
-    function Slider({ value, min, max, step, disabled, ariaLabel, onCommit }) {
+    function Slider({ value, min, max, step, disabled, ariaLabel, onCommit, onDraft }) {
       const initial = Number(value ?? min)
       const [draft, setDraft] = React.useState(initial)
       // 配置回读 / 「恢复默认」时把草稿拉回真实值（拖动过程中不覆盖本地值）。
@@ -1228,6 +1309,7 @@ window.__ModuleLoader__.load({
         if (!Number.isFinite(n)) return
         pending.current = n
         setDraft(n)
+        if (typeof onDraft === 'function') onDraft(n)
       }
       const commit = () => {
         if (disabled) return
@@ -1246,6 +1328,48 @@ window.__ModuleLoader__.load({
         // 鼠标拖到滑块外松手时 pointerup 可能不落在 input 上，失焦再兜一次。
         onBlur: commit,
       })
+    }
+
+    /* ── 上下文容量滑条（2026-10-27）───────────────────────────
+     *
+     * 需求是「100K~1M」，但真实模型窗口和 Config 默认值都是 128K 的整数倍，
+     * 所以档位以 128K 为基数分 8 档（128K / 256K … 1M）—— 滑条刻度与模型窗口
+     * 对齐，不会出现「拖到 300K 其实是 300K 而不是 384K」这种别扭。
+     *
+     * 实现上滑条本身只走**档位索引**（1~8），对外读写仍是 token 数：
+     *   · 默认 128000 正好是第 1 档；
+     *   · 老配置里存了非档位值（比如 200000）时，滑条就近吸附，读数仍显示真实值。
+     * 换算与格式化都做成纯函数，方便离线测试直接断言。
+     */
+    /** 档位基数：每档 128K。 */
+    const CONTEXT_TOKEN_STEP = 128000
+    /** 档位数：128K ~ 1M 共 8 档。 */
+    const CONTEXT_TOKEN_STEPS = 8
+    /** 容量下限 / 上限（token）。 */
+    const CONTEXT_TOKEN_MIN = CONTEXT_TOKEN_STEP
+    const CONTEXT_TOKEN_MAX = CONTEXT_TOKEN_STEP * CONTEXT_TOKEN_STEPS
+
+    /** 历史条数上限：Host Config 与桥接的 clamp 都是 50，这里必须一致。 */
+    const MEMORY_MAX_TURNS = 50
+
+    /** token 数 → 档位索引（1 起）。非档位值就近吸附，越界夹到两端。 */
+    function contextTokensToStep(tokens) {
+      const n = Number(tokens)
+      if (!Number.isFinite(n)) return 1
+      const step = Math.round(n / CONTEXT_TOKEN_STEP)
+      return Math.min(CONTEXT_TOKEN_STEPS, Math.max(1, step))
+    }
+
+    /** 档位索引 → token 数。 */
+    function contextStepToTokens(step) {
+      const s = Math.min(CONTEXT_TOKEN_STEPS, Math.max(1, Math.round(Number(step) || 1)))
+      return s * CONTEXT_TOKEN_STEP
+    }
+
+    /** token 数 → 读数文案（128K / 1M）。向下取整显示，绝不让 100000 显示成 100K。 */
+    function formatContextTokens(tokens) {
+      const n = Math.max(0, Math.round(Number(tokens) || 0))
+      return n >= 1000000 ? `${Math.round(n / 1000000 * 10) / 10}M` : `${Math.floor(n / 1000)}K`
     }
 
     /** 内置面板的左侧导航分类（Phase 2：五个主 Tab）。 */
@@ -3383,7 +3507,7 @@ window.__ModuleLoader__.load({
 
     /** 已真实接入桥接 / Host 的条目 id；其余只加「开发中」标签，不动配置。 */
     const IMPLEMENTED_IDS = {
-      skill: ['sk-voice', 'sk-vision', 'sk-search', 'sk-image', 'sk-poke', 'sk-quote', 'sk-context'],
+      skill: ['sk-voice', 'sk-vision', 'sk-search', 'sk-image', 'sk-poke', 'sk-quote', 'sk-memory', 'sk-time-aware', 'sk-unread'],
       plugin: ['pl-guard', 'pl-debounce', 'pl-ratelimit'],
     }
 
@@ -3463,27 +3587,6 @@ window.__ModuleLoader__.load({
             + '文字支持 {nick} / {qq}；图片存本机，单张 ≤ 5MB。',
         },
       ],
-      // 聊天记录解析（2026-10-27）：合并转发里最多读几张图当多模态附件。
-      'sk-quote': [
-        {
-          path: 'quote.forwardMaxImages', type: 'number', label: '聊天记录最大读取图片数',
-          min: 0, max: 10, step: 1,
-          hint: '合并转发里最多提取几张图片作为附件（0 = 只留 [图片] 占位；上限 10）。'
-            + '张数越多越耗 token，默认 3 张。',
-        },
-      ],
-      // 上下文感知（2026-10-27）：戳一戳「模型回复」注入最近聊天记录。
-      'sk-context': [
-        {
-          path: 'contextAware.enabled', type: 'switch', label: '启用上下文感知',
-          hint: '关闭后，「模型回复」不带本会话聊天记录，只让模型回一句。',
-        },
-        {
-          path: 'contextAware.turns', type: 'number', label: '读取条数',
-          min: 0, max: 50, step: 1,
-          hint: '注入最近多少条聊天记录（默认 15；0 = 关闭注入）。按会话隔离，群与群互不串。',
-        },
-      ],
       'sk-voice': [
         {
           path: 'voice.provider', type: 'select', label: '语音后端',
@@ -3544,23 +3647,114 @@ window.__ModuleLoader__.load({
           hint: '一段聊天记录里常塞十几张图，全读会撑爆 Token。默认 3；0 = 只留文本占位、不读图。',
         },
       ],
-      // 上下文感知（2026-10-27）：戳一戳「模型回复」时注入本会话最近聊天记录。
+      // 记忆与上下文（2026-10-27 合并）：总闸 / 两个条数 / 容量滑条 / 智能匹配。
       // 提取严格按 chatKey（g:群号 / u:QQ号）隔离，不同群不会串。
-      'sk-context': [
+      'sk-memory': [
         {
-          path: 'contextAware.enabled', type: 'switch', label: '启用上下文感知',
-          hint: '关闭后「模型回复」只回一句，不带本会话聊天记录。',
+          path: 'memory.enabled', type: 'switch', label: '启用记忆与上下文',
+          hint: '关闭后，戳一戳与普通消息都不再注入本会话聊天记录。',
         },
         {
-          path: 'contextAware.turns', type: 'number', label: '读取条数',
-          min: 0, max: 50, step: 1,
-          hint: '注入最近多少条聊天记录（默认 15）。0 = 等同关闭；按会话严格隔离。',
-          when: (valueOf) => valueOf('contextAware.enabled') !== false,
+          path: 'memory.pokeMaxTurns', type: 'number', label: '戳一戳读取轮次',
+          min: 0, max: MEMORY_MAX_TURNS, step: 1,
+          hint: '戳一戳选「模型回复」时注入最近多少条聊天记录（默认 15；0 = 不注入，只让模型回一句）。',
+          when: (valueOf) => valueOf('memory.enabled') !== false,
         },
         {
-          path: 'contextAware.smartMatch', type: 'switch', label: '智能匹配',
+          path: 'memory.messageMaxTurns', type: 'number', label: '普通消息读取轮次',
+          min: 0, max: MEMORY_MAX_TURNS, step: 1,
+          hint: '普通消息额外注入多少条最近聊天记录。默认 0 = 交给 DSH 原生上下文管理；'
+            + '大于 0 时由桥接层把最近 N 条记录强行拼进 prompt（对「会话被压缩/重建」特别有用）。',
+          when: (valueOf) => valueOf('memory.enabled') !== false,
+        },
+        {
+          path: 'memory.maxContextTokens', type: 'slider', label: '上下文容量',
+          // 档位走索引 1~8（每档 128K），对外仍读写 token 数。
+          min: CONTEXT_TOKEN_MIN, max: CONTEXT_TOKEN_MAX, step: CONTEXT_TOKEN_STEP,
+          steps: CONTEXT_TOKEN_STEPS,
+          hint: '一次注入的 token 预算：与上面的条数同时生效，超了从最老的记录开始截断。'
+            + '8 档，128K ~ 1M。',
+          when: (valueOf) => valueOf('memory.enabled') !== false,
+        },
+        {
+          path: 'memory.smartMatch', type: 'switch', label: '智能匹配',
           hint: '开启后只带最近一段连续对话（相邻两条超过 5 分钟就断开），避免把半小时前的闲聊也塞给模型。',
-          when: (valueOf) => valueOf('contextAware.enabled') !== false,
+          when: (valueOf) => valueOf('memory.enabled') !== false,
+        },
+      ],
+      // 时间感知（2026-10-27）：安静太久后有人说话，给模型补一句时间提示。
+      'sk-time-aware': [
+        {
+          path: 'timeAware.enabled', type: 'switch', label: '启用时间感知',
+          hint: '关闭后不记录活跃时间，也不会注入任何时间提示（卡片总开关关掉时同样不生效）。',
+        },
+        {
+          path: 'timeAware.silentMinutes', type: 'number', label: '静默阈值（分钟）',
+          min: 1, max: 1440, step: 1,
+          hint: '距离上一次有人说话超过这个分钟数，才认为「群聊安静了一会儿」并触发提示。默认 30。',
+          when: (valueOf) => valueOf('timeAware.enabled') !== false,
+        },
+        {
+          path: 'timeAware.promptText', type: 'textarea', label: '触发提示词', rows: 4,
+          placeholder: '[系统提示：群聊已经安静了 N 分钟，刚刚有人说话了，请表现得像刚回过神一样]',
+          hint: '注入到本轮 prompt 末尾的一句话。N 会被替换成实际静默分钟数（也支持 {minutes}）。',
+          when: (valueOf) => valueOf('timeAware.enabled') !== false,
+        },
+      ],
+      // 未读归纳（2026-10-28，v2.0 第一步）：主人 /归纳 的条数、预算、段数与摘要模型。
+      'sk-unread': [
+        {
+          path: 'unreadSummary.enabled', type: 'switch', label: '启用未读归纳',
+          hint: '关闭后 `/归纳` 只回一句提示，不拉群历史、也不花 token。',
+        },
+        {
+          path: 'unreadSummary.includeImages', type: 'switch', label: '图片检索',
+          hint: '把消息里的图片一起交给摘要模型（长截图会先自动切片）。默认关：'
+            + '多数廉价模型不吃图，硬塞只是白花 token。',
+          when: (valueOf) => valueOf('unreadSummary.enabled') !== false,
+        },
+        {
+          path: 'unreadSummary.maxMessages', type: 'number', label: '一次最大条数',
+          min: 10, max: 500, step: 10,
+          hint: '拉取并归纳多少条历史（硬上限 500）。群里发 `/归纳 80` 可以临时改这一次。',
+          when: (valueOf) => valueOf('unreadSummary.enabled') !== false,
+        },
+        {
+          path: 'unreadSummary.maxImages', type: 'number', label: '最多带图张数',
+          min: 0, max: 10, step: 1,
+          hint: '图片检索开启时，一次最多附几张。0 = 一张都不带。',
+          when: (valueOf) => valueOf('unreadSummary.enabled') !== false
+            && valueOf('unreadSummary.includeImages') === true,
+        },
+        {
+          path: 'unreadSummary.budgetTokens', type: 'number', label: '转写 token 预算',
+          min: 2000, max: 200000, step: 1000,
+          hint: '超预算就从**最老的**记录开始省略；日志会写「省略了几条」。',
+          when: (valueOf) => valueOf('unreadSummary.enabled') !== false,
+        },
+        {
+          path: 'unreadSummary.maxNodes', type: 'number', label: '合并转发段数上限',
+          min: 1, max: 20, step: 1,
+          hint: '结果最多拆成几个 node。超出的并进最后一段，不丢内容。',
+          when: (valueOf) => valueOf('unreadSummary.enabled') !== false,
+        },
+        {
+          path: 'unreadSummary.nodeChars', type: 'number', label: '每段字数上限',
+          min: 50, max: 2000, step: 50,
+          hint: '单段超过就截断加省略号。太长在 QQ 里不好读。',
+          when: (valueOf) => valueOf('unreadSummary.enabled') !== false,
+        },
+        {
+          path: 'unreadSummary.provider', type: 'textarea', label: '摘要模型 provider', rows: 1,
+          placeholder: '留空 = 跟随 DSH 全局默认',
+          hint: '归纳跑在一条临时会话里，这里单独指定廉价模型；留空就用全局默认。',
+          when: (valueOf) => valueOf('unreadSummary.enabled') !== false,
+        },
+        {
+          path: 'unreadSummary.model', type: 'textarea', label: '摘要模型名', rows: 1,
+          placeholder: '留空 = 跟随 DSH 全局默认',
+          hint: '和上面的 provider 一起填才生效；填错只影响归纳，不影响正常聊天。',
+          when: (valueOf) => valueOf('unreadSummary.enabled') !== false,
         },
       ],
       'pl-debounce': [
@@ -3590,7 +3784,6 @@ window.__ModuleLoader__.load({
 
     /** 未实装条目的「开发中」原因：齿轮可点，但只说明状态，不摆假表单。 */
     const TILE_DEV_REASON = {
-      'sk-memory': '记忆提取走 DSH 的记忆面，本插件没有可写的开关。',
       'sk-remind': '定时提醒还没实装，桥接侧没有对应实现。',
       'sk-weather': '天气查询还是实验条目，接口和触发词都没定。',
       'pl-compact': '上下文压缩由 DSH 会话内部完成，桥接侧没有可调参数。',
@@ -3755,6 +3948,32 @@ window.__ModuleLoader__.load({
             onChange: (next) => setField(field.path, next),
           })
         }
+        if (field.type === 'slider') {
+          // 容量滑条（2026-10-27）：滑条走档位索引，右侧读数跟手刷新。
+          // 读数来源：拖动中读本地草稿（onDraft 写进 `path.__ui`），否则读配置真值。
+          // 非档位的历史值（如 200000）也照实显示，滑条位置就近吸附 —— 不做静默取整，
+          // 否则用户会以为配置被自己改了。
+          const real = Number(value ?? CONTEXT_TOKEN_MIN)
+          const uiKey = field.path + '.__ui'
+          const shown = has(uiKey) ? Number(draft[uiKey]) : real
+          return h('label', { key: field.path, className: 'qqg-field' },
+            h('span', { className: 'qqg-field-label' }, field.label),
+            h('div', { className: 'qqg-slider-row' },
+              h(Slider, {
+                min: 1, max: field.steps ?? CONTEXT_TOKEN_STEPS, step: 1,
+                value: contextTokensToStep(real),
+                disabled: !writable,
+                ariaLabel: field.label,
+                onDraft: (stepIndex) => setField(uiKey, contextStepToTokens(stepIndex)),
+                // 松手才落盘：写入的是档位对应的 token 数。
+                onCommit: (stepIndex) => setField(field.path, contextStepToTokens(stepIndex)),
+              }),
+              h('span', { className: 'qqg-slider-value' }, formatContextTokens(shown))),
+            h('div', { className: 'qqg-slider-ticks-ends' },
+              h('span', null, formatContextTokens(CONTEXT_TOKEN_MIN)),
+              h('span', null, formatContextTokens(CONTEXT_TOKEN_MAX))),
+            field.hint ? h('span', { className: 'qqg-field-hint' }, field.hint) : null)
+        }
         if (field.type === 'number') {
           return h(NumField, {
             key: field.path, label: field.label, hint: field.hint,
@@ -3762,6 +3981,23 @@ window.__ModuleLoader__.load({
             disabled: !writable,
             onChange: (next) => setField(field.path, next),
           })
+        }
+        if (field.type === 'textarea') {
+          // 多行文本（2026-10-27）：触发提示词这类需要换行的字段用它，
+          // 单行的 TextField 会把换行吃掉，用户没法排版。
+          return h('label', { key: field.path, className: 'qqg-field' },
+            h('span', { className: 'qqg-field-label' }, field.label),
+            h('textarea', {
+              className: 'qqg-textarea',
+              style: { width: '100%' },
+              rows: field.rows ?? 4,
+              placeholder: field.placeholder ?? '',
+              value: String(value ?? ''),
+              disabled: !writable,
+              'aria-label': field.label,
+              onChange: (e) => setField(field.path, e.target.value),
+            }),
+            field.hint ? h('span', { className: 'qqg-field-hint' }, field.hint) : null)
         }
         if (field.type === 'secret') {
           // role('secret')：配置里的明文一律不回显，输入框里只有用户这次新敲的字符。
