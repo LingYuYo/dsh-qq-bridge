@@ -102,6 +102,9 @@ const HOT_KEYS = [
   'personaCore',
   // v2.0 第十一步：全局黑话词条（单群同名覆盖）。
   'slangGlobal',
+  // v2.0 第十三步：模板六项字段下沉，选中模板变化要热同步。
+  'personaPresets',
+  'personaPresetId',
 ]
 
 /**
@@ -122,6 +125,9 @@ const PERSONA_KEYS = [
   'personaParticipation',
   'personaExtraRules',
   'personaSystemPrompt',
+  // v2.0 第十三步：模板自带六项字段，选中模板或模板内容变化都要重拼。
+  'personaPresets',
+  'personaPresetId',
   // 默认人设变化也要重推（它决定「什么都没自定义」时的人设正文）。
   'personaDefault',
   // 模型路由会注入人设（【底层模型】一行），所以它也是人设签名的一部分：

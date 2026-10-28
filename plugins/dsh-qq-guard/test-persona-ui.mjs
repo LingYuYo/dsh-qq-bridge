@@ -117,7 +117,17 @@ const VALUE = {
   personaText: '',
   personaExtraRules: '',
   personaSystemPrompt: '',
-  personaPresets: [{ id: 'p1', name: '猫娘', text: '你是一只傲娇猫娘。' }],
+  personaPresets: [{
+    id: 'p1',
+    name: '猫娘',
+    text: '你是一只傲娇猫娘。',
+    botName: '猫猫',
+    groupName: '喵',
+    participation: 'active',
+    identity: '你是一只傲娇猫娘。',
+    boundary: '不咬人',
+    style: '被摸头就哼',
+  }],
   personaPresetId: '',
   personaPresetDefault: '默认人设正文',
   allow: { private: [], groups: [], allowAllWhenEmpty: false },
@@ -218,7 +228,7 @@ check('点编辑 → 弹窗包含全部字段与提示语', () => {
   tree = repaint()
   assert(modalTitle(tree) === '人设设置', `弹窗标题「${modalTitle(tree)}」`)
   for (const label of ['选择人设', '机器人名字', '群内展示名', '参与度',
-    '身份定义与气质', '边界与安全红线', '交互策略与应对模式', '系统提示词覆盖']) {
+    '身份定义与气质', '边界与安全红线', '交互策略与应对模式']) {
     const found = findAll(tree, (n) => n.props?.['aria-label'] === label)[0]
     assert(found, `缺字段「${label}」`)
   }
@@ -237,7 +247,7 @@ check('参与度下拉有三档', () => {
   assert(JSON.stringify(labels) === JSON.stringify(['安静型', '普通群友', '活跃型']), JSON.stringify(labels))
 })
 
-check('编辑并保存 → 字段一次性写回配置，弹窗关闭', () => {
+check('编辑并保存 → 六项写进当前模板与全局，弹窗关闭', () => {
   mutations.length = 0
   let tree = renderSettings()
   btnByText(tree, '⚙️ 编辑人设').props.onClick()
@@ -249,13 +259,16 @@ check('编辑并保存 → 字段一次性写回配置，弹窗关闭', () => {
     node.props.onChange({ target: { value } })
     tree = repaint()
   }
+  // v2.0 第十三步：默认内置时六项禁用；先选一个模板再改。
+  findAll(tree, (n) => n.tag === 'select' && n.props?.['aria-label'] === '选择人设')[0]
+    .props.onChange({ target: { value: 'p1' } })
+  tree = repaint()
   change('机器人名字', '深海小鱼')
   change('群内展示名', '小鱼酱')
   change('参与度', 'quiet')
   change('身份定义与气质', '新的角色设定\n第二行')
   change('边界与安全红线', '别说脏话')
   change('交互策略与应对模式', '被骂就损回去')
-  change('系统提示词覆盖', '')
   btnByText(tree, '保存').props.onClick()
   tree = repaint()
   assert(VALUE.personaBotName === '深海小鱼', VALUE.personaBotName)
@@ -265,8 +278,52 @@ check('编辑并保存 → 字段一次性写回配置，弹窗关闭', () => {
   assert(VALUE.personaCore.boundary === '别说脏话')
   assert(VALUE.personaCore.style === '被骂就损回去')
   assert(VALUE.personaText === '', '旧大文本框应被清空，避免两套设定叠加')
-  assert(VALUE.personaSystemPrompt === '', VALUE.personaSystemPrompt)
+  // 六项必须完整写进 p1 模板本身
+  const preset = VALUE.personaPresets.find((item) => item.id === 'p1')
+  assert(preset.botName === '深海小鱼', JSON.stringify(preset))
+  assert(preset.groupName === '小鱼酱')
+  assert(preset.participation === 'quiet')
+  assert(preset.identity === '新的角色设定\n第二行')
+  assert(preset.boundary === '别说脏话')
+  assert(preset.style === '被骂就损回去')
+  assert(VALUE.personaPresetId === 'p1')
   assert(!modalTitle(tree).includes('人设设置'), '保存后弹窗没关')
+})
+
+check('切换模板 / 新建 / 回到默认内置：六项完整重置，不残留', () => {
+  // 上一个用例改过 p1，这里先重置夹具，保证断言的是固定数据。
+  const p1 = VALUE.personaPresets.find((item) => item.id === 'p1')
+  Object.assign(p1, {
+    botName: '猫猫', groupName: '喵', participation: 'active',
+    identity: '你是一只傲娇猫娘。', boundary: '不咬人', style: '被摸头就哼',
+  })
+  let tree = renderSettings()
+  btnByText(tree, '⚙️ 编辑人设').props.onClick()
+  tree = repaint()
+  const field = (label) => findAll(tree, (n) => (n.tag === 'input' || n.tag === 'textarea' || n.tag === 'select')
+    && n.props?.['aria-label'] === label)[0]
+  const snapshot = () => ['机器人名字', '群内展示名', '参与度', '身份定义与气质', '边界与安全红线', '交互策略与应对模式']
+    .map((label) => String(field(label).props.value ?? ''))
+  const choose = (id) => {
+    findAll(tree, (n) => n.tag === 'select' && n.props?.['aria-label'] === '选择人设')[0]
+      .props.onChange({ target: { value: id } })
+    tree = repaint()
+  }
+  // 选 p1 → 六项 = 模板数据
+  choose('p1')
+  assert(JSON.stringify(snapshot()) === JSON.stringify(['猫猫', '喵', 'active', '你是一只傲娇猫娘。', '不咬人', '被摸头就哼']),
+    JSON.stringify(snapshot()))
+  // 回到默认内置 → 六项全空且禁用
+  choose('')
+  assert(JSON.stringify(snapshot()) === JSON.stringify(['', '', 'normal', '', '', '']), JSON.stringify(snapshot()))
+  assert(field('身份定义与气质').props.disabled === true, '默认内置时正文应禁用')
+  // 新建 → 六项全空、可编辑
+  choose('p1')
+  btnByText(tree, '+ 添加人设').props.onClick()
+  tree = repaint()
+  assert(JSON.stringify(snapshot()) === JSON.stringify(['', '', 'normal', '', '', '']),
+    `新建后应全空，实际 ${JSON.stringify(snapshot())}`)
+  assert(field('身份定义与气质').props.disabled !== true, '新建模板应可编辑')
 })
 
 check('取消不写配置', () => {
@@ -297,20 +354,31 @@ check('添加人设 → 下拉多一项，保存后写入列表并选中', () =>
   btnByText(tree, '保存').props.onClick()
   tree = repaint()
   assert(VALUE.personaPresets.length === 2, JSON.stringify(VALUE.personaPresets))
-  const added = VALUE.personaPresets.find((p) => p.text === '新人设正文')
+  const added = VALUE.personaPresets.find((p) => p.identity === '新人设正文')
   assert(added, '新人设没写进列表')
   assert(VALUE.personaPresetId === added.id, `选中 id 是「${VALUE.personaPresetId}」`)
 })
 
-check('选择已有自定义人设 → 角色设定回填', () => {
+check('选择已有自定义人设 → 六项完整回填', () => {
+  const p1 = VALUE.personaPresets.find((item) => item.id === 'p1')
+  Object.assign(p1, {
+    botName: '猫猫', groupName: '喵', participation: 'active',
+    identity: '你是一只傲娇猫娘。', boundary: '不咬人', style: '被摸头就哼',
+  })
   let tree = renderSettings()
   btnByText(tree, '⚙️ 编辑人设').props.onClick()
   tree = repaint()
   findAll(tree, (n) => n.tag === 'select' && n.props?.['aria-label'] === '选择人设')[0]
     .props.onChange({ target: { value: 'p1' } })
   tree = repaint()
-  const textarea = findAll(tree, (n) => n.tag === 'textarea' && n.props?.['aria-label'] === '身份定义与气质')[0]
-  assert(textarea.props.value === '你是一只傲娇猫娘。', `回填「${textarea.props.value}」`)
+  const valueOf = (label) => findAll(tree, (n) => n.tag === 'textarea' || n.tag === 'input' || n.tag === 'select')
+    .find((n) => n.props?.['aria-label'] === label)
+  assert(valueOf('身份定义与气质').props.value === '你是一只傲娇猫娘。', valueOf('身份定义与气质').props.value)
+  assert(valueOf('机器人名字').props.value === '猫猫', valueOf('机器人名字').props.value)
+  assert(valueOf('群内展示名').props.value === '喵')
+  assert(valueOf('参与度').props.value === 'active')
+  assert(valueOf('边界与安全红线').props.value === '不咬人')
+  assert(valueOf('交互策略与应对模式').props.value === '被摸头就哼')
   btnByText(tree, '取消').props.onClick()
 })
 

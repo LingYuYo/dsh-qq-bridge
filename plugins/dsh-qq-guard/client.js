@@ -2238,49 +2238,81 @@ window.__ModuleLoader__.load({
         return Array.isArray(raw)
           ? raw
             .filter((item) => item && typeof item === 'object')
-            .map((item) => ({ id: String(item.id ?? ''), name: String(item.name ?? ''), text: String(item.text ?? '') }))
+            .map((item) => ({
+              id: String(item.id ?? ''),
+              name: String(item.name ?? ''),
+              // v2.0 第十三步：六项全部存在模板里；text 兼容旧数据。
+              botName: String(item.botName ?? ''),
+              groupName: String(item.groupName ?? ''),
+              participation: String(item.participation ?? 'normal'),
+              identity: String(item.identity ?? item.text ?? ''),
+              boundary: String(item.boundary ?? ''),
+              style: String(item.style ?? ''),
+            }))
           : []
       }
-      const [draft, setDraft] = React.useState(() => ({
-        selected: String(get('personaPresetId') ?? ''),
-        botName: String(get('personaBotName') ?? ''),
-        groupName: String(get('personaGroupName') ?? ''),
-        participation: String(get('personaParticipation') ?? 'normal'),
-        // 三段式静态核心（v2.0 第十步）：替代原来的单一大文本框。
-        coreIdentity: String(get('personaCore.identity') ?? ''),
-        coreBoundary: String(get('personaCore.boundary') ?? ''),
-        coreStyle: String(get('personaCore.style') ?? ''),
-        extraRules: String(get('personaExtraRules') ?? ''),
-        systemPrompt: String(get('personaSystemPrompt') ?? ''),
-        presets: readPresets(),
-      }))
+      const [initialPresets] = React.useState(readPresets)
+      /**
+       * 下拉切换 / 新建 / 删除后，把整个表单覆盖成该模板的六项数据。
+       *
+       * 关键：不能只改 selected 与正文——名字、展示名、参与度、身份、边界、策略
+       * 必须一起重置，否则会残留上一个模板的内容（2026-10-28 实测 Bug）。
+       */
+      const snapshotFor = (id, presets) => {
+        if (id === '') {
+          // 默认内置：六项全空（禁用编辑），完全由内置人设兜底。
+          return {
+            selected: '',
+            name: '',
+            botName: '',
+            groupName: '',
+            participation: 'normal',
+            identity: '',
+            boundary: '',
+            style: '',
+            presets,
+          }
+        }
+        const preset = presets.find((item) => item.id === id) ?? null
+        return {
+          selected: id,
+          name: String(preset?.name ?? ''),
+          botName: String(preset?.botName ?? ''),
+          groupName: String(preset?.groupName ?? ''),
+          participation: String(preset?.participation ?? 'normal'),
+          identity: String(preset?.identity ?? ''),
+          boundary: String(preset?.boundary ?? ''),
+          style: String(preset?.style ?? ''),
+          presets,
+        }
+      }
+      const [draft, setDraft] = React.useState(
+        () => snapshotFor(String(get('personaPresetId') ?? ''), initialPresets),
+      )
       const set = (key, value) => setDraft((prev) => ({ ...prev, [key]: value }))
       const selectedPreset = draft.presets.find((item) => item.id === draft.selected) ?? null
+      const builtin = draft.selected === ''
 
-      const selectPreset = (id) => {
-        if (id === '') {
-          setDraft((prev) => ({ ...prev, selected: '', text: '', coreIdentity: '' }))
-          return
-        }
-        const preset = draft.presets.find((item) => item.id === id)
-        if (!preset) return
-        // 预设仍然兼容：选中时把它的正文填进「身份定义与气质」。
-        setDraft((prev) => ({ ...prev, selected: id, text: preset.text, coreIdentity: preset.text }))
-      }
+      const selectPreset = (id) => setDraft((prev) => snapshotFor(id, prev.presets))
       const addPreset = () => {
         const id = `persona-${Date.now()}`
-        const preset = { id, name: `人设 ${draft.presets.length + 1}`, text: '' }
-        setDraft((prev) => ({ ...prev, presets: [...prev.presets, preset], selected: id, text: '' }))
+        const preset = {
+          id,
+          name: `人设 ${draft.presets.length + 1}`,
+          botName: '',
+          groupName: '',
+          participation: 'normal',
+          identity: '',
+          boundary: '',
+          style: '',
+        }
+        const presets = [...draft.presets, preset]
+        // 新建：六项强制清空，让用户从零开始填。
+        setDraft(snapshotFor(id, presets))
       }
       const removePreset = () => {
         if (draft.selected === '') return
-        setDraft((prev) => ({
-          ...prev,
-          presets: prev.presets.filter((item) => item.id !== prev.selected),
-          selected: '',
-          text: '',
-          coreIdentity: '',
-        }))
+        setDraft((prev) => snapshotFor('', prev.presets.filter((item) => item.id !== prev.selected)))
       }
       /** 改名只动 draft.presets 里当前选中项的 name，保存时随整组一起写回。 */
       const renamePreset = (name) => setDraft((prev) => ({
@@ -2289,24 +2321,30 @@ window.__ModuleLoader__.load({
       }))
       const save = () => {
         if (!writable || typeof writeMany !== 'function') return
-        // 选中的自定义人设跟着「身份定义」一起更新。
+        // 六项完整写进当前选中的模板对象（名字也一起写回）。
         const presets = draft.presets.map((item) => (item.id === draft.selected
-          ? { ...item, text: draft.coreIdentity }
+          ? {
+            ...item,
+            name: String(item.name ?? ''),
+            botName: draft.botName.trim(),
+            groupName: draft.groupName.trim(),
+            participation: draft.participation,
+            identity: draft.identity,
+            boundary: draft.boundary,
+            style: draft.style,
+          }
           : item))
         // 一次 mutate 提交整组字段；writeMany 会先乐观生效，失败再整组回滚。
+        // 同时写全局六项（兼容旧字段 / 概览卡），并以当前选中模板为唯一拼装来源。
         writeMany([
           { op: 'set', path: ['personaBotName'], value: draft.botName.trim() },
           { op: 'set', path: ['personaGroupName'], value: draft.groupName.trim() },
           { op: 'set', path: ['personaParticipation'], value: draft.participation },
-          // v2.0 第十步：三段式静态核心；旧的大文本框清空，避免两套设定叠加。
-          // 逐字段 set（不要整对象 set）：DSH 的 mutate 对 object 字段按子键校验，
-          // 整对象 set 会被 schema 拒绝 → 整组回滚（2026-10-28 实测的保存失败根因）。
-          { op: 'set', path: ['personaCore', 'identity'], value: draft.coreIdentity },
-          { op: 'set', path: ['personaCore', 'boundary'], value: draft.coreBoundary },
-          { op: 'set', path: ['personaCore', 'style'], value: draft.coreStyle },
+          // 逐字段 set（不要整对象 set）：DSH 的 mutate 对 object 字段按子键校验。
+          { op: 'set', path: ['personaCore', 'identity'], value: draft.identity },
+          { op: 'set', path: ['personaCore', 'boundary'], value: draft.boundary },
+          { op: 'set', path: ['personaCore', 'style'], value: draft.style },
           { op: 'set', path: ['personaText'], value: '' },
-          { op: 'set', path: ['personaExtraRules'], value: draft.extraRules },
-          { op: 'set', path: ['personaSystemPrompt'], value: draft.systemPrompt },
           { op: 'set', path: ['personaPresetId'], value: draft.selected },
           { op: 'set', path: ['personaPresets'], value: presets },
         ])
@@ -2324,24 +2362,24 @@ window.__ModuleLoader__.load({
       desc ? h('div', { className: 'qqg-pf-desc' }, desc) : null,
       h('div', { className: 'qqg-pf-ctl' }, control))
 
-      /** 多行文本框 + 框下字数占位提示。 */
+      /** 多行文本框 + 框下字数占位提示。默认内置时禁用（没有模板可编辑）。 */
       const textarea = (key, ariaLabel, rows, placeholder) => h(React.Fragment, null,
         h('textarea', {
           className: 'qqg-textarea',
           rows,
           value: draft[key],
-          disabled: !writable,
-          placeholder,
+          disabled: !writable || builtin,
+          placeholder: builtin ? '默认内置人设不提供正文编辑；先选择或新建一个人设模板' : placeholder,
           'aria-label': ariaLabel,
           onChange: (e) => set(key, e.target.value),
         }),
         h('div', { className: 'qqg-pf-foot' },
-          charCount(draft[key]) > 0 ? `已填 ${charCount(draft[key])} 字` : '未填写'))
+          builtin ? '继承内置人设' : (charCount(draft[key]) > 0 ? `已填 ${charCount(draft[key])} 字` : '未填写')))
 
       return h(Modal, {
         open: true,
         title: '人设设置',
-        desc: '名字、参与度和附加规则会和角色设定一起拼成最终系统提示词；留空即用内置。',
+        desc: '每个人设模板自带名字、展示名、参与度与三段核心；选中的模板就是全局生效的人设。',
         onClose,
         footer: [
           h('button', { key: 'c', type: 'button', className: 'qqg-btn', onClick: onClose }, '取消'),
@@ -2354,6 +2392,10 @@ window.__ModuleLoader__.load({
       },
       writable ? null : h('div', { className: 'qqg-status qqg-status-err', style: { marginBottom: 10 } },
         '当前配置不可写，下面的内容只能看不能改。'),
+      builtin
+        ? h('div', { className: 'qqg-hint', style: { marginBottom: 8 } },
+          '当前是「默认人设（内置）」：六项字段不可编辑。选择或新建人设模板后再填写。')
+        : null,
 
       h('div', { className: 'qqg-pform' },
 
@@ -2389,23 +2431,23 @@ window.__ModuleLoader__.load({
             })
             : null),
 
-        // 第一排：名字 / 展示名 / 参与度（固定 200px，并排紧凑，不占满整行）
+        // 第一排：名字 / 展示名 / 参与度（模板自带，默认内置时禁用）
         h('div', { className: 'qqg-prow' },
-          pField('机器人名字', '会替换默认人设里的名字，并追加身份说明。',
+          pField('机器人名字', '模板自带；选中的模板决定 bot 的名字。',
             h('input', {
-              className: 'qqg-input', value: draft.botName, disabled: !writable,
+              className: 'qqg-input', value: draft.botName, disabled: !writable || builtin,
               placeholder: '例如：林小鱼', 'aria-label': '机器人名字',
               onChange: (e) => set('botName', e.target.value),
             })),
           pField('群内展示名', '群聊里对别人显示的昵称。',
             h('input', {
-              className: 'qqg-input', value: draft.groupName, disabled: !writable,
+              className: 'qqg-input', value: draft.groupName, disabled: !writable || builtin,
               placeholder: '例如：小鱼', 'aria-label': '群内展示名',
               onChange: (e) => set('groupName', e.target.value),
             })),
           pField('参与度', '决定 bot 在群里主动接话的频率。',
             h('select', {
-              className: 'qqg-input', value: draft.participation, disabled: !writable,
+              className: 'qqg-input', value: draft.participation, disabled: !writable || builtin,
               'aria-label': '参与度',
               onChange: (e) => set('participation', e.target.value),
             }, PERSONA_PARTICIPATION.map((item) => h('option', { key: item.id, value: item.id }, item.label))))),
@@ -2414,18 +2456,16 @@ window.__ModuleLoader__.load({
         // 三段式静态核心（v2.0 第十步）：替代原来的单一大文本框。
         // 这三段吃前缀缓存；动态记忆（群友档案 / 黑话）不在这里，也不会改它。
         pField('身份定义与气质', '你是谁、什么性格、怎么说话。锁定为最高优先级。',
-          textarea('coreIdentity', '身份定义与气质', 5, '例如：你是一只嘴上不饶人的鲸鱼娘，说话短、爱损人……'), true),
+          textarea('identity', '身份定义与气质', 5, '例如：你是一只嘴上不饶人的鲸鱼娘，说话短、爱损人……'), true),
         pField('边界与安全红线', '绝对不能做什么；越权、隐私、危险请求一律拒绝。',
-          textarea('coreBoundary', '边界与安全红线', 4, '例如：不透露本机路径与凭据；不执行任何管理操作……'), true),
+          textarea('boundary', '边界与安全红线', 4, '例如：不透露本机路径与凭据；不执行任何管理操作……'), true),
         pField('交互策略与应对模式', '被问到什么、被挑衅、冷场时分别怎么处理。',
-          textarea('coreStyle', '交互策略与应对模式', 4, '例如：不知道就直说不知道；被骂就损回去但不升级……'), true),
-        pField('系统提示词覆盖', '留空=使用内置。填了就完全替换上面拼出来的内容。',
-          textarea('systemPrompt', '系统提示词覆盖', 4, '整段系统提示词；填写后名字 / 参与度 / 附加规则都不再追加。'), true),
+          textarea('style', '交互策略与应对模式', 4, '例如：不知道就直说不知道；被骂就损回去但不升级……'), true),
 
         // 底部提示：紧贴表单下方
         h('div', { className: 'qqg-hint' },
-          '改动要点保存才会生效。'
-          + (selectedPreset ? `当前选择的自定义人设：${selectedPreset.name || selectedPreset.id}。` : '当前使用默认人设。'))))
+          '改动要点保存才会生效，六项会写进当前模板。'
+          + (selectedPreset ? `当前模板：${selectedPreset.name || selectedPreset.id}。` : '当前使用默认内置人设。'))))
     }
 
     /**
@@ -2434,12 +2474,15 @@ window.__ModuleLoader__.load({
      */
     function PersonaSection({ get, write, writable, writeMany }) {
       const [open, setOpen] = React.useState(false)
-      const botName = String(get('personaBotName') ?? '').trim()
-      const groupName = String(get('personaGroupName') ?? '').trim()
-      const participation = String(get('personaParticipation') ?? 'normal')
-      const coreIdentity = String(get('personaCore.identity') ?? '')
-      const coreBoundary = String(get('personaCore.boundary') ?? '')
-      const coreStyle = String(get('personaCore.style') ?? '')
+      // v2.0 第十三步：选中模板优先，旧全局字段只做兼容兜底。
+      const presets = Array.isArray(get('personaPresets')) ? get('personaPresets') : []
+      const activePreset = presets.find((item) => String(item?.id ?? '') === String(get('personaPresetId') ?? '')) ?? null
+      const botName = String(activePreset?.botName ?? get('personaBotName') ?? '').trim()
+      const groupName = String(activePreset?.groupName ?? get('personaGroupName') ?? '').trim()
+      const participation = String(activePreset?.participation ?? get('personaParticipation') ?? 'normal')
+      const coreIdentity = String(activePreset?.identity ?? get('personaCore.identity') ?? '')
+      const coreBoundary = String(activePreset?.boundary ?? get('personaCore.boundary') ?? '')
+      const coreStyle = String(activePreset?.style ?? get('personaCore.style') ?? '')
       const preview = (value) => String(value ?? '').replace(/\r/g, '').split('\n').filter((line) => line.trim() !== '').slice(0, 2).join('\n')
 
       return h('div', { className: 'qqg-group' },
@@ -4098,19 +4141,20 @@ window.__ModuleLoader__.load({
       const set = (key, value) => setDraft((prev) => ({ ...prev, [key]: value }))
       const chooseTemplate = (id) => {
         if (id === '') {
+          // 空 = 继承全局当前选中的模板（不复制值，保存为空串即可）。
           setDraft({ templateId: '', botName: '', groupName: '', participation: '', identity: '', boundary: '', style: '' })
           return
         }
         const preset = presets.find((item) => String(item.id) === String(id))
-        // 选中模板 = 以「全局当前配置 + 模板正文」为起点，之后允许单群局部改。
+        // 选中全局模板 = 用该模板的六项回填，之后允许单群局部改。
         setDraft({
           templateId: String(id),
-          botName: String(get?.('personaBotName') ?? ''),
-          groupName: String(get?.('personaGroupName') ?? ''),
-          participation: String(get?.('personaParticipation') ?? 'normal'),
-          identity: String(preset?.text ?? '') || globalCore.identity,
-          boundary: globalCore.boundary,
-          style: globalCore.style,
+          botName: String(preset?.botName ?? ''),
+          groupName: String(preset?.groupName ?? ''),
+          participation: String(preset?.participation ?? ''),
+          identity: String(preset?.identity ?? preset?.text ?? ''),
+          boundary: String(preset?.boundary ?? ''),
+          style: String(preset?.style ?? ''),
         })
       }
       const save = () => onSave({

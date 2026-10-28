@@ -213,5 +213,36 @@ await check('dynamic：空串 / null / 空对象 = 删除覆盖，重新继承�
   assert.equal(b.state.sessions[key].personaOverride, null, '空对象也算删除')
 })
 
+await check('模板六项：选中模板决定全局人设', () => {
+  const b = makeBridge()
+  b.live.personaPresets = [{
+    id: 'p1', name: '猫娘', botName: '猫猫', groupName: '喵', participation: 'active',
+    identity: '傲娇', boundary: '不咬人', style: '被摸头就哼',
+  }]
+  b.live.personaPresetId = 'p1'
+  const prompt = b.buildPersonaPrompt(b.live)
+  assert.match(prompt, /你的名字是「猫猫」/u)
+  assert.match(prompt, /展示名是「喵」/u)
+  assert.match(prompt, /傲娇/u)
+  assert.match(prompt, /不咬人/u)
+  assert.match(prompt, /被摸头就哼/u)
+})
+
+await check('单群留空继承模板字段（不覆盖时用模板）', () => {
+  const b = makeBridge()
+  b.live.personaPresets = [{
+    id: 'p1', botName: '猫猫', groupName: '喵', participation: 'active',
+    identity: '傲娇', boundary: '不咬人', style: '哼',
+  }]
+  b.live.personaPresetId = 'p1'
+  const prompt = b.buildPersonaPrompt(b.live, { core: { identity: '' } })
+  assert.match(prompt, /猫猫/u)
+  assert.match(prompt, /傲娇/u)
+  // 单群覆盖某一段时，其余段仍继承模板
+  const overridden = b.buildPersonaPrompt(b.live, { core: { identity: '本群潜水员' } })
+  assert.match(overridden, /本群潜水员/u)
+  assert.match(overridden, /不咬人/u)
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) process.exitCode = 1

@@ -554,8 +554,16 @@ const Config = Schema.object({
   personaPresets: Schema.array(Schema.object({
     id: Schema.string().required(),
     name: Schema.string().default(''),
+    // v2.0 第十三步（2026-10-28）：六项配置下沉到模板本身。
+    // text 保留兼容旧数据（= identity 的旧字段）。
     text: Schema.string().default(''),
-  })).description('自定义人设列表（UI 下拉选择用）。')
+    botName: Schema.string().default(''),
+    groupName: Schema.string().default(''),
+    participation: Schema.string().default('normal'),
+    identity: Schema.string().default(''),
+    boundary: Schema.string().default(''),
+    style: Schema.string().default(''),
+  })).description('人设模板列表：每个模板自带名字 / 展示名 / 参与度 / 三段核心。')
     .default([]).volatile(),
   personaPresetId: Schema.string()
     .description('当前选中的自定义人设 id；空串 = 使用默认人设。')

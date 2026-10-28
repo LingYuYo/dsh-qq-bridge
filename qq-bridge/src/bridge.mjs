@@ -1253,6 +1253,9 @@ export class Bridge {
         : 'normal',
       personaExtraRules: typeof config.personaExtraRules === 'string' ? config.personaExtraRules : '',
       personaSystemPrompt: typeof config.personaSystemPrompt === 'string' ? config.personaSystemPrompt : '',
+      // v2.0 第十三步：六项配置下沉到模板。桥接按 personaPresetId 取当前模板。
+      personaPresets: Array.isArray(config.personaPresets) ? config.personaPresets : [],
+      personaPresetId: typeof config.personaPresetId === 'string' ? config.personaPresetId : '',
       // 超时/看门狗失败时发给 QQ 的文案（2026-10-26）：空串 = 用内置默认，
       // 绝不把 DSH 的英文报错发到群里（见 _timeoutReplyText / _isTimeoutish）。
       timeoutReplyText: typeof config.timeoutReplyText === 'string' ? config.timeoutReplyText : '',
@@ -1368,11 +1371,38 @@ export class Bridge {
   }
 
   /**
+   * 取当前选中的全局人设模板（v2.0 第十三步）。
+   *
+   * 六项配置（名字 / 展示名 / 参与度 / 身份 / 边界 / 策略）全部下沉到模板；
+   * 没选模板时返回 null，由 `buildPersonaPrompt` 回落到旧全局字段与内置人设。
+   *
+   * @param {object} [source]
+   * @returns {{botName:string,groupName:string,participation:string,core:{identity:string,boundary:string,style:string}}|null}
+   */
+  _activeTemplate(source = this.live) {
+    const list = Array.isArray(source?.personaPresets) ? source.personaPresets : []
+    const id = String(source?.personaPresetId ?? '').trim()
+    if (id === '') return null
+    const preset = list.find((item) => String(item?.id ?? '') === id)
+    if (!preset || typeof preset !== 'object') return null
+    const str = (value) => (typeof value === 'string' ? value.trim() : '')
+    return {
+      botName: str(preset.botName),
+      groupName: str(preset.groupName),
+      participation: ['quiet', 'normal', 'active'].includes(preset.participation) ? preset.participation : '',
+      // 旧模板只有 text：把它当 identity，避免升级后正文丢失。
+      core: {
+        identity: str(preset.identity) || str(preset.text),
+        boundary: str(preset.boundary),
+        style: str(preset.style),
+      },
+    }
+  }
+
+  /**
    * 桥接层的最终系统提示词：把所有新增人设字段整合成一段 prefix 文本。
    *
-   * preset 里已经删掉静态 persona 行，这段文本会由 {@link setGlobalPersona} 推给
-   * 插件的动态 section，作为「全局默认人设」。返回空串表示什么都没自定义，
-   * 此时文本就是空，回落到插件侧 personaDefault。
+   * 优先级（v2.0 第十三步）：单群覆盖 > 当前全局模板 > 旧全局字段 > 内置默认。
    *
    * @param {object} [source] 默认读 this.live，测试可注入
    * @returns {string}
@@ -1380,33 +1410,37 @@ export class Bridge {
   buildPersonaPrompt(source = this.live, {
     core = null, botName = '', groupName = '', participation = '', selfId = '', selfName = '',
   } = {}) {
+    const template = this._activeTemplate(source)
     return composePersonaPrompt({
       systemPrompt: source?.personaSystemPrompt,
-      baseText: source?.personaText,
+      // 选中模板时不再用旧的大文本框（模板正文优先）；没选模板才兼容旧字段。
+      baseText: template ? '' : source?.personaText,
       defaultText: this._defaultPersona(source),
-      // 单群覆盖：名字 / 展示名 / 参与度留空就继承全局。
-      botName: botName || source?.personaBotName,
-      groupName: groupName || source?.personaGroupName,
-      participation: participation || source?.personaParticipation,
+      // 单群覆盖：名字 / 展示名 / 参与度留空就继承当前模板，再退旧全局字段。
+      botName: botName || template?.botName || source?.personaBotName,
+      groupName: groupName || template?.groupName || source?.personaGroupName,
+      participation: participation || template?.participation || source?.personaParticipation,
       extraRules: source?.personaExtraRules,
       // 模型自我认知：跟 _applyModel 用同一套优先级，保证「人设里说的」和「实际请求的」一致。
       modelRoute: this._modelRoute(source),
       // 技能能力：只有开启时才告诉模型它有哪些工具（图片理解 / 联网 / 语音）。
       features: this._features(),
-      // 静态核心（全局 ← 单群按段覆盖）与自身信息（QQ 号 / 昵称）。
-      core: this._effectiveCore(core, source),
+      // 静态核心（单群按段覆盖 > 当前模板 > 旧全局 core）。
+      core: this._effectiveCore(core, source, template?.core),
       selfId: String(selfId || this.qq?.selfId || ''),
-      selfName: String(selfName || groupName || source?.personaGroupName || source?.personaBotName || ''),
+      selfName: String(selfName || groupName || template?.groupName
+        || source?.personaGroupName || source?.personaBotName || ''),
     })
   }
 
   /**
-   * 合并三段式静态核心：单群某段非空就覆盖全局对应段，空则继承全局。
+   * 合并三段式静态核心：单群某段非空就覆盖模板对应段，空则继承模板；再回退旧全局 core。
    * @param {{identity?:string,boundary?:string,style?:string}|null} entryCore
    * @param {object} [source]
+   * @param {{identity:string,boundary:string,style:string}|null} [templateCore]
    * @returns {{identity:string,boundary:string,style:string}}
    */
-  _effectiveCore(entryCore, source = this.live) {
+  _effectiveCore(entryCore, source = this.live, templateCore = null) {
     const globalCore = source?.personaCore && typeof source.personaCore === 'object' && !Array.isArray(source.personaCore)
       ? source.personaCore
       : (this.config?.personaCore ?? {})
@@ -1415,6 +1449,8 @@ export class Bridge {
         ? String(entryCore[field] ?? '').trim()
         : ''
       if (local !== '') return local
+      const fromTemplate = templateCore ? String(templateCore[field] ?? '').trim() : ''
+      if (fromTemplate !== '') return fromTemplate
       return String(globalCore?.[field] ?? '').trim()
     }
     return { identity: pick('identity'), boundary: pick('boundary'), style: pick('style') }
