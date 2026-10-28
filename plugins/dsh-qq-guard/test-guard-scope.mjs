@@ -261,6 +261,8 @@ await check('role=settings 有 webServer → 注册全部设置面路由，且�
     '/dsh-qq-guard/napcat',
     // NapCat 登录二维码截图（qrcode.png → 浏览器）
     '/dsh-qq-guard/napcat-qr',
+    // 打开操作日志目录（v2.0 第六步）
+    '/dsh-qq-guard/open-log-dir',
     // 单人设覆盖（桥接每条消息前 POST；guard 实例动态 section 现读）
     '/dsh-qq-guard/persona',
     // 每小时人设归纳（桥接 POST 群聊记录，Host 侧调模型归纳；2026-10-26）
@@ -275,7 +277,7 @@ await check('role=settings 有 webServer → 注册全部设置面路由，且�
     // 真实用量统计（数据与用量面板）+ 历史回填
     '/dsh-qq-guard/usage',
     '/dsh-qq-guard/usage/backfill',
-  ], `路由应为 17 条，实际 ${JSON.stringify(paths)}`)
+  ], `路由应为 18 条，实际 ${JSON.stringify(paths)}`)
   assert.ok(calls.webRoutes.every((r) => r.kind === 'exact'))
 })
 await check('role=settings 无 webServer → 安全跳过', () => {
@@ -335,6 +337,63 @@ await check('session-ops：放行 manual-summarize，GET 能取回同一条指�
   const hit = ops.find((op) => op.op === 'manual-summarize')
   assert.ok(hit, 'GET 应能取到刚入队的 manual-summarize')
   assert.equal(hit.key, 'g:123456')
+})
+
+await check('操作日志目录解析与系统打开（v2.0 第六步）', async () => {
+  const path = await import('node:path')
+  assert.equal(mod.resolveLogDir({}, 'C:/bridge'), path.join('C:/bridge', 'state', 'logs'))
+  assert.equal(mod.resolveLogDir({ logDir: 'logs/custom' }, 'C:/bridge'), path.resolve('C:/bridge', 'logs/custom'))
+  assert.equal(mod.resolveLogDir({ logDir: 'D:/abs/logs' }, 'C:/bridge'), path.normalize('D:/abs/logs'))
+
+  const calls = []
+  const ok = await mod.openInFileManager('C:\\logs\\qq', {
+    execFileImpl: (bin, args, opts, cb) => { calls.push({ bin, args, opts }); cb(null) },
+  })
+  assert.equal(ok, null, '成功时返回 null')
+  assert.deepEqual(calls[0].args, ['C:\\logs\\qq'], '目录作为单个参数传，绝不能拼 shell')
+  assert.equal(calls[0].opts.windowsHide, true)
+
+  const failure = await mod.openInFileManager('C:\\logs', {
+    execFileImpl: (bin, args, opts, cb) => {
+      const error = new Error('spawn explorer.exe ENOENT')
+      error.code = 'ENOENT'
+      cb(error)
+    },
+  })
+  assert.ok(failure, 'ENOENT 才当作失败')
+})
+
+await check('POST /status 的 opLog 按白名单收敛（level 归一 / text 截断）', async () => {
+  const { ctx, calls } = makeCtx({ presetId: undefined, hasWebServer: true, settingsAvailable: true })
+  apply(ctx, Config({ role: 'settings' }))
+  const route = calls.webRoutes.find((r) => r.path === '/dsh-qq-guard/status')
+  assert.ok(route, '没有注册 status 路由')
+  const payload = JSON.stringify({
+    counts: {},
+    opLog: [
+      { at: 1700000000000, level: 'warn', text: '模型报错' },
+      { at: 1700000000001, level: 'weird', text: 'x'.repeat(2000) },
+      { at: 0, level: 'error', text: '   ' },
+    ],
+  })
+  const req = {
+    method: 'POST', headers: {},
+    on(evt, fn) {
+      if (evt === 'data') fn(Buffer.from(payload))
+      if (evt === 'end') fn()
+    },
+  }
+  const res = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+  route.handler(req, res)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(res.status, 200)
+  const getRes = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+  route.handler({ method: 'GET', headers: {} }, getRes)
+  const rows = JSON.parse(getRes.body).status.opLog
+  assert.equal(rows.length, 2, '空文本那条要丢掉')
+  assert.equal(rows[0].level, 'warn')
+  assert.equal(rows[1].level, 'info', '非法 level 归一成 info')
+  assert.equal(rows[1].text.length, 1000, '★ text 截断 1000')
 })
 
 await check('GET /config 带 features（桥接与 guard 共用同一份开关判断）', () => {

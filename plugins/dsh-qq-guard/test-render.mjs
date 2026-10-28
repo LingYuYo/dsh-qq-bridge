@@ -176,7 +176,7 @@ for (const tab of ['status', 'sessions', 'skills', 'settings', 'usage']) {
   if (textSink.length < 10) throw new Error(`Tab「${tab}」渲染出的文本过少（${textSink.length}），疑似空页面`)
   const joined = textSink.join('|')
   const expect = {
-    status: ['今日用量概览', 'AI 排障助手', '启动桥接'],
+    status: ['今日用量概览', 'AI 排障助手', '启动桥接', '桥接操作日志', '打开日志文件夹'],
     // 会话管理已接真实数据：桥接未上报时渲染「等待上报」，不再有假会话。
     sessions: ['会话管理', '等待桥接上报', '运行状态'],
     skills: ['技能（Skill）', '插件（Plugin）', '发语音', '图片理解', '网页搜索', '记忆与上下文',

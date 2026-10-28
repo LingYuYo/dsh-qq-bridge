@@ -93,7 +93,8 @@ import {
   handleUsageBackfillRoute,
   handleUsageRoute,
 } from './usage-stats.mjs'
-import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, realpathSync, promises as fsp } from 'node:fs'
+import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, realpathSync, mkdirSync, promises as fsp } from 'node:fs'
+import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { builtinModules } from 'node:module'
 import os from 'node:os'
@@ -907,6 +908,22 @@ const Config = Schema.object({
       .description('DSH 启动时自动拉起桥接（让状态灯常亮）。已有桥接实例在跑时会自动跳过，不会双开。')
       .default(false).volatile(),
   }).description('桥接进程管理').default({}),
+
+  // ── 操作日志（v2.0 第六步，2026-10-28）────────────────────────
+  //
+  // 桥接把「截断 / 归纳 / 模型报错」这类关键操作按天写进本地文件，
+  // 同时在内存留最近 50 条给设置页。三个字段都允许热改（下一条日志生效）。
+  // 默认目录 = <qq-bridge>/state/logs；填绝对路径可以直接落到别处。
+  logDir: Schema.string()
+    .description('操作日志目录。留空 = qq-bridge/state/logs；相对路径按 qq-bridge 目录解析，'
+      + '也支持绝对路径。')
+    .default('').volatile(),
+  logMaxSizeMB: Schema.number()
+    .description('单个日志文件上限（MB），达到后自动切分成 bridge-日期_时分秒.log。默认 5。')
+    .default(5).min(1).max(100).volatile(),
+  logMaxDays: Schema.number()
+    .description('日志保留天数：启动与每天清理一次，删除修改时间超过该天数的 .log。默认 15。')
+    .default(15).min(1).max(365).volatile(),
   // ── 技能与插件清单（Phase 4：真实读写）──────────────────────
   //
   // 数组顺序 = 界面排序（拖拽/上下移直接写回这个顺序）；
@@ -1026,6 +1043,52 @@ const NAPCAT_QR_MAX_BYTES = 4 * 1024 * 1024
 const BRIDGE_ROUTE_PATH = '/dsh-qq-guard/bridge'
 /** 路由路径：调起系统原生「选择文件夹」对话框（NapCat 安装目录的「浏览」按钮）。 */
 const PICK_DIR_ROUTE_PATH = '/dsh-qq-guard/pick-dir'
+/** 路由路径：在系统资源管理器里打开操作日志目录（v2.0 第六步）。 */
+const OPEN_LOG_DIR_ROUTE_PATH = '/dsh-qq-guard/open-log-dir'
+
+/**
+ * 解析操作日志目录（v2.0 第六步）。
+ *
+ * 口径必须与桥接 `OpLogFile.directory` 完全一致，否则「打开日志文件夹」会打开
+ * 一个空目录：空配置 → `<bridgeDir>/state/logs`；相对路径按 bridgeDir 解析；
+ * 绝对路径原样使用。
+ *
+ * @param {object} cfg 插件配置（已 plainConfig）
+ * @param {string} bridgeDir qq-bridge 目录
+ * @returns {string} 绝对路径
+ */
+export function resolveLogDir(cfg, bridgeDir) {
+  const raw = String(cfg?.logDir ?? '').trim()
+  const base = String(bridgeDir ?? '').trim() || DEFAULT_BRIDGE_DIR
+  if (raw === '') return path.join(base, 'state', 'logs')
+  return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(base, raw)
+}
+
+/**
+ * 在系统文件管理器里打开一个目录。
+ *
+ * macOS / Linux 用 `open` / `xdg-open`；Windows 用绝对路径的 explorer.exe。
+ * explorer 即使成功也常返回非 0 退出码，所以**只有 ENOENT**（可执行文件不存在）
+ * 才算失败 —— 否则用户会一直看到「打开失败」但窗口其实已经弹出来了。
+ *
+ * @param {string} target 绝对路径
+ * @param {{execFileImpl?:Function}} [opts] 测试注入
+ * @returns {Promise<Error|null>} null = 已发起打开；Error = 失败原因
+ */
+export function openInFileManager(target, { execFileImpl = execFile } = {}) {
+  const bin = process.platform === 'win32'
+    ? path.join(process.env.SystemRoot || 'C:\\Windows', 'explorer.exe')
+    : process.platform === 'darwin' ? 'open' : 'xdg-open'
+  return new Promise((resolve) => {
+    try {
+      execFileImpl(bin, [target], { windowsHide: true }, (error) => {
+        resolve(error && error.code === 'ENOENT' ? error : null)
+      })
+    } catch (error) {
+      resolve(error instanceof Error ? error : new Error(String(error)))
+    }
+  })
+}
 /** 路由路径：只读扫描外部插件目录（Phase 4）。 */
 const EXTERNAL_ROUTE_PATH = '/dsh-qq-guard/external-plugins'
 /** 路由路径：在独立沙箱子进程里加载一个外部插件（P1，只读测试）。 */
@@ -2915,6 +2978,29 @@ export async function cleanupOrphanPokeImages(config) {
 }
 
 /**
+ * 收敛「操作日志」单行：at 时间戳、level 三档、text 截断。
+ *
+ * 为什么不让桥接原样透传：这条路由对任何本机进程开放（无 Cookie），
+ * 只收白名单字段是既有原则；顺带把异常 level 归一成 info，前端样式不用兜底。
+ * @param {unknown} row
+ * @returns {{at:number, level:'info'|'warn'|'error', text:string}|null}
+ */
+function sanitizeOpLogRow(row) {
+  if (!row || typeof row !== 'object') return null
+  const at = Number(row.at)
+  const level = row.level === 'error' ? 'error' : row.level === 'warn' ? 'warn' : 'info'
+  const text = typeof row.text === 'string'
+    ? row.text.replace(/\r\n/gu, '\n').slice(0, 1000)
+    : ''
+  if (text.trim() === '') return null
+  return {
+    at: Number.isFinite(at) && at > 0 ? Math.min(Math.floor(at), 8.64e15) : 0,
+    level,
+    text,
+  }
+}
+
+/**
  * 收敛桥接上报的单条会话数据。
  *
  * 桥接是自己人，但**这条路由原则上是「只收白名单字段」**：任何字段、任何长度
@@ -4345,6 +4431,45 @@ function applySettings(ctx, config) {
     'qq-guard: native directory picker route',
   )
 
+  // ── 打开操作日志目录（v2.0 第六步，2026-10-28）────────────────
+  //
+  // 为什么走 Host 而不是桥接：浏览器点按钮时 Host 就在本机；桥接是另一个进程，
+  // 为一次「打开文件夹」再排一轮 2 秒轮询不值当。
+  // 安全边界：不吃路径参数，只打开配置里的 logDir（或默认 state/logs）；
+  // execFile 用数组参数、不经 shell，避免把用户填的路径拼成命令。
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: 'exact',
+      path: OPEN_LOG_DIR_ROUTE_PATH,
+      handler: async (req, res) => {
+        const fetchSite = req.headers['sec-fetch-site']
+        if (typeof fetchSite === 'string' && fetchSite !== 'same-origin' && fetchSite !== 'none') {
+          sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
+          return
+        }
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, reason: 'method not allowed' })
+          return
+        }
+        const cfg = plainConfig(config) ?? {}
+        const dir = resolveLogDir(cfg, cfg.bridge?.dir || DEFAULT_BRIDGE_DIR)
+        try {
+          mkdirSync(dir, { recursive: true })
+        } catch (error) {
+          sendJson(res, 500, { ok: false, reason: 'mkdir-failed', dir, detail: error?.message ?? String(error) })
+          return
+        }
+        const failure = await openInFileManager(dir)
+        if (failure) {
+          sendJson(res, 500, { ok: false, reason: 'open-failed', dir, detail: failure.message })
+          return
+        }
+        sendJson(res, 200, { ok: true, dir })
+      },
+    }),
+    'qq-guard: open log dir route',
+  )
+
   // ── 外部插件扫描（Phase 4 / P0）───────────────────────────────
   //
   // 只读扫描，不 import 外部代码、不写目标目录、不装包：
@@ -5213,6 +5338,10 @@ function applySettings(ctx, config) {
               // 前端据此区分「没有数据」和「确实一个会话都没有」。
               ...(Array.isArray(body?.sessions)
                 ? { sessions: body.sessions.slice(0, 100).map(sanitizeSessionRow).filter(Boolean) }
+                : {}),
+              // 操作日志（v2.0 第六步）：同样按白名单收敛，最多 50 条。
+              ...(Array.isArray(body?.opLog)
+                ? { opLog: body.opLog.slice(-50).map(sanitizeOpLogRow).filter(Boolean) }
                 : {}),
             }
             lastStatusAt = Date.now()

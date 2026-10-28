@@ -704,6 +704,19 @@ window.__ModuleLoader__.load({
   transition: width .25s ease; }
 .qqg-tokenbar-caption { font-size: 10.5px; line-height: 1.3; font-variant-numeric: tabular-nums;
   color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); }
+
+/* 操作日志面板（v2.0 第六步）：等宽、细滚动、级别配色。 */
+.qqg-oplog { display: flex; flex-direction: column; gap: 2px; max-height: 220px; overflow: auto;
+  padding: 6px 8px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
+.qqg-oplog-row { display: flex; gap: 8px; align-items: baseline; line-height: 1.5; }
+.qqg-oplog-time { flex: 0 0 auto; color: var(--dsw-alias-label-secondary); }
+.qqg-oplog-level { flex: 0 0 auto; width: 44px; font-weight: 600; }
+.qqg-oplog-info .qqg-oplog-level { color: var(--dsw-alias-label-secondary); }
+.qqg-oplog-warn .qqg-oplog-level { color: var(--dsw-alias-state-warning-primary, #d97706); }
+.qqg-oplog-error .qqg-oplog-level { color: var(--dsw-alias-state-error-primary, #e5484d); }
+.qqg-oplog-text { flex: 1 1 auto; word-break: break-word; white-space: pre-wrap; }
 .qqg-codebox { margin: 0; padding: 10px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2);
   border: 1px solid var(--dsw-alias-border-l1);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -1677,6 +1690,37 @@ window.__ModuleLoader__.load({
       const sysEvents = useSystemEvents(true)
       const [busy, setBusy] = React.useState(null)
       const [err, setErr] = React.useState(null)
+      // 操作日志（v2.0 第六步）：读桥接上报的内存队列；打开文件夹走 Host 路由。
+      const opLog = Array.isArray(live?.opLog) ? live.opLog : null
+      const [logDirBusy, setLogDirBusy] = React.useState(false)
+      const [logDirNote, setLogDirNote] = React.useState(null)
+      const opLogRef = React.useRef(null)
+      const opLogLen = opLog === null ? 0 : opLog.length
+      React.useEffect(() => {
+        const node = opLogRef.current
+        if (node) node.scrollTop = node.scrollHeight
+      }, [opLogLen])
+
+      const openLogDir = async () => {
+        setLogDirBusy(true)
+        setLogDirNote(null)
+        try {
+          const res = await fetch('/dsh-qq-guard/open-log-dir', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { accept: 'application/json' },
+          })
+          const body = await res.json().catch(() => ({}))
+          if (!res.ok || body?.ok !== true) {
+            throw new Error(body?.detail ?? body?.reason ?? ('HTTP ' + res.status))
+          }
+          setLogDirNote({ kind: 'ok', text: '已打开：' + (body.dir ?? '日志目录') })
+        } catch (error) {
+          setLogDirNote({ kind: 'err', text: '打开失败：' + (error?.message ?? error) })
+        } finally {
+          setLogDirBusy(false)
+        }
+      }
 
       const dot = (ok) => h('span', {
         className: 'qqg-dot ' + (ok === true ? 'qqg-dot-ok' : ok === false ? 'qqg-dot-err' : 'qqg-dot-idle'),
@@ -1777,6 +1821,35 @@ window.__ModuleLoader__.load({
               h('span', { className: 'qqg-ev-time' }, clockOf(event.at)),
               h('span', { className: 'qqg-ev-msg' },
                 `${event.level === 'error' ? '⛔' : event.level === 'warn' ? '⚠️' : '·'} ${event.message ?? ''}`))))),
+
+        // 操作日志（v2.0 第六步）：只记截断 / 归纳 / 模型报错这类关键操作。
+        // 数据是桥接上报的最近 50 条（内存队列），落盘由桥接负责；这里只管展示。
+        h(Panel, {
+          title: '桥接操作日志',
+          desc: '截断 / 归纳 / 模型报错等关键操作；内存保留最近 50 条，同时按天落盘到本地文件。',
+          right: h('button', {
+            type: 'button', className: 'qqg-btn',
+            disabled: logDirBusy,
+            onClick: () => { void openLogDir() },
+          }, logDirBusy ? '打开中…' : '打开日志文件夹'),
+        },
+          logDirNote
+            ? h('div', { className: 'qqg-status' + (logDirNote.kind === 'err' ? ' qqg-status-err' : '') },
+              logDirNote.text)
+            : null,
+          opLog === null
+            ? h('div', { className: 'qqg-hint' }, '桥接还没上报操作日志（旧版桥接，或刚启动还没产生记录）。')
+            : opLog.length === 0
+              ? h('div', { className: 'qqg-hint' }, '还没有操作记录。触发一次截断 / 归纳，或等模型报错再看看。')
+              : h('div', { className: 'qqg-oplog', ref: opLogRef },
+                opLog.map((item, index) => h('div', {
+                  key: `${item.at}-${index}`,
+                  className: 'qqg-oplog-row qqg-oplog-' + (item.level ?? 'info'),
+                },
+                h('span', { className: 'qqg-oplog-time' }, clockOf(item.at)),
+                h('span', { className: 'qqg-oplog-level' },
+                  item.level === 'error' ? 'ERROR' : item.level === 'warn' ? 'WARN' : 'INFO'),
+                h('span', { className: 'qqg-oplog-text' }, item.text ?? ''))))),
 
         proc?.logTail?.length
           ? h('details', { className: 'qqg-logbox' },

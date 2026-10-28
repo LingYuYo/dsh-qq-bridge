@@ -27,6 +27,7 @@ import { synthesize, TTS_MAX_CHARS, DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER } f
 import { ExternalHooksClient } from './external-hooks.mjs'
 import { DSH_IMAGE_LIMITS, MAX_TILES, prepareImageParts } from './image-prep.mjs'
 import { estimateTokens, truncateChatLine } from './tokens.mjs'
+import { OpLogFile } from './op-log.mjs'
 import {
   BRIEFING_HEADER,
   SUMMARY_HARD_LIMIT,
@@ -394,6 +395,8 @@ const NAME_TTL_MS = 30 * 60 * 1000
 const PREVIEW_MAX = 80
 /** 上报给设置页的会话行上限（多余的不展示，也不会无限撑大 POST 体积）。 */
 const SESSION_VIEW_CAP = 100
+/** 操作日志在内存里保留多少条（设置页「桥接操作日志」面板）。 */
+const OP_LOG_MAX = 50
 
 // ── 2026-10-28 v2.0：会话详情上报 / 开发者特权 ───────────────────────────
 
@@ -1027,6 +1030,12 @@ export class Bridge {
     // 手动提前截断（v2.0，2026-10-28）：同一会话同时只允许跑一次，
     // 避免连点两次触发两次「归档 + 新建」。
     this._manualRuns = new Set()
+    // 操作日志（v2.0 第六步，2026-10-28）：内存环形队列（给设置页）+ 本地按天落盘。
+    // 两者共用 `_logOp()` 一个出口，别再各写各的。
+    this._opLog = []
+    this._opLogSinkCache = null
+    this._opLogSinkSignature = ''
+    this._opLogCleanupTimer = null
     // fetch 可注入：测试里替换掉它，B 站 API / 短链跳转的解析就能确定性断言。
     this.fetchImpl = typeof globalThis.fetch === 'function' ? globalThis.fetch : null
     // 图文顺序（2026-10-27）：正在跑模型的那一轮会把 key 记在这里。
@@ -1417,8 +1426,83 @@ export class Bridge {
     }
   }
 
-  _saveState() {
-    fs.mkdirSync(path.dirname(this.statePath), { recursive: true })
+  /**
+   * 现读操作日志配置，返回（必要时重建）文件日志器。
+   *
+   * 设置页改完目录 / 上限 / 天数后，下一次 `_logOp` 就会用新配置（签名变化即重建）。
+   * @returns {OpLogFile}
+   */
+  _opLogSink() {
+    const live = this.live ?? {}
+    const cfg = this.config ?? {}
+    const dir = String(live.logDir ?? cfg.logDir ?? '').trim()
+    const maxSizeMB = Number(live.logMaxSizeMB ?? cfg.logMaxSizeMB) || 5
+    const maxDays = Number(live.logMaxDays ?? cfg.logMaxDays) || 15
+    // 默认目录跟着 stateFile 走：state/sessions.json → state/logs。
+    const baseDir = path.dirname(this.statePath)
+    const signature = `${baseDir}|${dir}|${maxSizeMB}|${maxDays}`
+    if (this._opLogSinkCache && this._opLogSinkSignature === signature) return this._opLogSinkCache
+    this._opLogSinkCache = new OpLogFile({
+      baseDir,
+      dir,
+      maxSizeMB,
+      maxDays,
+      logger: this.logger,
+    })
+    this._opLogSinkSignature = signature
+    return this._opLogSinkCache
+  }
+
+  /**
+   * 记一条操作日志（v2.0 第六步）：内存环形队列（50 条）+ 本地文件，同进同出。
+   *
+   * 只给「截断 / 归纳 / 模型报错」这类关键操作用；普通 debug 日志仍走 logger，
+   * 不要把高频输出灌进这里（内存队列只有 50 格）。
+   *
+   * @param {'info'|'warn'|'error'} level
+   * @param {string} text
+   * @param {{console?:boolean}} [options] `console:false` = 不重复打进程日志
+   */
+  _logOp(level, text, { console: toConsole = true } = {}) {
+    const body = String(text ?? '').trim()
+    if (body === '') return
+    const lv = String(level ?? 'info').toLowerCase()
+    this._opLog.push({ at: Date.now(), level: lv, text: body.slice(0, 1000) })
+    if (this._opLog.length > OP_LOG_MAX) this._opLog.splice(0, this._opLog.length - OP_LOG_MAX)
+    this._opLogSink().append(lv, body)
+    if (toConsole) {
+      const fn = lv === 'error' ? this.logger.error : lv === 'warn' ? this.logger.warn : this.logger.info
+      fn?.call(this.logger, body)
+    }
+  }
+
+  /** 给设置页用的操作日志快照（最近 50 条，时间正序）。 */
+  opLogViews() {
+    return this._opLog.map((item) => ({ at: item.at, level: item.level, text: item.text }))
+  }
+
+  /**
+   * 启动操作日志维护：立刻清理一次过期文件，之后每 24 小时一次。
+   * 启动时就清，避免「刚开机看到一堆过期文件」。
+   */
+  _startOpLogMaintenance() {
+    const run = () => {
+      try {
+        const result = this._opLogSink().cleanup()
+        if (result.removed > 0) {
+          this._logOp('info', `操作日志清理：删除 ${result.removed} 个超过 ${this._opLogSink().maxDays} 天的文件`)
+        }
+      } catch (error) {
+        this.logger.warn?.(`操作日志清理失败（忽略）：${error?.message ?? error}`)
+      }
+    }
+    run()
+    if (this._opLogCleanupTimer) clearInterval(this._opLogCleanupTimer)
+    this._opLogCleanupTimer = setInterval(run, 24 * 60 * 60 * 1000)
+    if (typeof this._opLogCleanupTimer.unref === 'function') this._opLogCleanupTimer.unref()
+  }
+
+  _saveState() {    fs.mkdirSync(path.dirname(this.statePath), { recursive: true })
     const tmp = this.statePath + '.tmp'
     fs.writeFileSync(tmp, JSON.stringify(this.state, null, 2))
     fs.renameSync(tmp, this.statePath)
@@ -2273,7 +2357,7 @@ export class Bridge {
       // 只告警一次，避免每条消息刷屏；热更新后会自动重试并在成功时复位。
       if (!this._modelRouteWarned) {
         this._modelRouteWarned = true
-        this.logger.warn?.(`模型偏好下发失败（不阻塞，本轮用会话当前模型）：${error.message}`)
+        this._logOp('warn', `模型偏好下发失败（不阻塞，本轮用会话当前模型）：${error.message}`)
       }
     }
   }
@@ -2499,10 +2583,10 @@ export class Bridge {
             briefing = await this._generateBriefing(key, log, conf)
           } catch (error) {
             // 提要失败不卡住按钮：仍然归档新建（等同 clear），日志里说明。
-            this.logger.warn?.(`提前截断：前情提要生成失败，继续归档（${error?.message ?? error}）`)
+            this._logOp('warn', `提前截断：前情提要生成失败，继续归档（${error?.message ?? error}）`)
           }
         } else {
-          this.logger.info?.(`提前截断：${key} 没有 L1 记录，跳过提要直接归档`)
+          this._logOp('info', `提前截断：${key} 没有 L1 记录，跳过提要直接归档`)
         }
         const cleared = log.length
         this._chatLog.delete(key)
@@ -2513,16 +2597,20 @@ export class Bridge {
         this._saveState()
         const rebuilt = await this._rebuildSessionContext(key, target, { reason: 'manual-summarize' })
         // 只写日志，不发 QQ（用户明确要求）。
-        this.logger.info?.(
+        this._logOp('info',
           `手动提前截断完成：${key} ${rebuilt.oldId || '(无会话)'} → ${rebuilt.sessionId}`
-          + `（归档=${rebuilt.archived}，清空 L1 ${cleared} 条，前情提要 ${briefing.length} 字）`,
-        )
+          + `（归档=${rebuilt.archived}，清空 L1 ${cleared} 条，前情提要 ${briefing.length} 字）`)
         return {
           ok: true, action: 'manual-summarize', key,
           sessionId: rebuilt.sessionId, archived: rebuilt.archived,
           cleared, briefingChars: briefing.length,
           detail: `已归档旧会话并新建，前情提要 ${briefing.length} 字`,
         }
+      } catch (error) {
+        // 归档 / 新建失败：回执给 Host 让 UI 能看到，同时留一条操作日志。
+        this._logOp('error', `提前截断失败：${key} ${error?.message ?? error}`)
+        return { ok: false, error: 'manual-summarize-failed', action: 'manual-summarize', key,
+          detail: String(error?.message ?? error) }
       } finally {
         this._manualRuns.delete(key)
       }
@@ -3793,7 +3881,7 @@ export class Bridge {
         }
       } catch (error) {
         this.stats.failed++
-        this.logger.error?.(`处理 ${key} 失败：${error?.message ?? error}`)
+        this._logOp('error', `处理 ${key} 失败：${error?.message ?? error}`)
         // 超时 / 看门狗类错误 → 用可配置的 timeoutReplyText（live → config → 默认）；
         // 其它仍用原中文提示。⚠️ 这里**只拼接固定中文**，绝不把 error.message 发到 QQ
         // （DSH 的报错是英文的，外泄既看不懂又难看）。
@@ -5325,14 +5413,12 @@ export class Bridge {
       prev.lastError = ''
       this._saveState()
       this.stats.unreadSummaries = (Number(this.stats.unreadSummaries) || 0) + 1
-      this.logger.info?.(
-        `未读归纳完成：${key} ${via}（${Math.round((Date.now() - startedAt) / 1000)}s，`
-        + `水位 ${prev.lastSummaryAt}/${prev.lastSummarySeq}）`,
-      )
+      this._logOp('info', `未读归纳完成：${key} ${via}（${Math.round((Date.now() - startedAt) / 1000)}s，`
+        + `水位 ${prev.lastSummaryAt}/${prev.lastSummarySeq}）`)
     } catch (error) {
       const code = error?.code ?? 'SUMMARY_FAILED'
       const detail = String(error?.message ?? error)
-      this.logger.error?.(`未读归纳失败：${key} ${code} ${detail}`)
+      this._logOp('error', `未读归纳失败：${key} ${code} ${detail}`)
       const prev = this._summaryState(key)
       prev.lastError = `${code}: ${detail}`.slice(0, 200)
       this._saveState()
@@ -5507,7 +5593,7 @@ export class Bridge {
   async start() {
     // 去重由 OneBotClient 内部按 message_id 负责（_isDuplicate），这里不再重复维护。
     this.qq.onMessage((msg) => {
-      this.handleMessage(msg).catch((e) => this.logger.error?.(`handleMessage 异常：${e?.message ?? e}`))
+      this.handleMessage(msg).catch((e) => this._logOp('error', `handleMessage 异常：${e?.message ?? e}`))
     })
     // 戳一戳（2026-10-26）：notice 走独立处理器，和消息处理互不干扰。
     // 用可选调用：onebot 客户端版本过旧（没有 onNotice）时最多收不到戳一戳，
@@ -5516,6 +5602,8 @@ export class Bridge {
       this.handleNotice(notice).catch((e) => this.logger.warn?.(`handleNotice 异常：${e?.message ?? e}`))
     })
     await this.qq.start()
+    // 操作日志维护（v2.0 第六步）：启动即清一次过期文件，之后每天一次。
+    this._startOpLogMaintenance()
     // 每小时人设归纳（2026-10-26）：间隔 1 小时，**不立刻跑第一次**（避免重启浪潮：
     // 桥接频繁重启时不该每次都拿聊天记录去打一轮模型）。unref：别拖住进程退出。
     this._summarizeTimer = setInterval(() => {
@@ -5540,6 +5628,9 @@ export class Bridge {
     // 每小时归纳的定时器必须清掉，否则 stop 之后还会再跑（测试里会阴魂不散）。
     if (this._summarizeTimer) clearInterval(this._summarizeTimer)
     this._summarizeTimer = null
+    // 操作日志的每日清理定时器同理。
+    if (this._opLogCleanupTimer) clearInterval(this._opLogCleanupTimer)
+    this._opLogCleanupTimer = null
     await this.qq.stop?.()
   }
 }

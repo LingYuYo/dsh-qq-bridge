@@ -88,6 +88,11 @@ const HOT_KEYS = [
   // ⚠️ 它**不能**进 PERSONA_KEYS：特权文本只追加在 Prompt 尾部，改它不该触发
   // 系统提示词重推（那会把前缀缓存白白打掉一次）。
   'developer',
+  // v2.0 第六步（2026-10-28）：操作日志目录 / 单文件上限 / 保留天数。
+  // 改完下一条日志就用新配置（OpLogFile 按签名重建）。
+  'logDir',
+  'logMaxSizeMB',
+  'logMaxDays',
   // OneBot 连接信息只用于 UI 展示；WS 连接在启动时建立，改它仍需重启桥接。
   'onebot',
 ]

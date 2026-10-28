@@ -32,6 +32,9 @@
     "debugPayload": false,
     "memoryNotes": []
   },
+  "logDir": "",
+  "logMaxSizeMB": 5,
+  "logMaxDays": 15,
   "replyTimeoutMs": 20000,
   "maxContextTurns": 30,
   "contextClearStrategy": "compact",
