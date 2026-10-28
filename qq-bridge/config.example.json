@@ -14,13 +14,23 @@
     "accessToken": "CHANGE_ME_随机令牌"
   },
   "allow": {
-    "_comment": "admins 能发 / 开头的指令；owners 在管理员之上，另有 /归纳 这类要花 token 的后台动作权限，且自动算管理员。昵称/消息文本/模型输出都提不了权。",
+    "_comment": "admins 能发 / 开头的指令；owners 在管理员之上，另有 /归纳 这类要花 token 的后台动作权限，且自动算管理员。developers 在主人之上（三阶：开发者 > 主人 > 管理员），命中 developer.keywords 时把 developer.prompt 追加到 Prompt 尾部。deny 优先于 allow。昵称/消息文本/模型输出都提不了权。",
     "private": [],
     "groups": [],
     "admins": [],
     "owners": [],
+    "developers": [],
     "deny": { "private": [], "groups": [] },
     "allowAllWhenEmpty": false
+  },
+  "developer": {
+    "_comment": "v2.0 开发者特权。默认全关（fail-closed）。触发词只认前缀；命中后先剥掉关键词再送 DSH，专属 Prompt 只追加在本轮 Prompt 尾部（不动系统提示词与前缀缓存）。memoryNotes 是只读预览，底层写入后续补。",
+    "enabled": false,
+    "keywords": ["/dev", "/admin"],
+    "prompt": "",
+    "strangerReply": false,
+    "debugPayload": false,
+    "memoryNotes": []
   },
   "replyTimeoutMs": 20000,
   "maxContextTurns": 30,
