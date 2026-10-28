@@ -26,6 +26,7 @@ import {
   stripLeadingMentions, stripMonologueLines,
 } from './onebot.mjs'
 import { DshClient } from './dsh.mjs'
+import { GlobalMemory } from './global-memory.mjs'
 import { synthesize, TTS_MAX_CHARS, DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER } from './tts.mjs'
 import { ExternalHooksClient } from './external-hooks.mjs'
 import { DSH_IMAGE_LIMITS, MAX_TILES, prepareImageParts } from './image-prep.mjs'
@@ -1220,6 +1221,12 @@ export class Bridge {
     this.logger = logger ?? console
     this.statePath = path.resolve(config.stateFile ?? './state/sessions.json')
     this.state = this._loadState()
+    // 跨群特别记忆（v2.0 第二十三步）：独立文件，与 sessions.json 同目录。
+    // 加载失败只 warn，绝不影响聊天。
+    this.globalMemory = new GlobalMemory({
+      dir: path.dirname(this.statePath),
+      logger: this.logger,
+    }).load()
     this.queues = new SerialQueues()
     this.inflight = new Map() // 会话 key -> 正在处理的 Promise
     // 节奏运行时状态（Phase 4）：全是内存态，不落盘。
@@ -2240,6 +2247,49 @@ export class Bridge {
       const name = String(profile?.nickname ?? '').trim() || qq
       const tags = Array.isArray(profile?.tags) ? profile.tags.filter(Boolean).slice(0, 5) : []
       lines.push(`- ${role} ${name}(${qq})${tags.length > 0 ? `：${tags.join('；')}` : ''}`)
+    }
+    return lines.join('\n')
+  }
+
+  /**
+   * 跨群特别记忆小节（v2.0 第二十三步）。
+   *
+   * 只在检索命中时返回非空：QQ 强命中（同一个人说话）或关键词命中。
+   * 0 命中就完全不注入，省 Token；也不进系统提示词，避免破坏前缀缓存。
+   *
+   * @param {string} key
+   * @param {{text?:string, senderQq?:string}} [options]
+   * @returns {string}
+   */
+  _crossGroupMemorySection(key, options = {}) {
+    const conf = this.live?.globalMemory
+    if (conf && conf.enabled === false) return ''
+    if (!this.globalMemory) return ''
+    const text = String(options?.text ?? '')
+    const senderQq = String(options?.senderQq ?? '')
+    if (text.trim() === '' && senderQq === '') return ''
+    let hits = []
+    try {
+      hits = this.globalMemory.search({
+        text,
+        senderQq,
+        chatKey: key,
+        topK: Number(conf?.topK) > 0 ? Number(conf.topK) : 3,
+        budgetChars: Number(conf?.budgetChars) > 0 ? Number(conf.budgetChars) : 600,
+      })
+    } catch (error) {
+      // 检索是增强项：失败就当没有，绝不影响回复。
+      this.logger.warn?.(`跨群记忆检索失败（已忽略）：${error?.message ?? error}`)
+      return ''
+    }
+    if (hits.length === 0) return ''
+    const lines = ['【跨群特别记忆（来自其他群/全局，仅相关时出现）】']
+    for (const hit of hits) {
+      if (hit.kind === 'person' && hit.qq !== '') {
+        lines.push(`- 群友 ${hit.title || hit.qq}(${hit.qq})：${hit.text}`)
+      } else {
+        lines.push(`- ${hit.title || hit.key}：${hit.text}`)
+      }
     }
     return lines.join('\n')
   }
@@ -4457,6 +4507,11 @@ export class Bridge {
           beforeSeq: options?.beforeSeq,
           renameEvents: options?.renameEvents,
           slangHits: options?.slangHits,
+          privileged: options?.privileged,
+          impersonation: options?.impersonation,
+          // v2.0 第二十三步：跨群记忆检索用当前消息原文（不含发送人标签）。
+          text: String(msg?.text ?? ''),
+          senderQq: String(msg?.userId ?? ''),
         })
         if (contextSections.length > 0) {
           promptText = `${promptText}\n\n${contextSections.join('\n\n')}`
@@ -5582,6 +5637,10 @@ export class Bridge {
     // 它绝不进系统提示词，所以不会污染前缀缓存，也不会跨群串台。
     const dynamic = this._dynamicMemorySection(key)
     if (dynamic !== '') sections.push(dynamic)
+    // 跨群特别记忆（v2.0 第二十三步）：只在检索命中时出现，0 命中 0 token。
+    // 放在动态记忆之后、权限/潜水指令之前，绝不进系统提示词。
+    const crossGroup = this._crossGroupMemorySection(key, options)
+    if (crossGroup !== '') sections.push(crossGroup)
     // 改名事件（仅本轮）：客观事实，放在所有上下文之后，让模型自己决定怎么回应。
     const renameEvents = Array.isArray(options.renameEvents) ? options.renameEvents : []
     if (renameEvents.length > 0) sections.push(renameEvents.join('\n'))
@@ -6412,6 +6471,8 @@ export class Bridge {
     // 操作日志的每日清理定时器同理。
     if (this._opLogCleanupTimer) clearInterval(this._opLogCleanupTimer)
     this._opLogCleanupTimer = null
+    // 跨群记忆：把检索累加的 hits 落盘（延迟写，退出前补一次）。
+    try { this.globalMemory?.flush?.() } catch { /* 退出路径不抛 */ }
     await this.qq.stop?.()
   }
 }

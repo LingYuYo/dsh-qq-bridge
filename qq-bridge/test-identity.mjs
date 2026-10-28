@@ -403,5 +403,40 @@ await check('briefing：没有摘要时重置返回 no-briefing', async () => {
   assert.equal(result.error, 'no-briefing')
 })
 
+console.log('\n— 跨群特别记忆（v2.0 第二十三步）—')
+await check('QQ 强命中才注入；0 命中不出现', () => {
+  const b = makeBridge()
+  b.globalMemory.upsert({
+    kind: 'person', key: 'qq:2677321941', qq: '2677321941', title: '翎羽',
+    text: '喜欢被叫小鱼', tags: ['小鱼'],
+  })
+  assert.equal(b._crossGroupMemorySection('g:1', { text: '今天天气不错', senderQq: '999' }), '')
+  const hit = b._crossGroupMemorySection('g:1', { text: '在吗', senderQq: '2677321941' })
+  assert.match(hit, /跨群特别记忆/u)
+  assert.match(hit, /翎羽\(2677321941\)/u)
+  assert.match(hit, /喜欢被叫小鱼/u)
+})
+
+await check('关键词命中 fact；开关关闭时不注入', () => {
+  const b = makeBridge()
+  b.globalMemory.upsert({
+    kind: 'fact', key: 'fact:hiking', title: '周末爬山', text: '鱼塘群周末去西山爬山', tags: ['爬山'],
+  })
+  assert.match(b._crossGroupMemorySection('g:1', { text: '周末爬山吗', senderQq: '1' }), /西山/u)
+  b.live.globalMemory = { enabled: false }
+  assert.equal(b._crossGroupMemorySection('g:1', { text: '周末爬山吗', senderQq: '1' }), '')
+})
+
+await check('注入位置：动态记忆之后、潜水指令之前', () => {
+  const b = makeBridge()
+  b._noteProfiles('g:1', groupMsg('在吗', { senderName: '甲' }))
+  b.globalMemory.upsert({ kind: 'person', key: 'qq:1001', qq: '1001', title: '甲', text: '喜欢短句' })
+  const sections = b._contextSections('g:1', { text: '在吗', senderQq: '1001' })
+  const dynamicIndex = sections.findIndex((item) => /本群动态记忆/u.test(item))
+  const crossIndex = sections.findIndex((item) => /跨群特别记忆/u.test(item))
+  assert.ok(dynamicIndex >= 0 && crossIndex > dynamicIndex, sections.join(' | '))
+  assert.ok(crossIndex < sections.indexOf(SILENT_INSTRUCTION), '跨群记忆应在潜水指令之前')
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) process.exitCode = 1
