@@ -1477,6 +1477,8 @@ function enqueueSessionOp(op, key, text = '', extra = {}) {
     ...(typeof extra.removeProfile === 'string' && extra.removeProfile !== ''
       ? { removeProfile: extra.removeProfile }
       : {}),
+    // v2.0 第十八步：L2 摘要重置（恢复自动生成的原文）。
+    ...(extra.reset === true ? { reset: true } : {}),
     at: Date.now(), lease: 0,
   })
   while (sessionOpsQueue.size > SESSION_OPS_CAP) {
@@ -3112,6 +3114,9 @@ function sanitizeSessionRow(row) {
     // v2.0 第十二步：单群人设覆盖 { templateId, botName, groupName, participation, core }。
     personaOverride: sanitizePersonaOverride(row.personaOverride),
     contextBriefing: typeof row.contextBriefing === 'string' ? row.contextBriefing.slice(0, 4000) : '',
+    // v2.0 第十八步：人工编辑标记 + 原始自动文本（UI 角标 / 重置）。
+    briefingEdited: row.briefingEdited === true,
+    briefingGenerated: typeof row.briefingGenerated === 'string' ? row.briefingGenerated.slice(0, 4000) : '',
   }
 }
 
@@ -4341,6 +4346,8 @@ function applySettings(ctx, config) {
               ...(op.slang === undefined ? {} : { slang: op.slang }),
               ...(op.personaOverride === undefined ? {} : { personaOverride: op.personaOverride }),
               ...(op.removeProfile ? { removeProfile: op.removeProfile } : {}),
+              // v2.0 第十八步：L2 摘要重置标记（text 走通用 text 字段）。
+              ...(op.reset === true ? { reset: true } : {}),
             })
           }
           sendJson(res, 200, { ok: true, ops })
@@ -4376,7 +4383,7 @@ function applySettings(ctx, config) {
         // manual-summarize（v2.0 第五步）：同一位置的「提前截断」按钮，
         // 桥接侧会生成前情提要 → 归档旧会话 → 新建同名会话。
         // 两者都不是 QQ 消息，桥接侧标 origin=console，**不冒充主人**（权限仍只认事件 QQ 号）。
-        if (!['clear', 'delete', 'persona', 'activity', 'summarize', 'manual-summarize', 'dynamic'].includes(op)) {
+        if (!['clear', 'delete', 'persona', 'activity', 'summarize', 'manual-summarize', 'dynamic', 'briefing'].includes(op)) {
           sendJson(res, 400, { ok: false, reason: 'unknown-op', detail: `未知操作：${op || '(空)'}` })
           return
         }
@@ -4422,9 +4429,11 @@ function applySettings(ctx, config) {
               : sanitizePersonaOverride(body.personaOverride)
           }
         }
+        // v2.0 第十八步：L2 摘要重置（不传 text 时恢复自动生成的原文）。
+        if (op === 'briefing' && body?.reset === true) extra.reset = true
         const id = enqueueSessionOp(
           op, key,
-          op === 'persona' ? text : '',
+          op === 'persona' || op === 'briefing' ? text : '',
           extra,
         )
         sendJson(res, 200, { ok: true, id, queued: sessionOpsQueue.size, note: '桥接 2 秒内轮询执行' })

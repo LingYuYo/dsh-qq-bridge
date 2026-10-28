@@ -1094,13 +1094,20 @@ export function normalizeSlangList(value) {
 function normalizeBriefing(value) {
   if (typeof value === 'string') {
     const text = value.trim()
-    return text === '' ? null : { text, at: 0 }
+    return text === '' ? null : { text, at: 0, generatedText: text, editedAt: 0 }
   }
   if (!value || typeof value !== 'object') return null
   const text = typeof value.text === 'string' ? value.text.trim() : ''
   if (text === '') return null
   const at = Number(value.at)
-  return { text, at: Number.isFinite(at) && at > 0 ? Math.floor(at) : 0 }
+  const editedAt = Number(value.editedAt)
+  return {
+    text,
+    at: Number.isFinite(at) && at > 0 ? Math.floor(at) : 0,
+    // v2.0 第十八步：人工编辑前的原始文本（重置用）与编辑时间戳（「已人工修正」角标）。
+    generatedText: typeof value.generatedText === 'string' ? value.generatedText : text,
+    editedAt: Number.isFinite(editedAt) && editedAt > 0 ? Math.floor(editedAt) : 0,
+  }
 }
 
 /**
@@ -2402,8 +2409,13 @@ export class Bridge {
         // v2.0 第十一步：黑话词条（对象数组，单群）与合并视图（UI 标签展示用）。
         slang: normalizeSlangList(entry.slang),
         mergedSlang: this._mergedSlang(key),
-        // L2 摘要：手动截断留下的前情提要（UI 用名册美化展示）。
+        // L2 摘要：手动截断留下的前情提要（UI 用名册美化展示 / 手动编辑）。
         contextBriefing: typeof entry.contextBriefing?.text === 'string' ? entry.contextBriefing.text.slice(0, 4000) : '',
+        // v2.0 第十八步：是否人工改过 + 原始自动文本（UI 角标与重置用）。
+        briefingEdited: Number(entry.contextBriefing?.editedAt) > 0,
+        briefingGenerated: typeof entry.contextBriefing?.generatedText === 'string'
+          ? entry.contextBriefing.generatedText.slice(0, 4000)
+          : '',
         _heavy: {
           recent: this._recentInboundViews(key),
           raw: this._rawInbound.get(key) ?? null,
@@ -2950,6 +2962,38 @@ export class Bridge {
       }
     }
 
+    // L2 摘要手动编辑（v2.0 第十八步）：{ text } = 保存修正；{ reset: true } = 恢复自动生成的原文。
+    // 注入侧只读 entry.contextBriefing.text，所以保存后下一轮 Prompt 立即用新文本。
+    if (action === 'briefing') {
+      const current = normalizeBriefing(entry.contextBriefing)
+      if (op?.reset === true) {
+        if (!current) return { ok: false, error: 'no-briefing', action: 'briefing', key,
+          detail: '当前会话还没有 L2 摘要' }
+        entry.contextBriefing = {
+          text: current.generatedText,
+          at: current.at,
+          generatedText: current.generatedText,
+          editedAt: 0,
+        }
+      } else {
+        const text = typeof op?.text === 'string' ? op.text.trim().slice(0, 8000) : ''
+        const base = current ?? { text: '', at: Date.now(), generatedText: '', editedAt: 0 }
+        entry.contextBriefing = {
+          text,
+          at: base.at || Date.now(),
+          // 第一次编辑时把当时的文本留作「原文」，重置才能回去。
+          generatedText: base.generatedText || base.text,
+          editedAt: Date.now(),
+        }
+      }
+      this._saveState()
+      return {
+        ok: true, action: 'briefing', key,
+        briefingChars: entry.contextBriefing.text.length,
+        edited: entry.contextBriefing.editedAt > 0,
+      }
+    }
+
     if (action === 'clear') {
       if (!entry.sessionId) return { ok: false, error: 'no-session', action: 'clear', key }
       // 归档 + 新建同名会话的实体在 _rebuildSessionContext 里（自动清理也走它）。
@@ -3068,7 +3112,9 @@ export class Bridge {
         const cleared = log.length
         this._chatLog.delete(key)
         this._lastMemoryTrimByKey.delete(key)
-        target.contextBriefing = briefing === '' ? null : { text: briefing, at: Date.now() }
+        target.contextBriefing = briefing === ''
+          ? null
+          : { text: briefing, at: Date.now(), generatedText: briefing, editedAt: 0 }
         target.unread = 0
         target.lastText = ''
         this._saveState()

@@ -488,6 +488,8 @@ await check('sanitizeSessionRow：core / userProfiles / slang / contextBriefing 
       core: { identity: ' 本群身份 ', boundary: '', style: '' },
     },
     contextBriefing: '前情提要正文',
+    briefingEdited: true,
+    briefingGenerated: '自动原文',
   })
   assert.equal(row.core.identity, '本群身份')
   assert.equal(row.userProfiles.length, 1, '非法 QQ 的档案要丢掉')
@@ -501,6 +503,8 @@ await check('sanitizeSessionRow：core / userProfiles / slang / contextBriefing 
   assert.equal(row.personaOverride.botName, '小鲸')
   assert.equal(row.personaOverride.core.identity, '本群身份')
   assert.equal(row.contextBriefing, '前情提要正文')
+  assert.equal(row.briefingEdited, true, '人工编辑标记要透传')
+  assert.equal(row.briefingGenerated, '自动原文', '原始自动文本要透传（重置用）')
   // 空覆盖 → null（继承全局）
   assert.equal(sanitizeSessionRow({ key: 'g:2', personaOverride: {} }).personaOverride, null)
 })
@@ -541,6 +545,40 @@ await check('session-ops：放行 dynamic，core/slang/removeProfile 能下发',
   assert.equal(hit.removeProfile, '123')
   assert.equal(hit.personaOverride.templateId, 'p1')
   assert.equal(hit.personaOverride.core.identity, '本群身份')
+})
+
+await check('session-ops：放行 briefing，text / reset 能下发', async () => {
+  const { ctx, calls } = makeCtx({ presetId: undefined, hasWebServer: true, settingsAvailable: true })
+  apply(ctx, Config({ role: 'settings' }))
+  const route = calls.webRoutes.find((r) => r.path === '/dsh-qq-guard/session-ops')
+  const post = async (payload) => {
+    const req = {
+      method: 'POST', headers: { 'sec-fetch-site': 'same-origin' },
+      on(evt, fn) {
+        if (evt === 'data') fn(Buffer.from(JSON.stringify(payload)))
+        if (evt === 'end') fn()
+      },
+    }
+    const res = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+    route.handler(req, res)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(res.status, 200)
+  }
+  const get = () => {
+    const getRes = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+    route.handler({ method: 'GET', headers: {} }, getRes)
+    return JSON.parse(getRes.body).ops.filter((op) => op.op === 'briefing')
+  }
+  // 同 key + 同 op 只保留最新一条（连点去重），所以分两次 POST/GET 断言。
+  await post({ op: 'briefing', key: 'g:123456', text: '人工修正的摘要' })
+  const first = get()
+  assert.equal(first.length, 1)
+  assert.equal(first[0].text, '人工修正的摘要')
+
+  await post({ op: 'briefing', key: 'g:123456', reset: true })
+  const second = get()
+  assert.equal(second.length, 1, '上一条已下发，新的 reset 不会被合并')
+  assert.equal(second[0].reset, true)
 })
 
 console.log('\n— 接入总闸（v2.0 第七步）—')

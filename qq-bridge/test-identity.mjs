@@ -335,5 +335,41 @@ await check('热同步 allow 后 isDeveloper / 前缀立即生效', () => {
     /^\[最高主人\/开发者/u)
 })
 
+console.log('\n— L2 摘要人工编辑（v2.0 第十八步）—')
+await check('briefing：保存人工修正并立即注入，重置回自动原文', async () => {
+  const b = makeBridge()
+  const key = 'g:briefing'
+  b.state.sessions[key] = normalizeSessionEntry(key, {
+    sessionId: 'sess-1',
+    contextBriefing: { text: '自动生成的提要', at: 1000, generatedText: '自动生成的提要', editedAt: 0 },
+  })
+  const saved = await b.applySessionOp({ op: 'briefing', key, text: '人工修正后的提要' })
+  assert.equal(saved.ok, true)
+  assert.equal(saved.edited, true)
+  const entry = b.state.sessions[key]
+  assert.equal(entry.contextBriefing.text, '人工修正后的提要')
+  assert.equal(entry.contextBriefing.generatedText, '自动生成的提要')
+  assert.ok(entry.contextBriefing.editedAt > 0)
+  // 注入侧读 text：下一轮 Prompt 必须是人工版本
+  const sections = b._contextSections(key).join('\n')
+  assert.match(sections, /人工修正后的提要/u)
+  assert.ok(!sections.includes('自动生成的提要'), '★ 注入不能还是旧文本')
+
+  const reset = await b.applySessionOp({ op: 'briefing', key, reset: true })
+  assert.equal(reset.ok, true)
+  assert.equal(reset.edited, false)
+  assert.equal(b.state.sessions[key].contextBriefing.text, '自动生成的提要')
+  assert.equal(b.state.sessions[key].contextBriefing.editedAt, 0)
+})
+
+await check('briefing：没有摘要时重置返回 no-briefing', async () => {
+  const b = makeBridge()
+  const key = 'g:none'
+  b.state.sessions[key] = normalizeSessionEntry(key, { sessionId: 'sess-1' })
+  const result = await b.applySessionOp({ op: 'briefing', key, reset: true })
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'no-briefing')
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) process.exitCode = 1

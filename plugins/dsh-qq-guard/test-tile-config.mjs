@@ -647,6 +647,39 @@ await check('生成未读归纳 → POST {op:"summarize"}，并给出提交提�
   truthy(textOf(tree).includes('已提交'), '缺少提交成功提示')
 })
 
+await check('L2 摘要：已人工修正角标 + 编辑保存走 briefing 指令', async () => {
+  reset()
+  const live = {
+    sessions: [{
+      ...LIVE_DETAIL.sessions[0],
+      contextBriefing: '旧的人工提要',
+      briefingEdited: true,
+      briefingGenerated: '自动原文',
+    }],
+  }
+  let tree = resetSessions(live)
+  tabBtn(tree, '记忆与摘要').props.onClick()
+  tree = render()
+  truthy(textOf(tree).includes('已人工修正'), '缺「已人工修正」角标')
+  const edit = btnAnywhere(tree, '编辑摘要')
+  truthy(edit, '缺少「编辑摘要」按钮')
+  edit.props.onClick()
+  tree = render()
+  const textarea = findAll(tree, (n) => n.tag === 'textarea'
+    && n.props?.['aria-label'] === '编辑 L2 摘要')[0]
+  truthy(textarea, '编辑态应有 textarea')
+  eq(textarea.props.value, '旧的人工提要')
+  textarea.props.onChange({ target: { value: '改过的提要' } })
+  tree = render()
+  btnAnywhere(tree, '保存摘要').props.onClick()
+  await new Promise((r) => setImmediate(r))
+  const post = FEED.filter((f) => f.url.includes('/session-ops')).pop()
+  truthy(post, '没有提交到 session-ops')
+  eq(JSON.parse(post.init.body), { op: 'briefing', key: 'g:123456', text: '改过的提要' })
+  tree = render()
+  truthy(textOf(tree).includes('摘要已保存'), '缺少保存成功提示')
+})
+
 await check('提前截断：按钮 → 确认弹窗 → POST manual-summarize', async () => {
   reset()
   let tree = resetSessions(LIVE_DETAIL)
@@ -658,7 +691,7 @@ await check('提前截断：按钮 → 确认弹窗 → POST manual-summarize', 
   tree = render()
   const modal = modalOf(tree)
   truthy(modal, '应弹出确认框')
-  truthy(textOf(modal).includes('将提炼当前上下文'), `提示文案不对：${textOf(modal)}`)
+  truthy(textOf(modal).includes('此操作会生成前情提要并归档旧会话'), `提示文案不对：${textOf(modal)}`)
   const confirm = findAll(modal, (n) => n.tag === 'button' && textOf(n).trim() === '确认截断')[0]
   truthy(confirm, '缺少「确认截断」按钮')
   confirm.props.onClick()

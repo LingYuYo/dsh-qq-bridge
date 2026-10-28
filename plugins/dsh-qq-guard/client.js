@@ -4483,6 +4483,12 @@ window.__ModuleLoader__.load({
       const [truncOpen, setTruncOpen] = React.useState(false)
       const [truncBusy, setTruncBusy] = React.useState(false)
       const [truncNote, setTruncNote] = React.useState(null)
+      // L2 摘要手动编辑（v2.0 第十八步）：编辑态 / 草稿 / 重置确认 / 提交中。
+      const [briefingEditing, setBriefingEditing] = React.useState(false)
+      const [briefingDraft, setBriefingDraft] = React.useState('')
+      const [briefingResetOpen, setBriefingResetOpen] = React.useState(false)
+      const [briefingBusy, setBriefingBusy] = React.useState(false)
+      const [briefingNote, setBriefingNote] = React.useState(null)
       const context = session.context ?? {}
       const summary = session.summary ?? {}
       const recent = Array.isArray(session.recent) ? session.recent : null
@@ -4494,6 +4500,8 @@ window.__ModuleLoader__.load({
       const profiles = Array.isArray(session.userProfiles) ? session.userProfiles : []
       const briefing = String(session.contextBriefing ?? '')
       const briefingRows = briefingToHuman(briefing, profiles)
+      const briefingEdited = session.briefingEdited === true
+      const briefingGenerated = String(session.briefingGenerated ?? '')
       // 占用比例：保留一位小数，超过 100% 时铺满（数值仍如实显示）。
       // 注意不要用整百分比取整：18.4% 和 18.6% 在细条上看起来差别很大。
       const pct = budget > 0 ? Math.min(100, Math.round((tokens / budget) * 1000) / 10) : 0
@@ -4508,6 +4516,34 @@ window.__ModuleLoader__.load({
           setNote({ kind: 'err', text: '提交失败：' + (error?.message ?? error) })
         } finally {
           setBusy(false)
+        }
+      }
+
+      const saveBriefing = async () => {
+        setBriefingBusy(true)
+        setBriefingNote(null)
+        try {
+          await postSessionOp({ op: 'briefing', key: session.key, text: briefingDraft })
+          setBriefingNote({ kind: 'ok', text: '摘要已保存，下一轮 Prompt 立即用修改后的文本。' })
+          setBriefingEditing(false)
+        } catch (error) {
+          setBriefingNote({ kind: 'err', text: '保存失败：' + (error?.message ?? error) })
+        } finally {
+          setBriefingBusy(false)
+        }
+      }
+      const resetBriefing = async () => {
+        setBriefingBusy(true)
+        setBriefingNote(null)
+        try {
+          await postSessionOp({ op: 'briefing', key: session.key, reset: true })
+          setBriefingNote({ kind: 'ok', text: '已恢复为自动生成的原文。' })
+          setBriefingEditing(false)
+        } catch (error) {
+          setBriefingNote({ kind: 'err', text: '重置失败：' + (error?.message ?? error) })
+        } finally {
+          setBriefingBusy(false)
+          setBriefingResetOpen(false)
         }
       }
 
@@ -4603,21 +4639,64 @@ window.__ModuleLoader__.load({
               h('div', { className: 'qqg-msgtext' }, item.text || '（空）'))))),
         h(Panel, {
           title: 'L2 摘要（前情提要）',
-          desc: '手动提前截断时生成的压缩记忆，已注入当前会话的 Prompt；这里只是人类可读的展示。',
-          right: briefing === ''
-            ? h('span', { className: 'qqg-pill' }, '暂无')
-            : h('span', { className: 'qqg-pill' }, briefing.length + ' 字'),
+          desc: '手动提前截断时生成的压缩记忆，已注入当前会话的 Prompt；可直接编辑修正。',
+          right: h(React.Fragment, null,
+            h('span', { className: 'qqg-pill' }, briefing === '' ? '暂无' : briefing.length + ' 字'),
+            briefingEdited
+              ? h('span', { className: 'qqg-pill qqg-pill-accent' }, '已人工修正')
+              : null),
         },
-          briefing === ''
-            ? h('div', { className: 'qqg-hint' },
-              '还没有摘要。点上方「提前截断」会生成前情提要，并归档旧会话。')
-            : h('div', { className: 'qqg-l2' }, briefingRows.map((row, index) => (
-              row.kind === 'msg'
-                ? h('div', { key: index, className: 'qqg-l2-msg' },
-                  h('span', { className: 'qqg-l2-who' }, roleLabelOf(row.role) + ' ' + row.name + ' 说：'),
-                  h('span', { className: 'qqg-l2-text' }, row.text))
-                : h('div', { key: index, className: 'qqg-l2-line' }, row.text)
-            )))),
+          briefingEditing
+            ? h(React.Fragment, null,
+              h('textarea', {
+                className: 'qqg-ai-input', rows: 8, value: briefingDraft,
+                'aria-label': '编辑 L2 摘要', disabled: briefingBusy,
+                placeholder: '手动修正这段前情提要……',
+                onChange: (e) => setBriefingDraft(e.target.value),
+              }),
+              h('div', { className: 'qqg-textarea-actions' },
+                h('button', {
+                  type: 'button', className: 'qqg-btn qqg-btn-primary',
+                  disabled: briefingBusy,
+                  onClick: saveBriefing,
+                }, briefingBusy ? h(React.Fragment, null, h(Spinner), '保存中…') : '保存摘要'),
+                h('button', {
+                  type: 'button', className: 'qqg-btn',
+                  disabled: briefingBusy,
+                  onClick: () => setBriefingEditing(false),
+                }, '取消'),
+                briefingEdited && briefingGenerated !== ''
+                  ? h('button', {
+                    type: 'button', className: 'qqg-btn qqg-btn-danger',
+                    disabled: briefingBusy,
+                    onClick: () => setBriefingResetOpen(true),
+                  }, '重置为自动生成')
+                  : null))
+            : (briefing === ''
+              ? h('div', { className: 'qqg-hint' },
+                '还没有摘要。点上方「提前截断」会生成前情提要，并归档旧会话。')
+              : h('div', { className: 'qqg-l2' }, briefingRows.map((row, index) => (
+                row.kind === 'msg'
+                  ? h('div', { key: index, className: 'qqg-l2-msg' },
+                    h('span', { className: 'qqg-l2-who' }, roleLabelOf(row.role) + ' ' + row.name + ' 说：'),
+                    h('span', { className: 'qqg-l2-text' }, row.text))
+                  : h('div', { key: index, className: 'qqg-l2-line' }, row.text)
+              )))),
+          !briefingEditing && briefing !== ''
+            ? h('div', { className: 'qqg-textarea-actions' },
+              h('button', {
+                type: 'button', className: 'qqg-btn',
+                onClick: () => {
+                  setBriefingDraft(briefing)
+                  setBriefingNote(null)
+                  setBriefingEditing(true)
+                },
+              }, '编辑摘要'))
+            : null,
+          briefingNote
+            ? h('div', { className: 'qqg-status' + (briefingNote.kind === 'err' ? ' qqg-status-err' : '') },
+              briefingNote.text)
+            : null),
         h(Panel, {
           title: '未读归纳',
           desc: '快捷触发：等价于在群里发 /归纳（旁路临时会话，结果合并转发回群）。',
@@ -4642,7 +4721,8 @@ window.__ModuleLoader__.load({
         h(ConfirmModal, {
           open: truncOpen,
           title: '提前截断「' + sessionDisplayName(session) + '」？',
-          desc: '将提炼当前上下文，并归档旧会话开启新会话，以释放内存。是否继续？',
+          // v2.0 第十八步：破坏性操作，文案直说后果。
+          desc: '此操作会生成前情提要并归档旧会话，确定要提前截断吗？',
           confirmText: '确认截断',
           danger: true,
           onCancel: () => setTruncOpen(false),
@@ -4650,6 +4730,15 @@ window.__ModuleLoader__.load({
             setTruncOpen(false)
             void truncate()
           },
+        }),
+        h(ConfirmModal, {
+          open: briefingResetOpen,
+          title: '重置 L2 摘要？',
+          desc: '将丢弃人工修改，恢复为自动生成的原文。确定吗？',
+          confirmText: '恢复原文',
+          danger: true,
+          onCancel: () => setBriefingResetOpen(false),
+          onConfirm: () => { void resetBriefing() },
         })
       )
     }
