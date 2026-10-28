@@ -506,5 +506,193 @@ await check('桥接没上报会话时不渲染档位卡片（保持等待态）'
   truthy(textOf(tree).includes('等待桥接上报'), '应保持等待上报空态')
 })
 
+/* ── 用例：会话详情四 Tab（v2.0，2026-10-28）────────────────── */
+console.log('\n会话管理 · v2.0 四 Tab：')
+
+const LIVE_DETAIL = {
+  sessions: [
+    {
+      key: 'g:123456', sessionId: 's2', kind: 'group', qq: '123456', name: '摸鱼群',
+      title: '群聊-摸鱼群(123456)', unread: 1, lastAt: 1700000000000, lastText: '今天这破网',
+      persona: '', activityLevel: 2,
+      modelRoute: 'deepseek-account/deepseek-flash',
+      context: { budget: 128000, enabled: true, turns: 2, tokens: 1234, dropped: 1 },
+      summary: { lastAt: 1700000000000, runs: 2, lastError: '' },
+      recent: [
+        { at: 1700000001000, name: '小明', qq: '1001', kind: 'group', text: '你好呀', quote: '[引用 小红] 原话' },
+        { at: 1700000000000, name: '小红', qq: '1002', kind: 'group', text: '在吗', quote: '' },
+      ],
+      raw: { at: 1700000001000, json: '{"messageId":"m1","text":"你好呀"}' },
+    },
+    {
+      key: 'u:1000000001', sessionId: 's1', kind: 'private', qq: '1000000001', name: '翎羽',
+      title: '私聊-翎羽', unread: 0, lastAt: 0, lastText: '', persona: '', activityLevel: null,
+      modelRoute: '', context: { budget: 0, enabled: false, turns: 0, tokens: 0, dropped: 0 },
+      summary: { lastAt: 0, runs: 0, lastError: '' },
+    },
+  ],
+}
+
+function tabBtn(tree, label) {
+  return findAll(tree, (n) => n.tag === 'button' && n.props?.role === 'tab'
+    && textOf(n).trim() === label)[0]
+}
+function btnAnywhere(tree, text) {
+  return findAll(tree, (n) => n.tag === 'button' && textOf(n).trim() === text)[0]
+}
+
+await check('详情头下方有四个分页，默认停在「基础配置」', () => {
+  reset()
+  const tree = resetSessions(LIVE_DETAIL)
+  const labels = findAll(tree, (n) => n.tag === 'button' && n.props?.role === 'tab').map((n) => textOf(n).trim())
+  eq(labels, ['基础配置', '记忆与摘要', '特权与权限', '调试信息'], '四个分页顺序')
+  truthy(levelSelect(tree), '基础配置应包含响应档位')
+  truthy(btnAnywhere(tree, '保存人设'), '基础配置应包含单人设保存')
+  eq(btnAnywhere(tree, '生成未读归纳'), undefined, '默认不该渲染记忆 Tab')
+})
+
+await check('记忆与摘要：上下文占用 + 最近入站（带引用）+ 归纳按钮', () => {
+  reset()
+  let tree = resetSessions(LIVE_DETAIL)
+  tabBtn(tree, '记忆与摘要').props.onClick()
+  tree = render()
+  const joined = textOf(tree)
+  truthy(joined.includes('128,000 token'), '应显示注入预算')
+  truthy(joined.includes('1,234 token / 2 条'), `应显示最近一轮注入，实际：${joined}`)
+  truthy(joined.includes('引用：[引用 小红] 原话'), '引用摘要要显示出来')
+  truthy(joined.includes('你好呀') && joined.includes('在吗'), '最近入站要显示')
+  truthy(btnAnywhere(tree, '生成未读归纳'), '缺少归纳按钮')
+  eq(levelSelect(tree), undefined, '切到记忆 Tab 后不该再渲染档位下拉')
+})
+
+await check('生成未读归纳 → POST {op:"summarize"}，并给出提交提示', async () => {
+  reset()
+  let tree = resetSessions(LIVE_DETAIL)
+  tabBtn(tree, '记忆与摘要').props.onClick()
+  tree = render()
+  btnAnywhere(tree, '生成未读归纳').props.onClick()
+  await new Promise((r) => setImmediate(r))
+  const post = FEED.filter((f) => f.url.includes('/session-ops')).pop()
+  truthy(post, '没有提交到 /dsh-qq-guard/session-ops')
+  eq(JSON.parse(post.init.body), { op: 'summarize', key: 'g:123456' }, '提交 body 形状')
+  tree = render()
+  truthy(textOf(tree).includes('已提交'), '缺少提交成功提示')
+})
+
+await check('特权与权限：三阶名单只读展示；群会话可加入白名单 / 黑名单', () => {
+  reset()
+  VALUE.allow = { ...VALUE.allow, developers: ['3300000000'], owners: ['2200000000'], admins: ['1100000000'] }
+  let tree = resetSessions(LIVE_DETAIL)
+  tabBtn(tree, '特权与权限').props.onClick()
+  tree = render()
+  const joined = textOf(tree)
+  for (const qq of ['3300000000', '2200000000', '1100000000']) {
+    truthy(joined.includes(qq), `名单里应显示 ${qq}`)
+  }
+  truthy(joined.includes('全局生效'), '要说明名单是全局的')
+  btnAnywhere(tree, '加入白名单').props.onClick()
+  eq(lastWrite('allow.groups'), ['123456'], '群会话加入白名单写 allow.groups')
+  btnAnywhere(tree, '加入黑名单').props.onClick()
+  eq(lastWrite('allow.deny.groups'), ['123456'], '黑名单写 allow.deny.groups')
+})
+
+await check('特权与权限：私聊会话可授予管理员 / 主人 / 开发者', () => {
+  reset()
+  VALUE.allow = { ...VALUE.allow, developers: [], owners: [], admins: [] }
+  let tree = resetSessions(LIVE_DETAIL)
+  // 切到私聊会话（第二行）。
+  findAll(tree, (n) => String(n.props?.className ?? '').split(' ').includes('qqg-session')
+    && typeof n.props?.onClick === 'function')[1].props.onClick()
+  tree = render()
+  tabBtn(tree, '特权与权限').props.onClick()
+  tree = render()
+  btnAnywhere(tree, '加入开发者').props.onClick()
+  eq(lastWrite('allow.developers'), ['1000000001'], '开发者名单写 allow.developers')
+  btnAnywhere(tree, '加入主人').props.onClick()
+  eq(lastWrite('allow.owners'), ['1000000001'], '主人名单写 allow.owners')
+})
+
+await check('调试信息：sessionId / 模型路由 / 原始 Payload', () => {
+  reset()
+  VALUE.developer = { debugPayload: true }
+  let tree = resetSessions(LIVE_DETAIL)
+  tabBtn(tree, '调试信息').props.onClick()
+  tree = render()
+  const joined = textOf(tree)
+  truthy(joined.includes('s2'), '要显示 sessionId')
+  truthy(joined.includes('deepseek-account/deepseek-flash'), '要显示实际下发路由')
+  truthy(joined.includes('"messageId":"m1"'), '原始 payload 要被渲染出来')
+})
+
+await check('调试信息：开关没开时给明确提示，不渲染 payload', () => {
+  reset()
+  VALUE.developer = { debugPayload: false }
+  let tree = resetSessions(LIVE_DETAIL)
+  tabBtn(tree, '调试信息').props.onClick()
+  tree = render()
+  const joined = textOf(tree)
+  truthy(joined.includes('未开启'), '要显示未开启状态')
+  truthy(!joined.includes('"messageId":"m1"'), '没开就不该显示 payload 内容')
+})
+
+/* ── 用例：开发者特权技能卡（v2.0）────────────────────────── */
+console.log('\n开发者特权技能卡：')
+
+await check('卡片默认出现（合并默认项），带只读动态记忆预览', () => {
+  reset()
+  const tree = resetSkills()
+  truthy(textOf(tree).includes('开发者特权'), '缺少「开发者特权」卡片')
+  truthy(textOf(tree).includes('动态记忆：暂无'), '缺少只读预览占位')
+})
+
+await check('弹窗字段：开关 / 触发词 / 专属 Prompt / 原始 Payload 开关 / 只读预览', () => {
+  reset()
+  let tree = resetSkills()
+  openGear(tree, '开发者特权')
+  tree = render()
+  const modal = modalOf(tree)
+  const switches = findAll(modal, (n) => n.tag === 'button' && n.props?.role === 'switch')
+  eq(switches.length, 3, '三个开关（暗号 / 普通群友回一句 / 原始 Payload）')
+  truthy(byAria(tree, '触发关键词'), '缺少触发关键词编辑器')
+  truthy(byAria(tree, '专属 Prompt'), '缺少专属 Prompt 多行框')
+  truthy(textOf(modal).includes('暂无（底层还没接入自动提取'), '只读预览要说明接口先留')
+  truthy(findAll(modal, (n) => String(n.props?.className ?? '').includes('qqg-devpreview')).length > 0,
+    '只读预览必须用 .qqg-devpreview')
+})
+
+await check('保存写回 developer.enabled / keywords；只读预览不写盘', () => {
+  reset()
+  let tree = resetSkills()
+  openGear(tree, '开发者特权')
+  tree = render()
+  // 第 0 个开关 = 启用特权暗号。
+  findAll(modalOf(tree), (n) => n.tag === 'button' && n.props?.role === 'switch')[0].props.onClick()
+  tree = render()
+  byAria(tree, '触发关键词').props.onChange({ target: { value: '/test' } })
+  tree = render()
+  findAll(modalOf(tree), (n) => n.tag === 'button' && n.props?.['aria-label'] === '触发关键词 添加')[0]
+    .props.onClick()
+  tree = render()
+  btnByText(tree, '保存').props.onClick()
+  eq(lastWrite('developer.enabled'), true, '开关写回')
+  // 默认值来自 client 的 DEFAULTS（/dev /admin），新增一个后整数组写回。
+  eq(lastWrite('developer.keywords'), ['/dev', '/admin', '/test'], '关键词整数组写回')
+  eq(lastWrite('developer.memoryNotes'), undefined, '★ 只读预览绝不能写盘')
+})
+
+await check('打开暗号但没有开发者 / Prompt 时，弹窗顶部有提示', () => {
+  reset()
+  VALUE.developer = { enabled: true, prompt: '', keywords: ['/dev'] }
+  let tree = resetSkills()
+  openGear(tree, '开发者特权')
+  tree = render()
+  truthy(textOf(modalOf(tree)).includes('专属 Prompt 是空的'), '缺少空 Prompt 提示')
+  VALUE.developer = { enabled: true, prompt: '有内容', keywords: ['/dev'] }
+  tree = resetSkills()
+  openGear(tree, '开发者特权')
+  tree = render()
+  truthy(textOf(modalOf(tree)).includes('还没有配置开发者 QQ 号'), '缺少空名单提示')
+})
+
 /* ── 汇总 ──────────────────────────────────────────────────── */
 console.log(`\n结果：${pass} 通过 / ${process.exitCode === 1 ? '≥1' : 0} 失败`)

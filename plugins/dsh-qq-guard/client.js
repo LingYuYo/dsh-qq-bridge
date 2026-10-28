@@ -680,6 +680,33 @@ window.__ModuleLoader__.load({
 /* 面板底部「正在保存…」：乐观更新在飞行中的唯一提示。 */
 .qqg-saving { display: inline-flex; align-items: center; font-size: 11.5px;
   color: var(--dsw-alias-label-secondary); }
+
+/* ── v2.0（2026-10-28）：会话详情四 Tab / 开发者特权预览 ───────────── */
+.qqg-dtabs { display: flex; gap: 4px; flex-wrap: wrap; padding: 3px; border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-2); border: 1px solid var(--dsw-alias-border-l1); }
+.qqg-dtab { font: inherit; font-size: 12px; line-height: 1.4; padding: 5px 12px; border: 0;
+  border-radius: 8px; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; }
+.qqg-dtab:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.qqg-dtab-on, .qqg-dtab-on:hover { background: var(--dsw-alias-button-primary-fill);
+  color: var(--dsw-alias-label-primary-foreground); }
+.qqg-dstack { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.qqg-msglist { display: flex; flex-direction: column; gap: 8px; max-height: 340px; overflow: auto; }
+.qqg-msgitem { display: flex; flex-direction: column; gap: 3px; padding: 8px 10px; border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-2); border: 1px solid var(--dsw-alias-border-l1); }
+.qqg-msgtext { font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.qqg-msgquote { font-size: 11.5px; line-height: 1.45; color: var(--dsw-alias-label-secondary);
+  border-left: 2px solid var(--dsw-alias-border-l2); padding-left: 7px; word-break: break-word; }
+.qqg-meter { height: 6px; border-radius: 999px; background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1); overflow: hidden; }
+.qqg-meter-fill { height: 100%; background: var(--qqg-accent); }
+.qqg-codebox { margin: 0; padding: 10px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px; line-height: 1.5; max-height: 300px; overflow: auto; white-space: pre-wrap;
+  word-break: break-all; }
+.qqg-devpreview { font-size: 11px; line-height: 1.5; padding: 8px; border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-2); border: 1px dashed var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-secondary); max-height: 96px; overflow: auto; }
 `
 
     /* ══════════ 真实数据源（会话列表）══════════ */
@@ -840,6 +867,12 @@ window.__ModuleLoader__.load({
       'rhythm.rateLimit.perMin': 12,
       'rhythm.rateLimit.burst': 3,
       'rhythm.rateLimit.silent': true,
+      // 开发者特权（v2.0）：默认全关（fail-closed），与 Host 侧 Config 默认值一致。
+      'developer.enabled': false,
+      'developer.keywords': ['/dev', '/admin'],
+      'developer.prompt': '',
+      'developer.strangerReply': false,
+      'developer.debugPayload': false,
     }
 
     /** 按点分路径取值（'typingDelay.enabled' → value.typingDelay.enabled）。 */
@@ -919,6 +952,17 @@ window.__ModuleLoader__.load({
       desc: '主人发 /归纳 [条数]：拉群历史 → 廉价模型总结 → 合并转发发回群里（失败降级纯文本）。',
     }
 
+    /**
+     * 内置「开发者特权」技能（v2.0 第二步，2026-10-28）。
+     *
+     * 默认**关闭**：这是提权通道（暗号 + 尾部专属 Prompt），老配置里没有这张卡时
+     * 绝不能凭空打开。与 index.js 的 DEFAULT_SKILLS 逐字一致。
+     */
+    const DEFAULT_DEVELOPER_SKILL = {
+      id: 'sk-developer', name: '开发者特权', icon: 'code', tag: '内置', ver: '1.0.0', enabled: false,
+      desc: '开发者 QQ 命中暗号时，把专属 Prompt 追加到本轮尾部；不进系统提示词、不改工具白名单。',
+    }
+
     /** 合并目标 id：老配置里的 sk-context 会被并进这一条。 */
     const MEMORY_SKILL_ID = 'sk-memory'
     /** 已合并掉的旧 id：读清单时直接滤掉，不再当独立卡片渲染。 */
@@ -927,7 +971,7 @@ window.__ModuleLoader__.load({
     /** 内置技能的新增项：配置里缺哪个补哪个，已有条目原样保留（不打断排序）。 */
     const DEFAULT_SKILLS_LOCAL = [
       DEFAULT_IMAGE_SKILL, DEFAULT_POKE_SKILL, DEFAULT_QUOTE_SKILL, DEFAULT_MEMORY_SKILL,
-      DEFAULT_TIME_AWARE_SKILL, DEFAULT_UNREAD_SKILL,
+      DEFAULT_TIME_AWARE_SKILL, DEFAULT_UNREAD_SKILL, DEFAULT_DEVELOPER_SKILL,
     ]
 
     /**
@@ -1783,6 +1827,10 @@ window.__ModuleLoader__.load({
       const priv = get('allow.private')
       const groups = get('allow.groups')
       const admins = get('allow.admins')
+      const owners = get('allow.owners')
+      const developers = get('allow.developers')
+      const denyPrivate = get('allow.deny.private')
+      const denyGroups = get('allow.deny.groups')
       const allowAll = get('allow.allowAllWhenEmpty') === true
       // 数组不能整体 set 后靠路径猜测，这里按 allow.<key> 逐项写；
       // 走 write() 而不是直接 form.mutate()，才能吃到外层统一的乐观更新 / 回滚。
@@ -1812,6 +1860,43 @@ window.__ModuleLoader__.load({
             ariaLabel: '管理员 QQ 号',
             onChange: (next) => setAllow({ admins: next }),
           })),
+        h(Field, {
+          label: '主人 QQ 号',
+          desc: '管理员全部权限 + 触发后台动作（/归纳，会花 token）。主人自动算管理员。',
+        },
+          h(ListEditor, {
+            items: Array.isArray(owners) ? owners : [], disabled: !writable, placeholder: '输入主人 QQ 号后回车',
+            ariaLabel: '主人 QQ 号',
+            onChange: (next) => setAllow({ owners: next }),
+          })),
+        h(Field, {
+          label: '开发者 QQ 号',
+          desc: '三阶权限最高一档（开发者 > 主人 > 管理员）：主人全部权限 + 命中暗号时'
+            + '把专属 Prompt 追加到本轮尾部。名单为空 = 自动降级，不会报错。',
+        },
+          h(ListEditor, {
+            items: Array.isArray(developers) ? developers : [], disabled: !writable, placeholder: '输入开发者 QQ 号后回车',
+            ariaLabel: '开发者 QQ 号',
+            onChange: (next) => setAllow({ developers: next }),
+          })),
+        h(Field, {
+          label: '私聊黑名单 QQ 号',
+          desc: '命中直接忽略，优先于私聊白名单。',
+        },
+          h(ListEditor, {
+            items: Array.isArray(denyPrivate) ? denyPrivate : [], disabled: !writable, placeholder: '输入 QQ 号后回车',
+            ariaLabel: '私聊黑名单',
+            onChange: (next) => setAllow({ 'deny.private': next }),
+          })),
+        h(Field, {
+          label: '群黑名单群号',
+          desc: '命中直接忽略，优先于群白名单。',
+        },
+          h(ListEditor, {
+            items: Array.isArray(denyGroups) ? denyGroups : [], disabled: !writable, placeholder: '输入群号后回车',
+            ariaLabel: '群黑名单',
+            onChange: (next) => setAllow({ 'deny.groups': next }),
+          })),
         h(Field, { label: '白名单为空时放行全部', desc: '⚠️ 打开后任何人都能让 bot 回话，慎用。' },
           h(Switch, {
             checked: allowAll, disabled: !writable,
@@ -1820,7 +1905,8 @@ window.__ModuleLoader__.load({
           })),
         h('div', { className: 'qqg-hint' },
           '白名单每次收到消息都从最新配置现读，保存后下一条消息立即生效，无需重启桥接。',
-          '管理员身份只对 / 指令生效，不会绕过白名单。'))
+          '管理员身份只对 / 指令生效，不会绕过白名单。',
+          '权限分阶：开发者 > 主人 > 管理员，高阶自动继承低阶；名单为空一律按低阶生效。'))
     }
 
     /** 参与度三档：id 与桥接 composePersonaPrompt 的 key 一一对应。 */
@@ -3250,17 +3336,52 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * v2.0（2026-10-28）：会话详情右侧的四张分页。
+     *
+     * 顺序 = 用户看问题的顺序：先调「它怎么回」（基础配置），再看「它记得什么」
+     * （记忆与摘要），然后「谁能动它」（特权与权限），最后「出问题怎么查」（调试信息）。
+     * 只放文案与 id；每个分页的实体在下面四个 Session*Tab 组件里。
+     */
+    const SESSION_DETAIL_TABS = [
+      { id: 'basic', label: '基础配置' },
+      { id: 'memory', label: '记忆与摘要' },
+      { id: 'privilege', label: '特权与权限' },
+      { id: 'debug', label: '调试信息' },
+    ]
+
+    /** 时间戳 → 消息列表里的 HH:MM（跨天补 MM-DD）。 */
+    function clockTime(ts) {
+      const value = Number(ts)
+      if (!Number.isFinite(value) || value <= 0) return '—'
+      const date = new Date(value)
+      const now = new Date()
+      const pad = (n) => String(n).padStart(2, '0')
+      const sameDay = date.getFullYear() === now.getFullYear()
+        && date.getMonth() === now.getMonth() && date.getDate() === now.getDate()
+      const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+      return sameDay ? clock : `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${clock}`
+    }
+
+    /** 会话显示名：昵称 > QQ / 群号 > key，永不返回空串。 */
+    function sessionDisplayName(row) {
+      return String(row?.name || row?.qq || row?.key || '')
+    }
+
+    /**
      * 会话管理页：桥接上报的会话列表在**本组件内部**轮询。
      *
      * 之前列表由 SettingsPanel 轮询后当 props 传下来，于是每 3 秒整个面板
      * （含左侧导航、其它 Tab 的空闲重渲染）都会跟着跑一遍。现在状态只落在
      * 这一层，切 Tab 时也只挂载当前 Tab。
      */
-    function SessionsTab({ get }) {
+    function SessionsTab({ get, write, writable }) {
       const live = useBridgeStatus(true)
       const rows = Array.isArray(live?.sessions) ? live.sessions : null
       const [selectedKey, setSelectedKey] = React.useState('')
       const [personaDraft, setPersonaDraft] = React.useState({})
+      // 详情右侧当前分页（v2.0）。切换会话时刻意**保留**分页：连着看三个群的
+      // 「记忆与摘要」不该每次都退回第一页。
+      const [detailTab, setDetailTab] = React.useState('basic')
       // 单群档位草稿：按会话 key 存，提交成功前不覆盖桥接上报的真实值。
       const [levelDraft, setLevelDraft] = React.useState({})
       const [busy, setBusy] = React.useState(null)
@@ -3408,82 +3529,45 @@ window.__ModuleLoader__.load({
             notice
               ? h('div', { className: 'qqg-status' + (notice.kind === 'err' ? ' qqg-status-err' : '') }, notice.text)
               : null,
-            h(Panel, { title: '会话信息', desc: 'DSH 标题在创建 / 接管会话时按「私聊-昵称 / 群聊-群名(群号)」强制对齐。' },
-              h('div', { className: 'qqg-list' },
-                h('div', { className: 'qqg-kv' }, h('span', null, '会话 key'), h('b', { className: 'qqg-mono' }, cur.key)),
-                h('div', { className: 'qqg-kv' }, h('span', null, 'DSH 会话 ID'),
-                  h('b', { className: 'qqg-mono qqg-kv-ellipsis' }, cur.sessionId || '（未建立）')),
-                h('div', { className: 'qqg-kv' }, h('span', null, 'DSH 标题'),
-                  h('b', { className: 'qqg-kv-ellipsis' }, cur.title || '（待对齐）')),
-                h('div', { className: 'qqg-kv' }, h('span', null, '最近活动'), h('b', null, sessionTime(cur.lastAt))))),
-            h(Panel, {
-              title: '响应档位',
-              desc: '单群覆盖全局档位：保存后桥接在下一条消息前读新值。留空/选「跟随全局」= 清掉覆盖。',
-              right: h('span', { className: 'qqg-pill' + (savedLevel === null ? '' : ' qqg-pill-accent') },
-                savedLevel === null ? '跟随全局' : '单群 ' + savedLevel + ' 档'),
-            },
-              h('div', { className: 'qqg-field' },
-                h('span', { className: 'qqg-field-label' }, '该会话的档位'),
-                h('select', {
-                  className: 'qqg-input', style: { width: '100%' },
-                  value: draftLevel === null ? '' : String(draftLevel),
-                  disabled: busy !== null,
-                  'aria-label': '单群响应档位',
-                  onChange: (e) => {
-                    const raw = e.target.value
-                    setLevelDraft((map) => ({ ...map, [cur.key]: raw === '' ? null : Number(raw) }))
-                  },
-                },
-                h('option', { value: '' }, '跟随全局（当前 ' + globalLevel + ' 档）'),
-                SESSION_LEVEL_LABELS.map((label, level) => h('option', {
-                  key: level, value: String(level),
-                }, level + ' · ' + label))),
-                h('span', { className: 'qqg-field-hint' },
-                  draftLevel === null
-                    ? '全局现在是 ' + globalLevel + ' 档（' + (sessionLevelLabel(globalLevel) ?? '未知') + '）。'
-                    : '覆盖为 ' + draftLevel + ' 档（' + (sessionLevelLabel(draftLevel) ?? '未知') + '），只影响这个会话。')),
-              h('div', { className: 'qqg-textarea-actions' },
-                h('button', {
-                  type: 'button', className: 'qqg-btn qqg-btn-primary',
-                  disabled: busy !== null || !levelDirty,
-                  onClick: saveLevel,
-                }, busy === 'activity'
-                  ? h(React.Fragment, null, h(Spinner), '提交中…')
-                  : '保存档位'))),
-            h(Panel, {
-              title: '单人设覆盖',
-              desc: '留空 = 沿用全局人设。保存后桥接下一条消息前推给插件，即时生效；只影响这个 QQ 会话。',
-              right: h('span', { className: 'qqg-pill' }, String(draftPersona.length) + ' 字'),
-            },
-              h('textarea', {
-                className: 'qqg-ai-input', rows: 5,
-                placeholder: '为该会话单独指定人设…（留空恢复全局）',
-                value: draftPersona,
-                'aria-label': '单人设覆盖',
-                disabled: busy === 'persona',
-                onChange: (e) => setPersonaDraft((map) => ({ ...map, [cur.key]: e.target.value })),
-              }),
-              h('div', { className: 'qqg-textarea-actions' },
-                h('button', {
-                  type: 'button', className: 'qqg-btn qqg-btn-primary',
-                  disabled: busy !== null || !personaDirty,
-                  onClick: savePersona,
-                }, busy === 'persona'
-                  ? h(React.Fragment, null, h(Spinner), '保存中…')
-                  : '保存人设'),
-                h('button', {
-                  type: 'button', className: 'qqg-btn',
-                  disabled: busy !== null || savedPersona === '',
-                  onClick: resetPersona,
-                }, '恢复全局'))),
-            h(Panel, {
-              title: '最近消息',
-              desc: '桥接只保留最后一条消息的预览；完整历史在 DSH 会话里。',
-            },
-              h('div', { className: 'qqg-list' },
-                h('div', { className: 'qqg-msg' },
-                  h('div', { className: 'qqg-msg-meta' }, displayName(cur) + ' · ' + sessionTime(cur.lastAt)),
-                  h('div', null, cur.lastText || '（还没有消息预览）')))))
+            // v2.0（2026-10-28）四 Tab：只挂当前 Tab 的叶子组件 —— 切 Tab 不会
+            // 连带左栏列表 / 其它 Tab 一起重渲染。草稿 state 仍留在 SessionsTab，
+            // 切走再切回不会丢（组件用 key=cur.key 重新挂载，只清 Tab 内的临时提示）。
+            h('div', { className: 'qqg-dtabs', role: 'tablist', 'aria-label': '会话详情分页' },
+              SESSION_DETAIL_TABS.map((tab) => h('button', {
+                key: tab.id,
+                type: 'button',
+                role: 'tab',
+                'aria-selected': detailTab === tab.id ? 'true' : 'false',
+                className: 'qqg-dtab' + (detailTab === tab.id ? ' qqg-dtab-on' : ''),
+                onClick: () => setDetailTab(tab.id),
+              }, tab.label))),
+            detailTab === 'memory'
+              ? h(SessionMemoryTab, { key: cur.key, session: cur })
+              : detailTab === 'privilege'
+                ? h(SessionPrivilegeTab, { key: cur.key, session: cur, get, write, writable })
+                : detailTab === 'debug'
+                  ? h(SessionDebugTab, { key: cur.key, session: cur, get })
+                  : h(SessionBasicTab, {
+                    key: cur.key,
+                    session: cur,
+                    busy,
+                    persona: {
+                      draft: draftPersona,
+                      saved: savedPersona,
+                      dirty: personaDirty,
+                      onChange: (value) => setPersonaDraft((map) => ({ ...map, [cur.key]: value })),
+                      onSave: savePersona,
+                      onReset: resetPersona,
+                    },
+                    level: {
+                      draft: draftLevel,
+                      saved: savedLevel,
+                      dirty: levelDirty,
+                      global: globalLevel,
+                      onChange: (value) => setLevelDraft((map) => ({ ...map, [cur.key]: value })),
+                      onSave: saveLevel,
+                    },
+                  }))
         ),
         h(ConfirmModal, {
           open: confirm !== null,
@@ -3505,9 +3589,331 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /* ══════════ v2.0 · 会话详情四 Tab 的叶子组件（2026-10-28）══════════ */
+    //
+    // 为什么拆成独立组件而不是内联渲染函数：内联函数每次 render 都是新类型，
+    // React 会整棵卸载重建 —— 单人设输入框会丢焦点、记忆 Tab 的「已提交」提示会闪没。
+    // 定义在闭包层（组件外）身份稳定，切 Tab 只影响自己这棵子树。
+
+    /** Tab 1 · 基础配置：响应档位 + 单人设覆盖（原「会话信息」挪去调试信息）。 */
+    function SessionBasicTab({ session, persona, level, busy }) {
+      return h('div', { className: 'qqg-dstack' },
+        h(Panel, {
+          title: '响应档位',
+          desc: '单群覆盖全局档位：保存后桥接在下一条消息前读新值。选「跟随全局」= 清掉覆盖。',
+          right: h('span', { className: 'qqg-pill' + (level.saved === null ? '' : ' qqg-pill-accent') },
+            level.saved === null ? '跟随全局' : '单群 ' + level.saved + ' 档'),
+        },
+          h('div', { className: 'qqg-field' },
+            h('span', { className: 'qqg-field-label' }, '该会话的档位'),
+            h('select', {
+              className: 'qqg-input', style: { width: '100%' },
+              value: level.draft === null ? '' : String(level.draft),
+              disabled: busy !== null,
+              'aria-label': '单群响应档位',
+              onChange: (e) => level.onChange(e.target.value === '' ? null : Number(e.target.value)),
+            },
+            h('option', { value: '' }, '跟随全局（当前 ' + level.global + ' 档）'),
+            SESSION_LEVEL_LABELS.map((label, index) => h('option', {
+              key: index, value: String(index),
+            }, index + ' · ' + label))),
+            h('span', { className: 'qqg-field-hint' },
+              level.draft === null
+                ? '全局现在是 ' + level.global + ' 档（' + (sessionLevelLabel(level.global) ?? '未知') + '）。'
+                : '覆盖为 ' + level.draft + ' 档（' + (sessionLevelLabel(level.draft) ?? '未知') + '），只影响这个会话。')),
+          h('div', { className: 'qqg-textarea-actions' },
+            h('button', {
+              type: 'button', className: 'qqg-btn qqg-btn-primary',
+              disabled: busy !== null || !level.dirty,
+              onClick: level.onSave,
+            }, busy === 'activity'
+              ? h(React.Fragment, null, h(Spinner), '提交中…')
+              : '保存档位'))),
+        h(Panel, {
+          title: '单人设覆盖',
+          desc: '留空 = 沿用全局人设。保存后桥接下一条消息前推给插件，即时生效；只影响这个 QQ 会话。',
+          right: h('span', { className: 'qqg-pill' }, String(persona.draft.length) + ' 字'),
+        },
+          h('textarea', {
+            className: 'qqg-ai-input', rows: 6,
+            placeholder: '为该会话单独指定人设…（留空恢复全局）',
+            value: persona.draft,
+            'aria-label': '单人设覆盖',
+            disabled: busy === 'persona',
+            onChange: (e) => persona.onChange(e.target.value),
+          }),
+          h('div', { className: 'qqg-textarea-actions' },
+            h('button', {
+              type: 'button', className: 'qqg-btn qqg-btn-primary',
+              disabled: busy !== null || !persona.dirty,
+              onClick: persona.onSave,
+            }, busy === 'persona'
+              ? h(React.Fragment, null, h(Spinner), '保存中…')
+              : '保存人设'),
+            h('button', {
+              type: 'button', className: 'qqg-btn',
+              disabled: busy !== null || persona.saved === '',
+              onClick: persona.onReset,
+            }, '恢复全局'))),
+        h('div', { className: 'qqg-hint' },
+          '单人设走插件的人设 section（系统提示词层）；「开发者特权」的专属 Prompt 只追加在',
+          '本轮 Prompt 尾部，两条通路互不覆盖。'))
+    }
+
+    /** Tab 2 · 记忆与摘要：上下文占用 + 最近 10 条入站 + 未读归纳快捷键。 */
+    function SessionMemoryTab({ session }) {
+      const [busy, setBusy] = React.useState(false)
+      const [note, setNote] = React.useState(null)
+      const context = session.context ?? {}
+      const summary = session.summary ?? {}
+      const recent = Array.isArray(session.recent) ? session.recent : null
+      const budget = Number(context.budget) || 0
+      const tokens = Number(context.tokens) || 0
+      const turns = Number(context.turns) || 0
+      const dropped = Number(context.dropped) || 0
+      const pct = budget > 0 ? Math.min(100, Math.round((tokens / budget) * 100)) : 0
+
+      const summarize = async () => {
+        setBusy(true)
+        setNote(null)
+        try {
+          await postSessionOp({ op: 'summarize', key: session.key })
+          setNote({ kind: 'ok', text: '已提交，桥接会在 2 秒内开始归纳；结果合并转发回该群。' })
+        } catch (error) {
+          setNote({ kind: 'err', text: '提交失败：' + (error?.message ?? error) })
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h('div', { className: 'qqg-dstack' },
+        h(Panel, {
+          title: '上下文 Token 占用',
+          desc: '桥接侧可观测的部分：这一轮实际注入了多少条历史 / 多少 token，以及配置的预算上限。',
+          right: h('span', { className: 'qqg-pill' + (context.enabled === false ? '' : ' qqg-pill-accent') },
+            context.enabled === false ? '记忆已关闭' : '记忆已开启'),
+        },
+          h('div', { className: 'qqg-list' },
+            h('div', { className: 'qqg-kv' }, h('span', null, '注入预算'),
+              h('b', null, budget > 0 ? fmtNum(budget) + ' token' : '未设置')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '最近一轮注入'),
+              h('b', null, tokens > 0 ? fmtNum(tokens) + ' token / ' + turns + ' 条' : '（还没注入过）')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '按预算截断'),
+              h('b', null, dropped + ' 条'))),
+          budget > 0
+            ? h('div', { className: 'qqg-meter', title: '最近一轮注入量 / 预算' },
+              h('div', { className: 'qqg-meter-fill', style: { width: pct + '%' } }))
+            : null,
+          h('div', { className: 'qqg-hint' },
+            '这里统计的是桥接自己注入的聊天记录；DSH 会话里的完整上下文占用由 DSH 管理，插件侧读不到。')),
+        h(Panel, {
+          title: '最近 10 条入站消息',
+          desc: '来自桥接内存缓冲（1 小时窗口），带引用解析结果；不是 DSH 的完整历史。',
+          right: recent === null
+            ? h('span', { className: 'qqg-pill' }, '未上报')
+            : h('span', { className: 'qqg-pill' }, recent.length + ' 条'),
+        },
+          recent === null
+            ? h('div', { className: 'qqg-hint' },
+              '该会话不在最近 12 条活跃窗口内，桥接没有上报明细（让它先收到一条消息再看）。')
+            : recent.length === 0
+              ? h('div', { className: 'qqg-hint' }, '缓冲里还没有消息（只保留最近 1 小时）。')
+              : h('div', { className: 'qqg-msglist' }, recent.map((item, index) => h('div', {
+                key: index, className: 'qqg-msgitem',
+              },
+              h('div', { className: 'qqg-msg-meta' },
+                clockTime(item.at) + ' · ' + (item.name || item.qq || '未知')
+                + (item.qq ? '(' + item.qq + ')' : '')),
+              item.quote ? h('div', { className: 'qqg-msgquote' }, '引用：' + item.quote) : null,
+              h('div', { className: 'qqg-msgtext' }, item.text || '（空）'))))),
+        h(Panel, {
+          title: '未读归纳',
+          desc: '快捷触发：等价于在群里发 /归纳（旁路临时会话，结果合并转发回群）。',
+          right: summary.lastAt > 0
+            ? h('span', { className: 'qqg-pill' }, '上次 ' + sessionTime(summary.lastAt))
+            : h('span', { className: 'qqg-pill' }, '还没归纳过'),
+        },
+          h('div', { className: 'qqg-textarea-actions' },
+            h('button', {
+              type: 'button', className: 'qqg-btn qqg-btn-primary',
+              disabled: busy || !session.sessionId,
+              title: session.sessionId ? '让桥接按水位归纳这个群最近的消息' : '该会话还没建立 DSH 会话',
+              onClick: summarize,
+            }, busy ? h(React.Fragment, null, h(Spinner), '提交中…') : '生成未读归纳')),
+          summary.lastError
+            ? h('div', { className: 'qqg-status qqg-status-err' }, '上次失败：' + summary.lastError)
+            : null,
+          note ? h('div', { className: 'qqg-status' + (note.kind === 'err' ? ' qqg-status-err' : '') },
+            note.text) : null,
+          h('div', { className: 'qqg-hint' },
+            '控制台触发的归纳会标 origin=console，不冒充任何 QQ 号；水位与 /归纳 共用。'))
+      )
+    }
+
+    /** Tab 3 · 特权与权限：三阶名单 + 白名单/黑名单快捷操作。 */
+    function SessionPrivilegeTab({ session, get, write, writable }) {
+      const asList = (value) => (Array.isArray(value) ? value.map(String) : [])
+      const developers = asList(get('allow.developers'))
+      const owners = asList(get('allow.owners'))
+      const admins = asList(get('allow.admins'))
+      const isGroup = session.kind === 'group'
+      const target = String(session.qq || '')
+      const allowPath = isGroup ? 'allow.groups' : 'allow.private'
+      const denyPath = isGroup ? 'allow.deny.groups' : 'allow.deny.private'
+      const inAllow = asList(get(allowPath)).includes(target)
+      const inDeny = asList(get(denyPath)).includes(target)
+      const roleOf = (list) => list.includes(target)
+
+      /** 名单是**全局**的（不按群区分），所以这里只能整体读写。 */
+      const toggleIn = (path, value) => {
+        if (!writable || value === '') return
+        const list = asList(get(path))
+        write(path, list.includes(value) ? list.filter((item) => item !== value) : [...list, value])
+      }
+
+      const nameRow = (label, list, accent) => h('div', { className: 'qqg-kv' },
+        h('span', null, label),
+        list.length === 0
+          ? h('b', null, '（空）')
+          : h('b', { className: accent ? 'qqg-mono' : '' }, list.join('、')))
+
+      const roleButton = (label, path, active) => h('button', {
+        type: 'button',
+        className: 'qqg-btn' + (active ? ' qqg-btn-primary' : ''),
+        disabled: !writable || target === '',
+        onClick: () => toggleIn(path, target),
+        title: active ? '点击移出该名单' : '点击加入该名单',
+      }, active ? label + '（已加入）' : '加入' + label)
+
+      return h('div', { className: 'qqg-dstack' },
+        h(Panel, {
+          title: '当前生效的特权名单',
+          desc: '三阶权限：开发者 > 主人 > 管理员；高阶自动继承低阶（开发者也算主人、管理员）。',
+          right: h('span', { className: 'qqg-pill' }, '全局生效'),
+        },
+          h('div', { className: 'qqg-list' },
+            nameRow('开发者', developers, true),
+            nameRow('主人', owners, true),
+            nameRow('管理员', admins, true)),
+          h('div', { className: 'qqg-hint' },
+            '名单是全局的，不按群区分——所以这里显示的是「所有会话生效」的完整名单。',
+            '点右侧快捷操作只会往这几份名单里增删，不会改任何 QQ 消息内容。')),
+        h(Panel, {
+          title: '白名单 / 黑名单',
+          desc: isGroup
+            ? '针对这个群：加入白名单才会被理；黑名单优先生效，命中直接忽略。'
+            : '针对这个 QQ：加入白名单才会被理；黑名单优先生效，命中直接忽略。',
+          right: h('span', { className: 'qqg-pill' },
+            (inDeny ? '黑名单' : inAllow ? '白名单' : '未放行')),
+        },
+          h('div', { className: 'qqg-list' },
+            h('div', { className: 'qqg-kv' }, h('span', null, isGroup ? '群号' : 'QQ 号'),
+              h('b', { className: 'qqg-mono' }, target || '—')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '当前状态'),
+              h('b', null, inDeny ? '黑名单（忽略）' : inAllow ? '白名单（放行）' : '未加入（按 allowAllWhenEmpty 判定）'))),
+          h('div', { className: 'qqg-textarea-actions' },
+            h('button', {
+              type: 'button', className: 'qqg-btn' + (inAllow ? ' qqg-btn-primary' : ''),
+              disabled: !writable || target === '',
+              onClick: () => toggleIn(allowPath, target),
+            }, inAllow ? '移出白名单' : '加入白名单'),
+            h('button', {
+              type: 'button', className: 'qqg-btn' + (inDeny ? ' qqg-btn-danger' : ''),
+              disabled: !writable || target === '',
+              onClick: () => toggleIn(denyPath, target),
+            }, inDeny ? '移出黑名单' : '加入黑名单')),
+          h('div', { className: 'qqg-hint' },
+            '黑名单优先于白名单；改动保存后，桥接在下一条消息前现读生效，不用重启。')),
+        isGroup
+          ? h(Panel, {
+            title: '身份授予（仅私聊会话）',
+            desc: '管理员 / 主人 / 开发者名单只收 QQ 号；群会话没有「群成员」信息，不能整群授予。',
+          },
+            h('div', { className: 'qqg-hint' },
+              '要给某个人提权，请先切到与他的私聊会话，再在那一页操作。'))
+          : h(Panel, {
+            title: '身份授予',
+            desc: '把这个 QQ 号加入 / 移出对应名单。开发者 = 主人权限 + 暗号提权。',
+          },
+            h('div', { className: 'qqg-textarea-actions' },
+              roleButton('管理员', 'allow.admins', roleOf(admins)),
+              roleButton('主人', 'allow.owners', roleOf(owners)),
+              roleButton('开发者', 'allow.developers', roleOf(developers))),
+            h('div', { className: 'qqg-hint' },
+              '开发者的暗号提权还要同时满足：「开发者特权」技能卡开启 + developer.enabled 打开 +',
+              '触发词命中。三者缺一，这条消息按普通链路走。')))
+    }
+
+    /** Tab 4 · 调试信息：会话标识 + 模型路由 + 原始入站 Payload。 */
+    function SessionDebugTab({ session, get }) {
+      const provider = String(get('model.provider') ?? '').trim()
+      const model = String(get('model.model') ?? '').trim()
+      const effort = String(get('model.reasoningEffort') ?? '').trim()
+      const fallbacks = Array.isArray(get('modelFallbacks')) ? get('modelFallbacks') : []
+      const configured = provider && model ? `${provider}/${model}` : ''
+      const active = String(session.modelRoute || '')
+      const debugPayload = get('developer.debugPayload') === true
+      const raw = session.raw && typeof session.raw === 'object' ? session.raw : null
+
+      return h('div', { className: 'qqg-dstack' },
+        h(Panel, {
+          title: '会话标识',
+          desc: 'QQ 会话 ↔ DSH 会话的映射。DSH 标题在创建 / 接管时按「私聊-昵称 / 群聊-群名(群号)」强制对齐。',
+        },
+          h('div', { className: 'qqg-list' },
+            h('div', { className: 'qqg-kv' }, h('span', null, '会话 key'),
+              h('b', { className: 'qqg-mono' }, session.key)),
+            h('div', { className: 'qqg-kv' }, h('span', null, 'DSH 会话 ID'),
+              h('b', { className: 'qqg-mono qqg-kv-ellipsis' }, session.sessionId || '（未建立）')),
+            h('div', { className: 'qqg-kv' }, h('span', null, 'DSH 标题'),
+              h('b', { className: 'qqg-kv-ellipsis' }, session.title || '（待对齐）')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '最近活动'),
+              h('b', null, sessionTime(session.lastAt))),
+            h('div', { className: 'qqg-kv' }, h('span', null, '未读数'),
+              h('b', null, String(session.unread ?? 0))))),
+        h(Panel, {
+          title: '模型路由',
+          desc: '桥接在每条消息前无痕覆写这一次请求的 route；不改会话选择，也不动 DSH 全局默认。',
+          right: h('span', { className: 'qqg-pill' + (active === '' ? '' : ' qqg-pill-accent') },
+            active === '' ? '跟随全局' : '已覆写'),
+        },
+          h('div', { className: 'qqg-list' },
+            h('div', { className: 'qqg-kv' }, h('span', null, '实际下发'),
+              h('b', { className: 'qqg-mono' }, active || '（跟随会话当前模型）')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '设置页配置'),
+              h('b', { className: 'qqg-mono' }, configured || '（未配置 = 不接管）')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '推理档位'),
+              h('b', null, effort || '模型默认')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '备用模型'),
+              h('b', null, fallbacks.length > 0 ? fallbacks.length + ' 个' : '无'))),
+          h('div', { className: 'qqg-hint' },
+            '「实际下发」是桥接最近一次成功推给插件的值；失败重试不会覆盖它。')),
+        h(Panel, {
+          title: '原始入站 Payload',
+          desc: '排查引用 / 图片解析用的最后一条原始事件。只在桥接内存里，截断 2000 字，不落盘。',
+          right: h('span', { className: 'qqg-pill' + (debugPayload ? ' qqg-pill-accent' : '') },
+            debugPayload ? '已开启' : '未开启'),
+        },
+          debugPayload
+            ? (raw
+              ? h('details', { className: 'qqg-advanced' },
+                h('summary', null, '查看原始入站 Payload（' + clockTime(raw.at) + '）'),
+                h('pre', { className: 'qqg-codebox' }, raw.json || '（空）'))
+              : h('div', { className: 'qqg-hint' }, '开关已开，但这个会话还没收到过消息。'))
+            : h('div', { className: 'qqg-hint' },
+              '未开启：到「技能与插件 → 开发者特权 → 齿轮」里打开「记录原始入站 Payload」，',
+              '下一条消息进来后这里就能展开查看。'),
+          h('div', { className: 'qqg-hint' },
+            '开关只影响留存与上报，不改变任何消息解析逻辑。'))
+      )
+    }
+
+
+
     /** 已真实接入桥接 / Host 的条目 id；其余只加「开发中」标签，不动配置。 */
     const IMPLEMENTED_IDS = {
-      skill: ['sk-voice', 'sk-vision', 'sk-search', 'sk-image', 'sk-poke', 'sk-quote', 'sk-memory', 'sk-time-aware', 'sk-unread'],
+      skill: ['sk-voice', 'sk-vision', 'sk-search', 'sk-image', 'sk-poke', 'sk-quote',
+        'sk-memory', 'sk-time-aware', 'sk-unread', 'sk-developer'],
       plugin: ['pl-guard', 'pl-debounce', 'pl-ratelimit'],
     }
 
@@ -3757,6 +4163,42 @@ window.__ModuleLoader__.load({
           when: (valueOf) => valueOf('unreadSummary.enabled') !== false,
         },
       ],
+      // 开发者特权（v2.0，2026-10-28）：暗号提权 + 动态记忆预览。
+      //
+      // 红线：这里的 prompt 只会被桥接追加到**本轮 Prompt 尾部**，不进系统提示词、
+      // 不进工具白名单。别把任何「身份/权限」写进这段文本，权限只认 allow.developers。
+      'sk-developer': [
+        {
+          path: 'developer.enabled', type: 'switch', label: '启用特权暗号',
+          hint: '关闭时触发词完全不参与判定（消息原样走普通链路，也不会被吞掉）。'
+            + '默认关；还要这张技能卡本身也开着才生效（双闸）。',
+        },
+        {
+          path: 'developer.keywords', type: 'tags', label: '触发关键词',
+          placeholder: '输入关键词后回车（如 /dev）',
+          hint: '只认**以关键词开头**的消息（/dev 干活 命中，今天 /dev 挂了 不命中）；'
+            + '关键词后必须跟空格或标点。命中后会先剥掉关键词再送 DSH。',
+        },
+        {
+          path: 'developer.prompt', type: 'textarea', label: '专属 Prompt', rows: 6,
+          placeholder: '命中暗号时追加到本轮 Prompt 尾部的内容…',
+          hint: '只追加在尾部（前缀缓存不动）。在这里写调试/内部约定，不要写权限声明——'
+            + '权限由 allow.developers 决定，模型说什么都不算数。',
+        },
+        {
+          path: 'developer.strangerReply', type: 'switch', label: '普通群友命中时回一句',
+          hint: '默认关：静默丢弃，不暴露暗号机制存在。开启后回一句固定文案「（暗号不对哦）」。',
+        },
+        {
+          path: 'developer.debugPayload', type: 'switch', label: '记录原始入站 Payload',
+          hint: '仅用于排查引用 / 图片解析：把每会话最近一条原始事件留在桥接内存'
+            + '（截断 2000 字、不落盘），设置页「调试信息」Tab 可展开查看。',
+        },
+        {
+          path: 'developer.memoryNotes', type: 'readonly', label: '开发者动态记忆（只读）',
+          hint: '模型自动提取的开发者偏好。当前先留 UI 接口，底层写入后续补；这里只展示、不可编辑。',
+        },
+      ],
       'pl-debounce': [
         {
           path: 'rhythm.debounceWindowMs', type: 'number', label: '防抖合并窗口（毫秒）',
@@ -3807,6 +4249,19 @@ window.__ModuleLoader__.load({
         ? '未配置 Key：QQ 会话里调 web_search 会直接报错（WEB_PROVIDER_CREDENTIAL_MISSING）；'
           + '填入 DeepSeek Platform 的 Key 并保存后生效。'
         : null),
+      // 开发者特权：三件事任一没配好，暗号就是「开了但没用」——必须在弹窗顶部说清楚，
+      // 否则用户会以为桥接坏了。
+      'sk-developer': (valueOf, get) => {
+        if (valueOf('developer.enabled') !== true) return null
+        if (String(valueOf('developer.prompt') ?? '').trim() === '') {
+          return '暗号开关开着，但专属 Prompt 是空的：命中后只会剥掉触发词，不会追加任何内容。'
+        }
+        const developers = Array.isArray(get('allow.developers')) ? get('allow.developers') : []
+        if (developers.length === 0) {
+          return '还没有配置开发者 QQ 号（设置 → 白名单管理 → 开发者 QQ 号）：暗号现在对任何人都不生效。'
+        }
+        return null
+      },
     }
 
     /**
@@ -3824,6 +4279,24 @@ window.__ModuleLoader__.load({
       ],
     }
 
+    /**
+     * 「开发者特权」卡片上的只读预览（v2.0 任务三）。
+     *
+     * 数据源是 Config 的 `developer.memoryNotes` —— 当前底层还没有写入逻辑，
+     * 所以正常情况下是空数组，这里显示占位。等底层接入后无需改 UI 就能看到内容。
+     * 红线：只读，不提供任何编辑/删除入口（动态记忆由模型维护，不由用户手改）。
+     */
+    function DeveloperMemoryPreview({ get }) {
+      const notes = Array.isArray(get('developer.memoryNotes')) ? get('developer.memoryNotes') : []
+      const lines = notes
+        .map((item) => String(item && typeof item === 'object' ? (item.text ?? '') : item ?? '').trim())
+        .filter((text) => text !== '')
+      return h('div', { className: 'qqg-devpreview', title: '模型自动提取的开发者偏好（只读）' },
+        lines.length === 0
+          ? '动态记忆：暂无（底层自动提取还没接入）'
+          : lines.slice(0, 3).map((text, index) => h('div', { key: index }, text)))
+    }
+
     /* ══════════ Tab 3 · 技能与插件 ══════════ */
     /**
      * 一张卡片：图标 + 名字 + 版本 + 描述 + 开关，右侧工具区（齿轮 / 垃圾桶 / 拖拽手柄）。
@@ -3831,7 +4304,7 @@ window.__ModuleLoader__.load({
      * 上下箭头是拖拽的降级方案，键盘用户也能排序。
      */
     function Tile({ item, index, total, implemented, onToggle, onSettings, onDelete, onMove,
-      dragging, dragOver, onDragStart, onDragEnd, onDragOver, onDrop }) {
+      dragging, dragOver, onDragStart, onDragEnd, onDragOver, onDrop, extra }) {
       const cls = ['qqg-tile']
       if (dragging) cls.push('qqg-tile-dragging')
       if (dragOver) cls.push('qqg-tile-over')
@@ -3862,6 +4335,9 @@ window.__ModuleLoader__.load({
             onClick: (e) => { e.stopPropagation(); onDelete(item) },
           }, h(Glyph, { name: 'trash', size: 14 })))),
       h('div', { className: 'qqg-tile-desc' }, item.desc),
+      // 卡片级附加只读区（v2.0：开发者特权的动态记忆预览）。
+      // 只有传进来的卡片才渲染，其它卡片一个字节都不变。
+      extra ?? null,
       h('div', { className: 'qqg-tile-foot' },
         h('div', { className: 'qqg-tile-flags' },
           h('span', { className: 'qqg-pill' + (implemented ? ' qqg-pill-ok' : '') },
@@ -3917,7 +4393,7 @@ window.__ModuleLoader__.load({
       })
       const visible = (field) => (typeof field.when === 'function' ? field.when(valueOf) === true : true)
       // 卡片级状态提示 / 右栏说明（按 id 查表；没有条目的卡片两者都为空）。
-      const alert = typeof TILE_ALERTS[id] === 'function' ? TILE_ALERTS[id](valueOf) : null
+      const alert = typeof TILE_ALERTS[id] === 'function' ? TILE_ALERTS[id](valueOf, get) : null
       const notes = TILE_MODAL_NOTES[id] ?? []
 
       const control = (field) => {
@@ -3931,6 +4407,33 @@ window.__ModuleLoader__.load({
               // 只改草稿，「保存」时才整数组写回 poke.replies（与其它字段一致）。
               onChange: (next) => setField(field.path, next),
             }),
+            field.hint ? h('span', { className: 'qqg-field-hint' }, field.hint) : null)
+        }
+        if (field.type === 'tags') {
+          // 字符串数组（v2.0 开发者触发词）：复用设置页那套 ListEditor，
+          // 只在草稿里改，点「保存」才整数组写回。
+          return h('label', { key: field.path, className: 'qqg-field' },
+            h('span', { className: 'qqg-field-label' }, field.label),
+            h(ListEditor, {
+              items: Array.isArray(value) ? value : [],
+              disabled: !writable,
+              placeholder: field.placeholder ?? '输入后回车',
+              ariaLabel: field.label,
+              onChange: (next) => setField(field.path, next),
+            }),
+            field.hint ? h('span', { className: 'qqg-field-hint' }, field.hint) : null)
+        }
+        if (field.type === 'readonly') {
+          // 只读预览（v2.0 任务三）：开发者动态记忆的 UI 接口先留好，底层后续补写入。
+          // 不进入保存流程（见 save() 里的跳过），点了也改不了。
+          const rows = Array.isArray(value) ? value : []
+          return h('label', { key: field.path, className: 'qqg-field' },
+            h('span', { className: 'qqg-field-label' }, field.label),
+            h('div', { className: 'qqg-devpreview' },
+              rows.length === 0
+                ? '暂无（底层还没接入自动提取；这里只展示，不可编辑）'
+                : rows.map((item, index) => h('div', { key: index },
+                  String(item && typeof item === 'object' ? (item.text ?? '') : item ?? '')))),
             field.hint ? h('span', { className: 'qqg-field-hint' }, field.hint) : null)
         }
         if (field.type === 'switch') {
@@ -4028,6 +4531,8 @@ window.__ModuleLoader__.load({
         if (!writable) return
         for (const field of fields) {
           if (!visible(field)) continue
+          // readonly 是纯展示（开发者动态记忆预览），不参与写盘。
+          if (field.type === 'readonly') continue
           if (field.type === 'secret') {
             const typed = has(field.path) ? String(draft[field.path]).trim() : ''
             if (typed !== '') write(field.path, typed)
@@ -4049,6 +4554,7 @@ window.__ModuleLoader__.load({
         const next = {}
         for (const field of fields) {
           if (field.type === 'secret') continue
+          if (field.type === 'readonly') continue
           if (!Object.prototype.hasOwnProperty.call(DEFAULTS, field.path)) continue
           next[field.path] = DEFAULTS[field.path]
           write(field.path, DEFAULTS[field.path])
@@ -4478,6 +4984,11 @@ window.__ModuleLoader__.load({
               if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
             },
             onDragEnd: () => setDrag({ from: null, over: null }),
+            // 开发者特权卡面挂一块只读预览（任务三的 UI 接口）：
+            // 展示模型自动提取的开发者偏好，底层写入后续补，这里绝不提供编辑。
+            extra: it.id === 'sk-developer'
+              ? h(DeveloperMemoryPreview, { get })
+              : null,
             onDragOver: (e) => {
               if (!drag.from || !drag.from.startsWith(kind + ':')) return
               e.preventDefault()  // 不 preventDefault 就不会触发 drop
@@ -5830,7 +6341,8 @@ window.__ModuleLoader__.load({
       let body
       // 会话列表 / 引导计数 / 未读角标各自的轮询都在叶子组件里（见 SessionsTab /
       // GuideNavButton / SessionsBadge），面板层不再持有任何轮询 state。
-      if (active === 'sessions') body = h(SessionsTab, { get })
+      // 会话管理页需要 write/writable：v2.0 的「特权与权限」Tab 直接改 allow 名单。
+      if (active === 'sessions') body = h(SessionsTab, { get, write, writable })
       else if (active === 'skills') body = h(SkillsTab, { ...common, pickDirectory: props?.pickDirectory })
       else if (active === 'usage') body = h(UsageTab, common)
       else if (active === 'settings') body = h(SettingsTab, { ...common, pickDirectory: props?.pickDirectory })

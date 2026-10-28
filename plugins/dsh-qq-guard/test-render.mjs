@@ -215,7 +215,10 @@ for (const tab of ['status', 'sessions', 'skills', 'settings', 'usage']) {
   effects.length = 0; textSink.length = 0; handlers.length = 0; renderedNodes.length = 0
   render(React.createElement(Comp, { remoteForm: form }), root)
   const joined = textSink.join('|')
-  for (const k of ['摸鱼群', '翎羽', '群聊-摸鱼群(123456)', '3 条未读', '今天这破网', 'DSH 会话 ID',
+  // v2.0：详情默认停在「基础配置」Tab —— 会话标题 / sessionId 挪去了「调试信息」，
+  // 默认渲染里只应有列表 + 档位 + 单人设 + 四个分页。
+  for (const k of ['摸鱼群', '翎羽', '3 条未读', '今天这破网',
+    '基础配置', '记忆与摘要', '特权与权限', '调试信息',
     '单人设覆盖', '保存人设', '恢复全局', '清空上下文', '删除会话']) {
     if (!joined.includes(k)) throw new Error(`会话列表（真实数据）缺少「${k}」`)
   }

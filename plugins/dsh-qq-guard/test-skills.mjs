@@ -654,10 +654,10 @@ check('切「发图片」开关 → 写回整数组（含 sk-image，enabled=fal
   if (!sk) throw new Error('写回的数组里没有 sk-image（老配置点一下就丢了默认项）')
   eq(sk.enabled, false, '写回的 sk-image.enabled')
   // 2026-10-27 合并后：默认技能补 sk-poke / sk-quote / sk-memory / sk-time-aware；
-  // 2026-10-28（v2.0）再补 sk-unread，合并后是 catalog + 5。
-  // （夹具里本来就有 sk-memory 一条，所以只补 5 个。）
-  eq(written.length, CONFIG_CATALOG.skills.length + 5, '写回的是合并后的整数组（补 5 个内置技能）')
-  for (const id of ['sk-poke', 'sk-quote', 'sk-memory', 'sk-time-aware', 'sk-unread']) {
+  // 2026-10-28（v2.0）再补 sk-unread / sk-developer，合并后是 catalog + 6。
+  // （夹具里本来就有 sk-memory 一条，所以只补 6 个。）
+  eq(written.length, CONFIG_CATALOG.skills.length + 6, '写回的是合并后的整数组（补 6 个内置技能）')
+  for (const id of ['sk-poke', 'sk-quote', 'sk-memory', 'sk-time-aware', 'sk-unread', 'sk-developer']) {
     if (!written.find((x) => x.id === id)) throw new Error(`写回的数组里没有 ${id}（新默认项丢了）`)
   }
   // 合并迁移：写回的清单里不能再留着旧的 sk-context。
