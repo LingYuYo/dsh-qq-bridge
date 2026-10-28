@@ -3132,6 +3132,8 @@ function sanitizeSessionRow(row) {
     unread: num(row.unread, 9999),
     lastAt: num(row.lastAt, 8.64e15),
     lastText: text(row.lastText, 200),
+    // v2.0 第二十五步：主人级休眠截止时间（ms）。0 = 未休眠。
+    mutedUntil: num(row.mutedUntil, 8.64e15),
     // 单人设回填（会话详情里的输入框要显示已保存的值）。多行不能压成单行，
     // 只裁掉首尾空白与长度，换行原样保留。
     persona: textPreservingLines(row.persona, 20000),

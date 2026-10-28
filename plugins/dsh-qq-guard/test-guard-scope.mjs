@@ -490,6 +490,7 @@ await check('sanitizeSessionRow：core / userProfiles / slang / contextBriefing 
     contextBriefing: '前情提要正文',
     briefingEdited: true,
     briefingGenerated: '自动原文',
+    mutedUntil: 1_793_000_000_000,
   })
   assert.equal(row.core.identity, '本群身份')
   assert.equal(row.userProfiles.length, 1, '非法 QQ 的档案要丢掉')
@@ -505,6 +506,7 @@ await check('sanitizeSessionRow：core / userProfiles / slang / contextBriefing 
   assert.equal(row.contextBriefing, '前情提要正文')
   assert.equal(row.briefingEdited, true, '人工编辑标记要透传')
   assert.equal(row.briefingGenerated, '自动原文', '原始自动文本要透传（重置用）')
+  assert.equal(row.mutedUntil, 1_793_000_000_000, '休眠截止时间要透传（UI 角标用）')
   // 空覆盖 → null（继承全局）
   assert.equal(sanitizeSessionRow({ key: 'g:2', personaOverride: {} }).personaOverride, null)
 })

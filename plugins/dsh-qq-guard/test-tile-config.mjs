@@ -759,6 +759,22 @@ await check('调试信息：开关没开时给明确提示，不渲染 payload',
   truthy(!joined.includes('"messageId":"m1"'), '没开就不该显示 payload 内容')
 })
 
+/* ── 用例：休眠角标（v2.0 第二十五步）──────────────────────── */
+console.log('\n休眠角标：')
+
+await check('休眠中的会话显示 💤 角标，悬停带剩余时间', () => {
+  reset()
+  const live = {
+    sessions: [{ ...LIVE_DETAIL.sessions[0], mutedUntil: Date.now() + 3_600_000 }],
+  }
+  const tree = resetSessions(live)
+  const text = textOf(tree)
+  truthy(text.includes('休眠中'), `缺少休眠角标：${text.slice(0, 120)}`)
+  const badge = findAll(tree, (n) => String(n.props?.className ?? '').includes('qqg-sleep-pill'))[0]
+  truthy(badge, '缺少 qqg-sleep-pill 类')
+  truthy(String(badge.props.title).includes('剩余'), '悬停要显示剩余时间')
+})
+
 /* ── 用例：开发者特权技能卡（v2.0）────────────────────────── */
 console.log('\n开发者特权技能卡：')
 

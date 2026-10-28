@@ -994,6 +994,11 @@ export function normalizeSessionEntry(key, raw) {
     // v2.0 第十七步：截断新建会话的标题后缀（如「-截断于2140」），
     // 持久化后每次改名都会带上，不会被下一条消息洗掉。
     titleSuffix: typeof value.titleSuffix === 'string' ? value.titleSuffix.slice(0, 40) : '',
+    // v2.0 第二十五步：主人级休眠截止时间（ms）。0 = 未休眠。
+    // 跨重启有效：入口处直接丢弃消息，绝不进上下文、不调模型。
+    mutedUntil: Number.isFinite(Number(value.mutedUntil)) && Number(value.mutedUntil) > 0
+      ? Math.floor(Number(value.mutedUntil))
+      : 0,
     lastAt: Number.isFinite(lastAt) && lastAt > 0 ? lastAt : 0,
     lastText: typeof value.lastText === 'string' ? value.lastText : '',
     nameAt: Number.isFinite(nameAt) && nameAt > 0 ? nameAt : 0,
@@ -1483,6 +1488,8 @@ export class Bridge {
       paused: 0,
       // 模型主动潜水（<silent> / 整段括号内心戏被丢弃）的次数（v2.0 第十四步）。
       silent: 0,
+      // 群休眠中丢弃的消息数（v2.0 第二十五步）。
+      sleeping: 0,
     }
   }
 
@@ -2507,6 +2514,8 @@ export class Bridge {
         // v2.0 第十一步：黑话词条（对象数组，单群）与合并视图（UI 标签展示用）。
         slang: normalizeSlangList(entry.slang),
         mergedSlang: this._mergedSlang(key),
+        // v2.0 第二十五步：主人级休眠截止时间（UI 显示 💤 与剩余时间）。
+        mutedUntil: Number(entry.mutedUntil) || 0,
         // L2 摘要：手动截断留下的前情提要（UI 用名册美化展示 / 手动编辑）。
         contextBriefing: typeof entry.contextBriefing?.text === 'string' ? entry.contextBriefing.text.slice(0, 4000) : '',
         // v2.0 第十八步：是否人工改过 + 原始自动文本（UI 角标与重置用）。
@@ -4129,6 +4138,16 @@ export class Bridge {
       return
     }
     const key = this.keyOf(msg)
+    // v2.0 第二十五步：休眠 / 唤醒必须**最先**判定（连群友档案都不更新）。
+    // 顺序：先放行「起床」（否则睡着后主人也叫不醒），再丢弃休眠中的一切消息。
+    const earlyText = stripLeadingMentions(msg?.text ?? '')
+    if (await this._handleWakeCommand(msg, earlyText, key)) return
+    if (this._isSleeping(key)) {
+      this.stats.sleeping++
+      this.logger.info?.(`会话 ${key} 休眠中（至 ${new Date(Number(this.state.sessions?.[key]?.mutedUntil)).toLocaleString('zh-CN')}），丢弃本条`)
+      return
+    }
+    if (await this._handleSleepCommand(msg, earlyText, key)) return
     // 群友档案 + 改名感知（v2.0 第十步）：记录当前昵称/身份；改名时返回一条
     // 「仅本轮生效」的系统事件，稍后压到 Prompt 最末尾。
     const renameEvent = this._noteProfiles(key, msg)
@@ -6128,6 +6147,63 @@ export class Bridge {
     // 后台跑：不 await。异常在 _runUnreadSummary 内部兜住，不会冒到 handleMessage。
     void this._runUnreadSummary({ msg, key, count, conf, windowMinutes: parsed.windowMinutes })
     return true
+  }
+
+  /**
+   * 主人级休眠指令（v2.0 第二十五步）。
+   *
+   * 触发：群里「@bot 睡觉 [小时]」（默认 4）；私聊直接说也行。
+   * 只认主人 / 开发者；普通群友发了一律拒绝（不设置休眠）。
+   * 休眠状态写进 `state.sessions[key].mutedUntil`，跨重启有效。
+   */
+  async _handleSleepCommand(msg, commandText, key) {
+    // 群聊必须 @ 过 bot，避免「我去睡觉了」这种正常聊天误触发。
+    if (msg.kind === 'group' && !/^\s*@/u.test(String(msg.text ?? ''))) return false
+    const hit = /^(?:睡觉|休眠|去睡|睡吧)(?:\s+(\d{1,2}(?:\.\d)?))?$/u.exec(String(commandText ?? '').trim())
+    if (!hit) return false
+    if (!this.isOwner(msg)) {
+      const sent = await this._send(msg, '⚠️ 权限不足：只有主人 / 开发者能让我睡觉。')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    const hours = Math.min(24, Math.max(1, Number(hit[1]) || 4))
+    const entry = this._entryOf(key)
+    entry.mutedUntil = Date.now() + hours * 60 * 60 * 1000
+    this._saveState()
+    this._logOp('info', `群 ${key} 进入休眠 ${hours} 小时（主人指令）`)
+    const sent = await this._send(msg, `喵，收到，我先去睡 ${hours} 个小时。`)
+    if (!(sent && sent.ok === false)) this._noteReplied(key)
+    return true
+  }
+
+  /** 唤醒指令（v2.0 第二十五步）：只有主人 / 开发者能叫醒；不在休眠也回一句。 */
+  async _handleWakeCommand(msg, commandText, key) {
+    if (msg.kind === 'group' && !/^\s*@/u.test(String(msg.text ?? ''))) return false
+    const hit = /^(?:起床|醒来|醒醒|唤醒)$/u.exec(String(commandText ?? '').trim())
+    if (!hit) return false
+    if (!this.isOwner(msg)) {
+      const sent = await this._send(msg, '⚠️ 权限不足：只有主人 / 开发者能叫醒我。')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    const entry = this._entryOf(key)
+    if (!(Number(entry.mutedUntil) > Date.now())) {
+      const sent = await this._send(msg, '我没在睡觉啊喵。')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    entry.mutedUntil = 0
+    this._saveState()
+    this._logOp('info', `群 ${key} 已唤醒（主人指令）`)
+    const sent = await this._send(msg, '喵，我醒了。')
+    if (!(sent && sent.ok === false)) this._noteReplied(key)
+    return true
+  }
+
+  /** 当前群是否在休眠（v2.0 第二十五步）。 */
+  _isSleeping(key, now = Date.now()) {
+    const entry = this.state.sessions?.[key]
+    return Number(entry?.mutedUntil) > now
   }
 
   /**

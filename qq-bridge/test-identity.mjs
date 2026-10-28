@@ -519,5 +519,42 @@ await check('/确认任务：写入 scheduler 并清 pending', async () => {
   b.scheduler.removeTask(b.scheduler.list()[0].id)
 })
 
+console.log('\n— 休眠 / 唤醒（v2.0 第二十五步）—')
+await check('睡觉/唤醒：仅主人可触发，mutedUntil 持久化', async () => {
+  const b = makeBridge({ allow: { owners: ['1001'] } })
+  const sent = fakeQq(b)
+  const slept = await b._handleSleepCommand(groupMsg('@小鱼 睡觉 2'), '睡觉 2', 'g:1')
+  assert.equal(slept, true)
+  assert.ok(b.state.sessions['g:1'].mutedUntil > Date.now(), '要写入 mutedUntil')
+  assert.match(sent.at(-1), /睡 2 个小时/u)
+
+  const denied = await b._handleSleepCommand(
+    groupMsg('@小鱼 睡觉', { userId: '2002' }), '睡觉', 'g:1',
+  )
+  assert.equal(denied, true)
+  assert.match(sent.at(-1), /权限不足/u)
+
+  const woke = await b._handleWakeCommand(groupMsg('@小鱼 起床'), '起床', 'g:1')
+  assert.equal(woke, true)
+  assert.equal(b.state.sessions['g:1'].mutedUntil, 0, '唤醒要清空')
+  assert.match(sent.at(-1), /我醒了/u)
+
+  const again = await b._handleWakeCommand(groupMsg('@小鱼 起床'), '起床', 'g:1')
+  assert.equal(again, true)
+  assert.match(sent.at(-1), /没在睡觉/u)
+})
+
+await check('休眠中消息直接丢弃：不进 L1、不调模型', async () => {
+  const b = makeBridge({ allow: { owners: ['1001'], groups: ['123456'] } })
+  fakeQq(b)
+  b._entryOf('g:123456').mutedUntil = Date.now() + 3_600_000
+  let prompted = 0
+  b._enqueue = async () => { prompted += 1 }
+  await b.handleMessage(groupMsg('在吗', { groupId: '123456' }))
+  assert.equal(prompted, 0, '★ 休眠中不能投递')
+  assert.equal(b.stats.sleeping, 1)
+  assert.equal(b._chatLog.has('g:123456'), false, '★ 休眠消息不能进归纳缓冲')
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) process.exitCode = 1

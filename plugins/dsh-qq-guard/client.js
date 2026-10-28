@@ -3895,6 +3895,20 @@ window.__ModuleLoader__.load({
       }
       const ask = (op) => setConfirm({ op, key: cur.key, name: displayName(cur) })
 
+      // v2.0 第二十五步：休眠角标（剩余时间悬停可见）。
+      const sleepBadge = (row) => {
+        const until = Number(row?.mutedUntil) || 0
+        if (!(until > Date.now())) return null
+        const minutes = Math.max(1, Math.ceil((until - Date.now()) / 60000))
+        const left = minutes >= 60
+          ? `${Math.floor(minutes / 60)} 小时${minutes % 60 > 0 ? ` ${minutes % 60} 分` : ''}`
+          : `${minutes} 分钟`
+        return h('span', {
+          className: 'qqg-pill qqg-pill-accent qqg-sleep-pill',
+          title: `休眠中，剩余约 ${left}（至 ${sessionTime(until)}）`,
+        }, '💤 休眠中')
+      }
+
       return h('div', { className: 'qqg-stack' },
         h(TabHead, {
           title: '会话管理',
@@ -3918,6 +3932,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'qqg-session-main' },
               h('div', { className: 'qqg-session-top' },
                 h('span', { className: 'qqg-session-name' }, displayName(s)),
+                sleepBadge(s),
                 h('span', { className: 'qqg-session-time' }, sessionTime(s.lastAt))),
               h('div', { className: 'qqg-session-preview' },
                 (s.persona ? '[单人设] ' : '') + (s.lastText || (s.sessionId ? '（还没收到消息）' : '（等待首条消息建会话）')))),
@@ -3933,6 +3948,7 @@ window.__ModuleLoader__.load({
                     h('span', { className: 'qqg-mono' }, cur.qq),
                     h('span', { className: 'qqg-pill' }, kindLabel(cur)),
                     cur.persona ? h('span', { className: 'qqg-pill qqg-pill-accent' }, '单人设') : null,
+                    sleepBadge(cur),
                     // 只在桥接确认该会话有独立档位时才显示，避免「跟随全局」被误读成覆盖。
                     savedLevel !== null
                       ? h('span', {
