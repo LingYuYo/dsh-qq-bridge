@@ -16,7 +16,7 @@
 import assert from 'node:assert/strict'
 import os from 'node:os'
 import path from 'node:path'
-import { Bridge } from './src/bridge.mjs'
+import { Bridge, normalizeSessionEntry } from './src/bridge.mjs'
 import {
   SUMMARY_FOOTER,
   SUMMARY_HARD_LIMIT,
@@ -740,6 +740,69 @@ await check('端到端：/归纳 1h 翻两页，40 条都进 prompt', async () =
   assert.equal(fake.forwards.length, 1)
   assert.match(b._lastPrompt, /【消息条数】40/u, '★ 两页 40 条都要进 prompt')
   assert.deepEqual(calls.map((item) => item.cursor), ['', '2000', '1000'])
+})
+
+console.log('\n— 手动提前截断（v2.0 第五步，2026-10-28）—')
+
+await check('归档旧会话 + 新建同名 + 前情提要写回 + 清空 L1', async () => {
+  const b = makeBridge()
+  const key = `g:${GROUP}`
+  const fake = fakeRuntime(b, {
+    history: [],
+    reply: '· 大家在聊周末搬家，定在周六上午。\n· 还缺两个人手，小红说可以来。',
+  })
+  b.state.sessions[key] = normalizeSessionEntry(key, { sessionId: 'sess-old', name: '测试群' })
+  b._noteChatLog(key, { kind: 'group', userId: '20001', senderName: '小明' }, '周末搬家', [], '')
+  b._noteChatLog(key, { kind: 'group', userId: '20002', senderName: '小红' }, '我有空', [], '')
+  // 第一次 createSession 是摘要用的临时会话，第二次是 rebuild 的新会话。
+  const created = []
+  b.dsh.createSession = async () => {
+    const id = created.length === 0 ? 'sess-summary-1' : 'sess-new-1'
+    created.push(id)
+    return id
+  }
+  const result = await b.applySessionOp({ op: 'manual-summarize', key })
+  assert.equal(result.ok, true)
+  assert.equal(result.action, 'manual-summarize')
+  assert.equal(result.archived, true, '旧会话必须归档')
+  assert.ok(fake.archive.includes('sess-old'), '归档列表里要有旧会话')
+  assert.equal(b.state.sessions[key].sessionId, 'sess-new-1', '★ 要换成新会话')
+  assert.equal(b._chatLog.has(key), false, '★ L1 必须清空')
+  assert.equal(result.cleared, 2)
+  assert.ok(b.state.sessions[key].contextBriefing?.text.includes('搬家'), '★ 前情提要要写进 state')
+  // 下次拼 prompt 时作为头部注入（第一段）。
+  const sections = b._contextSections(key)
+  assert.match(sections[0], /前情提要/u)
+  assert.match(sections[0], /搬家/u)
+})
+
+await check('没有 L1 记录时跳过提要，仍然归档新建', async () => {
+  const b = makeBridge()
+  const key = `g:${GROUP}`
+  const fake = fakeRuntime(b, { history: [] })
+  b.state.sessions[key] = normalizeSessionEntry(key, { sessionId: 'sess-old' })
+  const created = []
+  b.dsh.createSession = async () => {
+    const id = created.length === 0 ? 'sess-summary-1' : 'sess-new-1'
+    created.push(id)
+    return id
+  }
+  const result = await b.applySessionOp({ op: 'manual-summarize', key })
+  assert.equal(result.ok, true)
+  assert.equal(result.cleared, 0)
+  assert.equal(result.briefingChars, 0)
+  assert.equal(b.state.sessions[key].contextBriefing, null, '没提要就是 null，不是空对象')
+  assert.equal(fake.forwards.length, 0, '★ 全程不发 QQ 合并转发')
+})
+
+await check('并发保护：同一会话正在截断时拒绝第二次', async () => {
+  const b = makeBridge()
+  const key = `g:${GROUP}`
+  b.state.sessions[key] = normalizeSessionEntry(key, { sessionId: 'sess-old' })
+  b._manualRuns.add(key)
+  const result = await b.applySessionOp({ op: 'manual-summarize', key })
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'manual-running')
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

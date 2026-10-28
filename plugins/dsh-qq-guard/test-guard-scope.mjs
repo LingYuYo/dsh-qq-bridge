@@ -311,6 +311,32 @@ await check('GET 返回当前 config，非 GET 返回 405', async () => {
   route.handler({ method: 'POST', headers: {} }, res2)
   assert.equal(res2.status, 405)
 })
+await check('session-ops：放行 manual-summarize，GET 能取回同一条指令', async () => {
+  const { ctx, calls } = makeCtx({ presetId: undefined, hasWebServer: true, settingsAvailable: true })
+  apply(ctx, Config({ role: 'settings' }))
+  const route = calls.webRoutes.find((r) => r.path === '/dsh-qq-guard/session-ops')
+  assert.ok(route, '没有注册 session-ops 路由')
+  const payload = JSON.stringify({ op: 'manual-summarize', key: 'g:123456' })
+  const req = {
+    method: 'POST', headers: { 'sec-fetch-site': 'same-origin' },
+    on(evt, fn) {
+      if (evt === 'data') fn(Buffer.from(payload))
+      if (evt === 'end') fn()
+    },
+  }
+  const res = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+  route.handler(req, res)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(res.status, 200)
+  assert.equal(JSON.parse(res.body).ok, true)
+  const getRes = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+  route.handler({ method: 'GET', headers: {} }, getRes)
+  const ops = JSON.parse(getRes.body).ops
+  const hit = ops.find((op) => op.op === 'manual-summarize')
+  assert.ok(hit, 'GET 应能取到刚入队的 manual-summarize')
+  assert.equal(hit.key, 'g:123456')
+})
+
 await check('GET /config 带 features（桥接与 guard 共用同一份开关判断）', () => {
   const { ctx, calls } = makeCtx({ presetId: undefined, hasWebServer: true, settingsAvailable: true })
   apply(ctx, Config({ role: 'settings' }))

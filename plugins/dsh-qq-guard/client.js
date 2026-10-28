@@ -3683,6 +3683,10 @@ window.__ModuleLoader__.load({
     function SessionMemoryTab({ session }) {
       const [busy, setBusy] = React.useState(false)
       const [note, setNote] = React.useState(null)
+      // 提前截断（v2.0 第五步）：确认弹窗 / 提交中 / 结果提示。
+      const [truncOpen, setTruncOpen] = React.useState(false)
+      const [truncBusy, setTruncBusy] = React.useState(false)
+      const [truncNote, setTruncNote] = React.useState(null)
       const context = session.context ?? {}
       const summary = session.summary ?? {}
       const recent = Array.isArray(session.recent) ? session.recent : null
@@ -3704,6 +3708,23 @@ window.__ModuleLoader__.load({
           setNote({ kind: 'err', text: '提交失败：' + (error?.message ?? error) })
         } finally {
           setBusy(false)
+        }
+      }
+
+      /**
+       * 提前截断（v2.0 第五步）：生成前情提要 → 归档旧会话 → 新建同名会话。
+       * 只有「归档 + 新建」这一种方案（用户拍板）；完成后不往 QQ 发任何消息。
+       */
+      const truncate = async () => {
+        setTruncBusy(true)
+        setTruncNote(null)
+        try {
+          await postSessionOp({ op: 'manual-summarize', key: session.key })
+          setTruncNote({ kind: 'ok', text: '已提交：桥接会在 2 秒内提炼前情提要、归档旧会话并新建同名会话。' })
+        } catch (error) {
+          setTruncNote({ kind: 'err', text: '提交失败：' + (error?.message ?? error) })
+        } finally {
+          setTruncBusy(false)
         }
       }
 
@@ -3735,6 +3756,24 @@ window.__ModuleLoader__.load({
               h('div', { className: 'qqg-tokenbar-caption' },
                 fmtTokenCompact(tokens) + ' / ' + fmtTokenCompact(budget)))
             : null,
+          h('div', { className: 'qqg-textarea-actions' },
+            h('button', {
+              type: 'button', className: 'qqg-btn qqg-btn-danger',
+              disabled: truncBusy || !session.sessionId,
+              title: session.sessionId
+                ? '提炼前情提要，归档旧会话并新建同名会话'
+                : '该会话还没建立 DSH 会话',
+              onClick: () => setTruncOpen(true),
+            }, truncBusy
+              ? h(React.Fragment, null, h(Spinner), '提交中…')
+              : '提前截断')),
+          truncNote
+            ? h('div', { className: 'qqg-status' + (truncNote.kind === 'err' ? ' qqg-status-err' : '') },
+              truncNote.text)
+            : null,
+          h('div', { className: 'qqg-hint' },
+            '提前截断 = 生成前情提要 → 归档旧会话 → 新建同名会话；',
+            '全程不发 QQ 消息，新会话的第一条消息会带上这段提要。'),
           h('div', { className: 'qqg-hint' },
             '这里统计的是桥接自己注入的聊天记录；DSH 会话里的完整上下文占用由 DSH 管理，插件侧读不到。')),
         h(Panel, {
@@ -3777,7 +3816,19 @@ window.__ModuleLoader__.load({
           note ? h('div', { className: 'qqg-status' + (note.kind === 'err' ? ' qqg-status-err' : '') },
             note.text) : null,
           h('div', { className: 'qqg-hint' },
-            '控制台触发的归纳会标 origin=console，不冒充任何 QQ 号；水位与 /归纳 共用。'))
+            '控制台触发的归纳会标 origin=console，不冒充任何 QQ 号；水位与 /归纳 共用。')),
+        h(ConfirmModal, {
+          open: truncOpen,
+          title: '提前截断「' + sessionDisplayName(session) + '」？',
+          desc: '将提炼当前上下文，并归档旧会话开启新会话，以释放内存。是否继续？',
+          confirmText: '确认截断',
+          danger: true,
+          onCancel: () => setTruncOpen(false),
+          onConfirm: () => {
+            setTruncOpen(false)
+            void truncate()
+          },
+        })
       )
     }
 

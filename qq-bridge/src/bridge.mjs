@@ -28,9 +28,11 @@ import { ExternalHooksClient } from './external-hooks.mjs'
 import { DSH_IMAGE_LIMITS, MAX_TILES, prepareImageParts } from './image-prep.mjs'
 import { estimateTokens, truncateChatLine } from './tokens.mjs'
 import {
+  BRIEFING_HEADER,
   SUMMARY_HARD_LIMIT,
   SUMMARY_NODE_NAME,
   SUMMARY_PERSONA,
+  buildBriefingPrompt,
   buildForwardNodes,
   buildSummaryPrompt,
   fetchHistoryPaged,
@@ -40,6 +42,7 @@ import {
   normalizeSummary,
   parseSummaryCommand,
   pickUnread,
+  sanitizeSummaryTone,
 } from './unread-summary.mjs'
 
 /**
@@ -883,7 +886,27 @@ export function normalizeSessionEntry(key, raw) {
       ? Math.floor(Number(value.ctxBaseTurns))
       : 0,
     ctxBaseSessionId: typeof value.ctxBaseSessionId === 'string' ? value.ctxBaseSessionId : '',
+    // 手动提前截断留下的前情提要（v2.0，2026-10-28）：{ text, at }。
+    // 旧 state 没有这个字段 → null（语义 = 没有提要）；也兼容早期写成裸字符串的形态。
+    contextBriefing: normalizeBriefing(value.contextBriefing),
   }
+}
+
+/**
+ * 归一化前情提要：只认 `{ text, at }` 或裸字符串；空文本一律 null。
+ * @param {unknown} value
+ * @returns {{text:string, at:number}|null}
+ */
+function normalizeBriefing(value) {
+  if (typeof value === 'string') {
+    const text = value.trim()
+    return text === '' ? null : { text, at: 0 }
+  }
+  if (!value || typeof value !== 'object') return null
+  const text = typeof value.text === 'string' ? value.text.trim() : ''
+  if (text === '') return null
+  const at = Number(value.at)
+  return { text, at: Number.isFinite(at) && at > 0 ? Math.floor(at) : 0 }
 }
 
 /**
@@ -1001,6 +1024,9 @@ export class Bridge {
     this._biliCache = new Map()
     // 未读归纳（v2.0，2026-10-28）：正在跑归纳的会话 key，防同群重复触发。
     this._summaryRuns = new Set()
+    // 手动提前截断（v2.0，2026-10-28）：同一会话同时只允许跑一次，
+    // 避免连点两次触发两次「归档 + 新建」。
+    this._manualRuns = new Set()
     // fetch 可注入：测试里替换掉它，B 站 API / 短链跳转的解析就能确定性断言。
     this.fetchImpl = typeof globalThis.fetch === 'function' ? globalThis.fetch : null
     // 图文顺序（2026-10-27）：正在跑模型的那一轮会把 key 记在这里。
@@ -2346,7 +2372,9 @@ export class Bridge {
     // voice / image 任务由 guard 工具按 sessionId 入队（没有 QQ 会话 key），
     // 不能走 _entryOf('')，否则会在 state.sessions 里留下一个空 key 的垃圾行。
     // summarize（v2.0）：由设置页按钮按群 key 触发，也不该顺手建占位空会话。
-    const entry = (action === 'voice' || action === 'image' || action === 'summarize')
+    // manual-summarize：key 校验通过后分支内部才取 entry，非法 key 不留垃圾行。
+    const entry = (action === 'voice' || action === 'image' || action === 'summarize'
+      || action === 'manual-summarize')
       ? null
       : this._entryOf(key)
 
@@ -2437,6 +2465,67 @@ export class Bridge {
       this.logger.info?.(`未读归纳由控制台触发（origin=console）：${key} count=${count}`)
       void this._runUnreadSummary({ msg, key, count, conf })
       return { ok: true, action: 'summarize', key, detail: `已开始归纳最近 ${count} 条` }
+    }
+
+    // 手动提前截断（v2.0 第五步，2026-10-28）：设置页「记忆与摘要」的按钮。
+    //
+    // 只保留一种方案（用户拍板）：**归档旧会话 + 新建同名会话**。
+    // DSH 没有「只清历史不换会话」的 API，所以这是唯一能真正把 token 归零的做法。
+    //
+    // 顺序（不能换）：
+    //   ① 用桥接层 L1（chatLog）生成前情提要；
+    //   ② 清空 L1 与注入统计；
+    //   ③ 提要写进 entry.contextBriefing（_rebuildSessionContext 不会覆盖它）；
+    //   ④ 归档旧会话、新建同名会话（轮数基线随之归零）。
+    // 全程不发 QQ 消息，只在桥接日志里留一行。
+    if (action === 'manual-summarize') {
+      if (!/^[ug]:\d{1,20}$/u.test(key)) {
+        return { ok: false, error: 'bad-key', action: 'manual-summarize', key,
+          detail: '会话 key 必须是 u:<QQ号> 或 g:<群号>' }
+      }
+      if (this._manualRuns.has(key)) {
+        return { ok: false, error: 'manual-running', action: 'manual-summarize', key,
+          detail: '上一次提前截断还没完成，稍等一下' }
+      }
+      this._manualRuns.add(key)
+      try {
+        const target = this._entryOf(key)
+        const log = (this._chatLog.get(key) ?? [])
+          .filter((item) => Date.now() - (Number(item?.at) || 0) < CHAT_LOG_WINDOW_MS)
+        const conf = this._summaryConfig()
+        let briefing = ''
+        if (log.length > 0) {
+          try {
+            briefing = await this._generateBriefing(key, log, conf)
+          } catch (error) {
+            // 提要失败不卡住按钮：仍然归档新建（等同 clear），日志里说明。
+            this.logger.warn?.(`提前截断：前情提要生成失败，继续归档（${error?.message ?? error}）`)
+          }
+        } else {
+          this.logger.info?.(`提前截断：${key} 没有 L1 记录，跳过提要直接归档`)
+        }
+        const cleared = log.length
+        this._chatLog.delete(key)
+        this._lastMemoryTrimByKey.delete(key)
+        target.contextBriefing = briefing === '' ? null : { text: briefing, at: Date.now() }
+        target.unread = 0
+        target.lastText = ''
+        this._saveState()
+        const rebuilt = await this._rebuildSessionContext(key, target, { reason: 'manual-summarize' })
+        // 只写日志，不发 QQ（用户明确要求）。
+        this.logger.info?.(
+          `手动提前截断完成：${key} ${rebuilt.oldId || '(无会话)'} → ${rebuilt.sessionId}`
+          + `（归档=${rebuilt.archived}，清空 L1 ${cleared} 条，前情提要 ${briefing.length} 字）`,
+        )
+        return {
+          ok: true, action: 'manual-summarize', key,
+          sessionId: rebuilt.sessionId, archived: rebuilt.archived,
+          cleared, briefingChars: briefing.length,
+          detail: `已归档旧会话并新建，前情提要 ${briefing.length} 字`,
+        }
+      } finally {
+        this._manualRuns.delete(key)
+      }
     }
 
     return { ok: false, error: 'unknown-op', action }
@@ -4662,6 +4751,13 @@ export class Bridge {
    */
   _contextSections(key, options = {}) {
     const sections = []
+    // 前情提要（v2.0，手动提前截断留下的压缩记忆）：放在最前面，作为「头部注入」。
+    // 它是动态上下文，不是系统提示词 —— 前缀缓存与人设 section 一行都不动。
+    const rawEntry = this.state.sessions?.[key]
+    const briefing = normalizeBriefing(
+      rawEntry && typeof rawEntry === 'object' ? rawEntry.contextBriefing : null,
+    )
+    if (briefing) sections.push(`${BRIEFING_HEADER}\n${briefing.text}`)
     const memory = this._memoryConfig()
     if (memory.enabled && memory.messageMaxTurns > 0) {
       const lines = this._recentChatLines(key, memory.messageMaxTurns, {
@@ -5178,26 +5274,8 @@ export class Bridge {
       }
 
       // 旁路临时会话：独立上下文，跑完归档；模型按配置覆写，不动全局默认。
-      const { sessionCwd, workspaceTitle } = this.config.dsh
-      fs.mkdirSync(sessionCwd, { recursive: true })
-      const workspaceId = await this.dsh.ensureWorkspace(sessionCwd, workspaceTitle)
-      sessionId = await this.dsh.createSession(workspaceId, this.config.dsh.agentPreset)
-      if (conf.provider && conf.model) {
-        await this.dsh.setSessionModel({ sessionId, provider: conf.provider, model: conf.model })
-          .catch((error) => this.logger.warn?.(`未读归纳：摘要模型下发失败（继续用会话默认）：${error?.message ?? error}`))
-      }
-      // 「群聊管家」独立人设（v2.0 第三步，2026-10-28）：临时会话默认会继承
-      // qq-chat preset 的人设（暴躁 / 傲娇），总结会带口癖甚至拒答。
-      // 这里按 sessionId 推一份管家系统提示词，插件的人设 section 会优先取它；
-      // 失败不影响流程 —— Prompt 尾部还有一句同样的覆写兜底。
-      if (typeof this.dsh.setSessionPersona === 'function') {
-        try {
-          await this.dsh.setSessionPersona({ sessionId, text: SUMMARY_PERSONA })
-          this.logger.info?.('未读归纳：临时会话已切换为「群聊管家」人设')
-        } catch (error) {
-          this.logger.warn?.(`未读归纳：管家人生设下发失败（继续用 Prompt 里的覆写）：${error?.message ?? error}`)
-        }
-      }
+      // （v2.0 第五步起与「手动提前截断」共用同一套创建 / 清理逻辑。）
+      sessionId = await this._createSummarySession(conf)
       let reply = ''
       try {
         reply = await this.dsh.promptAndWait(sessionId, prompt, { timeoutMs: conf.timeoutMs, content })
@@ -5265,20 +5343,104 @@ export class Bridge {
       } catch { /* 发送失败就算了，别再抛 */ }
     } finally {
       this._summaryRuns.delete(key)
-      if (sessionId) {
-        // 临时会话用完即归档：不删历史，也不留在会话列表里碍眼。
-        try {
-          await this.dsh.archiveSession(sessionId, { stopActivity: true })
-        } catch (error) {
-          this.logger.warn?.(`未读归纳：临时会话归档失败（可手动清理）：${error?.message ?? error}`)
-        }
-        // 人设覆盖是按 sessionId 存在 Host 内存里的，归档后顺手删掉，
-        // 否则长跑进程里会堆一堆再也不会用到的临时人设（Map 上限 500）。
-        if (typeof this.dsh.setSessionPersona === 'function') {
-          void this.dsh.setSessionPersona({ sessionId, text: '' })
-            .catch(() => { /* 清理失败不影响任何功能 */ })
-        }
+      await this._disposeSummarySession(sessionId)
+    }
+  }
+
+  /**
+   * 建一条旁路临时会话（未读归纳 / 手动提前截断共用）。
+   *
+   * 顺序不能换：先建会话，再下发模型，最后推「群聊管家」人设 ——
+   * 人设按 sessionId 存在 Host 内存里，必须在第一次 prompt 之前就位。
+   *
+   * @param {object} conf `_summaryConfig()` 的结果
+   * @returns {Promise<string>} sessionId
+   */
+  async _createSummarySession(conf) {
+    const { sessionCwd, workspaceTitle } = this.config.dsh
+    fs.mkdirSync(sessionCwd, { recursive: true })
+    const workspaceId = await this.dsh.ensureWorkspace(sessionCwd, workspaceTitle)
+    const sessionId = await this.dsh.createSession(workspaceId, this.config.dsh.agentPreset)
+    if (conf.provider && conf.model) {
+      await this.dsh.setSessionModel({ sessionId, provider: conf.provider, model: conf.model })
+        .catch((error) => this.logger.warn?.(`摘要模型下发失败（继续用会话默认）：${error?.message ?? error}`))
+    }
+    // 临时会话默认会继承 qq-chat preset 的人设（暴躁 / 傲娇），总结会带口癖甚至拒答。
+    // 这里按 sessionId 推一份管家系统提示词，插件的人设 section 会优先取它；
+    // 失败不影响流程 —— Prompt 尾部还有一句同样的覆写兜底。
+    if (typeof this.dsh.setSessionPersona === 'function') {
+      try {
+        await this.dsh.setSessionPersona({ sessionId, text: SUMMARY_PERSONA })
+        this.logger.info?.('临时摘要会话已切换为「群聊管家」人设')
+      } catch (error) {
+        this.logger.warn?.(`管家人生设下发失败（继续用 Prompt 里的覆写）：${error?.message ?? error}`)
       }
+    }
+    return sessionId
+  }
+
+  /**
+   * 归档并清理临时会话。
+   *
+   * 人设覆盖是按 sessionId 存在 Host 内存里的，归档后顺手删掉，
+   * 否则长跑进程里会堆一堆再也不会用到的临时人设（Map 上限 500）。
+   * @param {string} sessionId
+   */
+  async _disposeSummarySession(sessionId) {
+    const id = String(sessionId ?? '').trim()
+    if (id === '') return
+    try {
+      await this.dsh.archiveSession(id, { stopActivity: true })
+    } catch (error) {
+      this.logger.warn?.(`临时摘要会话归档失败（可手动清理）：${error?.message ?? error}`)
+    }
+    if (typeof this.dsh.setSessionPersona === 'function') {
+      void this.dsh.setSessionPersona({ sessionId: id, text: '' })
+        .catch(() => { /* 清理失败不影响任何功能 */ })
+    }
+  }
+
+  /**
+   * 把桥接层 L1（聊天记录环形缓冲）压成一段前情提要（v2.0 第五步）。
+   *
+   * 只读内存里的 `_chatLog`，不碰 DSH 会话历史 —— DSH 的历史在归档后自然消失，
+   * 这段提要就是新会话接续对话的唯一线索。
+   *
+   * 失败策略：调用方（手动截断）会捕获异常并继续归档（没有提要也不能卡住按钮），
+   * 所以这里不吞错，让上层决定。
+   *
+   * @param {string} key
+   * @param {Array<object>} log `_chatLog` 里的条目
+   * @param {object} conf
+   * @returns {Promise<string>} 已清洗的提要文本（可能为空串）
+   */
+  async _generateBriefing(key, log, conf) {
+    const entry = this.state.sessions?.[key]
+    const items = (Array.isArray(log) ? log : []).map((item) => ({
+      text: String(item?.text ?? ''),
+      name: String(item?.name ?? ''),
+      userId: String(item?.qq ?? ''),
+      time: Math.floor((Number(item?.at) || 0) / 1000),
+      isSelf: false,
+    }))
+    const transcript = formatTranscript(items, {
+      perMessageChars: conf.perMessageChars,
+      // 提要不是全量简报：预算再收一档，别为了压缩又烧一遍大上下文。
+      budgetTokens: Math.min(Number(conf.budgetTokens) || 12_000, 12_000),
+    })
+    const prompt = buildBriefingPrompt({
+      groupName: String(entry?.name ?? ''),
+      total: items.length,
+      transcript: transcript.text,
+    })
+    const sessionId = await this._createSummarySession(conf)
+    try {
+      const reply = await this.dsh.promptAndWait(sessionId, prompt, {
+        timeoutMs: Math.min(Number(conf.timeoutMs) || 60_000, 60_000),
+      })
+      return sanitizeSummaryTone(String(reply ?? '').trim()).slice(0, 2000)
+    } finally {
+      await this._disposeSummarySession(sessionId)
     }
   }
 

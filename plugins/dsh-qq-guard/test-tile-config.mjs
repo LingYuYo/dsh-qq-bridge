@@ -628,6 +628,29 @@ await check('生成未读归纳 → POST {op:"summarize"}，并给出提交提�
   truthy(textOf(tree).includes('已提交'), '缺少提交成功提示')
 })
 
+await check('提前截断：按钮 → 确认弹窗 → POST manual-summarize', async () => {
+  reset()
+  let tree = resetSessions(LIVE_DETAIL)
+  tabBtn(tree, '记忆与摘要').props.onClick()
+  tree = render()
+  const button = btnAnywhere(tree, '提前截断')
+  truthy(button, '缺少「提前截断」按钮')
+  button.props.onClick()
+  tree = render()
+  const modal = modalOf(tree)
+  truthy(modal, '应弹出确认框')
+  truthy(textOf(modal).includes('将提炼当前上下文'), `提示文案不对：${textOf(modal)}`)
+  const confirm = findAll(modal, (n) => n.tag === 'button' && textOf(n).trim() === '确认截断')[0]
+  truthy(confirm, '缺少「确认截断」按钮')
+  confirm.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+  const post = FEED.filter((f) => f.url.includes('/session-ops')).pop()
+  truthy(post, '没有提交到 /dsh-qq-guard/session-ops')
+  eq(JSON.parse(post.init.body), { op: 'manual-summarize', key: 'g:123456' }, '提交 body 形状')
+  tree = render()
+  truthy(textOf(tree).includes('已提交'), '缺少提交成功提示')
+})
+
 await check('特权与权限：三阶名单只读展示；群会话可加入白名单 / 黑名单', () => {
   reset()
   VALUE.allow = { ...VALUE.allow, developers: ['3300000000'], owners: ['2200000000'], admins: ['1100000000'] }

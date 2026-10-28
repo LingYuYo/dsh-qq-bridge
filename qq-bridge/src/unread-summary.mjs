@@ -50,6 +50,8 @@ export const PROMPT_OVERHEAD_TOKENS = 320
 export const SUMMARY_NODE_NAME = '群聊小助手'
 /** 结构化简报的收尾句。 */
 export const SUMMARY_FOOTER = '——由 AI 自动生成，仅供娱乐参考'
+/** 手动提前截断留下的前情提要小节标题（注入 Prompt 时用，与生成端共用同一句）。 */
+export const BRIEFING_HEADER = '【前情提要（更早对话的压缩版，仅供参考）】'
 /** 简报最多几个话题（与 Prompt 里的「3-5 个」对齐）。 */
 export const SUMMARY_MAX_TOPICS = 5
 /** 话题标题行：`【标题】`，允许前面带 markdown 列表符。 */
@@ -475,8 +477,34 @@ export function buildSummaryPrompt({
   ].join('\n')
 }
 
-/** 模型回复的通用清洗：去掉代码围栏、加粗、标题符号。 */
-function cleanModelText(reply) {
+/**
+ * 拼「前情提要」提示词（手动提前截断用，v2.0 第五步）。
+ *
+ * 与未读归纳的区别：那份是发给全群的「话题简报」，这份是留给**下一条消息**接续用的
+ * 压缩记忆，所以要有约定 / 待办 / 人物称呼，不要话题卡和时间线。
+ *
+ * @param {{groupName?:string, total?:number, transcript:string}} input
+ * @returns {string}
+ */
+export function buildBriefingPrompt({ groupName = '', total = 0, transcript = '' } = {}) {
+  return [
+    '你是「群聊管家」。请把下面这段聊天记录压缩成一份**前情提要**，供之后接续对话使用。',
+    '',
+    '要求：',
+    '1. 250~400 字，分 3~6 点，每点用「· 」起头；不要写标题、不要用 Markdown。',
+    '2. 保留：正在聊什么、已经定下的事 / 约定、待办与时间、人物关系与称呼。',
+    '3. 不逐条复述，不编造记录里没有的内容；拿不准就写「不确定」。',
+    '4. 不评价记录本身，不写「以上」「综上」这类套话，也不要加免责声明。',
+    '',
+    `【群】${groupName || '（未命名群）'}`,
+    `【消息条数】${total}`,
+    '',
+    '【聊天记录】',
+    transcript,
+  ].join('\n')
+}
+
+/** 模型回复的通用清洗：去掉代码围栏、加粗、标题符号。 */function cleanModelText(reply) {
   return String(reply ?? '')
     .replace(/^```[a-z]*\s*/iu, '')
     .replace(/```\s*$/u, '')

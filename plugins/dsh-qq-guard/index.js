@@ -4152,8 +4152,10 @@ function applySettings(ctx, config) {
         // UI 入队：{ op, key, text?, level? }
         const op = typeof body?.op === 'string' ? body.op : ''
         // summarize（v2.0）：设置页「记忆与摘要」的快捷按钮，由桥接按群 key 触发归纳。
-        // 它不是 QQ 消息，桥接侧标 origin=console，**不冒充主人**（权限仍只认事件 QQ 号）。
-        if (!['clear', 'delete', 'persona', 'activity', 'summarize'].includes(op)) {
+        // manual-summarize（v2.0 第五步）：同一位置的「提前截断」按钮，
+        // 桥接侧会生成前情提要 → 归档旧会话 → 新建同名会话。
+        // 两者都不是 QQ 消息，桥接侧标 origin=console，**不冒充主人**（权限仍只认事件 QQ 号）。
+        if (!['clear', 'delete', 'persona', 'activity', 'summarize', 'manual-summarize'].includes(op)) {
           sendJson(res, 400, { ok: false, reason: 'unknown-op', detail: `未知操作：${op || '(空)'}` })
           return
         }
