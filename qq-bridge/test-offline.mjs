@@ -1440,7 +1440,10 @@ await check('防抖：窗口内 3 条合并成 1 次 prompt（换行拼接）', 
   assert.ok(await waitUntil(() => calls.prompts.length > 0, 2000), '窗口结束后应投递')
   await tick(20) // 给可能的第二次投递留时间
   assert.equal(calls.prompts.length, 1, `实际 ${calls.prompts.length} 次 prompt`)
-  assert.equal(calls.prompts[0].text, '[群友 1000000001(1000000001)]: 第一句\n[群友 1000000001(1000000001)]: 第二句\n[群友 1000000001(1000000001)]: 第三句')
+  // v2.0 第十步：prompt 末尾会追加「本群动态记忆」小节，这里只断言正文开头。
+  assert.ok(calls.prompts[0].text.startsWith(
+    '[群友 1000000001(1000000001)]: 第一句\n[群友 1000000001(1000000001)]: 第二句\n[群友 1000000001(1000000001)]: 第三句',
+  ), `正文不对：${calls.prompts[0].text.slice(0, 120)}`)
 })
 await check('防抖：超过窗口的两条分别投递', async () => {
   const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 30 } })
@@ -1448,7 +1451,9 @@ await check('防抖：超过窗口的两条分别投递', async () => {
   assert.ok(await waitUntil(() => calls.prompts.length === 1, 1000))
   await b.handleMessage(groupMsg('乙', { id: 'e2' }))
   assert.ok(await waitUntil(() => calls.prompts.length === 2, 1000))
-  assert.deepEqual(calls.prompts.map((p) => p.text), ['[群友 1000000001(1000000001)]: 甲', '[群友 1000000001(1000000001)]: 乙'])
+  const texts = calls.prompts.map((p) => p.text)
+  assert.ok(texts[0].startsWith('[群友 1000000001(1000000001)]: 甲'), `第 1 条正文不对：${texts[0].slice(0, 80)}`)
+  assert.ok(texts[1].startsWith('[群友 1000000001(1000000001)]: 乙'), `第 2 条正文不对：${texts[1].slice(0, 80)}`)
 })
 await check('热配置改 debounceWindowMs 立即生效', async () => {
   const { b, calls } = makeBridge({ rhythm: { activityLevel: 3, debounceWindowMs: 0 } })
@@ -1459,7 +1464,9 @@ await check('热配置改 debounceWindowMs 立即生效', async () => {
   await b.handleMessage(groupMsg('三', { id: 'w3' }))
   assert.equal(calls.prompts.length, 1, '改窗口后应攒着')
   assert.ok(await waitUntil(() => calls.prompts.length === 2, 1000))
-  assert.equal(calls.prompts[1].text, '[群友 1000000001(1000000001)]: 二\n[群友 1000000001(1000000001)]: 三')
+  assert.ok(calls.prompts[1].text.startsWith(
+    '[群友 1000000001(1000000001)]: 二\n[群友 1000000001(1000000001)]: 三',
+  ), `正文不对：${calls.prompts[1].text.slice(0, 100)}`)
 })
 await check('限频：超过 perMin+burst 静默丢弃（silent=true）', async () => {
   const { b, calls } = makeBridge({
@@ -1740,7 +1747,7 @@ await check('管理员指令不受响应档位限制（群里没 @ 也能执行�
   })
   await b.handleMessage(groupMsg('/reset', { id: 'cmd4' }))
   assert.equal(calls.prompts.length, 1, '★ 管理员指令应放行，不因档位被跳过')
-  assert.equal(calls.prompts[0].text, '/reset')
+  assert.ok(calls.prompts[0].text.startsWith('/reset'), `指令正文不对：${calls.prompts[0].text.slice(0, 60)}`)
 })
 
 console.log('\n— 人设推送（动态 section 的数据源）—')

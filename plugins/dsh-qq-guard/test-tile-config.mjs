@@ -547,7 +547,8 @@ await check('详情头下方有四个分页，默认停在「基础配置」', (
   const labels = findAll(tree, (n) => n.tag === 'button' && n.props?.role === 'tab').map((n) => textOf(n).trim())
   eq(labels, ['基础配置', '记忆与摘要', '特权与权限', '调试信息'], '四个分页顺序')
   truthy(levelSelect(tree), '基础配置应包含响应档位')
-  truthy(btnAnywhere(tree, '保存人设'), '基础配置应包含单人设保存')
+  truthy(btnAnywhere(tree, '保存静态核心'), '基础配置应包含静态核心保存')
+  truthy(btnAnywhere(tree, '保存动态记忆'), '基础配置应包含动态记忆保存')
   eq(btnAnywhere(tree, '生成未读归纳'), undefined, '默认不该渲染记忆 Tab')
 })
 

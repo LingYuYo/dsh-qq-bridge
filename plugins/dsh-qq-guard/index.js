@@ -527,6 +527,19 @@ const Config = Schema.object({
   personaExtraRules: Schema.string()
     .description('管理员附加规则。非空时追加到最终系统提示词末尾。')
     .default('').volatile(),
+  // 三段式静态核心（v2.0 第十步）：全局底座，吃前缀缓存，动态记忆无权修改。
+  // 单群可以在「会话管理 → 基础配置」按段覆盖（state.sessions[key].core）。
+  personaCore: Schema.object({
+    identity: Schema.string()
+      .description('身份定义与气质：你是谁、什么性格、怎么说话。')
+      .default('').volatile(),
+    boundary: Schema.string()
+      .description('边界与安全红线：绝对不能做什么、遇到什么要拒绝。')
+      .default('').volatile(),
+    style: Schema.string()
+      .description('交互策略与应对模式：被问到什么、被挑衅、冷场时分别怎么处理。')
+      .default('').volatile(),
+  }).description('三段式静态核心人设（全局默认底座）').default({}),
   personaSystemPrompt: Schema.string()
     .description('完整系统提示词覆盖。非空时完全替换内置人设（名字/参与度/附加规则都不再追加）。')
     .default('').volatile(),
@@ -1435,6 +1448,12 @@ function enqueueSessionOp(op, key, text = '', extra = {}) {
     file: typeof extra.file === 'string' ? extra.file : '',
     ...(level === undefined ? {} : { level }),
     ...(subType === undefined ? {} : { subType }),
+    // v2.0 第十步：动态记忆编辑（静态核心覆盖 / 黑话列表 / 删除群友档案）。
+    ...(extra.core === undefined ? {} : { core: extra.core }),
+    ...(extra.slang === undefined ? {} : { slang: extra.slang }),
+    ...(typeof extra.removeProfile === 'string' && extra.removeProfile !== ''
+      ? { removeProfile: extra.removeProfile }
+      : {}),
     at: Date.now(), lease: 0,
   })
   while (sessionOpsQueue.size > SESSION_OPS_CAP) {
@@ -3059,6 +3078,41 @@ function sanitizeSessionRow(row) {
     // 前端据此区分「不在活跃窗口」和「确实没有消息」。
     ...(Array.isArray(row.recent) ? { recent: sanitizeRecentRows(row.recent) } : {}),
     ...(row.raw && typeof row.raw === 'object' ? { raw: sanitizeRawPayload(row.raw) } : {}),
+    // ── v2.0 第十步：双轨制人设 / 动态记忆 ────────────────────────────
+    core: sanitizeCore(row.core),
+    userProfiles: Array.isArray(row.userProfiles)
+      ? row.userProfiles.slice(0, 50).map(sanitizeUserProfile).filter(Boolean)
+      : [],
+    slang: Array.isArray(row.slang)
+      ? [...new Set(row.slang
+        .map((item) => (typeof item === 'string' ? item.replace(/\s+/gu, ' ').trim().slice(0, 60) : ''))
+        .filter(Boolean))].slice(0, 50)
+      : [],
+    contextBriefing: typeof row.contextBriefing === 'string' ? row.contextBriefing.slice(0, 4000) : '',
+  }
+}
+
+/** 收敛单群静态核心（三段，纯文本展示 / 编辑回填）。 */
+function sanitizeCore(value) {
+  const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  const line = (input) => (typeof input === 'string' ? input.slice(0, 4000) : '')
+  return { identity: line(src.identity), boundary: line(src.boundary), style: line(src.style) }
+}
+
+/** 收敛单条群友档案。 */
+function sanitizeUserProfile(value) {
+  if (!value || typeof value !== 'object') return null
+  const qq = typeof value.qq === 'string' ? value.qq.replace(/\D/gu, '').slice(0, 20) : ''
+  if (qq === '') return null
+  const text = (input, max) => (typeof input === 'string' ? input.replace(/\s+/gu, ' ').trim().slice(0, max) : '')
+  return {
+    qq,
+    nickname: text(value.nickname, 60),
+    lastNickname: text(value.lastNickname, 60),
+    role: value.role === 'owner' || value.role === 'admin' ? value.role : 'member',
+    tags: Array.isArray(value.tags)
+      ? [...new Set(value.tags.map((tag) => text(tag, 40)).filter(Boolean))].slice(0, 5)
+      : [],
   }
 }
 
@@ -4215,6 +4269,10 @@ function applySettings(ctx, config) {
               ...(op.subType === 0 || op.subType === 1 ? { subType: op.subType } : {}),
               // 单群响应档位：null 也要下发（null = 跟随全局，是明确的语义，不是缺省）。
               ...(op.level === undefined ? {} : { level: op.level }),
+              // v2.0 第十步：动态记忆编辑字段原样透传给桥接。
+              ...(op.core === undefined ? {} : { core: op.core }),
+              ...(op.slang === undefined ? {} : { slang: op.slang }),
+              ...(op.removeProfile ? { removeProfile: op.removeProfile } : {}),
             })
           }
           sendJson(res, 200, { ok: true, ops })
@@ -4250,7 +4308,7 @@ function applySettings(ctx, config) {
         // manual-summarize（v2.0 第五步）：同一位置的「提前截断」按钮，
         // 桥接侧会生成前情提要 → 归档旧会话 → 新建同名会话。
         // 两者都不是 QQ 消息，桥接侧标 origin=console，**不冒充主人**（权限仍只认事件 QQ 号）。
-        if (!['clear', 'delete', 'persona', 'activity', 'summarize', 'manual-summarize'].includes(op)) {
+        if (!['clear', 'delete', 'persona', 'activity', 'summarize', 'manual-summarize', 'dynamic'].includes(op)) {
           sendJson(res, 400, { ok: false, reason: 'unknown-op', detail: `未知操作：${op || '(空)'}` })
           return
         }
@@ -4271,10 +4329,30 @@ function applySettings(ctx, config) {
           }
         }
         const text = typeof body?.text === 'string' ? body.text.slice(0, PERSONA_MAX_CHARS) : ''
+        // v2.0 第十步：动态记忆编辑。core 三段 / slang 字符串数组 / removeProfile（QQ）。
+        const extra = op === 'activity' ? { level } : {}
+        if (op === 'dynamic') {
+          if (body?.core && typeof body.core === 'object' && !Array.isArray(body.core)) {
+            const line = (value) => (typeof value === 'string' ? value.slice(0, 4000) : '')
+            extra.core = {
+              identity: line(body.core.identity),
+              boundary: line(body.core.boundary),
+              style: line(body.core.style),
+            }
+          }
+          if (Array.isArray(body?.slang)) {
+            extra.slang = body.slang.slice(0, 50)
+              .map((item) => (typeof item === 'string' ? item.trim().slice(0, 60) : ''))
+              .filter(Boolean)
+          }
+          if (typeof body?.removeProfile === 'string' && /^\d{1,20}$/u.test(body.removeProfile.trim())) {
+            extra.removeProfile = body.removeProfile.trim()
+          }
+        }
         const id = enqueueSessionOp(
           op, key,
           op === 'persona' ? text : '',
-          op === 'activity' ? { level } : {},
+          extra,
         )
         sendJson(res, 200, { ok: true, id, queued: sessionOpsQueue.size, note: '桥接 2 秒内轮询执行' })
       },

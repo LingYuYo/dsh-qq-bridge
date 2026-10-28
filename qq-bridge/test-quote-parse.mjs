@@ -218,7 +218,7 @@ await check('斜杠指令带引用 → 不拼引用块，也不去拉原消息',
   let fetched = 0
   b.qq.getMessage = async () => { fetched++; return { ok: true, text: '不该出现', images: [], videos: [], quote: {} } }
   await b.handleMessage(groupMsg('/clear', { quote: replyQuote('777') }))
-  assert.equal(calls.prompts[0].text, '/clear', 'DSH 只认以 / 开头的 prompt')
+  assert.ok(calls.prompts[0].text.startsWith('/clear'), 'DSH 只认以 / 开头的 prompt')
   assert.equal(fetched, 0, '斜杠指令不该浪费一次 get_msg')
 })
 

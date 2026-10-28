@@ -98,6 +98,8 @@ const HOT_KEYS = [
   'bridgeEnabled',
   // OneBot 连接信息只用于 UI 展示；WS 连接在启动时建立，改它仍需重启桥接。
   'onebot',
+  // v2.0 第十步（2026-10-28）：三段式静态核心人设（全局底座）。
+  'personaCore',
 ]
 
 /**
@@ -112,6 +114,7 @@ const HOT_DSH_KEYS = ['archiveStaleSessions']
 /** 人设相关字段：任何一项变化都要重拼系统提示词（不能只盯 personaText）。 */
 const PERSONA_KEYS = [
   'personaText',
+  'personaCore',
   'personaBotName',
   'personaGroupName',
   'personaParticipation',

@@ -48,20 +48,51 @@ const SUMMARIZE_TIMEOUT_MS = 60_000
 const MAX_PERSONA_CHARS = 2_000
 
 /**
- * 归纳用的 system 提示词。
+ * 归纳用的 system 提示词（v2.0 第十步：从「改人设」改成「提取动态记忆」）。
  *
- * 为什么要写得这么「死板」：归纳结果会被**追加进系统提示词**，一旦模型开始自由发挥
- * （解释、编号、「以下是总结」），这段垃圾就会长期影响 QQ 会话的语气。
- * 所以把「只输出设定、1–5 条短句、没有就空串」写死，并且在 Host 侧再做一次截断。
+ * 为什么输出 JSON：结果要拆成两个结构化列表（黑话 / 群友特征），
+ * 塞回人设只会污染前缀缓存；只提取事实，交给桥接写进本群档案。
  */
 const SYSTEM_PROMPT = [
-  '你是一个群聊人设归纳器。根据给出的群聊记录，提炼值得补充进机器人人设的设定。',
-  '只输出要补充的设定：1 到 5 条短句，每行一条，用陈述句写。',
-  '不要解释、不要编号、不要加引号、不要复述聊天内容、不要写「以下是」这类开场白。',
-  '不要重复已有设定；不要写人身攻击、隐私、群友的真实身份信息；',
-  '不要写天气、时间、某次具体事件这类闲聊事实——只沉淀长期有效的偏好、称呼与相处方式。',
-  '没有值得沉淀的内容就输出空字符串（什么都不输出）。',
+  '你是一个群聊动态记忆提取器。根据给出的群聊记录，提取「本群黑话/梗」与「群友特征」。',
+  '只输出一个 JSON 对象，不要 Markdown、不要解释、不要代码围栏：',
+  '{"slang":["…"],"profiles":[{"qq":"123","tags":["…"]}]}',
+  '规则：',
+  '- slang 最多 5 条，每条 20 字以内，必须是这个群特有的说法或梗；没有就空数组。',
+  '- profiles 只列给出的群友 QQ；每人 tags 最多 3 条、每条 20 字以内。',
+  '- 只写稳定特征（口头禅、常聊话题、称呼习惯），不写隐私、外貌、真实身份，不写人身攻击。',
+  '- 不确定就不写，宁可少写。',
 ].join('\n')
+
+/**
+ * 解析模型返回的 JSON（容忍代码围栏与前后废话）。
+ * @param {string} text
+ * @returns {{slang:string[], profiles:Array<{qq:string, tags:string[]}>}}
+ */
+export function parseMemoryJson(text) {
+  const raw = String(text ?? '')
+    .replace(/^```(?:json)?\s*/iu, '')
+    .replace(/```\s*$/u, '')
+    .trim()
+  const start = raw.indexOf('{')
+  const end = raw.lastIndexOf('}')
+  if (start < 0 || end <= start) return { slang: [], profiles: [] }
+  let parsed
+  try { parsed = JSON.parse(raw.slice(start, end + 1)) } catch { return { slang: [], profiles: [] } }
+  const slang = Array.isArray(parsed?.slang)
+    ? [...new Set(parsed.slang.map((item) => String(item ?? '').trim()).filter(Boolean))].slice(0, 5)
+    : []
+  const profiles = []
+  for (const item of Array.isArray(parsed?.profiles) ? parsed.profiles.slice(0, 30) : []) {
+    const qq = String(item?.qq ?? '').trim()
+    if (!/^\d{1,20}$/u.test(qq)) continue
+    const tags = Array.isArray(item?.tags)
+      ? [...new Set(item.tags.map((tag) => String(tag ?? '').trim()).filter(Boolean))].slice(0, 3)
+      : []
+    if (tags.length > 0) profiles.push({ qq, tags })
+  }
+  return { slang, profiles }
+}
 
 /**
  * 读 schemastery volatile 字段的当前值。
@@ -285,17 +316,19 @@ export async function handlePersonaSummarizeRoute(ctx, config, req, res, logger 
     }
 
     if (failure !== undefined) {
-      logger.warn?.(`[qq-guard] 人设归纳失败：${failure.reason}${failure.detail === '' ? '' : `（${failure.detail}）`}`)
+      logger.warn?.(`[qq-guard] 动态记忆提取失败：${failure.reason}${failure.detail === '' ? '' : `（${failure.detail}）`}`)
       sendJson(res, failure.reason === 'aborted' ? 504 : 502, { ok: false, reason: failure.reason })
       return
     }
 
-    logger.info?.(`[qq-guard] 人设归纳完成：${route.provider}/${route.model}，输入 ${prompt.length} 字符，输出 ${text.length} 字符`)
-    sendJson(res, 200, { ok: true, persona: text.trim().slice(0, MAX_PERSONA_CHARS) })
+    const memory = parseMemoryJson(text)
+    logger.info?.(`[qq-guard] 动态记忆提取完成：${route.provider}/${route.model}，`
+      + `输入 ${prompt.length} 字符，黑话 ${memory.slang.length} 条，群友 ${memory.profiles.length} 人`)
+    sendJson(res, 200, { ok: true, ...memory })
   } catch (error) {
     // 适配器在流开始前抛错、或消费者侧异常：都算软失败，桥接跳过本轮。
     const reason = controller.signal.aborted ? 'aborted' : 'stream-failed'
-    logger.warn?.(`[qq-guard] 人设归纳失败：${reason}（${error?.message ?? error}）`)
+    logger.warn?.(`[qq-guard] 动态记忆提取失败：${reason}（${error?.message ?? error}）`)
     sendJson(res, controller.signal.aborted ? 504 : 502, { ok: false, reason })
   } finally {
     clearTimeout(timer)

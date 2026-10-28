@@ -109,7 +109,12 @@ const VALUE = {
   personaBotName: '林小鱼',
   personaGroupName: '小鱼',
   personaParticipation: 'active',
-  personaText: '第一行角色设定。\n第二行角色设定。\n第三行不该出现在概览里。',
+  personaCore: {
+    identity: '第一行角色设定。\n第二行角色设定。\n第三行不该出现在概览里。',
+    boundary: '',
+    style: '',
+  },
+  personaText: '',
   personaExtraRules: '',
   personaSystemPrompt: '',
   personaPresets: [{ id: 'p1', name: '猫娘', text: '你是一只傲娇猫娘。' }],
@@ -212,7 +217,8 @@ check('点编辑 → 弹窗包含全部字段与提示语', () => {
   btnByText(tree, '⚙️ 编辑人设').props.onClick()
   tree = repaint()
   assert(modalTitle(tree) === '人设设置', `弹窗标题「${modalTitle(tree)}」`)
-  for (const label of ['选择人设', '机器人名字', '群内展示名', '参与度', '角色设定', '管理员附加规则', '系统提示词覆盖']) {
+  for (const label of ['选择人设', '机器人名字', '群内展示名', '参与度',
+    '身份定义与气质', '边界与安全红线', '交互策略与应对模式', '系统提示词覆盖']) {
     const found = findAll(tree, (n) => n.props?.['aria-label'] === label)[0]
     assert(found, `缺字段「${label}」`)
   }
@@ -246,16 +252,19 @@ check('编辑并保存 → 字段一次性写回配置，弹窗关闭', () => {
   change('机器人名字', '深海小鱼')
   change('群内展示名', '小鱼酱')
   change('参与度', 'quiet')
-  change('角色设定', '新的角色设定\n第二行')
-  change('管理员附加规则', '别在凌晨发言')
+  change('身份定义与气质', '新的角色设定\n第二行')
+  change('边界与安全红线', '别说脏话')
+  change('交互策略与应对模式', '被骂就损回去')
   change('系统提示词覆盖', '')
   btnByText(tree, '保存').props.onClick()
   tree = repaint()
   assert(VALUE.personaBotName === '深海小鱼', VALUE.personaBotName)
   assert(VALUE.personaGroupName === '小鱼酱', VALUE.personaGroupName)
   assert(VALUE.personaParticipation === 'quiet', VALUE.personaParticipation)
-  assert(VALUE.personaText === '新的角色设定\n第二行', VALUE.personaText)
-  assert(VALUE.personaExtraRules === '别在凌晨发言', VALUE.personaExtraRules)
+  assert(VALUE.personaCore.identity === '新的角色设定\n第二行', JSON.stringify(VALUE.personaCore))
+  assert(VALUE.personaCore.boundary === '别说脏话')
+  assert(VALUE.personaCore.style === '被骂就损回去')
+  assert(VALUE.personaText === '', '旧大文本框应被清空，避免两套设定叠加')
   assert(VALUE.personaSystemPrompt === '', VALUE.personaSystemPrompt)
   assert(!modalTitle(tree).includes('人设设置'), '保存后弹窗没关')
 })
@@ -282,7 +291,7 @@ check('添加人设 → 下拉多一项，保存后写入列表并选中', () =>
   const select = findAll(tree, (n) => n.tag === 'select' && n.props?.['aria-label'] === '选择人设')[0]
   const options = findAll(select, (n) => n.tag === 'option').map(textOf)
   assert(options.length === 3, JSON.stringify(options)) // 默认 + 猫娘 + 新人设
-  findAll(tree, (n) => n.tag === 'textarea' && n.props?.['aria-label'] === '角色设定')[0]
+  findAll(tree, (n) => n.tag === 'textarea' && n.props?.['aria-label'] === '身份定义与气质')[0]
     .props.onChange({ target: { value: '新人设正文' } })
   tree = repaint()
   btnByText(tree, '保存').props.onClick()
@@ -300,7 +309,7 @@ check('选择已有自定义人设 → 角色设定回填', () => {
   findAll(tree, (n) => n.tag === 'select' && n.props?.['aria-label'] === '选择人设')[0]
     .props.onChange({ target: { value: 'p1' } })
   tree = repaint()
-  const textarea = findAll(tree, (n) => n.tag === 'textarea' && n.props?.['aria-label'] === '角色设定')[0]
+  const textarea = findAll(tree, (n) => n.tag === 'textarea' && n.props?.['aria-label'] === '身份定义与气质')[0]
   assert(textarea.props.value === '你是一只傲娇猫娘。', `回填「${textarea.props.value}」`)
   btnByText(tree, '取消').props.onClick()
 })
@@ -345,8 +354,8 @@ check('删除当前自定义人设 → 清空选择并回落到默认', () => {
   tree = repaint()
   btnByText(tree, '删除当前自定义人设').props.onClick()
   tree = repaint()
-  const textarea = findAll(tree, (n) => n.tag === 'textarea' && n.props?.['aria-label'] === '角色设定')[0]
-  assert(textarea.props.value === '', `删除后角色设定应为空，实际「${textarea.props.value}」`)
+  const textarea = findAll(tree, (n) => n.tag === 'textarea' && n.props?.['aria-label'] === '身份定义与气质')[0]
+  assert(textarea.props.value === '', `删除后身份定义应为空，实际「${textarea.props.value}」`)
   btnByText(tree, '保存').props.onClick()
   tree = repaint()
   assert(VALUE.personaPresetId === '', `选中 id 应为空，实际「${VALUE.personaPresetId}」`)

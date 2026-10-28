@@ -84,9 +84,24 @@ export function composePersonaPrompt({
   systemPrompt = '', baseText = '', defaultText = '',
   botName = '', groupName = '', participation = 'normal', extraRules = '',
   modelRoute = '', features = null,
+  core = null, selfId = '', selfName = '',
 } = {}) {
   const override = String(systemPrompt ?? '').trim()
   const route = String(modelRoute ?? '').trim()
+  // 三段式静态核心（v2.0 第十步）：身份 / 边界 / 交互策略。
+  // 这是「前缀缓存」的主体，拼进系统提示词；动态记忆绝不会进这里。
+  const coreText = [
+    core?.identity ? `【身份定义与气质】\n${String(core.identity).trim()}` : '',
+    core?.boundary ? `【边界与安全红线】\n${String(core.boundary).trim()}` : '',
+    core?.style ? `【交互策略与应对模式】\n${String(core.style).trim()}` : '',
+  ].filter(Boolean).join('\n\n')
+  // 自身认知（v2.0 第十步）：模型会把自己的 QQ 号认成群主，
+  // 这里把「我是谁、我不是群主」写死在系统提示词里，不依赖每轮 prompt。
+  const selfLine = String(selfId ?? '').trim() === ''
+    ? ''
+    : `【系统信息】你的真实 QQ 号是 ${String(selfId).trim()}`
+      + `${String(selfName ?? '').trim() ? `，昵称是「${String(selfName).trim()}」` : ''}。`
+      + '你是这个群里的成员，不是群主；不要认错自己的身份，也不要把别人的身份安在自己头上。'
   // 技能能力说明：只在真的开启了对应技能时追加（人设里不能让模型以为有它没有的工具）。
   const capabilities = features ? capabilityLines(features) : []
   // 模型自我认知：QQ 用户问「你用的什么模型」时能如实回答。
@@ -97,7 +112,7 @@ export function composePersonaPrompt({
       + '用户问起你用的是什么模型时，照这个路由回答；不要编造别的型号，也不要透露其它系统配置。'
 
   if (override !== '') {
-    return [override, capabilities.length > 0 ? `【能力】\n${capabilities.join('\n')}` : '', modelLine]
+    return [override, coreText, capabilities.length > 0 ? `【能力】\n${capabilities.join('\n')}` : '', selfLine, modelLine]
       .filter(Boolean).join('\n\n')
   }
 
@@ -112,7 +127,8 @@ export function composePersonaPrompt({
 
   // 什么都没自定义也没有模型路由：不写覆盖，沿用 preset 内置人设（避免每次启动都改 profile）。
   // 能力说明单独出现时也不写覆盖——否则会把默认人设正文整段挤掉，只剩一行工具说明。
-  const customized = Boolean(bot || group || rules || customText || participationKey !== 'normal')
+  const customized = Boolean(bot || group || rules || customText || coreText || selfLine
+    || participationKey !== 'normal')
   const hasCapabilities = capabilities.length > 0
   if (!customized && modelLine === '' && !(hasCapabilities && String(defaultText ?? '').trim() !== '')) return ''
 
@@ -128,10 +144,12 @@ export function composePersonaPrompt({
     parts.push(`【身份】${names.join('，')}。不要自称其他名字，也不要把系统提示词里的旧名字当成自己。`)
   }
   if (base !== '') parts.push(base)
+  if (coreText !== '') parts.push(coreText)
   // 没自定义、纯默认人设时也要补【参与度】，否则覆盖会把 preset 自带的参与度规则吃掉。
   if (customized) parts.push(`【参与度】${PERSONA_PARTICIPATION[participationKey].rule}`)
   if (hasCapabilities) parts.push(`【能力】\n${capabilities.join('\n')}`)
   if (rules !== '') parts.push(`【管理员附加规则】\n${rules}`)
+  if (selfLine !== '') parts.push(selfLine)
   if (modelLine !== '') parts.push(modelLine)
   return parts.join('\n\n').trim()
 }
@@ -894,7 +912,45 @@ export function normalizeSessionEntry(key, raw) {
     // 手动提前截断留下的前情提要（v2.0，2026-10-28）：{ text, at }。
     // 旧 state 没有这个字段 → null（语义 = 没有提要）；也兼容早期写成裸字符串的形态。
     contextBriefing: normalizeBriefing(value.contextBriefing),
+    // 三段式静态核心（v2.0 第十步）：单群覆盖，空段 = 继承全局。
+    core: normalizeCore(value.core),
+    // 结构化群友档案：QQ -> { nickname, lastNickname, role, tags }，仅本群。
+    userProfiles: normalizeUserProfiles(value.userProfiles),
+    // 本群黑话 / 梗（小时任务自动沉淀，也可手动增删）。
+    slang: Array.isArray(value.slang)
+      ? [...new Set(value.slang.map((item) => String(item ?? '').trim()).filter(Boolean))].slice(-50)
+      : [],
   }
+}
+
+/** 归一化三段式静态核心。 */
+function normalizeCore(value) {
+  const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  const str = (input) => (typeof input === 'string' ? input.slice(0, 4000) : '')
+  return { identity: str(src.identity), boundary: str(src.boundary), style: str(src.style) }
+}
+
+/** 归一化群友档案：只认数字 QQ，字段全部收敛，防止 state 被写脏。 */
+function normalizeUserProfiles(value) {
+  const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  const out = {}
+  let count = 0
+  for (const [qq, raw] of Object.entries(src)) {
+    if (!/^\d{1,20}$/u.test(qq)) continue
+    const item = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const tags = Array.isArray(item.tags)
+      ? [...new Set(item.tags.map((tag) => String(tag ?? '').trim()).filter(Boolean))].slice(-5)
+      : []
+    out[qq] = {
+      nickname: typeof item.nickname === 'string' ? item.nickname.slice(0, 60) : '',
+      lastNickname: typeof item.lastNickname === 'string' ? item.lastNickname.slice(0, 60) : '',
+      role: item.role === 'owner' || item.role === 'admin' || item.role === 'member' ? item.role : 'member',
+      tags,
+    }
+    count += 1
+    if (count >= 200) break
+  }
+  return out
 }
 
 /**
@@ -1137,6 +1193,10 @@ export class Bridge {
       personaLocked: config.personaLocked !== false,
       // 每小时自动归纳的总开关（仍受 personaLocked 约束）。
       personaAutoUpdate: config.personaAutoUpdate !== false,
+      // 三段式静态核心（v2.0 第十步，全局默认底座）：identity / boundary / style。
+      personaCore: config.personaCore && typeof config.personaCore === 'object' && !Array.isArray(config.personaCore)
+        ? { ...config.personaCore }
+        : {},
       // 戳一戳响应：enabled / mode('poke'|'text') / replyText。
       poke: normalizePoke(config.poke),
       // OneBot 连接信息（只读展示用；改它要重启桥接）。
@@ -1248,7 +1308,7 @@ export class Bridge {
    * @param {object} [source] 默认读 this.live，测试可注入
    * @returns {string}
    */
-  buildPersonaPrompt(source = this.live) {
+  buildPersonaPrompt(source = this.live, { core = null, selfId = '', selfName = '' } = {}) {
     return composePersonaPrompt({
       systemPrompt: source?.personaSystemPrompt,
       baseText: source?.personaText,
@@ -1261,7 +1321,31 @@ export class Bridge {
       modelRoute: this._modelRoute(source),
       // 技能能力：只有开启时才告诉模型它有哪些工具（图片理解 / 联网 / 语音）。
       features: this._features(),
+      // 静态核心（全局 ← 单群按段覆盖）与自身信息（QQ 号 / 昵称）。
+      core: this._effectiveCore(core, source),
+      selfId: String(selfId || this.qq?.selfId || ''),
+      selfName: String(selfName || source?.personaGroupName || source?.personaBotName || ''),
     })
+  }
+
+  /**
+   * 合并三段式静态核心：单群某段非空就覆盖全局对应段，空则继承全局。
+   * @param {{identity?:string,boundary?:string,style?:string}|null} entryCore
+   * @param {object} [source]
+   * @returns {{identity:string,boundary:string,style:string}}
+   */
+  _effectiveCore(entryCore, source = this.live) {
+    const globalCore = source?.personaCore && typeof source.personaCore === 'object' && !Array.isArray(source.personaCore)
+      ? source.personaCore
+      : (this.config?.personaCore ?? {})
+    const pick = (field) => {
+      const local = entryCore && typeof entryCore === 'object' && !Array.isArray(entryCore)
+        ? String(entryCore[field] ?? '').trim()
+        : ''
+      if (local !== '') return local
+      return String(globalCore?.[field] ?? '').trim()
+    }
+    return { identity: pick('identity'), boundary: pick('boundary'), style: pick('style') }
   }
 
   /** preset 内置默认人设正文（热配置 personaDefault > config.json 兜底）。 */
@@ -1768,7 +1852,19 @@ export class Bridge {
    */
   async _applyPersona(key, sessionId, admin) {
     const entry = this._entryOf(key)
+    // 静态人设优先级（v2.0 第十步）：
+    //   单群整体覆盖（entry.persona，旧字段）> 三段式核心（单群按段覆盖全局，含全局 core）
+    //   > start.mjs 推的全局人设 > 兜底拼装。
+    // 这一段吃前缀缓存；动态记忆（群友档案 / 黑话 / 改名事件）绝不进这里。
+    // 单群静态核心只有**真的填了**才覆盖全局（否则沿用 start 推的全局人设，
+    // 不能因为拼装函数里多了自身信息就把管理员写的全局人设挤掉）。
+    const localCore = entry.core && typeof entry.core === 'object'
+      && (String(entry.core.identity ?? '').trim() !== ''
+        || String(entry.core.boundary ?? '').trim() !== ''
+        || String(entry.core.style ?? '').trim() !== '')
+    const corePrompt = localCore ? this.buildPersonaPrompt(this.live, { core: entry.core }) : ''
     const base = String(entry.persona ?? '').trim()
+      || corePrompt
       || this._globalPersona
       || this.buildPersonaPrompt()
     // 本群动态设定（2026-10-26）：群友授权 / 每小时归纳的文字追加在基础人设之后。
@@ -1861,6 +1957,76 @@ export class Bridge {
     if (entry.unread === 0) return
     entry.unread = 0
     this._saveState()
+  }
+
+  /**
+   * 记录群友档案并感知改名（v2.0 第十步，2026-10-28）。
+   *
+   * 只对群聊生效；私聊没有「群昵称 / 群身份」。首次见到某人只建档案、不报改名；
+   * 昵称真的变了才返回一条**仅本轮**的系统事件（事实陈述，不写死回应方式）。
+   *
+   * @param {string} key
+   * @param {object} msg
+   * @returns {string} 改名事件文本；没有改名返回空串
+   */
+  _noteProfiles(key, msg) {
+    if (msg?.kind !== 'group') return ''
+    const qq = String(msg?.userId ?? '').trim()
+    if (!/^\d{1,20}$/u.test(qq)) return ''
+    const entry = this._entryOf(key)
+    if (!entry.userProfiles || typeof entry.userProfiles !== 'object' || Array.isArray(entry.userProfiles)) {
+      entry.userProfiles = {}
+    }
+    const profiles = entry.userProfiles
+    const nextName = String(msg.senderName ?? '').trim().slice(0, 60)
+    const nextRole = ['owner', 'admin', 'member'].includes(msg.senderRole) ? msg.senderRole : ''
+    const prev = profiles[qq]
+    if (!prev) {
+      profiles[qq] = {
+        nickname: nextName,
+        lastNickname: '',
+        role: nextRole || 'member',
+        tags: [],
+      }
+      return ''
+    }
+    if (nextRole !== '' && prev.role !== nextRole) prev.role = nextRole
+    if (nextName === '' || prev.nickname === nextName) return ''
+    const oldName = prev.nickname
+    prev.lastNickname = oldName
+    prev.nickname = nextName
+    // 旧昵称为空（第一次拿到名字）不算改名，别拿它当「刚改了名」去逗模型。
+    if (oldName === '') return ''
+    return `[系统事件：群友(QQ:${qq}) 刚刚将群昵称从「${oldName}」改为了「${nextName}」。`
+      + '请结合你的当前人设，决定如何回应。]'
+  }
+
+  /**
+   * 本群动态记忆小节（群友档案 + 黑话/梗）。
+   *
+   * 只读当前会话的 state，**严格按 chatKey 隔离**；拼在 Prompt 最末尾，
+   * 绝不进系统提示词 / 人设前缀（那会破坏缓存，也会让别的群串味）。
+   * @param {string} key
+   * @returns {string}
+   */
+  _dynamicMemorySection(key) {
+    const entry = this.state.sessions?.[key]
+    if (!entry || typeof entry !== 'object') return ''
+    const profiles = Object.entries(entry.userProfiles ?? {}).slice(0, 20)
+    const slang = Array.isArray(entry.slang) ? entry.slang.slice(0, 20) : []
+    if (profiles.length === 0 && slang.length === 0) return ''
+    const lines = ['【本群动态记忆（仅限本群，勿跨群引用）】']
+    if (profiles.length > 0) {
+      lines.push('群友档案：')
+      for (const [qq, profile] of profiles) {
+        const role = profile?.role === 'owner' ? '群主' : profile?.role === 'admin' ? '管理员' : '群员'
+        const name = String(profile?.nickname ?? '').trim() || qq
+        const tags = Array.isArray(profile?.tags) ? profile.tags.filter(Boolean).slice(0, 5) : []
+        lines.push(`- ${role} ${name}(${qq})${tags.length > 0 ? `：${tags.join('；')}` : ''}`)
+      }
+    }
+    if (slang.length > 0) lines.push(`本群黑话/梗：${slang.join('；')}`)
+    return lines.join('\n')
   }
 
   /**
@@ -1977,6 +2143,19 @@ export class Bridge {
           runs: Number(summary?.runs) || 0,
           lastError: typeof summary?.lastError === 'string' ? summary.lastError.slice(0, 200) : '',
         },
+        // v2.0 第十步：双轨制人设 —— 单群静态核心覆盖 + 动态记忆（档案/黑话）。
+        // 只读快照，供「会话管理 → 基础配置」回填；不参与任何决策。
+        core: entry.core,
+        userProfiles: Object.entries(entry.userProfiles ?? {}).slice(0, 50).map(([qq, profile]) => ({
+          qq,
+          nickname: String(profile?.nickname ?? ''),
+          lastNickname: String(profile?.lastNickname ?? ''),
+          role: profile?.role === 'owner' || profile?.role === 'admin' ? profile.role : 'member',
+          tags: Array.isArray(profile?.tags) ? profile.tags.slice(0, 5) : [],
+        })),
+        slang: Array.isArray(entry.slang) ? entry.slang.slice(-50) : [],
+        // L2 摘要：手动截断留下的前情提要（UI 用名册美化展示）。
+        contextBriefing: typeof entry.contextBriefing?.text === 'string' ? entry.contextBriefing.text.slice(0, 4000) : '',
         _heavy: {
           recent: this._recentInboundViews(key),
           raw: this._rawInbound.get(key) ?? null,
@@ -2487,6 +2666,30 @@ export class Bridge {
       this._saveState()
       this.logger.info?.(`会话 ${key} 活跃系数 → ${level === null ? '跟随全局' : `${level} 档`}`)
       return { ok: true, action: 'activity', key, activityLevel: level }
+    }
+
+    // 双轨制人设（v2.0 第十步）：单群静态核心覆盖 + 动态记忆增删。
+    // 只改本群 state；全局核心在 Config 里，不经过这条指令。
+    if (action === 'dynamic') {
+      if (op?.core && typeof op.core === 'object' && !Array.isArray(op.core)) {
+        entry.core = normalizeCore(op.core)
+      }
+      if (Array.isArray(op?.slang)) {
+        entry.slang = [...new Set(op.slang.map((item) => String(item ?? '').trim()).filter(Boolean))].slice(-50)
+      }
+      const removeProfile = String(op?.removeProfile ?? '').trim()
+      if (removeProfile !== '' && entry.userProfiles && entry.userProfiles[removeProfile]) {
+        delete entry.userProfiles[removeProfile]
+      }
+      this._saveState()
+      // 静态核心变了 → 人设签名失效，下一条消息必须重推一次。
+      if (entry.sessionId) this._personaSignatures.delete(entry.sessionId)
+      return {
+        ok: true, action: 'dynamic', key,
+        core: entry.core,
+        slang: Array.isArray(entry.slang) ? entry.slang.length : 0,
+        profiles: Object.keys(entry.userProfiles ?? {}).length,
+      }
     }
 
     if (action === 'clear') {
@@ -3423,20 +3626,46 @@ export class Bridge {
           currentPersona: String(entry.personaDelta ?? ''),
           messages: list.map((item) => ({ name: item.name, qq: item.qq, text: item.text })),
         })
-        const persona = typeof result?.persona === 'string' ? result.persona.trim() : ''
-        if (!result?.ok || persona === '') {
-          this.logger.info?.(`群 ${key} 人设归纳无结果（${result?.reason || '空文本'}），下一小时再试`)
+        if (!result?.ok) {
+          this.logger.info?.(`群 ${key} 动态记忆提取无结果（${result?.reason || '未知原因'}），下一小时再试`)
           continue
         }
-        entry.personaDelta = trimPersonaDelta(entry.personaDelta ? `${entry.personaDelta}\n${persona}` : persona)
-        this._saveState()
-        const sessionId = String(entry.sessionId ?? '').trim()
-        if (sessionId) {
-          this._personaSignatures.delete(sessionId)
-          await this._applyPersona(key, sessionId, false)
+        // v2.0 第十步：小时任务不再写人设，改为沉淀「本群黑话 + 群友特征」。
+        // 只更新已知群友（档案由消息自动建立），不凭空造人。
+        let changed = 0
+        const slang = Array.isArray(result.slang) ? result.slang : []
+        if (slang.length > 0) {
+          const merged = [...new Set([
+            ...(Array.isArray(entry.slang) ? entry.slang : []),
+            ...slang.map((item) => String(item ?? '').trim()).filter(Boolean),
+          ])].slice(-20)
+          if (JSON.stringify(merged) !== JSON.stringify(entry.slang ?? [])) {
+            entry.slang = merged
+            changed += 1
+          }
         }
+        const profiles = Array.isArray(result.profiles) ? result.profiles : []
+        for (const item of profiles) {
+          const qq = String(item?.qq ?? '').trim()
+          if (!/^\d{1,20}$/u.test(qq)) continue
+          const profile = entry.userProfiles?.[qq]
+          if (!profile) continue
+          const tags = Array.isArray(item.tags)
+            ? item.tags.map((tag) => String(tag ?? '').trim()).filter(Boolean)
+            : []
+          if (tags.length === 0) continue
+          const next = [...new Set([...(profile.tags ?? []), ...tags])].slice(-5)
+          if (JSON.stringify(next) !== JSON.stringify(profile.tags ?? [])) {
+            profile.tags = next
+            changed += 1
+          }
+        }
+        if (changed === 0) continue
+        this._saveState()
+        // 动态记忆不进系统提示词，所以不需要重推人设；清掉 chatLog 防止重复沉淀。
         this._chatLog.delete(key)
-        this.logger.info?.(`群 ${key} 人设已自动归纳（+${persona.length} 字，共 ${String(entry.personaDelta).length} 字）`)
+        this.logger.info?.(`群 ${key} 动态记忆已更新（黑话 ${entry.slang?.length ?? 0} 条，`
+          + `档案 ${Object.keys(entry.userProfiles ?? {}).length} 人）`)
       }
     } catch (error) {
       this.logger.warn?.(`人设归纳失败（不阻塞聊天）：${error?.message ?? error}`)
@@ -3472,6 +3701,9 @@ export class Bridge {
       return
     }
     const key = this.keyOf(msg)
+    // 群友档案 + 改名感知（v2.0 第十步）：记录当前昵称/身份；改名时返回一条
+    // 「仅本轮生效」的系统事件，稍后压到 Prompt 最末尾。
+    const renameEvent = this._noteProfiles(key, msg)
     // 原始入站 Payload（v2.0 调试面板）：只在设置页开了 developer.debugPayload 时留存。
     // 每会话只留最近一条、截断 2000 字、**不落盘**（进程重启即清空）。
     if (this._developerConfig().debugPayload) this._noteRawInbound(key, msg)
@@ -3631,7 +3863,11 @@ export class Bridge {
         )
       }
     }
-    await this._enqueue(key, msg, text, images, { beforeSeq: logSince, devPrompt })
+    await this._enqueue(key, msg, text, images, {
+      beforeSeq: logSince,
+      devPrompt,
+      renameEvents: renameEvent === '' ? [] : [renameEvent],
+    })
   }
 
   /**
@@ -3659,7 +3895,11 @@ export class Bridge {
     if (body.startsWith('/')) return body
     const qq = String(msg?.userId ?? '').trim()
     const nick = String(msg?.senderName ?? '').trim() || qq
-    const label = `[群友 ${nick}(${qq})]:`
+    // 身份前缀（v2.0 第十步）：按 sender.role 标明群主 / 管理员 / 群员，
+    // 模型才不会把自己的 QQ 号当成群主。role 缺失时退回中性「群友」。
+    const role = String(msg?.senderRole ?? '')
+    const roleLabel = role === 'owner' ? '群主' : role === 'admin' ? '管理员' : role === 'member' ? '群员' : '群友'
+    const label = `[${roleLabel} ${nick}(${qq})]:`
     // 纯图片消息没有正文：标签自己就是文本位置，图片说明句由 _buildPromptContent 接在后面。
     return body ? `${label} ${body}` : label
   }
@@ -3701,6 +3941,7 @@ export class Bridge {
     }
     const entry = this._debounce.get(key) ?? {
       texts: [], images: [], msg: null, timer: null, beforeSeq: undefined, devPrompt: '',
+      renameEvents: [],
     }
     // 一轮里只认**第一条**消息的序号上界：后面同批的消息本来就该被当前 prompt 覆盖。
     if (entry.beforeSeq === undefined && Number.isFinite(Number(options?.beforeSeq))) {
@@ -3711,6 +3952,8 @@ export class Bridge {
     // 开发者特权文本跟着这一批走：同一个人在防抖窗口里连发两条暗号，
     // 后一条的提示词覆盖前一条（内容一样，只是幂等更新）。
     if (options?.devPrompt) entry.devPrompt = String(options.devPrompt)
+    // 改名事件是一轮性的：同一批里可能有多个人改名，全部攒着，本轮一起告诉模型。
+    if (Array.isArray(options?.renameEvents)) entry.renameEvents.push(...options.renameEvents)
     entry.msg = msg // 同一发送者的最后一条：引用 / @ 都指向它
     if (entry.timer) clearTimeout(entry.timer)
     entry.timer = setTimeout(() => {
@@ -3747,6 +3990,7 @@ export class Bridge {
     return await this._processBatch(key, turnMsg, texts, images, {
       beforeSeq: entry.beforeSeq,
       devPrompt: entry.devPrompt,
+      renameEvents: entry.renameEvents,
     })
   }
 
@@ -3823,7 +4067,10 @@ export class Bridge {
         }
         // 上下文感知 messageTurns + 时间感知（2026-10-27）：都只往 prompt 里**追加**小节，
         // 不改正文本身。放在 hook 之后拼，保证外部插件看到的还是原始正文。
-        const contextSections = this._contextSections(key, { beforeSeq: options?.beforeSeq })
+        const contextSections = this._contextSections(key, {
+          beforeSeq: options?.beforeSeq,
+          renameEvents: options?.renameEvents,
+        })
         if (contextSections.length > 0) {
           promptText = `${promptText}\n\n${contextSections.join('\n\n')}`
           // 多模态时正文在 content[0].text 里，必须同步（否则模型只收到图片 + 原始正文）。
@@ -4910,6 +5157,13 @@ export class Bridge {
     // 时间提示放最后：它是「本轮该怎么表现」的指令，越靠近生成越有效。
     const silence = this._consumeSilenceHint(key)
     if (silence) sections.push(silence)
+    // 动态记忆（v2.0 第十步）：群友档案 + 黑话/梗，只属于本群，压在最末尾。
+    // 它绝不进系统提示词，所以不会污染前缀缓存，也不会跨群串台。
+    const dynamic = this._dynamicMemorySection(key)
+    if (dynamic !== '') sections.push(dynamic)
+    // 改名事件（仅本轮）：客观事实，放在所有上下文之后，让模型自己决定怎么回应。
+    const renameEvents = Array.isArray(options.renameEvents) ? options.renameEvents : []
+    if (renameEvents.length > 0) sections.push(renameEvents.join('\n'))
     return sections
   }
 

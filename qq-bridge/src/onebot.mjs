@@ -2076,6 +2076,12 @@ export class OneBotClient {
     // 「@1000000001」变成「@小明」。私聊用 'u' 作为作用域。
     const scopeKey = kind === 'group' ? String(packet.group_id ?? '') : 'u'
     const senderName = String(rawSender.card || rawSender.nickname || '')
+    // 群成员身份（v2.0 第十步）：NapCat 的 sender.role 是 owner/admin/member。
+    // 只在群聊里认；私聊一律空串，避免把好友当成群主。
+    const roleRaw = String(rawSender.role ?? '').toLowerCase()
+    const senderRole = kind === 'group' && (roleRaw === 'owner' || roleRaw === 'admin' || roleRaw === 'member')
+      ? roleRaw
+      : ''
     if (scopeKey) this._rememberName(scopeKey, userId, senderName)
     const message = packet.message
     return {
@@ -2096,6 +2102,8 @@ export class OneBotClient {
       quote: parseQuoteSegments(message),
       messageId: packet.message_id === undefined || packet.message_id === null ? '' : String(packet.message_id),
       senderName,
+      // 群身份（owner/admin/member；私聊为空）。Prompt 里按它打前缀，模型才不会瞎认群主。
+      senderRole,
       sender: rawSender,
       selfId: packet.self_id === undefined || packet.self_id === null ? null : String(packet.self_id),
       time: Number.isFinite(Number(packet.time)) ? Number(packet.time) : null,

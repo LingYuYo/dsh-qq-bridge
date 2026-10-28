@@ -733,6 +733,24 @@ window.__ModuleLoader__.load({
 .qqg-check-bad .qqg-check-mark { color: var(--dsw-alias-state-error-primary, #e5484d); }
 .qqg-check-label { flex: 0 0 auto; min-width: 88px; }
 .qqg-check-hint { color: var(--dsw-alias-label-secondary); }
+
+/* 双轨制人设 / 动态记忆（v2.0 第十步）：群友档案列表 + L2 摘要卡片。 */
+.qqg-profile-list { display: flex; flex-direction: column; gap: 4px; }
+.qqg-profile-row { display: flex; align-items: baseline; gap: 8px; padding: 5px 8px;
+  border-radius: 7px; background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1); font-size: 11.5px; }
+.qqg-profile-who { flex: 0 0 auto; font-weight: 600; }
+.qqg-profile-old { flex: 0 0 auto; color: var(--dsw-alias-label-secondary); font-size: 10.5px; }
+.qqg-profile-tags { flex: 1 1 auto; min-width: 0; color: var(--dsw-alias-label-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qqg-l2 { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow: auto; }
+.qqg-l2-msg { display: flex; gap: 6px; align-items: baseline; padding: 7px 9px; border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-2); border: 1px solid var(--dsw-alias-border-l1);
+  font-size: 12px; line-height: 1.5; }
+.qqg-l2-who { flex: 0 0 auto; font-weight: 600; color: var(--dsw-alias-label-primary); }
+.qqg-l2-text { flex: 1 1 auto; min-width: 0; word-break: break-word; white-space: pre-wrap; }
+.qqg-l2-line { font-size: 12px; line-height: 1.55; color: var(--dsw-alias-label-secondary);
+  white-space: pre-wrap; word-break: break-word; }
 .qqg-codebox { margin: 0; padding: 10px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2);
   border: 1px solid var(--dsw-alias-border-l1);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -2221,7 +2239,10 @@ window.__ModuleLoader__.load({
         botName: String(get('personaBotName') ?? ''),
         groupName: String(get('personaGroupName') ?? ''),
         participation: String(get('personaParticipation') ?? 'normal'),
-        text: String(get('personaText') ?? ''),
+        // 三段式静态核心（v2.0 第十步）：替代原来的单一大文本框。
+        coreIdentity: String(get('personaCore.identity') ?? ''),
+        coreBoundary: String(get('personaCore.boundary') ?? ''),
+        coreStyle: String(get('personaCore.style') ?? ''),
         extraRules: String(get('personaExtraRules') ?? ''),
         systemPrompt: String(get('personaSystemPrompt') ?? ''),
         presets: readPresets(),
@@ -2231,12 +2252,13 @@ window.__ModuleLoader__.load({
 
       const selectPreset = (id) => {
         if (id === '') {
-          setDraft((prev) => ({ ...prev, selected: '', text: '' }))
+          setDraft((prev) => ({ ...prev, selected: '', text: '', coreIdentity: '' }))
           return
         }
         const preset = draft.presets.find((item) => item.id === id)
         if (!preset) return
-        setDraft((prev) => ({ ...prev, selected: id, text: preset.text }))
+        // 预设仍然兼容：选中时把它的正文填进「身份定义与气质」。
+        setDraft((prev) => ({ ...prev, selected: id, text: preset.text, coreIdentity: preset.text }))
       }
       const addPreset = () => {
         const id = `persona-${Date.now()}`
@@ -2250,6 +2272,7 @@ window.__ModuleLoader__.load({
           presets: prev.presets.filter((item) => item.id !== prev.selected),
           selected: '',
           text: '',
+          coreIdentity: '',
         }))
       }
       /** 改名只动 draft.presets 里当前选中项的 name，保存时随整组一起写回。 */
@@ -2259,16 +2282,22 @@ window.__ModuleLoader__.load({
       }))
       const save = () => {
         if (!writable || typeof writeMany !== 'function') return
-        // 选中的自定义人设跟着角色设定文本一起更新。
+        // 选中的自定义人设跟着「身份定义」一起更新。
         const presets = draft.presets.map((item) => (item.id === draft.selected
-          ? { ...item, text: draft.text }
+          ? { ...item, text: draft.coreIdentity }
           : item))
         // 一次 mutate 提交整组字段；writeMany 会先乐观生效，失败再整组回滚。
         writeMany([
           { op: 'set', path: ['personaBotName'], value: draft.botName.trim() },
           { op: 'set', path: ['personaGroupName'], value: draft.groupName.trim() },
           { op: 'set', path: ['personaParticipation'], value: draft.participation },
-          { op: 'set', path: ['personaText'], value: draft.text },
+          // v2.0 第十步：三段式静态核心；旧的大文本框清空，避免两套设定叠加。
+          { op: 'set', path: ['personaCore'], value: {
+            identity: draft.coreIdentity,
+            boundary: draft.coreBoundary,
+            style: draft.coreStyle,
+          } },
+          { op: 'set', path: ['personaText'], value: '' },
           { op: 'set', path: ['personaExtraRules'], value: draft.extraRules },
           { op: 'set', path: ['personaSystemPrompt'], value: draft.systemPrompt },
           { op: 'set', path: ['personaPresetId'], value: draft.selected },
@@ -2375,10 +2404,14 @@ window.__ModuleLoader__.load({
             }, PERSONA_PARTICIPATION.map((item) => h('option', { key: item.id, value: item.id }, item.label))))),
 
         // 第二~四排：多行文本，整行宽 + 120px 起，框下带字数占位提示
-        pField('角色设定', '核心人设正文。留空 = 使用 qq-chat preset 的默认人设。',
-          textarea('text', '角色设定', 6, '例如：你是一只傲娇猫娘，说话带「哼」「才不是呢」……'), true),
-        pField('管理员附加规则', '可选，追加到系统提示词末尾。',
-          textarea('extraRules', '管理员附加规则', 4, '例如：晚上 11 点后说话轻一点。'), true),
+        // 三段式静态核心（v2.0 第十步）：替代原来的单一大文本框。
+        // 这三段吃前缀缓存；动态记忆（群友档案 / 黑话）不在这里，也不会改它。
+        pField('身份定义与气质', '你是谁、什么性格、怎么说话。锁定为最高优先级。',
+          textarea('coreIdentity', '身份定义与气质', 5, '例如：你是一只嘴上不饶人的鲸鱼娘，说话短、爱损人……'), true),
+        pField('边界与安全红线', '绝对不能做什么；越权、隐私、危险请求一律拒绝。',
+          textarea('coreBoundary', '边界与安全红线', 4, '例如：不透露本机路径与凭据；不执行任何管理操作……'), true),
+        pField('交互策略与应对模式', '被问到什么、被挑衅、冷场时分别怎么处理。',
+          textarea('coreStyle', '交互策略与应对模式', 4, '例如：不知道就直说不知道；被骂就损回去但不升级……'), true),
         pField('系统提示词覆盖', '留空=使用内置。填了就完全替换上面拼出来的内容。',
           textarea('systemPrompt', '系统提示词覆盖', 4, '整段系统提示词；填写后名字 / 参与度 / 附加规则都不再追加。'), true),
 
@@ -2397,8 +2430,10 @@ window.__ModuleLoader__.load({
       const botName = String(get('personaBotName') ?? '').trim()
       const groupName = String(get('personaGroupName') ?? '').trim()
       const participation = String(get('personaParticipation') ?? 'normal')
-      const text = String(get('personaText') ?? '')
-      const preview = text.replace(/\r/g, '').split('\n').filter((line) => line.trim() !== '').slice(0, 2).join('\n')
+      const coreIdentity = String(get('personaCore.identity') ?? '')
+      const coreBoundary = String(get('personaCore.boundary') ?? '')
+      const coreStyle = String(get('personaCore.style') ?? '')
+      const preview = (value) => String(value ?? '').replace(/\r/g, '').split('\n').filter((line) => line.trim() !== '').slice(0, 2).join('\n')
 
       return h('div', { className: 'qqg-group' },
         h('div', { className: 'qqg-group-title' }, '人设配置'),
@@ -2407,9 +2442,10 @@ window.__ModuleLoader__.load({
           h('div', { className: 'qqg-kv' }, h('span', null, '群内展示名'), h('b', null, groupName || '未设置')),
           h('div', { className: 'qqg-kv' }, h('span', null, '参与度'), h('b', null, personaParticipationLabel(participation))),
           h('div', { className: 'qqg-persona-role' },
-            h('div', { className: 'qqg-label-desc' }, '角色设定'),
+            h('div', { className: 'qqg-label-desc' }, '静态核心'),
             h('div', { className: 'qqg-persona-preview' },
-              preview !== '' ? preview : '未自定义，使用 qq-chat preset 的内置人设。'))),
+              preview(coreIdentity) || preview(coreBoundary) || preview(coreStyle)
+              || '未自定义，使用内置默认人设。'))),
         h('div', { className: 'qqg-actions' },
           h('button', {
             type: 'button', className: 'qqg-btn qqg-btn-primary',
@@ -2425,16 +2461,16 @@ window.__ModuleLoader__.load({
             ariaLabel: '锁定人设', onChange: (v) => write('personaLocked', v),
           })),
         h(Field, {
-          label: '每小时自动归纳人设',
-          desc: '每小时把本群聊天记录交给模型归纳，自动补充设定（需先解锁）。',
+          label: '每小时提取动态记忆',
+          desc: '每小时把本群聊天记录交给模型，提取群聊黑话与群友特征，写进「动态群聊记忆」；不再修改静态人设。',
         },
           h(Switch, {
             checked: get('personaAutoUpdate') !== false, disabled: !writable,
-            ariaLabel: '每小时自动归纳人设', onChange: (v) => write('personaAutoUpdate', v),
+            ariaLabel: '每小时提取动态记忆', onChange: (v) => write('personaAutoUpdate', v),
           })),
         open
           ? h(PersonaModal, {
-            key: `persona-${botName}-${participation}-${[...text].length}`,
+            key: `persona-${botName}-${participation}-${[...coreIdentity].length}`,
             get, write, writable, writeMany,
             onClose: () => setOpen(false),
           })
@@ -3663,6 +3699,48 @@ window.__ModuleLoader__.load({
       return String(row?.name || row?.qq || row?.key || '')
     }
 
+    /** 群身份 → 中文。 */
+    function roleLabelOf(role) {
+      return role === 'owner' ? '群主' : role === 'admin' ? '管理员' : '群员'
+    }
+
+    /**
+     * L2 摘要「人类可读」渲染（v2.0 第十步，任务三）。
+     *
+     * 底层生成逻辑不变（仍是纯文本模板，注入给 AI 看），这里只在 UI 展示时
+     * 把 `[群友 昵称(QQ)]: 正文` 这种机器标签换成「群主 AAA 说：正文」。
+     * 没有标签的行原样保留，交给前端当段落渲染。
+     *
+     * @param {string} text
+     * @param {Array<{qq:string, nickname:string, role:string}>} profiles 本群名册
+     * @returns {Array<{kind:'msg'|'text', role?:string, name?:string, qq?:string, text:string}>}
+     */
+    function briefingToHuman(text, profiles) {
+      const byQq = new Map((Array.isArray(profiles) ? profiles : []).map((p) => [String(p?.qq ?? ''), p]))
+      const lineRe = /^\[(群友|群主|管理员|群员)\s+([^\]（(]+)[（(](\d+)[)）]\]\s*[:：]\s*(.*)$/u
+      const out = []
+      for (const raw of String(text ?? '').split('\n')) {
+        const line = raw.trim()
+        if (line === '') continue
+        const hit = lineRe.exec(line)
+        if (!hit) {
+          out.push({ kind: 'text', text: line })
+          continue
+        }
+        const qq = hit[3]
+        const profile = byQq.get(qq)
+        const role = profile?.role || (hit[1] === '群主' ? 'owner' : hit[1] === '管理员' ? 'admin' : 'member')
+        out.push({
+          kind: 'msg',
+          role,
+          name: String(profile?.nickname ?? '').trim() || hit[2],
+          qq,
+          text: hit[4],
+        })
+      }
+      return out
+    }
+
     /**
      * 会话管理页：桥接上报的会话列表在**本组件内部**轮询。
      *
@@ -3893,6 +3971,47 @@ window.__ModuleLoader__.load({
 
     /** Tab 1 · 基础配置：响应档位 + 单人设覆盖（原「会话信息」挪去调试信息）。 */
     function SessionBasicTab({ session, persona, level, busy }) {
+      // 双轨制（v2.0 第十步）：静态核心三框（单群覆盖，留空继承全局）+ 动态记忆（本群专属）。
+      const [coreDraft, setCoreDraft] = React.useState(() => ({
+        identity: String(session.core?.identity ?? ''),
+        boundary: String(session.core?.boundary ?? ''),
+        style: String(session.core?.style ?? ''),
+      }))
+      const [slangDraft, setSlangDraft] = React.useState(() => (Array.isArray(session.slang) ? [...session.slang] : []))
+      const [slangInput, setSlangInput] = React.useState('')
+      const [dynBusy, setDynBusy] = React.useState(false)
+      const [dynNote, setDynNote] = React.useState(null)
+      const profiles = Array.isArray(session.userProfiles) ? session.userProfiles : []
+      const roleLabel = (role) => (role === 'owner' ? '群主' : role === 'admin' ? '管理员' : '群员')
+
+      const submitDynamic = async (body, label) => {
+        setDynBusy(true)
+        setDynNote(null)
+        try {
+          await postSessionOp({ op: 'dynamic', key: session.key, ...body })
+          setDynNote({ kind: 'ok', text: label + '已提交，桥接会在 2 秒内生效。' })
+        } catch (error) {
+          setDynNote({ kind: 'err', text: label + '失败：' + (error?.message ?? error) })
+        } finally {
+          setDynBusy(false)
+        }
+      }
+      const saveCore = () => submitDynamic({ core: coreDraft }, '静态核心')
+      const saveSlang = () => submitDynamic({ core: coreDraft, slang: slangDraft }, '动态记忆')
+      const removeProfile = (qq) => submitDynamic({ removeProfile: qq }, '删除群友档案')
+
+      const coreField = (label, key, rows, placeholder) => h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, label),
+        h('textarea', {
+          className: 'qqg-ai-input',
+          rows,
+          value: coreDraft[key],
+          placeholder,
+          'aria-label': label,
+          disabled: dynBusy,
+          onChange: (e) => setCoreDraft((prev) => ({ ...prev, [key]: e.target.value })),
+        }))
+
       return h('div', { className: 'qqg-dstack' },
         h(Panel, {
           title: '响应档位',
@@ -3926,34 +4045,97 @@ window.__ModuleLoader__.load({
               ? h(React.Fragment, null, h(Spinner), '提交中…')
               : '保存档位'))),
         h(Panel, {
-          title: '单人设覆盖',
-          desc: '留空 = 沿用全局人设。保存后桥接下一条消息前推给插件，即时生效；只影响这个 QQ 会话。',
-          right: h('span', { className: 'qqg-pill' }, String(persona.draft.length) + ' 字'),
+          title: '静态核心人格（单群覆盖）',
+          desc: '留空整段继承全局；填写后覆盖全局对应段。吃前缀缓存，动态记忆无权修改。',
+          right: h('span', { className: 'qqg-pill' },
+            session.core && (session.core.identity || session.core.boundary || session.core.style)
+              ? '单群覆盖' : '继承全局'),
         },
-          h('textarea', {
-            className: 'qqg-ai-input', rows: 6,
-            placeholder: '为该会话单独指定人设…（留空恢复全局）',
-            value: persona.draft,
-            'aria-label': '单人设覆盖',
-            disabled: busy === 'persona',
-            onChange: (e) => persona.onChange(e.target.value),
-          }),
+          coreField('身份定义与气质', 'identity', 4, '留空 = 继承全局；例如：你是这个群里的潜水员，说话很短……'),
+          coreField('边界与安全红线', 'boundary', 3, '留空 = 继承全局；例如：不透露任何本机路径与凭据……'),
+          coreField('交互策略与应对模式', 'style', 3, '留空 = 继承全局；例如：被点名才接话，冷场时不主动刷屏……'),
           h('div', { className: 'qqg-textarea-actions' },
             h('button', {
               type: 'button', className: 'qqg-btn qqg-btn-primary',
-              disabled: busy !== null || !persona.dirty,
-              onClick: persona.onSave,
-            }, busy === 'persona'
-              ? h(React.Fragment, null, h(Spinner), '保存中…')
-              : '保存人设'),
+              disabled: dynBusy || !session.sessionId,
+              onClick: saveCore,
+            }, dynBusy ? h(React.Fragment, null, h(Spinner), '提交中…') : '保存静态核心'))),
+        h(Panel, {
+          title: '动态群聊记忆',
+          desc: '只属于这个群：群友档案自动记录，黑话/梗可手动增删。拼在本轮 Prompt 最末尾，不进系统提示词。',
+          right: h('span', { className: 'qqg-pill' }, profiles.length + ' 人 / ' + slangDraft.length + ' 条黑话'),
+        },
+          h('div', { className: 'qqg-group-title' }, '群友特征档案'),
+          profiles.length === 0
+            ? h('div', { className: 'qqg-hint' }, '还没有档案。群里有人说话后会自动记录昵称与身份。')
+            : h('div', { className: 'qqg-profile-list' }, profiles.map((profile) => h('div', {
+              key: profile.qq, className: 'qqg-profile-row',
+            },
+            h('span', { className: 'qqg-profile-who' },
+              roleLabel(profile.role) + ' ' + (profile.nickname || profile.qq) + '(' + profile.qq + ')'),
+            profile.lastNickname
+              ? h('span', { className: 'qqg-profile-old' }, '曾用名：' + profile.lastNickname)
+              : null,
+            profile.tags.length > 0
+              ? h('span', { className: 'qqg-profile-tags' }, profile.tags.join('；'))
+              : null,
+            h('button', {
+              type: 'button', className: 'qqg-chip-x', title: '删除这条档案',
+              'aria-label': '删除档案 ' + profile.qq,
+              disabled: dynBusy,
+              onClick: () => removeProfile(profile.qq),
+            }, '×')))),
+          h('div', { className: 'qqg-group-title' }, '群聊黑话 / 梗'),
+          slangDraft.length === 0
+            ? h('div', { className: 'qqg-hint' }, '还没有记录。每小时任务会自动提取，也可以手动加。')
+            : h('div', { className: 'qqg-chips' }, slangDraft.map((item, index) => h('span', {
+              key: item + index, className: 'qqg-chip',
+            },
+            h('span', { className: 'qqg-chip-text' }, item),
+            h('button', {
+              type: 'button', className: 'qqg-chip-x', disabled: dynBusy,
+              'aria-label': '删除黑话 ' + item,
+              onClick: () => setSlangDraft((prev) => prev.filter((_, i) => i !== index)),
+            }, '×')))),
+          h('div', { className: 'qqg-list-add' },
+            h('input', {
+              className: 'qqg-input qqg-input-grow',
+              value: slangInput,
+              disabled: dynBusy,
+              placeholder: '例如：上车 / 润了',
+              'aria-label': '新增黑话',
+              onChange: (e) => setSlangInput(e.target.value),
+              onKeyDown: (e) => {
+                if (e.key !== 'Enter') return
+                e.preventDefault()
+                const next = slangInput.trim()
+                if (next === '' || slangDraft.includes(next)) return
+                setSlangDraft((prev) => [...prev, next])
+                setSlangInput('')
+              },
+            }),
             h('button', {
               type: 'button', className: 'qqg-btn',
-              disabled: busy !== null || persona.saved === '',
-              onClick: persona.onReset,
-            }, '恢复全局'))),
+              disabled: dynBusy || slangInput.trim() === '',
+              onClick: () => {
+                const next = slangInput.trim()
+                if (next === '' || slangDraft.includes(next)) return
+                setSlangDraft((prev) => [...prev, next])
+                setSlangInput('')
+              },
+            }, '添加')),
+          h('div', { className: 'qqg-textarea-actions' },
+            h('button', {
+              type: 'button', className: 'qqg-btn qqg-btn-primary',
+              disabled: dynBusy || !session.sessionId,
+              onClick: saveSlang,
+            }, dynBusy ? h(React.Fragment, null, h(Spinner), '提交中…') : '保存动态记忆')),
+          dynNote
+            ? h('div', { className: 'qqg-status' + (dynNote.kind === 'err' ? ' qqg-status-err' : '') }, dynNote.text)
+            : null),
         h('div', { className: 'qqg-hint' },
-          '单人设走插件的人设 section（系统提示词层）；「开发者特权」的专属 Prompt 只追加在',
-          '本轮 Prompt 尾部，两条通路互不覆盖。'))
+          '静态核心走插件的人设 section（系统提示词层）；动态记忆与改名事件只追加在本轮 Prompt 尾部，',
+          '两条通路互不覆盖，也不会跨群串台。'))
     }
 
     /** Tab 2 · 记忆与摘要：上下文占用 + 最近 10 条入站 + 未读归纳快捷键。 */
@@ -3971,6 +4153,10 @@ window.__ModuleLoader__.load({
       const tokens = Number(context.tokens) || 0
       const turns = Number(context.turns) || 0
       const dropped = Number(context.dropped) || 0
+      // v2.0 第十步：L2 摘要展示（用本群名册把机器标签换成人类可读的「谁说」）。
+      const profiles = Array.isArray(session.userProfiles) ? session.userProfiles : []
+      const briefing = String(session.contextBriefing ?? '')
+      const briefingRows = briefingToHuman(briefing, profiles)
       // 占用比例：保留一位小数，超过 100% 时铺满（数值仍如实显示）。
       // 注意不要用整百分比取整：18.4% 和 18.6% 在细条上看起来差别很大。
       const pct = budget > 0 ? Math.min(100, Math.round((tokens / budget) * 1000) / 10) : 0
@@ -4069,10 +4255,30 @@ window.__ModuleLoader__.load({
                 key: index, className: 'qqg-msgitem',
               },
               h('div', { className: 'qqg-msg-meta' },
-                clockTime(item.at) + ' · ' + (item.name || item.qq || '未知')
-                + (item.qq ? '(' + item.qq + ')' : '')),
+                clockTime(item.at) + ' · ' + (() => {
+                  const profile = profiles.find((p) => String(p.qq) === String(item.qq))
+                  if (profile) return roleLabelOf(profile.role) + ' ' + (profile.nickname || item.name || item.qq)
+                  return (item.name || item.qq || '未知') + (item.qq ? '(' + item.qq + ')' : '')
+                })()),
               item.quote ? h('div', { className: 'qqg-msgquote' }, '引用：' + item.quote) : null,
               h('div', { className: 'qqg-msgtext' }, item.text || '（空）'))))),
+        h(Panel, {
+          title: 'L2 摘要（前情提要）',
+          desc: '手动提前截断时生成的压缩记忆，已注入当前会话的 Prompt；这里只是人类可读的展示。',
+          right: briefing === ''
+            ? h('span', { className: 'qqg-pill' }, '暂无')
+            : h('span', { className: 'qqg-pill' }, briefing.length + ' 字'),
+        },
+          briefing === ''
+            ? h('div', { className: 'qqg-hint' },
+              '还没有摘要。点上方「提前截断」会生成前情提要，并归档旧会话。')
+            : h('div', { className: 'qqg-l2' }, briefingRows.map((row, index) => (
+              row.kind === 'msg'
+                ? h('div', { key: index, className: 'qqg-l2-msg' },
+                  h('span', { className: 'qqg-l2-who' }, roleLabelOf(row.role) + ' ' + row.name + ' 说：'),
+                  h('span', { className: 'qqg-l2-text' }, row.text))
+                : h('div', { key: index, className: 'qqg-l2-line' }, row.text)
+            )))),
         h(Panel, {
           title: '未读归纳',
           desc: '快捷触发：等价于在群里发 /归纳（旁路临时会话，结果合并转发回群）。',

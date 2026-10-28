@@ -217,18 +217,18 @@ for (const tab of ['status', 'sessions', 'skills', 'settings', 'logs', 'usage'])
   effects.length = 0; textSink.length = 0; handlers.length = 0; renderedNodes.length = 0
   render(React.createElement(Comp, { remoteForm: form }), root)
   const joined = textSink.join('|')
-  // v2.0：详情默认停在「基础配置」Tab —— 会话标题 / sessionId 挪去了「调试信息」，
-  // 默认渲染里只应有列表 + 档位 + 单人设 + 四个分页。
+  // v2.0 第十步：基础配置改成双轨制（静态核心三框 + 动态记忆）。
   for (const k of ['摸鱼群', '翎羽', '3 条未读', '今天这破网',
     '基础配置', '记忆与摘要', '特权与权限', '调试信息',
-    '单人设覆盖', '保存人设', '恢复全局', '清空上下文', '删除会话']) {
+    '静态核心人格（单群覆盖）', '身份定义与气质', '动态群聊记忆', '群友特征档案',
+    '清空上下文', '删除会话']) {
     if (!joined.includes(k)) throw new Error(`会话列表（真实数据）缺少「${k}」`)
   }
   if (joined.includes('等待桥接上报')) throw new Error('有数据时不应显示等待态')
   // 本批解锁：按钮与文本框都必须是可用的（不再是置灰占位）
-  const textarea = renderedNodes.find((n) => n.props?.['aria-label'] === '单人设覆盖')
-  if (!textarea) throw new Error('缺少单人设输入框')
-  if (textarea.props.disabled === true) throw new Error('单人设输入框不该置灰')
+  const textarea = renderedNodes.find((n) => n.props?.['aria-label'] === '身份定义与气质')
+  if (!textarea) throw new Error('缺少静态核心输入框')
+  if (textarea.props.disabled === true) throw new Error('静态核心输入框不该置灰')
   const clearBtn = renderedNodes.find((n) => n.tag === 'button' && textOf(n).trim() === '清空上下文')
   if (!clearBtn) throw new Error('缺少「清空上下文」按钮')
   if (clearBtn.props.disabled === true) throw new Error('「清空上下文」按钮不该置灰')

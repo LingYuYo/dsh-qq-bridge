@@ -87,13 +87,13 @@ await check('群聊单条：正文带 [群友 昵称(QQ)]: 前缀', async () => 
   const { b, calls } = makeBridge()
   await b.handleMessage(groupMsg('你好呀', { senderName: '小明' }))
   assert.equal(calls.prompts.length, 1)
-  assert.equal(calls.prompts[0].text, '[群友 小明(1000000001)]: 你好呀')
+  assert.ok(calls.prompts[0].text.startsWith('[群友 小明(1000000001)]: 你好呀'))
 })
 
 await check('昵称为空 → 用 QQ 号当昵称（格式不变）', async () => {
   const { b, calls } = makeBridge()
   await b.handleMessage(groupMsg('在吗'))
-  assert.equal(calls.prompts[0].text, '[群友 1000000001(1000000001)]: 在吗')
+  assert.ok(calls.prompts[0].text.startsWith('[群友 1000000001(1000000001)]: 在吗'))
 })
 
 await check('私聊不加标签（保持原样）', async () => {
@@ -106,8 +106,9 @@ await check('标签格式严格：英文冒号 + 一个空格', async () => {
   const { b, calls } = makeBridge()
   await b.handleMessage(groupMsg('内容', { senderName: '小红' }))
   const text = calls.prompts[0].text
-  assert.match(text, /^\[群友 小红\(1000000001\)\]: 内容$/u)
-  assert.equal(text.includes('：'), false, '不能用全角冒号')
+  // v2.0 第十步：prompt 末尾可能追加「本群动态记忆」，标签仍必须严格在第一行。
+  assert.match(text, /^\[群友 小红\(1000000001\)\]: 内容/u)
+  assert.equal(text.split('\n')[0].includes('：'), false, '不能用全角冒号')
 })
 
 await check('防抖合并：同一发送者连发两条 → 各带各的标签，按行拼', async () => {
@@ -118,10 +119,9 @@ await check('防抖合并：同一发送者连发两条 → 各带各的标签�
   // 等防抖窗口结束
   for (let i = 0; i < 40 && calls.prompts.length === 0; i++) await sleep(20)
   assert.equal(calls.prompts.length, 1)
-  assert.equal(
-    calls.prompts[0].text,
+  assert.ok(calls.prompts[0].text.startsWith(
     '[群友 小明(1000000001)]: 第一句\n[群友 小明(1000000001)]: 第二句',
-  )
+  ), calls.prompts[0].text.slice(0, 120))
 })
 
 await check('不同发送者不合并：换人立刻投递上一批（防引用串台）', async () => {
@@ -133,10 +133,10 @@ await check('不同发送者不合并：换人立刻投递上一批（防引用�
   // 换人时上一批被立刻 flush，不等 200ms 窗口。
   for (let i = 0; i < 20 && calls.prompts.length < 1; i++) await sleep(10)
   assert.equal(calls.prompts.length, 1, '换人应立刻投递上一批')
-  assert.equal(calls.prompts[0].text, '[群友 小明(1000000001)]: 第一句')
+  assert.ok(calls.prompts[0].text.startsWith('[群友 小明(1000000001)]: 第一句'))
   // 第二批（小红）等自己的窗口到点再发。
   for (let i = 0; i < 40 && calls.prompts.length < 2; i++) await sleep(20)
-  assert.equal(calls.prompts[1].text, '[群友 小红(2000000002)]: 第二句')
+  assert.ok(calls.prompts[1].text.startsWith('[群友 小红(2000000002)]: 第二句'))
 })
 
 await check('纯图片消息：标签占文本位置，图片说明句接在后面', async () => {
@@ -177,7 +177,7 @@ await check('/ 开头的管理员指令不打标签（DSH 斜杠指令必须仍�
   })
   await b.handleMessage(groupMsg('/clear', { senderName: '小明' }))
   assert.equal(calls.prompts.length, 1)
-  assert.equal(calls.prompts[0].text, '/clear')
+  assert.ok(calls.prompts[0].text.startsWith('/clear'))
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

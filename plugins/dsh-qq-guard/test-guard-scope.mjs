@@ -467,6 +467,64 @@ await check('POST /status 会话行带 activityLevel（端到端不丢）', asyn
   assert.equal(row.persona, '单人设', '★ 单人设回填也要存活')
 })
 
+console.log('\n— 双轨制人设 / 动态记忆（v2.0 第十步）—')
+await check('Config：personaCore 三段默认空', () => {
+  const plain = mod.plainConfig(Config({ role: 'settings' })) ?? {}
+  assert.deepEqual(plain.personaCore, { identity: '', boundary: '', style: '' })
+})
+
+await check('sanitizeSessionRow：core / userProfiles / slang / contextBriefing 全部收敛', () => {
+  const { sanitizeSessionRow } = mod
+  const row = sanitizeSessionRow({
+    key: 'g:1',
+    core: { identity: '本群身份', boundary: '', style: '策略' },
+    userProfiles: [
+      { qq: '123', nickname: ' 小明 ', lastNickname: '旧名', role: 'owner', tags: [' 爱开玩笑 ', '话多', '', 'x', 'y', 'z'] },
+      { qq: 'abc', nickname: '非法QQ' },
+    ],
+    slang: [' 上车 ', '', '润了'],
+    contextBriefing: '前情提要正文',
+  })
+  assert.equal(row.core.identity, '本群身份')
+  assert.equal(row.userProfiles.length, 1, '非法 QQ 的档案要丢掉')
+  assert.equal(row.userProfiles[0].nickname, '小明')
+  assert.equal(row.userProfiles[0].role, 'owner')
+  assert.equal(row.userProfiles[0].tags.length, 5, 'tags 最多 5 条')
+  assert.deepEqual(row.slang, ['上车', '润了'])
+  assert.equal(row.contextBriefing, '前情提要正文')
+})
+
+await check('session-ops：放行 dynamic，core/slang/removeProfile 能下发', async () => {
+  const { ctx, calls } = makeCtx({ presetId: undefined, hasWebServer: true, settingsAvailable: true })
+  apply(ctx, Config({ role: 'settings' }))
+  const route = calls.webRoutes.find((r) => r.path === '/dsh-qq-guard/session-ops')
+  const payload = JSON.stringify({
+    op: 'dynamic',
+    key: 'g:123456',
+    core: { identity: '本群身份', boundary: '边界', style: '' },
+    slang: ['上车'],
+    removeProfile: '123',
+  })
+  const req = {
+    method: 'POST', headers: { 'sec-fetch-site': 'same-origin' },
+    on(evt, fn) {
+      if (evt === 'data') fn(Buffer.from(payload))
+      if (evt === 'end') fn()
+    },
+  }
+  const res = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+  route.handler(req, res)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(res.status, 200)
+  const getRes = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+  route.handler({ method: 'GET', headers: {} }, getRes)
+  const hit = JSON.parse(getRes.body).ops.find((op) => op.op === 'dynamic')
+  assert.ok(hit, 'GET 应能取到 dynamic 指令')
+  assert.equal(hit.core.identity, '本群身份')
+  assert.deepEqual(hit.slang, ['上车'])
+  assert.equal(hit.removeProfile, '123')
+})
+
 console.log('\n— 接入总闸（v2.0 第七步）—')
 await check('Config：bridgeEnabled 默认开启；日志配置默认值不变', () => {
   const plain = mod.plainConfig(Config({ role: 'settings' })) ?? {}

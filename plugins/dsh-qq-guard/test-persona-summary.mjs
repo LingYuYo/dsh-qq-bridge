@@ -81,10 +81,10 @@ function makeCtx({ providers = ['raccoon', 'workbuddy'], defaultSelection = { pr
   return { ctx, captured, llm }
 }
 
-/** 默认的成功流：两个 text-delta + 正常结束。 */
+/** 默认的成功流：两个 text-delta + 正常结束（v2.0 第十步起输出 JSON）。 */
 function* goldenStream() {
-  yield { type: 'text-delta', index: 0, text: '群友喜欢' }
-  yield { type: 'text-delta', index: 0, text: '被叫小鱼' }
+  yield { type: 'text-delta', index: 0, text: '{"slang":["喜欢被叫小鱼"],' }
+  yield { type: 'text-delta', index: 0, text: '"profiles":[{"qq":"123","tags":["爱开玩笑"]}]}' }
   yield { type: 'finish', reason: { kind: 'stop' } }
 }
 
@@ -121,18 +121,22 @@ const promptOf = (routeOptions) => routeOptions.messages?.[0]?.content?.[0]?.tex
 
 console.log('persona-summary:')
 
-await check('成功：text-delta 按顺序拼成 persona，返回 {ok:true}', async () => {
+await check('成功：text-delta 拼成 JSON，返回 {ok:true, slang, profiles}', async () => {
   const out = await callRoute({ body: bodyOf() })
   assert.equal(out.status, 200)
-  assert.deepEqual(out.payload, { ok: true, persona: '群友喜欢被叫小鱼' })
+  assert.deepEqual(out.payload, {
+    ok: true,
+    slang: ['喜欢被叫小鱼'],
+    profiles: [{ qq: '123', tags: ['爱开玩笑'] }],
+  })
 })
 
-await check('协议：system 是归纳提示词，user 正文带群名/现有人设/发送人标签', async () => {
+await check('协议：system 是动态记忆提取提示词，user 正文带群名/现有人设/发送人标签', async () => {
   const out = await callRoute({
     body: bodyOf({ messages: [{ name: '翎羽', qq: '123', text: '你好呀' }, { name: '', qq: '456', text: '只有 QQ 号' }] }),
   })
-  assert.equal(out.options.system.includes('人设归纳器'), true, 'system 要讲清角色')
-  assert.equal(out.options.system.includes('只输出'), true, 'system 要限制输出形态')
+  assert.equal(out.options.system.includes('动态记忆提取器'), true, 'system 要讲清角色')
+  assert.equal(out.options.system.includes('JSON'), true, 'system 要限制输出形态')
   const prompt = promptOf(out.options)
   assert.match(prompt, /群名：测试群/)
   assert.match(prompt, /已有设定A/)
@@ -208,7 +212,7 @@ await check('流直接抛错 → {ok:false, reason:"stream-failed"}，不抛给 
   assert.deepEqual(out.payload, { ok: false, reason: 'stream-failed' })
 })
 
-await check('正常结束但没吐字 → ok:true + 空 persona（没有值得沉淀的）', async () => {
+await check('正常结束但没吐字 → ok:true + 空列表', async () => {
   const out = await callRoute({
     body: bodyOf(),
     makeStream: () => (async function* () {
@@ -216,7 +220,7 @@ await check('正常结束但没吐字 → ok:true + 空 persona（没有值得�
     })(),
   })
   assert.equal(out.status, 200)
-  assert.deepEqual(out.payload, { ok: true, persona: '' })
+  assert.deepEqual(out.payload, { ok: true, slang: [], profiles: [] })
 })
 
 await check('缺 llm → 503，且不调 stream', async () => {
@@ -291,16 +295,24 @@ await check('收敛：正文超过 24000 字符时丢最旧的（70 条 × 400 �
   assert.ok(prompt.length < 24_000 + 1_000, `正文应被压到 24000 字符量级，实际 ${prompt.length}`)
 })
 
-await check('返回的 persona 被裁到 2000 字以内（防上游话痨）', async () => {
+await check('模型输出超量 → slang 截到 5 条、profiles 每人 tags 截到 3 条', async () => {
   const out = await callRoute({
     body: bodyOf(),
     makeStream: () => (async function* () {
-      yield { type: 'text-delta', index: 0, text: '长'.repeat(5000) }
+      yield {
+        type: 'text-delta',
+        index: 0,
+        text: JSON.stringify({
+          slang: Array.from({ length: 20 }, (_, i) => `梗${i}`),
+          profiles: [{ qq: '123', tags: Array.from({ length: 10 }, (_, i) => `特征${i}`) }],
+        }),
+      }
       yield { type: 'finish', reason: { kind: 'stop' } }
     })(),
   })
   assert.equal(out.status, 200)
-  assert.equal(out.payload.persona.length, 2000)
+  assert.equal(out.payload.slang.length, 5)
+  assert.equal(out.payload.profiles[0].tags.length, 3)
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

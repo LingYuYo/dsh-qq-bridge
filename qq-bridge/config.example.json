@@ -67,6 +67,12 @@
   "personaBotName": "",
   "personaGroupName": "",
   "personaParticipation": "normal",
+  "personaCore": {
+    "_comment": "v2.0 第十步：三段式静态核心（全局底座，吃前缀缓存）。单群可在「会话管理 → 基础配置」按段覆盖；动态记忆（群友档案/黑话）不会写进这里。personaText 是旧版单一文本框，保留兼容但已不再由 UI 写入。",
+    "identity": "",
+    "boundary": "",
+    "style": ""
+  },
   "personaText": "",
   "personaExtraRules": "",
   "personaSystemPrompt": "",
