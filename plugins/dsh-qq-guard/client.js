@@ -253,6 +253,9 @@ window.__ModuleLoader__.load({
    尺寸/圆角/悬浮效果刻意与 .qqg-nav-item 对齐，只是图标带一点主题色。 */
 .qqg-nav-foot { flex: 0 0 auto; margin-top: auto; padding-top: 12px; padding-bottom: 4px;
   border-top: 1px solid var(--dsw-alias-border-l1); }
+/* 沉底的「系统日志」项：和上方功能菜单用 nav-foot 的 border-top 隔开，
+   与下面的状态卡之间留一点距离。 */
+.qqg-nav-item-tail { margin-bottom: 8px; }
 .qqg-nav-guide { box-sizing: border-box; width: 100%; display: flex; align-items: center; gap: 9px;
   text-align: left; font: inherit; font-size: 13px; color: var(--dsw-alias-label-secondary);
   background: transparent; border: 0; border-radius: 6px; padding: 7px 10px; cursor: pointer;
@@ -268,7 +271,8 @@ window.__ModuleLoader__.load({
   margin-bottom: 8px; padding: 10px; border-radius: 10px;
   background: var(--qqg-inset-bg); border: 1px solid var(--dsw-alias-border-l1); }
 .qqg-launch-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.qqg-launch-state { font-size: 11.5px; color: var(--dsw-alias-label-secondary); white-space: nowrap; }
+.qqg-launch-state { font-size: 11.5px; color: var(--dsw-alias-label-secondary); white-space: nowrap;
+  display: inline-flex; align-items: center; gap: 4px; }
 .qqg-launch-model { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
 .qqg-launch-model-label { flex: 0 0 auto; font-size: 10px; color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); }
 .qqg-launch-model-name { min-width: 0; font-size: 10.5px; color: var(--dsw-alias-label-secondary);
@@ -1452,9 +1456,30 @@ window.__ModuleLoader__.load({
       { id: 'sessions', label: '会话管理', icon: 'sessions' },
       { id: 'skills', label: '技能与插件', icon: 'skills' },
       { id: 'settings', label: '全局设置', icon: 'settings' },
-      { id: 'logs', label: '系统日志', icon: 'file' },
       { id: 'usage', label: '数据与用量', icon: 'usage' },
     ]
+
+    /**
+     * 「系统日志」不跟功能菜单一起滚（v2.0 第八步）：
+     * 沉到导航最下方，放在「使用引导」和状态卡上方，顶部用分割线隔开。
+     * 之所以单列：它属于排障入口，不是日常功能页。
+     */
+    const LOGS_SECTION = { id: 'logs', label: '系统日志', icon: 'file' }
+
+    /** 渲染一个导航项（列表与底部沉底项共用，保证样式/徽标一致）。 */
+    function navItemFor(section, active, onSelect) {
+      return h('button', {
+        key: section.id,
+        type: 'button',
+        className: 'qqg-nav-item' + (active === section.id ? ' qqg-nav-item-on' : '')
+          + (section.id === 'logs' ? ' qqg-nav-item-tail' : ''),
+        'aria-current': active === section.id ? 'page' : undefined,
+        onClick: () => onSelect(section.id),
+      },
+      h('span', { className: 'qqg-nav-icon' }, h(Glyph, { name: section.icon, size: 15 })),
+      h('span', { className: 'qqg-nav-text' }, section.label),
+      section.id === 'sessions' ? h(SessionsBadge) : null)
+    }
 
     /** 使用引导弹窗里「去配置」按钮的目标锚点。 */
     const ANCHORS = {
@@ -6707,17 +6732,11 @@ window.__ModuleLoader__.load({
             h('span', { className: 'qqg-nav-brand-text' }, 'QQ 桥接')),
           // 菜单列表独立滚动；底部引导按钮用 margin-top:auto 沉底，不跟着滚。
           h('div', { className: 'qqg-nav-list' },
-            SECTIONS.map((s) => h('button', {
-              key: s.id,
-              type: 'button',
-              className: 'qqg-nav-item' + (active === s.id ? ' qqg-nav-item-on' : ''),
-              'aria-current': active === s.id ? 'page' : undefined,
-              onClick: () => setActive(s.id),
-            },
-            h('span', { className: 'qqg-nav-icon' }, h(Glyph, { name: s.icon, size: 15 })),
-            h('span', { className: 'qqg-nav-text' }, s.label),
-            s.id === 'sessions' ? h(SessionsBadge) : null))),
+            SECTIONS.map((s) => navItemFor(s, active, setActive))),
+          // 底部沉底区（v2.0 第八步）：系统日志 → 状态卡 → 使用引导。
+          // .qqg-nav-foot 自带 border-top，正好是「系统日志」上方那条淡灰分割线。
           h('div', { className: 'qqg-nav-foot' },
+            navItemFor(LOGS_SECTION, active, setActive),
             // 快捷启动卡：模型名由卡内自己从 /config + /models 读真实值；这里只传配置兜底。
             h(LaunchCard, { model: launchModel }),
             h(GuideNavButton, { get, onOpen: () => setGuideOpen(true) }))),

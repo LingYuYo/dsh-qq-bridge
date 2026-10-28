@@ -384,6 +384,17 @@ VALUE.napcat.dir = 'D:\\NapCat.52230.Shell'
 console.log('\n系统底层事件 / 高级参数：')
 
 const eventsTree = await renderTab('logs')
+check('「系统日志」沉底到 nav-foot，主菜单列表里没有它', () => {
+  const foot = findAll(eventsTree, (n) => String(n.props?.className ?? '').split(/\s+/).includes('qqg-nav-foot'))[0]
+  const list = findAll(eventsTree, (n) => String(n.props?.className ?? '').split(/\s+/).includes('qqg-nav-list'))[0]
+  assert(foot, '找不到 .qqg-nav-foot')
+  assert(list, '找不到 .qqg-nav-list')
+  assert(textOf(foot).includes('系统日志'), '底部区应有「系统日志」')
+  assert(!textOf(list).includes('系统日志'), '★ 主菜单列表里不该再有「系统日志」')
+  const tailBtn = findAll(foot, (n) => String(n.props?.className ?? '').includes('qqg-nav-item-tail'))[0]
+  assert(tailBtn, '沉底的日志按钮应带 qqg-nav-item-tail 类（上方分割线靠它定位）')
+})
+
 check('系统日志页的「高级」里有「系统底层事件」折叠面板', () => {
   const panel = findAll(eventsTree, (n) => typeof n.props?.className === 'string'
     && n.props.className.split(/\s+/).includes('qqg-events'))[0]
