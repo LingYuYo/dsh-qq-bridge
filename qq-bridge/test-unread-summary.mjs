@@ -18,14 +18,18 @@ import os from 'node:os'
 import path from 'node:path'
 import { Bridge } from './src/bridge.mjs'
 import {
+  SUMMARY_FOOTER,
   SUMMARY_HARD_LIMIT,
+  SUMMARY_NODE_NAME,
   buildForwardNodes,
   buildSummaryPrompt,
   formatTranscript,
+  forwardNodeText,
   nextWatermark,
   normalizeHistoryMessage,
   normalizeSummary,
   parseSummaryCommand,
+  parseStructuredSummary,
   pickUnread,
   splitSummaryNodes,
 } from './src/unread-summary.mjs'
@@ -229,10 +233,12 @@ await check('单条超字数会被截断加省略号', () => {
 
 console.log('\n── 五、提示词与节点切分 ─────────────────────────')
 
-await check('提示词要求 `---` 分隔，并写明段数/字数上限', () => {
+await check('提示词已改成结构化简报口径，并写明话题数/字数上限', () => {
   const prompt = buildSummaryPrompt({ groupName: '测试群', total: 12, transcript: 'A: 1', maxNodes: 4, nodeChars: 200 })
-  assert.match(prompt, /1~4 段/u)
-  assert.match(prompt, /不超过 200 字/u)
+  assert.match(prompt, /专业的群聊管家/u)
+  // maxNodes=4 → 头部+尾部占 2，最多 2 个话题。
+  assert.match(prompt, /最多 2 个话题/u)
+  assert.match(prompt, /不超过 200 字|200 字以内/u)
   assert.match(prompt, /只会留文本占位|不要描述图片内容|记录里的图片/u)
   assert.match(prompt, /【群】测试群/u)
 })
@@ -404,6 +410,101 @@ await check('图片检索默认关：不带 image part', async () => {
   await b._runUnreadSummary({ msg: ownerMsg(), key: `g:${GROUP}`, count: 50, conf: b._summaryConfig() })
   assert.equal(b._lastPromptOpts.content, null)
   assert.equal(fake.forwards.length, 1)
+})
+
+console.log('\n— 结构化简报（v2.0 第二步，2026-10-28）—')
+
+const STRUCTURED_REPLY = [
+  '128 条消息，群内氛围热烈，主要围绕 Apex 排位与晚饭。',
+  '【Apex 排位组队】',
+  '🕒 时间：20:15 - 21:40',
+  '👥 参与人：小明、小红',
+  '📝 总结：三排冲分两胜一负，约好明晚继续。',
+  '💬 锐评/金句：阿强：「再输我就去写作业。」',
+  '【晚饭吃什么】',
+  '🕒 时间：21:40 - 22:00',
+  '👥 参与人：阿强、小明',
+  '📝 总结：最后点了烧烤，没分歧。',
+  '💬 锐评/金句：废话半小时，饿着点单。',
+].join('\n')
+
+await check('Prompt 已换成结构化简报口径（管家 / 总览 / 四行话题 / 禁 Markdown）', () => {
+  const prompt = buildSummaryPrompt({ groupName: '鱼塘', total: 50, transcript: '[10-28 20:15] 小明: 上号' })
+  assert.match(prompt, /专业的群聊管家/u)
+  assert.match(prompt, /先写一句总览/u)
+  assert.match(prompt, /🕒 时间：XX:XX - XX:XX/u)
+  assert.match(prompt, /最多 3-5 个核心话题/u)
+  assert.match(prompt, /不要包含任何多余的 Markdown/u)
+})
+
+await check('parseStructuredSummary：总览 + 两个话题，字段原样保留', () => {
+  const parsed = parseStructuredSummary(STRUCTURED_REPLY)
+  assert.ok(parsed, '应能解析')
+  assert.match(parsed.overview, /128 条消息/u)
+  assert.equal(parsed.topics.length, 2)
+  assert.equal(parsed.topics[0].title, 'Apex 排位组队')
+  assert.match(parsed.topics[0].body, /🕒 时间：20:15 - 21:40/u)
+})
+
+await check('结构化回复 → 头部 / 每话题一条 / 尾部，node 数 > 1', () => {
+  const nodes = buildForwardNodes(STRUCTURED_REPLY, { botName: SUMMARY_NODE_NAME, maxNodes: 8 })
+  assert.ok(nodes.length > 1, `node 数应大于 1，实际 ${nodes.length}`)
+  const texts = nodes.map((node) => forwardNodeText(node))
+  assert.equal(texts.length, 4, '头部 + 2 话题 + 尾部')
+  assert.match(texts[0], /群聊总结报告/u)
+  assert.match(texts[0], /128 条消息/u)
+  assert.match(texts[1], /【Apex 排位组队】/u)
+  assert.match(texts[1], /🕒 时间：/u)
+  assert.match(texts[2], /【晚饭吃什么】/u)
+  assert.equal(texts[3], SUMMARY_FOOTER)
+  for (const node of nodes) {
+    assert.equal(node.type, 'node')
+    assert.equal(node.data.nickname, SUMMARY_NODE_NAME, '★ 发件人统一为群聊小助手')
+  }
+})
+
+await check('话题数超过 maxNodes-2：并进最后一条，总 node 数不超上限', () => {
+  const many = Array.from({ length: 5 }, (_, i) =>
+    `【话题${i + 1}】\n🕒 时间：10:0${i} - 10:1${i}\n📝 总结：第${i + 1}件事。`).join('\n')
+  const nodes = buildForwardNodes(`总览一句。\n${many}`, { maxNodes: 6, nodeChars: 2000 })
+  assert.ok(nodes.length <= 6, `不能超过 maxNodes，实际 ${nodes.length}`)
+  const lastTopic = forwardNodeText(nodes[nodes.length - 2])
+  assert.match(lastTopic, /【话题5】/u, '被裁掉的话题要并进最后一条，不能丢')
+})
+
+await check('格式不对 → 退回旧的 --- 切分，不报错、不加尾部', () => {
+  const nodes = buildForwardNodes('一大段废话，没有标题也没有字段。', { maxNodes: 6 })
+  assert.equal(nodes.length, 1)
+  assert.match(forwardNodeText(nodes[0]), /一大段废话/u)
+  assert.ok(!nodes.map((node) => forwardNodeText(node)).includes(SUMMARY_FOOTER), '降级路径不该凭空加尾部')
+})
+
+await check('只有【标题】没有字段 → 也降级（防止把废话加括号当简报）', () => {
+  const nodes = buildForwardNodes('【看起来像标题】\n这里是随便一段废话', { maxNodes: 6 })
+  assert.equal(nodes.length, 1)
+  assert.match(forwardNodeText(nodes[0]), /随便一段废话/u)
+})
+
+await check('旧数组入参保持原行为（兼容既有调用）', () => {
+  const nodes = buildForwardNodes(['第一段', '第二段'], { botName: '群聊归纳' })
+  assert.equal(nodes.length, 2)
+  assert.equal(nodes[0].data.nickname, '群聊归纳')
+})
+
+await check('端到端：模型返回结构化 → 合并转发多段且带时间字段', async () => {
+  const b = makeBridge()
+  const fake = fakeRuntime(b, {
+    history: [rawMsg({ id: 11, text: '上号', time: 5000 }), rawMsg({ id: 12, text: '吃啥', time: 5100 })],
+    reply: STRUCTURED_REPLY,
+  })
+  await b._runUnreadSummary({ msg: ownerMsg(), key: `g:${GROUP}`, count: 50, conf: b._summaryConfig() })
+  assert.equal(fake.forwards.length, 1)
+  const forwarded = fake.forwards[0].nodes
+  assert.ok(forwarded.length > 1, '★ 应切成多段发出')
+  const joined = forwarded.map((node) => forwardNodeText(node)).join('\n')
+  assert.match(joined, /🕒 时间：/u)
+  assert.match(joined, /【Apex/u)
+  assert.equal(b._summaryState(`g:${GROUP}`).lastSummarySeq, 12, '多段也要正常推水位')
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

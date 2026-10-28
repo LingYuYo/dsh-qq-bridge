@@ -29,14 +29,15 @@ import { DSH_IMAGE_LIMITS, MAX_TILES, prepareImageParts } from './image-prep.mjs
 import { estimateTokens, truncateChatLine } from './tokens.mjs'
 import {
   SUMMARY_HARD_LIMIT,
+  SUMMARY_NODE_NAME,
   buildForwardNodes,
   buildSummaryPrompt,
   formatTranscript,
+  forwardNodeText,
   nextWatermark,
   normalizeSummary,
   parseSummaryCommand,
   pickUnread,
-  splitSummaryNodes,
 } from './unread-summary.mjs'
 
 /**
@@ -5169,22 +5170,30 @@ export class Bridge {
       }
 
       // 切节点 → 审计 → 合并转发 → 失败降级纯文本。
-      let nodes = splitSummaryNodes(reply, { maxNodes: conf.maxNodes, nodeChars: conf.nodeChars })
+      //
+      // v2.0 第二步（2026-10-28）：直接把模型原文交给 buildForwardNodes，
+      // 由它先按「结构化简报」排版（总览头 / 每话题一条 / 免责尾），
+      // 认不出结构就自动退回旧的 `---` 切分 —— 桥接这层不再关心格式细节。
+      const nodes = buildForwardNodes(reply, {
+        botName: SUMMARY_NODE_NAME,
+        botUin: selfId,
+        groupName,
+        maxNodes: conf.maxNodes,
+        nodeChars: conf.nodeChars,
+      })
       if (nodes.length === 0) throw summaryError('EMPTY_REPLY', '模型没有返回可用内容')
-      const audit = auditReply(nodes.join('\n\n'), [this.config.onebot?.accessToken])
+      const nodeTexts = nodes.map((node) => forwardNodeText(node)).filter((text) => text !== '')
+      const audit = auditReply(nodeTexts.join('\n\n'), [this.config.onebot?.accessToken])
       if (!audit.ok) {
         this.stats.blocked++
         throw summaryError('AUDIT_BLOCKED', `归纳结果命中「${audit.label}」，整条不发`)
       }
-      const forward = await this.qq.sendGroupForward(groupId, buildForwardNodes(nodes, {
-        botName: this.config.personaBotName || '群聊归纳',
-        botUin: selfId,
-      }))
+      const forward = await this.qq.sendGroupForward(groupId, nodes)
       let delivered = forward.ok === true
       let via = delivered ? `合并转发 ${nodes.length} 段` : `合并转发失败（${forward.reason ?? '未知原因'}）`
       if (!delivered) {
         // 降级：纯文本一次性发（照走原有分片 / 打字延时）。不带引用、不 @ 任何人。
-        const sent = await this._send(msg, `【群聊归纳】\n${nodes.join('\n\n')}`, { at: false })
+        const sent = await this._send(msg, `【群聊归纳】\n${nodeTexts.join('\n\n')}`, { at: false })
         delivered = !(sent && sent.ok === false)
         if (!delivered) throw summaryError('SEND_FAILED', sent?.error ?? '合并转发与纯文本都没发出去')
         via = `${via} → 已降级纯文本`

@@ -40,6 +40,25 @@ export const DEFAULT_SUMMARY = Object.freeze({
 /** 提示词骨架（说明文字 + 群名 + 时间范围）大概占掉的 token，预算里先扣掉。 */
 export const PROMPT_OVERHEAD_TOKENS = 320
 
+// ── 结构化简报（v2.0 第二步，2026-10-28）─────────────────────────────────
+//
+// 目标：发到群里的合并转发不是流水账，而是「一条总览 + 每个话题一张卡片 + 一句免责」。
+// 解析一律**先严后宽**：认得出结构化格式就走新排版，认不出就原样退回旧的 `---` 切分，
+// 绝不让一次格式抽风把整次归纳搞挂。
+
+/** 合并转发里所有 node 的发件人名字（结构化简报统一用它）。 */
+export const SUMMARY_NODE_NAME = '群聊小助手'
+/** 结构化简报的收尾句。 */
+export const SUMMARY_FOOTER = '——由 AI 自动生成，仅供娱乐参考'
+/** 简报最多几个话题（与 Prompt 里的「3-5 个」对齐）。 */
+export const SUMMARY_MAX_TOPICS = 5
+/** 话题标题行：`【标题】`，允许前面带 markdown 列表符。 */
+const TOPIC_LINE_RE = /^\s*(?:[-*]\s*)?【([^】\n]{1,40})】\s*(.*)$/u
+/** 话题里至少要有一行这种字段，才认定模型真的按格式写了。 */
+const TOPIC_FIELD_RE = /(?:🕒|👥|📝|💬)/u
+/** 模型自己加的免责句：剔掉，避免和我们的 footer 重复。 */
+const MODEL_TAIL_RE = /^(?:—+\s*)?(?:由\s*AI\s*自动生成|仅供娱乐)/iu
+
 const clampInt = (value, fallback, min, max) => {
   const num = Number(value)
   if (!Number.isFinite(num)) return fallback
@@ -226,8 +245,9 @@ function formatStamp(seconds) {
 /**
  * 拼归纳用的提示词。
  *
- * 要求模型输出「多段、`---` 分隔」而不是 JSON：廉价模型对 JSON 的稳定性差，
- * 而分隔符解析失败时还能退化成单段纯文本，不会一个字都发不出去。
+ * 输出必须是**结构化简报**（总览 + 若干【话题】卡片），这样合并转发才能一条话题一张卡。
+ * 为什么不用 JSON：廉价模型对 JSON 的稳定性差；而「标题 + emoji 字段」这种格式即使
+ * 被写歪一点，也能靠宽松解析兜住，最差退回旧的整段切分。
  *
  * @param {{groupName?:string, total?:number, transcript:string,
  *   nodeChars?:number, maxNodes?:number, includeImages?:boolean}} input
@@ -243,17 +263,26 @@ export function buildSummaryPrompt({
 } = {}) {
   const nodes = Math.max(1, Math.trunc(Number(maxNodes) || DEFAULT_SUMMARY.maxNodes))
   const chars = Math.max(50, Math.trunc(Number(nodeChars) || DEFAULT_SUMMARY.nodeChars))
+  // 头部 + 尾部各占一条 node，剩下才是话题；最少 1 个、最多 5 个。
+  const topics = Math.max(1, Math.min(SUMMARY_MAX_TOPICS, nodes - 2))
   return [
-    '你是一个群聊记录整理员。下面是一段 QQ 群里的聊天记录，请把它归纳成可以直接发回群里的「聊天记录摘要」。',
+    '你是一个专业的群聊管家。请阅读以下群聊记录，提取核心信息并输出一份高密度的简报。要求：',
     '',
-    '输出要求（必须遵守）：',
-    `1. 分成 1~${nodes} 段，段与段之间单独一行写 \`---\`。`,
-    '2. 第一段用一两句话写这段时间的主线（大家在聊什么、有没有结论）。',
-    '3. 后面按话题分段，每段一件事；有人名就用记录里的名字，别改。',
-    `4. 每段不超过 ${chars} 字，像群友说话，不要写「首先/其次/综上」。`,
-    '5. 不要逐条复述，不要加序号、不要加 Markdown、不要输出思考过程。',
-    '6. 记录里没说的事不要编；拿不准就用「好像」「不确定」。',
-    includeImages ? '7. 随消息附了图片，只写你能确认的画面内容；看不清就别猜。' : '7. 记录里的图片只有占位，不要描述图片内容。',
+    '1. 先写一句总览（如：XXX条消息，群内氛围热烈，主要涉及XX话题）。',
+    '2. 提取最多 3-5 个核心话题，每个话题严格按以下格式输出（必须换行）：',
+    '【话题标题】（如：Apex排位组队）',
+    '🕒 时间：XX:XX - XX:XX',
+    '👥 参与人：群友A、群友B',
+    '📝 总结：（30字以内概括聊了什么、结论是什么）',
+    '💬 锐评/金句：（挑一句好玩的话，或者用一句话吐槽）',
+    '',
+    '【补充约束】记录里没说的不要编；时间、人名一律照记录写，拿不准就写「不确定」。',
+    includeImages
+      ? '随消息附了图片，只写你能确认的画面内容；看不清就别猜。'
+      : '记录里的图片只有占位，不要描述图片内容。',
+    `每个话题连同四行信息控制在 ${chars} 字以内，最多 ${topics} 个话题。`,
+    '',
+    '请只输出上述文本，不要包含任何多余的 Markdown 符号（如 **、# 等）。',
     '',
     `【群】${groupName || '（未命名群）'}`,
     `【消息条数】${total}`,
@@ -261,6 +290,105 @@ export function buildSummaryPrompt({
     '【聊天记录】',
     transcript,
   ].join('\n')
+}
+
+/** 模型回复的通用清洗：去掉代码围栏、加粗、标题符号。 */
+function cleanModelText(reply) {
+  return String(reply ?? '')
+    .replace(/^```[a-z]*\s*/iu, '')
+    .replace(/```\s*$/u, '')
+    .replace(/\*\*/gu, '')
+    .replace(/^#{1,6}\s*/gmu, '')
+    .trim()
+}
+
+/**
+ * 把模型的「结构化简报」解析成总览 + 话题数组。
+ *
+ * 判定标准（任一不满足就算没按格式写 → 返回 null，由调用方降级）：
+ *   · 至少有一个 `【标题】` 行；
+ *   · 至少一个话题里出现 🕒 / 👥 / 📝 / 💬 之一（否则只是把废话加了几个括号）。
+ *
+ * @param {string} reply
+ * @returns {{overview:string, topics:Array<{title:string, body:string}>}|null}
+ */
+export function parseStructuredSummary(reply) {
+  const body = cleanModelText(reply)
+  if (body === '') return null
+  const lines = body.split(/\r?\n/u)
+  const overviewLines = []
+  const topics = []
+  let current = null
+  for (const line of lines) {
+    const hit = TOPIC_LINE_RE.exec(line)
+    if (hit) {
+      current = { title: String(hit[1]).trim(), lines: [] }
+      const inline = String(hit[2] ?? '').trim()
+      if (inline !== '') current.lines.push(inline)
+      topics.push(current)
+      continue
+    }
+    if (current) current.lines.push(line)
+    else overviewLines.push(line)
+  }
+  if (topics.length === 0) return null
+  const dropTail = (list) => list.filter((line) => !MODEL_TAIL_RE.test(String(line).trim()))
+  const overview = dropTail(overviewLines).join('\n').trim()
+  const cleanedTopics = topics.map((topic) => ({
+    title: topic.title,
+    body: dropTail(topic.lines).join('\n').replace(/\n{3,}/gu, '\n\n').trim(),
+  })).filter((topic) => topic.title !== '')
+  if (cleanedTopics.length === 0) return null
+  if (!cleanedTopics.some((topic) => TOPIC_FIELD_RE.test(topic.body))) return null
+  return { overview, topics: cleanedTopics }
+}
+
+/** `2026-10-28`（本地时区）。 */
+function formatDayLabel(ms) {
+  const date = new Date(Number(ms) || Date.now())
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+/**
+ * 结构化简报 → 合并转发的 node 文本。
+ *
+ * 排版约定：
+ *   ① 头部：`📋 群聊总结报告 · 群名 · 日期` + 总览；
+ *   ② 每个话题一条：`【标题】` + 四行字段；
+ *   ③ 尾部：{@link SUMMARY_FOOTER}。
+ * `maxNodes` 装不下时把多余话题并进最后一条（和旧切分同一条原则：宁可啰嗦别丢话题）。
+ *
+ * @param {string} reply
+ * @param {{groupName?:string, date?:string|number, maxNodes?:number, nodeChars?:number}} [options]
+ * @returns {string[]|null} null = 不是结构化格式（调用方走旧切分）
+ */
+export function buildStructuredSummaryNodes(reply, {
+  groupName = '',
+  date = '',
+  maxNodes = DEFAULT_SUMMARY.maxNodes,
+  nodeChars = DEFAULT_SUMMARY.nodeChars,
+} = {}) {
+  const parsed = parseStructuredSummary(reply)
+  if (!parsed || parsed.topics.length === 0) return null
+  const cap = Math.max(1, Math.trunc(Number(maxNodes) || DEFAULT_SUMMARY.maxNodes))
+  // 头部 + 1 话题 + 尾部 = 3；比这还小就说明配置不适合结构化，老实走旧切分。
+  if (cap < 3) return null
+  const chars = Math.max(50, Math.trunc(Number(nodeChars) || DEFAULT_SUMMARY.nodeChars))
+  const allowed = Math.max(1, Math.min(SUMMARY_MAX_TOPICS, cap - 2, parsed.topics.length))
+  const kept = parsed.topics.slice(0, allowed)
+  const overflow = parsed.topics.slice(allowed)
+  const topicTexts = kept.map((topic) => `【${topic.title}】${topic.body ? `\n${topic.body}` : ''}`)
+  if (overflow.length > 0 && topicTexts.length > 0) {
+    const extra = overflow.map((topic) => `【${topic.title}】${topic.body ? `\n${topic.body}` : ''}`).join('\n\n')
+    topicTexts[topicTexts.length - 1] = `${topicTexts[topicTexts.length - 1]}\n\n${extra}`
+  }
+  const day = String(date ?? '').trim() || formatDayLabel(Date.now())
+  const title = groupName ? `${groupName} · ${day}` : day
+  const overview = parsed.overview || `本段时间共整理出 ${parsed.topics.length} 个话题。`
+  const header = clampByTokens(`📋 群聊总结报告 · ${title}\n\n${overview}`, chars)
+  const body = topicTexts.map((text) => clampByTokens(text, chars))
+  return [header, ...body, SUMMARY_FOOTER]
 }
 
 /** 按显示宽度截断（用 token 估，CJK 1 字 1 token，非 CJK 约 0.3）。 */
@@ -327,18 +455,40 @@ export function splitSummaryNodes(reply, { maxNodes = DEFAULT_SUMMARY.maxNodes, 
 /**
  * 组 `send_group_forward_msg` 的 nodes。
  *
+ * 入参两种形态：
+ *   · **字符串**（生产路径）：先按「结构化简报」切（头部 / 每话题一条 / 尾部）；
+ *     认不出结构化格式就原样退回旧的 `---` 切分，绝不报错。
+ *   · **字符串数组**（旧调用 / 测试）：原样一条一段，兼容既有行为。
+ *
  * NapCat 的节点 schema（`packages/napcat-onebot/types/message.ts` 的
  * `OB11MessageNodeSchema`）：`{type:'node', data:{nickname, user_id?, content}}`，
  * 且整条消息**只能全是 node**，混普通段会被拒。
  *
- * @param {string[]} nodes
- * @param {{botName?:string, botUin?:string}} [options]
+ * @param {string|string[]} input
+ * @param {{botName?:string, botUin?:string, groupName?:string, date?:string|number,
+ *   maxNodes?:number, nodeChars?:number}} [options]
  * @returns {Array<object>}
  */
-export function buildForwardNodes(nodes, { botName = '', botUin = '' } = {}) {
+export function buildForwardNodes(input, {
+  botName = '',
+  botUin = '',
+  groupName = '',
+  date = '',
+  maxNodes = DEFAULT_SUMMARY.maxNodes,
+  nodeChars = DEFAULT_SUMMARY.nodeChars,
+} = {}) {
   const name = String(botName ?? '').trim() || '群聊归纳'
   const uin = String(botUin ?? '').trim()
-  return (Array.isArray(nodes) ? nodes : [])
+  let texts
+  if (Array.isArray(input)) {
+    texts = input.map((text) => String(text ?? '').trim()).filter(Boolean)
+  } else {
+    const raw = String(input ?? '').trim()
+    if (raw === '') return []
+    const structured = buildStructuredSummaryNodes(raw, { groupName, date, maxNodes, nodeChars })
+    texts = structured ?? splitSummaryNodes(raw, { maxNodes, nodeChars })
+  }
+  return texts
     .map((text) => String(text ?? '').trim())
     .filter(Boolean)
     .map((text) => ({
@@ -349,6 +499,16 @@ export function buildForwardNodes(nodes, { botName = '', botUin = '' } = {}) {
         content: [{ type: 'text', data: { text } }],
       },
     }))
+}
+
+/** 从 node 里取回纯文本（审计 / 纯文本降级用）。 */
+export function forwardNodeText(node) {
+  const content = node?.data?.content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((seg) => seg && seg.type === 'text')
+    .map((seg) => String(seg.data?.text ?? ''))
+    .join('')
 }
 
 /**
