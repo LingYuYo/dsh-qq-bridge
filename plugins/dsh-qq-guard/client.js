@@ -696,9 +696,14 @@ window.__ModuleLoader__.load({
 .qqg-msgtext { font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
 .qqg-msgquote { font-size: 11.5px; line-height: 1.45; color: var(--dsw-alias-label-secondary);
   border-left: 2px solid var(--dsw-alias-border-l2); padding-left: 7px; word-break: break-word; }
-.qqg-meter { height: 6px; border-radius: 999px; background: var(--dsw-alias-bg-layer-2);
-  border: 1px solid var(--dsw-alias-border-l1); overflow: hidden; }
-.qqg-meter-fill { height: 100%; background: var(--qqg-accent); }
+/* 上下文占用进度条（v2.0 精修）：细长、红色占用、灰白轨道、下方小字读数。 */
+.qqg-tokenbar { display: flex; flex-direction: column; gap: 5px; }
+.qqg-tokenbar-track { height: 4px; border-radius: 999px; overflow: hidden;
+  background: var(--dsw-alias-bg-layer-3, var(--dsw-alias-border-l1, rgba(127, 127, 127, .18))); }
+.qqg-tokenbar-fill { height: 100%; border-radius: 999px; background: var(--dsw-alias-state-error-primary, #e5484d);
+  transition: width .25s ease; }
+.qqg-tokenbar-caption { font-size: 10.5px; line-height: 1.3; font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary)); }
 .qqg-codebox { margin: 0; padding: 10px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2);
   border: 1px solid var(--dsw-alias-border-l1);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -3362,6 +3367,20 @@ window.__ModuleLoader__.load({
       return sameDay ? clock : `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${clock}`
     }
 
+    /**
+     * Token 数的紧凑写法（进度条下方那行小字用）。
+     *
+     *   0 → `0`；1234 → `1.2k`；18500 → `18.5k`；128000 → `128k`；132000 → `132k`。
+     * 超过预算也如实显示（132k / 128k），不做截断——用户要看的就是真实占用。
+     * @param {number} value
+     */
+    function fmtTokenCompact(value) {
+      const n = Math.max(0, Number(value) || 0)
+      if (n < 1000) return String(Math.round(n))
+      const k = Math.round((n / 1000) * 10) / 10
+      return Number.isInteger(k) ? `${k.toFixed(0)}k` : `${k.toFixed(1)}k`
+    }
+
     /** 会话显示名：昵称 > QQ / 群号 > key，永不返回空串。 */
     function sessionDisplayName(row) {
       return String(row?.name || row?.qq || row?.key || '')
@@ -3671,7 +3690,9 @@ window.__ModuleLoader__.load({
       const tokens = Number(context.tokens) || 0
       const turns = Number(context.turns) || 0
       const dropped = Number(context.dropped) || 0
-      const pct = budget > 0 ? Math.min(100, Math.round((tokens / budget) * 100)) : 0
+      // 占用比例：保留一位小数，超过 100% 时铺满（数值仍如实显示）。
+      // 注意不要用整百分比取整：18.4% 和 18.6% 在细条上看起来差别很大。
+      const pct = budget > 0 ? Math.min(100, Math.round((tokens / budget) * 1000) / 10) : 0
 
       const summarize = async () => {
         setBusy(true)
@@ -3701,8 +3722,18 @@ window.__ModuleLoader__.load({
             h('div', { className: 'qqg-kv' }, h('span', null, '按预算截断'),
               h('b', null, dropped + ' 条'))),
           budget > 0
-            ? h('div', { className: 'qqg-meter', title: '最近一轮注入量 / 预算' },
-              h('div', { className: 'qqg-meter-fill', style: { width: pct + '%' } }))
+            ? h('div', { className: 'qqg-tokenbar' },
+              h('div', {
+                className: 'qqg-tokenbar-track',
+                role: 'progressbar',
+                'aria-label': '上下文 Token 占用',
+                'aria-valuemin': '0',
+                'aria-valuemax': String(budget),
+                'aria-valuenow': String(Math.min(tokens, budget)),
+                title: '最近一轮注入量 / 预算',
+              }, h('div', { className: 'qqg-tokenbar-fill', style: { width: pct + '%' } })),
+              h('div', { className: 'qqg-tokenbar-caption' },
+                fmtTokenCompact(tokens) + ' / ' + fmtTokenCompact(budget)))
             : null,
           h('div', { className: 'qqg-hint' },
             '这里统计的是桥接自己注入的聊天记录；DSH 会话里的完整上下文占用由 DSH 管理，插件侧读不到。')),

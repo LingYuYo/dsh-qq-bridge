@@ -565,6 +565,55 @@ await check('记忆与摘要：上下文占用 + 最近入站（带引用）+ �
   eq(levelSelect(tree), undefined, '切到记忆 Tab 后不该再渲染档位下拉')
 })
 
+await check('Token 进度条：细条 + 红色填充 + 下方读数（1.2k / 128k）', () => {
+  reset()
+  let tree = resetSessions(LIVE_DETAIL)
+  tabBtn(tree, '记忆与摘要').props.onClick()
+  tree = render()
+  const track = findAll(tree, (n) => String(n.props?.className ?? '').includes('qqg-tokenbar-track'))[0]
+  truthy(track, '缺少进度条')
+  eq(track.props.role, 'progressbar', '要有 progressbar 语义')
+  const fill = findAll(tree, (n) => String(n.props?.className ?? '').includes('qqg-tokenbar-fill'))[0]
+  truthy(fill, '缺少填充部分')
+  eq(fill.props.style.width, '1%', '1234 / 128000 ≈ 1%')
+  const caption = findAll(tree, (n) => String(n.props?.className ?? '').includes('qqg-tokenbar-caption'))[0]
+  eq(textOf(caption), '1.2k / 128k', '读数格式')
+})
+
+await check('Token 进度条：还没注入过显示 0 / 预算', () => {
+  reset()
+  const live = {
+    sessions: [{
+      ...LIVE_DETAIL.sessions[0],
+      context: { budget: 128000, enabled: true, turns: 0, tokens: 0, dropped: 0 },
+    }],
+  }
+  let tree = resetSessions(live)
+  tabBtn(tree, '记忆与摘要').props.onClick()
+  tree = render()
+  eq(textOf(findAll(tree, (n) => String(n.props?.className ?? '').includes('qqg-tokenbar-caption'))[0]),
+    '0 / 128k')
+  eq(findAll(tree, (n) => String(n.props?.className ?? '').includes('qqg-tokenbar-fill'))[0].props.style.width,
+    '0%')
+})
+
+await check('Token 进度条：超预算铺满，但数值如实显示', () => {
+  reset()
+  const live = {
+    sessions: [{
+      ...LIVE_DETAIL.sessions[0],
+      context: { budget: 128000, enabled: true, turns: 9, tokens: 132000, dropped: 0 },
+    }],
+  }
+  let tree = resetSessions(live)
+  tabBtn(tree, '记忆与摘要').props.onClick()
+  tree = render()
+  eq(findAll(tree, (n) => String(n.props?.className ?? '').includes('qqg-tokenbar-fill'))[0].props.style.width,
+    '100%', '超出时铺满')
+  eq(textOf(findAll(tree, (n) => String(n.props?.className ?? '').includes('qqg-tokenbar-caption'))[0]),
+    '132k / 128k', '★ 数值不能被截断')
+})
+
 await check('生成未读归纳 → POST {op:"summarize"}，并给出提交提示', async () => {
   reset()
   let tree = resetSessions(LIVE_DETAIL)
