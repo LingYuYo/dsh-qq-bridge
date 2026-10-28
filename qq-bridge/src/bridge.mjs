@@ -1210,6 +1210,8 @@ export class Bridge {
       capabilityRefreshes: 0,
       // 开发者暗号（v2.0）：命中次数 / 非开发者命中被忽略的次数。
       devTriggers: 0, devDenied: 0,
+      // 接入总闸关着时丢弃的消息数（v2.0 第七步）。
+      paused: 0,
     }
   }
 
@@ -3427,7 +3429,26 @@ export class Bridge {
     }
   }
 
+  /**
+   * 接入总闸（v2.0 第七步，2026-10-28）。
+   *
+   * false = **彻底断开消息处理**：handleMessage 连白名单都不判，直接丢弃。
+   * 值来自设置页 `bridgeEnabled`（Host Config 持久化），桥接重启后热同步照样是 false，
+   * 所以「重启不自动连回」不需要额外状态文件。
+   * @returns {boolean}
+   */
+  _bridgeEnabled() {
+    const hot = this.live?.bridgeEnabled
+    if (typeof hot === 'boolean') return hot
+    return this.config?.bridgeEnabled !== false
+  }
+
   async handleMessage(msg) {
+    // 总闸关着：直接丢弃（只计数，不写操作日志 —— 群里刷屏时会把日志文件写爆）。
+    if (!this._bridgeEnabled()) {
+      this.stats.paused = (Number(this.stats.paused) || 0) + 1
+      return
+    }
     this.stats.received++
     if (!this.isAllowed(msg)) {
       this.stats.denied++

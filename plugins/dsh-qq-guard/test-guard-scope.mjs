@@ -467,6 +467,15 @@ await check('POST /status 会话行带 activityLevel（端到端不丢）', asyn
   assert.equal(row.persona, '单人设', '★ 单人设回填也要存活')
 })
 
+console.log('\n— 接入总闸（v2.0 第七步）—')
+await check('Config：bridgeEnabled 默认开启；日志配置默认值不变', () => {
+  const plain = mod.plainConfig(Config({ role: 'settings' })) ?? {}
+  assert.equal(plain.bridgeEnabled, true, '总闸默认开，不能让升级把消息全断了')
+  assert.equal(plain.logMaxSizeMB, 5)
+  assert.equal(plain.logMaxDays, 15)
+  assert.equal(plain.logDir, '')
+})
+
 console.log('\n— v2.0 会话详情字段（只读上报，任务一）—')
 await check('sanitizeSessionRow：recent / context / summary / modelRoute 全部白名单收敛', () => {
   const { sanitizeSessionRow } = mod

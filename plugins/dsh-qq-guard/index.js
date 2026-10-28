@@ -924,6 +924,15 @@ const Config = Schema.object({
   logMaxDays: Schema.number()
     .description('日志保留天数：启动与每天清理一次，删除修改时间超过该天数的 .log。默认 15。')
     .default(15).min(1).max(365).volatile(),
+
+  // ── 接入总闸（v2.0 第七步，2026-10-28）──────────────────────
+  //
+  // false = 桥接连一条消息都不处理（连白名单都不判），但进程与 NapCat 连接照常。
+  // 存在 Config 里是为了「重启不自动连回」：profile 配置会持久化，
+  // 桥接重启后热同步读到的仍然是 false。
+  bridgeEnabled: Schema.boolean()
+    .description('接入总闸：关闭后桥接彻底不处理任何消息（含指令），重启后保持关闭。')
+    .default(true).volatile(),
   // ── 技能与插件清单（Phase 4：真实读写）──────────────────────
   //
   // 数组顺序 = 界面排序（拖拽/上下移直接写回这个顺序）；
@@ -5260,7 +5269,10 @@ function applySettings(ctx, config) {
             ? runner.stop()
             : action === 'exit'
               ? runner.exit()
-              : Promise.resolve({ ok: false, action: 'unknown', detail: `未知 action：${action}` })
+              // 一键重启（v2.0 第七步）：底层串起来，避免前端 stop → start 撞竞态。
+              : action === 'restart'
+                ? runner.stop().then(() => runner.start({ manual: true }))
+                : Promise.resolve({ ok: false, action: 'unknown', detail: `未知 action：${action}` })
         run
           .then((r) => sendJson(res, r.ok ? 200 : 500, r))
           .catch((error) => sendJson(res, 500, { ok: false, reason: error?.message ?? String(error) }))
@@ -5343,6 +5355,12 @@ function applySettings(ctx, config) {
               ...(Array.isArray(body?.opLog)
                 ? { opLog: body.opLog.slice(-50).map(sanitizeOpLogRow).filter(Boolean) }
                 : {}),
+              // 接入总闸 + 实际连接地址（v2.0 第七步，系统日志 → 高级面板）。
+              ...(typeof body?.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+              ...(typeof body?.dshBaseUrl === 'string'
+                ? { dshBaseUrl: body.dshBaseUrl.slice(0, 200) }
+                : {}),
+              ...(typeof body?.wsUrl === 'string' ? { wsUrl: body.wsUrl.slice(0, 200) } : {}),
             }
             lastStatusAt = Date.now()
             sendJson(res, 200, { ok: true })

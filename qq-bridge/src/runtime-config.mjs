@@ -93,6 +93,9 @@ const HOT_KEYS = [
   'logDir',
   'logMaxSizeMB',
   'logMaxDays',
+  // v2.0 第七步（2026-10-28）：接入总闸。必须热同步 —— 设置页关掉后，
+  // 下一条消息就该被丢弃，而不是等重启桥接。
+  'bridgeEnabled',
   // OneBot 连接信息只用于 UI 展示；WS 连接在启动时建立，改它仍需重启桥接。
   'onebot',
 ]

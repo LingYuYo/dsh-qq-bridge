@@ -186,8 +186,12 @@ const stopPolling = startConfigPolling({
     // 只有桥接进程知道每个 QQ 会话的未读 / 昵称 / DSH 映射，
     // 一起上报给 Host，设置页「会话管理」才有真实数据。
     sessions: bridge.sessionViews(),
-    // 操作日志（v2.0 第六步）：内存最近 50 条，设置页「运行状态」直接展示。
+    // 操作日志（v2.0 第六步）：内存最近 50 条，设置页「系统日志」直接展示。
     opLog: bridge.opLogViews(),
+    // 接入总闸 + 实际连接地址（v2.0 第七步，系统日志 → 高级面板用）。
+    enabled: bridge._bridgeEnabled(),
+    dshBaseUrl: String(bridge.dsh?.baseUrl ?? ''),
+    wsUrl: String(bridge.qq?.wsUrl ?? ''),
     // 能走到这里说明刚成功拉过 DSH 的配置路由，链路是通的。
     dshOk: true,
   }),

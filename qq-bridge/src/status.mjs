@@ -52,16 +52,28 @@ export function qqStateFromHealth(health) {
  * @param {boolean} [opts.dshOk=true] 能调用本函数说明刚成功拉过 DSH 配置，链路是通的
  * @param {Array<object>} [opts.sessions] 「会话管理」用的真实列表（见 Bridge.sessionViews）
  * @param {Array<object>} [opts.opLog] 操作日志环形队列（见 Bridge.opLogViews，最近 50 条）
+ * @param {boolean} [opts.enabled] 接入总闸（false = 暂停消息处理，重启后仍保持）
+ * @param {string} [opts.dshBaseUrl] 桥接实际连的 DSH 地址（高级面板显示端口）
+ * @param {string} [opts.wsUrl] 桥接实际连的 NapCat WS 地址
  * @returns {{qqConnected:boolean, qqState:string, dshOk:boolean, counts:object,
- *   sessions?:Array<object>, opLog?:Array<object>}}
+ *   sessions?:Array<object>, opLog?:Array<object>, enabled?:boolean,
+ *   dshBaseUrl?:string, wsUrl?:string}}
  */
-export function buildBridgeStatus({ health, counts, dshOk = true, sessions, opLog } = {}) {
+export function buildBridgeStatus({
+  health, counts, dshOk = true, sessions, opLog,
+  enabled = true, dshBaseUrl = '', wsUrl = '',
+} = {}) {
   const qqState = qqStateFromHealth(health)
   return {
     qqConnected: qqState === 'online',
     qqState,
     dshOk: dshOk === true,
     counts: counts && typeof counts === 'object' ? counts : {},
+    // 接入总闸：缺省 true（旧版桥接不报这个键时按「正常处理」）。
+    enabled: enabled !== false,
+    // 高级面板展示用；空串表示还没连上 / 拿不到。
+    ...(typeof dshBaseUrl === 'string' && dshBaseUrl !== '' ? { dshBaseUrl: dshBaseUrl.slice(0, 200) } : {}),
+    ...(typeof wsUrl === 'string' && wsUrl !== '' ? { wsUrl: wsUrl.slice(0, 200) } : {}),
     // 会话列表是设置页「会话管理」的唯一真实数据源。旧版桥接不报这个字段，
     // Host / 前端必须把「缺省」当成「没有数据」，不能当成「空列表」覆盖掉。
     ...(Array.isArray(sessions) ? { sessions: sessions.slice(0, 100) } : {}),

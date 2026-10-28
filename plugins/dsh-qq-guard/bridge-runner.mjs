@@ -41,8 +41,8 @@ import { fileURLToPath } from 'node:url'
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 /** 默认桥接目录（与插件同仓库的 qq-bridge/）。 */
 export const DEFAULT_BRIDGE_DIR = path.resolve(HERE, '../../qq-bridge')
-/** 保留的日志行数。 */
-const LOG_LINES = 40
+/** 保留的日志行数（v2.0：40 → 100，系统日志页要能回看一屏多）。 */
+const LOG_LINES = 100
 /** 自动重启上限（崩溃循环保护）。 */
 const MAX_AUTO_RESTARTS = 3
 /** 与 `qq-bridge/src/instance-lock.mjs` 约定一致的单实例锁文件名。 */
@@ -362,6 +362,8 @@ export class BridgeRunner {
     return {
       alive: this.processAlive,
       managed: this.handle !== null,
+      // 进程 PID：「系统日志 → 高级」要显示。拿不到就是 null（别显示 0）。
+      pid: Number(this.handle?.pid) || null,
       startedAt: this.startedAt,
       uptimeMs: this.startedAt ? Date.now() - this.startedAt : null,
       bridgeDir: cfg.bridgeDir,

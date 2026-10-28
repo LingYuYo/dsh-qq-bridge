@@ -717,6 +717,18 @@ window.__ModuleLoader__.load({
 .qqg-oplog-warn .qqg-oplog-level { color: var(--dsw-alias-state-warning-primary, #d97706); }
 .qqg-oplog-error .qqg-oplog-level { color: var(--dsw-alias-state-error-primary, #e5484d); }
 .qqg-oplog-text { flex: 1 1 auto; word-break: break-word; white-space: pre-wrap; }
+
+/* 系统日志页（v2.0 第七步）：终端风格运行日志 + 自检清单。 */
+.qqg-term { margin: 0; padding: 10px 12px; border-radius: 8px; background: #111;
+  color: #7ee787; font-family: Consolas, "Fira Code", ui-monospace, monospace;
+  font-size: 12px; line-height: 1.5; max-height: 320px; overflow: auto;
+  white-space: pre-wrap; word-break: break-word; }
+.qqg-check { display: flex; align-items: baseline; gap: 8px; padding: 4px 0; font-size: 12px; }
+.qqg-check-mark { flex: 0 0 auto; width: 14px; font-weight: 700; }
+.qqg-check-ok .qqg-check-mark { color: var(--dsw-alias-state-success-primary, #16a34a); }
+.qqg-check-bad .qqg-check-mark { color: var(--dsw-alias-state-error-primary, #e5484d); }
+.qqg-check-label { flex: 0 0 auto; min-width: 88px; }
+.qqg-check-hint { color: var(--dsw-alias-label-secondary); }
 .qqg-codebox { margin: 0; padding: 10px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2);
   border: 1px solid var(--dsw-alias-border-l1);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -1440,6 +1452,7 @@ window.__ModuleLoader__.load({
       { id: 'sessions', label: '会话管理', icon: 'sessions' },
       { id: 'skills', label: '技能与插件', icon: 'skills' },
       { id: 'settings', label: '全局设置', icon: 'settings' },
+      { id: 'logs', label: '系统日志', icon: 'file' },
       { id: 'usage', label: '数据与用量', icon: 'usage' },
     ]
 
@@ -1524,7 +1537,7 @@ window.__ModuleLoader__.load({
     }
 
     /** 轮询桥接上报的运行状态（桥接 → Host → 这里）。 */
-    function useBridgeStatus(enabled) {
+    function useBridgeStatus(enabled, revision = 0) {
       const [status, setStatus] = React.useState(null)
       React.useEffect(() => {
         if (!enabled) return undefined
@@ -1546,7 +1559,8 @@ window.__ModuleLoader__.load({
         }
         void tick()
         return () => { stopped = true; if (timer) clearTimeout(timer) }
-      }, [enabled])
+        // revision：系统日志页的 [刷新] 手动触发一次立即重取（轮询本身不变）。
+      }, [enabled, revision])
       return status
     }
 
@@ -1687,40 +1701,8 @@ window.__ModuleLoader__.load({
     function StatusLive({ get, writable }) {
       const live = useBridgeStatus(true)
       const [proc, refreshProc] = useBridgeProc(true)
-      const sysEvents = useSystemEvents(true)
       const [busy, setBusy] = React.useState(null)
       const [err, setErr] = React.useState(null)
-      // 操作日志（v2.0 第六步）：读桥接上报的内存队列；打开文件夹走 Host 路由。
-      const opLog = Array.isArray(live?.opLog) ? live.opLog : null
-      const [logDirBusy, setLogDirBusy] = React.useState(false)
-      const [logDirNote, setLogDirNote] = React.useState(null)
-      const opLogRef = React.useRef(null)
-      const opLogLen = opLog === null ? 0 : opLog.length
-      React.useEffect(() => {
-        const node = opLogRef.current
-        if (node) node.scrollTop = node.scrollHeight
-      }, [opLogLen])
-
-      const openLogDir = async () => {
-        setLogDirBusy(true)
-        setLogDirNote(null)
-        try {
-          const res = await fetch('/dsh-qq-guard/open-log-dir', {
-            method: 'POST',
-            credentials: 'include',
-            headers: { accept: 'application/json' },
-          })
-          const body = await res.json().catch(() => ({}))
-          if (!res.ok || body?.ok !== true) {
-            throw new Error(body?.detail ?? body?.reason ?? ('HTTP ' + res.status))
-          }
-          setLogDirNote({ kind: 'ok', text: '已打开：' + (body.dir ?? '日志目录') })
-        } catch (error) {
-          setLogDirNote({ kind: 'err', text: '打开失败：' + (error?.message ?? error) })
-        } finally {
-          setLogDirBusy(false)
-        }
-      }
 
       const dot = (ok) => h('span', {
         className: 'qqg-dot ' + (ok === true ? 'qqg-dot-ok' : ok === false ? 'qqg-dot-err' : 'qqg-dot-idle'),
@@ -1806,61 +1788,258 @@ window.__ModuleLoader__.load({
         err ? h('div', { className: 'qqg-status qqg-status-err' }, err) : null,
         proc?.lastError ? h('div', { className: 'qqg-detail' }, `上次错误：${proc.lastError}`) : null,
 
-        // 系统底层事件：看门狗 / 降级 / 抛错。默认收起，标题里带最新一条，扫一眼就知道有没有事。
-        h('details', { className: 'qqg-logbox qqg-events' },
-          h('summary', null,
-            `系统底层事件（最近 ${sysEvents.length} 条` +
-            (sysEvents.length > 0 ? `：${sysEvents.at(-1)?.message ?? ''}` : '，暂无') + '）'),
-          sysEvents.length === 0
-            ? h('div', { className: 'qqg-hint' }, '还没有底层事件。看门狗触发、切备用模型、请求抛错都会记在这里。')
-            : h('div', { className: 'qqg-event-list' },
-              [...sysEvents].reverse().map((event, index) => h('div', {
-                key: `${event.ts ?? index}-${index}`,
-                className: 'qqg-ev qqg-ev-' + (event.level ?? 'info'),
-              },
-              h('span', { className: 'qqg-ev-time' }, clockOf(event.at)),
-              h('span', { className: 'qqg-ev-msg' },
-                `${event.level === 'error' ? '⛔' : event.level === 'warn' ? '⚠️' : '·'} ${event.message ?? ''}`))))),
+        h('div', { className: 'qqg-hint' },
+          '「启动桥接」会在后台常驻运行 start.mjs；进程输出与操作日志已移到左侧「系统日志」。',
+          h('br'),
+          '「退出桥接」= 停止且不自动重启；DSH 退出时会自动停掉它，不留孤儿进程。'))
+    }
 
-        // 操作日志（v2.0 第六步）：只记截断 / 归纳 / 模型报错这类关键操作。
-        // 数据是桥接上报的最近 50 条（内存队列），落盘由桥接负责；这里只管展示。
+    /* ══════════ 系统日志 Tab（v2.0 第七步，2026-10-28）══════════ */
+    //
+    // 运行状态页只留「概览 / 实时状态 / NapCat」，日志与排查统一搬到这里：
+    //   · 运行日志 = 桥接进程 stdout（bridge-runner 环形缓冲，100 行）；
+    //   · 应用日志 = 桥接 opLog（截断 / 归纳 / 模型报错，50 条，可过滤）；
+    //   · 高级 = PID / 端口 / 重启 / 接入总闸 / 自检清单 / AI 排障。
+    // 三个区块各自持有轮询 state，切 Tab 只重渲染当前块。
+
+    function LogsTab({ get, write, writable }) {
+      const [revision, setRevision] = React.useState(0)
+      const live = useBridgeStatus(true, revision)
+      const [proc, refreshProc] = useBridgeProc(true)
+      const [level, setLevel] = React.useState('all')
+      const opLog = Array.isArray(live?.opLog) ? live.opLog : null
+      const logBoxRef = React.useRef(null)
+      const opLogLen = opLog === null ? 0 : opLog.length
+      React.useEffect(() => {
+        const node = logBoxRef.current
+        if (node) node.scrollTop = node.scrollHeight
+      }, [opLogLen])
+
+      const filtered = opLog === null
+        ? null
+        : opLog.filter((item) => level === 'all' || item.level === level)
+
+      return h('div', { className: 'qqg-stack' },
+        h(TabHead, {
+          title: '系统日志',
+          desc: '桥接进程输出与应用操作日志；出问题先看这里，再翻「高级」里的自检清单。',
+          tags: h(React.Fragment, null,
+            h('span', { className: 'qqg-pill' }, '运行日志 100 行'),
+            h('span', { className: 'qqg-pill' }, '应用日志 50 条'),
+            h('span', { className: 'qqg-pill' }, '每 3 秒刷新')),
+        }),
+
         h(Panel, {
-          title: '桥接操作日志',
-          desc: '截断 / 归纳 / 模型报错等关键操作；内存保留最近 50 条，同时按天落盘到本地文件。',
+          title: '运行日志',
+          desc: '桥接进程的原始 stdout / stderr（启动、连接 NapCat、看门狗、抛错）。',
           right: h('button', {
             type: 'button', className: 'qqg-btn',
-            disabled: logDirBusy,
-            onClick: () => { void openLogDir() },
-          }, logDirBusy ? '打开中…' : '打开日志文件夹'),
+            onClick: () => refreshProc(),
+          }, '刷新'),
         },
-          logDirNote
-            ? h('div', { className: 'qqg-status' + (logDirNote.kind === 'err' ? ' qqg-status-err' : '') },
-              logDirNote.text)
-            : null,
+          proc === null
+            ? h('div', { className: 'qqg-hint' }, '查询中…')
+            : (proc.logTail?.length
+              ? h('pre', { className: 'qqg-term', 'aria-label': '运行日志' }, proc.logTail.join('\n'))
+              : h('div', { className: 'qqg-hint' }, '还没有输出。启动桥接后这里会出现启动与连接日志。'))),
+
+        h(Panel, {
+          title: '应用日志',
+          desc: '桥接操作日志：截断 / 归纳 / 模型报错。内存保留最近 50 条，同时按天落盘到本地文件。',
+          right: h('div', { className: 'qqg-actions' },
+            h('select', {
+              className: 'qqg-input',
+              value: level,
+              'aria-label': '日志级别',
+              onChange: (e) => setLevel(e.target.value),
+            },
+            h('option', { value: 'all' }, '全部'),
+            h('option', { value: 'info' }, 'INFO'),
+            h('option', { value: 'warn' }, 'WARN'),
+            h('option', { value: 'error' }, 'ERROR')),
+            h('button', {
+              type: 'button', className: 'qqg-btn',
+              onClick: () => setRevision((value) => value + 1),
+            }, '刷新')),
+        },
           opLog === null
             ? h('div', { className: 'qqg-hint' }, '桥接还没上报操作日志（旧版桥接，或刚启动还没产生记录）。')
-            : opLog.length === 0
-              ? h('div', { className: 'qqg-hint' }, '还没有操作记录。触发一次截断 / 归纳，或等模型报错再看看。')
-              : h('div', { className: 'qqg-oplog', ref: opLogRef },
-                opLog.map((item, index) => h('div', {
+            : (filtered.length === 0
+              ? h('div', { className: 'qqg-hint' },
+                level === 'all' ? '还没有操作记录。' : `没有 ${level.toUpperCase()} 级别的记录。`)
+              : h('div', { className: 'qqg-oplog', ref: logBoxRef, 'aria-label': '应用日志' },
+                filtered.map((item, index) => h('div', {
                   key: `${item.at}-${index}`,
                   className: 'qqg-oplog-row qqg-oplog-' + (item.level ?? 'info'),
                 },
                 h('span', { className: 'qqg-oplog-time' }, clockOf(item.at)),
                 h('span', { className: 'qqg-oplog-level' },
                   item.level === 'error' ? 'ERROR' : item.level === 'warn' ? 'WARN' : 'INFO'),
-                h('span', { className: 'qqg-oplog-text' }, item.text ?? ''))))),
+                h('span', { className: 'qqg-oplog-text' }, item.text ?? '')))))),
 
-        proc?.logTail?.length
-          ? h('details', { className: 'qqg-logbox' },
-            h('summary', null, `桥接最近日志（${proc.logTail.length} 行）`),
-            h('pre', { className: 'qqg-log' }, proc.logTail.join('\n')))
-          : null,
+        h(LogsAdvancedPanel, { get, write, writable, proc, live, refreshProc })
+      )
+    }
 
-        h('div', { className: 'qqg-hint' },
-          '「启动桥接」会在后台常驻运行 start.mjs，日志可见于上方折叠区。',
-          h('br'),
-          '「退出桥接」= 停止且不自动重启；DSH 退出时会自动停掉它，不留孤儿进程。'))
+    /** 自检清单的一行：✓ / ✗ + 名称 + 提示。 */
+    function CheckRow({ ok, label, hint }) {
+      return h('div', { className: 'qqg-check' + (ok === true ? ' qqg-check-ok' : ' qqg-check-bad') },
+        h('span', { className: 'qqg-check-mark' }, ok === true ? '✓' : '✗'),
+        h('span', { className: 'qqg-check-label' }, label),
+        h('span', { className: 'qqg-check-hint' }, hint))
+    }
+
+    function LogsAdvancedPanel({ get, write, writable, proc, live, refreshProc }) {
+      const [busy, setBusy] = React.useState(null)
+      const [note, setNote] = React.useState(null)
+      // 系统底层事件（看门狗 / 降级 / 抛错）也搬到这里：不占运行状态页，
+      // 但排查时仍然能从「高级」里展开（v2.0 第七步）。
+      const sysEvents = useSystemEvents(true)
+      const enabled = live?.enabled !== false
+      const pid = proc?.pid ?? null
+      const bridgeDir = proc?.bridgeDir ?? ''
+      const entry = proc?.entry ?? 'start.mjs'
+      const wsUrl = live?.wsUrl ?? String(get('onebot.wsUrl') ?? '')
+      const dshBaseUrl = live?.dshBaseUrl ?? ''
+      const alive = proc?.alive === true
+      const dshOk = live?.dshOk === true
+      const qq = live?.qqState
+
+      const call = async (label, url) => {
+        setBusy(label)
+        setNote(null)
+        try {
+          const res = await fetch(url, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { accept: 'application/json' },
+          })
+          const body = await res.json().catch(() => ({}))
+          if (!res.ok || body?.ok === false) {
+            throw new Error(body?.detail ?? body?.reason ?? ('HTTP ' + res.status))
+          }
+          setNote({ kind: 'ok', text: label + '已提交' })
+        } catch (error) {
+          setNote({ kind: 'err', text: label + '失败：' + (error?.message ?? error) })
+        } finally {
+          setBusy(null)
+          refreshProc()
+        }
+      }
+
+      const openLogDir = async () => {
+        setBusy('打开日志文件夹')
+        setNote(null)
+        try {
+          const res = await fetch('/dsh-qq-guard/open-log-dir', {
+            method: 'POST', credentials: 'include', headers: { accept: 'application/json' },
+          })
+          const body = await res.json().catch(() => ({}))
+          if (!res.ok || body?.ok !== true) {
+            throw new Error(body?.detail ?? body?.reason ?? ('HTTP ' + res.status))
+          }
+          setNote({ kind: 'ok', text: '已打开：' + (body.dir ?? '日志目录') })
+        } catch (error) {
+          setNote({ kind: 'err', text: '打开失败：' + (error?.message ?? error) })
+        } finally {
+          setBusy(null)
+        }
+      }
+
+      const kv = (label, value) => h('div', { className: 'qqg-kv' },
+        h('span', null, label),
+        h('b', { className: 'qqg-mono qqg-kv-ellipsis' }, value === '' || value === null ? '—' : String(value)))
+
+      return h('details', { className: 'qqg-advanced' },
+        h('summary', null, '高级：控制台、接入开关与连接排查'),
+
+        h('div', { className: 'qqg-stack', style: { marginTop: '10px' } },
+          h('div', { className: 'qqg-list' },
+            kv('桥接 PID', pid),
+            kv('桥接目录', bridgeDir),
+            kv('入口', entry),
+            kv('NapCat WS', wsUrl),
+            kv('DSH 地址', dshBaseUrl)),
+
+          h('div', { className: 'qqg-textarea-actions' },
+            h('button', {
+              type: 'button', className: 'qqg-btn qqg-btn-primary',
+              disabled: busy !== null || !writable,
+              onClick: () => call('重启桥接', '/dsh-qq-guard/bridge?action=restart'),
+            }, busy === '重启桥接' ? h(React.Fragment, null, h(Spinner), '重启中…') : '重启桥接'),
+            h('button', {
+              type: 'button', className: 'qqg-btn',
+              disabled: busy !== null || !writable,
+              onClick: () => call('启动 NapCat', '/dsh-qq-guard/napcat?action=start'),
+            }, busy === '启动 NapCat' ? h(React.Fragment, null, h(Spinner), '启动中…') : '启动 NapCat'),
+            h('button', {
+              type: 'button', className: 'qqg-btn',
+              disabled: busy !== null,
+              onClick: () => { void openLogDir() },
+            }, '打开日志文件夹')),
+
+          note
+            ? h('div', { className: 'qqg-status' + (note.kind === 'err' ? ' qqg-status-err' : '') }, note.text)
+            : null,
+
+          h(Field, {
+            label: '接入总闸',
+            desc: '关闭后桥接彻底不处理任何消息（含指令），但进程与 NapCat 连接照常；'
+              + '配置持久化在 profile 里，重启桥接也不会自动连回。',
+          },
+            h('div', { className: 'qqg-inline' },
+              h(Switch, {
+                checked: enabled,
+                disabled: !writable,
+                ariaLabel: '接入总闸',
+                onChange: (next) => write('bridgeEnabled', next),
+              }),
+              h('span', { className: 'qqg-state' }, enabled ? '开启（正常处理消息）' : '已暂停（消息全部丢弃）'))),
+
+          h('div', { className: 'qqg-group-title', style: { marginTop: '6px' } }, '连接自检'),
+          h('div', { className: 'qqg-list' },
+            h(CheckRow, {
+              ok: alive,
+              label: '桥接进程',
+              hint: alive ? '运行中' : '未运行：点上面「重启桥接」，或到运行状态页启动',
+            }),
+            h(CheckRow, {
+              ok: dshOk,
+              label: 'DSH 连接',
+              hint: dshOk ? '已连接' : '连不上：确认 DSH 还在运行，桥接会自动探测新端口',
+            }),
+            h(CheckRow, {
+              ok: qq === 'online',
+              label: 'NapCat / QQ',
+              hint: qq === 'online' ? '在线（get_status 确认）'
+                : qq === 'unverified' ? 'WS 已连，账号状态未确认'
+                  : qq === 'offline' ? 'WS 已连但 QQ 未登录'
+                    : 'WS 未连接：检查 NapCat 是否启动、端口是否 3001',
+            }),
+            h(CheckRow, {
+              ok: enabled,
+              label: '接入总闸',
+              hint: enabled ? '开启' : '已暂停：所有消息（含指令）都会丢弃',
+            })),
+
+          // 系统底层事件：看门狗触发、切备用模型、请求抛错。
+          h('details', { className: 'qqg-logbox qqg-events' },
+            h('summary', null,
+              `系统底层事件（最近 ${sysEvents.length} 条`
+              + (sysEvents.length > 0 ? `：${sysEvents.at(-1)?.message ?? ''}` : '，暂无') + '）'),
+            sysEvents.length === 0
+              ? h('div', { className: 'qqg-hint' }, '还没有底层事件。看门狗触发、切备用模型、请求抛错都会记在这里。')
+              : h('div', { className: 'qqg-event-list' },
+                [...sysEvents].reverse().map((event, index) => h('div', {
+                  key: `${event.ts ?? index}-${index}`,
+                  className: 'qqg-ev qqg-ev-' + (event.level ?? 'info'),
+                },
+                h('span', { className: 'qqg-ev-time' }, clockOf(event.at)),
+                h('span', { className: 'qqg-ev-msg' },
+                  `${event.level === 'error' ? '⛔' : event.level === 'warn' ? '⚠️' : '·'} ${event.message ?? ''}`))))),
+
+          h(AiAssistant))
+      )
     }
 
     function OneBotSection({ get, write, writable }) {
@@ -6501,8 +6680,10 @@ window.__ModuleLoader__.load({
       else if (active === 'skills') body = h(SkillsTab, { ...common, pickDirectory: props?.pickDirectory })
       else if (active === 'usage') body = h(UsageTab, common)
       else if (active === 'settings') body = h(SettingsTab, { ...common, pickDirectory: props?.pickDirectory })
+      else if (active === 'logs') body = h(LogsTab, common)
       else {
-        // 运行状态：既有状态/启停/日志 + 今日用量 + AI 排障助手。
+        // 运行状态（v2.0 第七步精简）：只留概览 / 实时状态 / NapCat。
+        // 日志、系统事件、AI 排障都搬去了「系统日志」Tab。
         body = h('div', { className: 'qqg-stack' },
           h(TabHead, {
             title: '运行状态',
@@ -6514,8 +6695,7 @@ window.__ModuleLoader__.load({
           h(TodayUsage),
           h(StatusSection, common),
           // NapCat 的状态与启停也放在这一页：和桥接启停挨着，不用再切 Tab。
-          h(NapcatProcessSection, common),
-          h(AiAssistant))
+          h(NapcatProcessSection, common))
       }
 
       return h('div', { className: 'qqg-layout' },

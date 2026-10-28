@@ -35,6 +35,7 @@
   "logDir": "",
   "logMaxSizeMB": 5,
   "logMaxDays": 15,
+  "bridgeEnabled": true,
   "replyTimeoutMs": 20000,
   "maxContextTurns": 30,
   "contextClearStrategy": "compact",

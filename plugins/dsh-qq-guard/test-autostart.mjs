@@ -354,5 +354,30 @@ await check('旧版桥接只报 qqConnected 时仍兼容（不回退成错误状
   assert.equal('qqState' in status.status, false, '缺 qqState 时前端走旧字段回落')
 })
 
+await check('snapshot 带 pid 与 100 行日志缓冲（系统日志页要用）', () => {
+  const runner = new BridgeRunner({
+    subprocess: makeFakeSubprocess(), logger: loggerNoop, getConfig: () => ({ bridgeDir: makeBridgeDir() }),
+  })
+  assert.equal(runner.snapshot().pid, null, '未启动时 pid 为 null，不能是 0')
+  runner.handle = { pid: 4242 }
+  assert.equal(runner.snapshot().pid, 4242)
+  for (let i = 0; i < 120; i += 1) runner._push(`line-${i}`)
+  assert.equal(runner.logTail.length, 100, '★ 环形缓冲上限 100 行')
+  assert.equal(runner.logTail.at(-1), 'line-119')
+})
+
+await check('POST /status 放行 enabled / dshBaseUrl / wsUrl（高级面板用）', async () => {
+  const { ctx, routes } = makeCtx()
+  mod.apply(ctx, mod.Config({ role: 'settings' }))
+  await postStatus(routes, {
+    qqState: 'online', counts: {}, enabled: false,
+    dshBaseUrl: 'http://127.0.0.1:1234', wsUrl: 'ws://127.0.0.1:3001',
+  })
+  const status = getStatus(routes)
+  assert.equal(status.status.enabled, false)
+  assert.equal(status.status.dshBaseUrl, 'http://127.0.0.1:1234')
+  assert.equal(status.status.wsUrl, 'ws://127.0.0.1:3001')
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 process.exit(fail === 0 ? 0 : 1)

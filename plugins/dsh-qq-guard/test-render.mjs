@@ -166,7 +166,7 @@ for (const [key, props] of targets) {
 // active 是 #1（假 React 里 useEffect 不占 useState 序号）。
 const Comp = registered['main:qq-bridge']
 const allHandlers = []
-for (const tab of ['status', 'sessions', 'skills', 'settings', 'usage']) {
+for (const tab of ['status', 'sessions', 'skills', 'settings', 'logs', 'usage']) {
   const root = `tab:${tab}`
   hookStore = new Map([[`${root}.BridgePanel.SettingsPanel#1`, tab]])
   effects.length = 0; textSink.length = 0; handlers.length = 0
@@ -176,7 +176,9 @@ for (const tab of ['status', 'sessions', 'skills', 'settings', 'usage']) {
   if (textSink.length < 10) throw new Error(`Tab「${tab}」渲染出的文本过少（${textSink.length}），疑似空页面`)
   const joined = textSink.join('|')
   const expect = {
-    status: ['今日用量概览', 'AI 排障助手', '启动桥接', '桥接操作日志', '打开日志文件夹'],
+    // v2.0 第七步：运行状态精简为概览 / 实时状态 / NapCat；日志独立成 Tab。
+    status: ['今日用量概览', '实时状态', '启动桥接', 'NapCat 进程'],
+    logs: ['系统日志', '运行日志', '应用日志', '高级：控制台、接入开关与连接排查', '连接自检'],
     // 会话管理已接真实数据：桥接未上报时渲染「等待上报」，不再有假会话。
     sessions: ['会话管理', '等待桥接上报', '运行状态'],
     skills: ['技能（Skill）', '插件（Plugin）', '发语音', '图片理解', '网页搜索', '记忆与上下文',

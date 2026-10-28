@@ -383,8 +383,8 @@ VALUE.napcat.dir = 'D:\\NapCat.52230.Shell'
 /* ── 系统底层事件 + 高级参数（2026-10-23 新增）───────────────── */
 console.log('\n系统底层事件 / 高级参数：')
 
-const eventsTree = await renderTab('status')
-check('运行状态页有「系统底层事件」折叠面板', () => {
+const eventsTree = await renderTab('logs')
+check('系统日志页的「高级」里有「系统底层事件」折叠面板', () => {
   const panel = findAll(eventsTree, (n) => typeof n.props?.className === 'string'
     && n.props.className.split(/\s+/).includes('qqg-events'))[0]
   assert(panel, '找不到 .qqg-events 折叠面板')

@@ -157,5 +157,33 @@ await check('logDir 热改后下一个 _logOp 就用新目录', () => {
   assert.equal(fs.existsSync(path.join(dirB, 'bridge-' + dayKey(new Date()) + '.log')), true)
 })
 
+console.log('\n— 接入总闸 / 高级面板字段（v2.0 第七步）—')
+await check('总闸关闭：消息直接丢弃并计数；打开后恢复处理', async () => {
+  const b = makeBridge(tmpDir())
+  const msg = {
+    kind: 'group', groupId: '123456', userId: '1000000001', text: 'hi', messageId: 'm1',
+    raw: { message: [{ type: 'text', data: { text: 'hi' } }] },
+  }
+  b.live.bridgeEnabled = false
+  await b.handleMessage(msg)
+  assert.equal(b.stats.paused, 1, '★ 关闭时要计 paused')
+  assert.equal(b.stats.received, 0, '★ 关闭时连 received 都不该加')
+  b.live.bridgeEnabled = true
+  await b.handleMessage(msg)
+  assert.equal(b.stats.received, 1, '打开后恢复正常计数')
+})
+
+await check('buildBridgeStatus 透传 enabled / 连接地址', () => {
+  const status = buildBridgeStatus({
+    health: { online: true, connected: true }, counts: {},
+    enabled: false, dshBaseUrl: 'http://127.0.0.1:1234', wsUrl: 'ws://127.0.0.1:3001',
+  })
+  assert.equal(status.enabled, false)
+  assert.equal(status.dshBaseUrl, 'http://127.0.0.1:1234')
+  assert.equal(status.wsUrl, 'ws://127.0.0.1:3001')
+  const fallback = buildBridgeStatus({ health: {}, counts: {} })
+  assert.equal(fallback.enabled, true, '缺省按开启')
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) process.exitCode = 1
