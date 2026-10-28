@@ -817,16 +817,27 @@ function mergeFragments(frags, bubbleMax, mergeMax) {
   return out
 }
 
-/** 超硬上限的代码块/日志块：按换行切。 */
+/**
+ * 超硬上限的代码块/日志块：优先按换行切。
+ *
+ * v2.0 第二十步修复：以前单行超过 hard（例如一行 5000 字的代码块）会整条返回，
+ * 超过 QQ 单条上限直接发送失败。现在对超长单行再用 `splitText` 兜底切到 hard 以内
+ * （优先标点、切不动硬切，不劈代理对）。
+ */
 function splitByLines(text, hard) {
   const out = []
+  const flush = (value) => {
+    if (value === '') return
+    if (charCount(value) <= hard) { out.push(value); return }
+    out.push(...splitText(value, hard))
+  }
   let buf = ''
   for (const line of String(text).split('\n')) {
     if (!buf) { buf = line; continue }
     if (charCount(buf) + 1 + charCount(line) <= hard) buf += '\n' + line
-    else { out.push(buf); buf = line }
+    else { flush(buf); buf = line }
   }
-  if (buf) out.push(buf)
+  flush(buf)
   return out
 }
 

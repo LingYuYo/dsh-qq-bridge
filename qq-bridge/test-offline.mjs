@@ -328,6 +328,12 @@ await check('刻意断开的应答词 / 短句 / 1 字不合并', () => {
   assert.deepEqual(splitBubbles('第一句\n第二句\n第三句'), ['第一句', '第二句', '第三句'])
   assert.deepEqual(splitBubbles('甲\r\n乙\r丙'), ['甲', '乙', '丙'])
 })
+// v2.0 第二十步：超长单行代码块必须切到 chunkSize 以内，不能整条超 QQ 上限。
+await check('单行 5000 字代码块 → 按硬上限切开，不整条发', () => {
+  const parts = splitBubbles('```\n' + 'x'.repeat(5000) + '\n```', { chunkSize: 1000 })
+  assert.ok(parts.length >= 5, `应至少 5 条，实际 ${parts.length}`)
+  assert.ok(parts.every((p) => charCount(p) <= 1000), parts.map((p) => charCount(p)).join('/'))
+})
 await check('超过 15 字的长行不参与合并', () => {
   const a = '这句话已经超过十五个字了真的超了'
   const b = '这句同样超过十五个字了吧确实超了'
