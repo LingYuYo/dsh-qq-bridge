@@ -10,7 +10,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   Bridge, IMPERSONATION_RE, SILENT_INSTRUCTION, composePersonaPrompt, isInnerMonologueReply,
-  isSilentReply, normalizeSessionEntry,
+  isSilentReply, normalizeSessionEntry, stripSilentMarkers,
 } from './src/bridge.mjs'
 
 let pass = 0, fail = 0
@@ -265,9 +265,34 @@ await check('潜水判定：<silent> 带标点也算；整段括号算内心戏'
   assert.equal(isSilentReply('（<silent>。）'), true)
   assert.equal(isSilentReply('silent!'), true)
   assert.equal(isSilentReply('你好'), false)
+  assert.equal(isSilentReply('好的\n<silent>'), false, '混入正文不算纯潜水，交给清洗')
   assert.equal(isInnerMonologueReply('(等一下)'), true)
   assert.equal(isInnerMonologueReply('（内心戏）'), true)
   assert.equal(isInnerMonologueReply('（先这样）然后是正文'), false)
+})
+
+await check('stripSilentMarkers：全局清洗标记，正文保留', () => {
+  assert.equal(stripSilentMarkers('好的<silent>'), '好的')
+  assert.equal(stripSilentMarkers('<silent>\n'), '')
+  assert.equal(stripSilentMarkers('收到<silent>，马上来'), '收到马上来', '标记周围标点一并清掉')
+  assert.equal(stripSilentMarkers('＜SILENT＞'), '')
+  assert.equal(stripSilentMarkers('< silent > 在的'), '在的')
+})
+
+await check('_send 兜底：纯 <silent> 不发 QQ，混入则清洗后发送', async () => {
+  const b = makeBridge()
+  const sent = []
+  b.qq = {
+    groupAtReply: false,
+    async sendGroup(groupId, text) { sent.push(text); return { ok: true } },
+    async sendPrivate(userId, text) { sent.push(text); return { ok: true } },
+  }
+  const msg = { kind: 'group', groupId: '123456', userId: '1001', messageId: '' }
+  const dropped = await b._send(msg, '<silent>\n')
+  assert.equal(dropped.dropped, true)
+  assert.equal(sent.length, 0, '★ 纯标记绝不能变成 QQ 气泡')
+  await b._send(msg, '好的<silent>')
+  assert.deepEqual(sent, ['好的'])
 })
 
 await check('冒充识别：普通群友自称主人', () => {

@@ -468,16 +468,41 @@ export const SILENT_INSTRUCTION = '[系统绝对指令：如果没有需要回�
   + '且不附带任何标点或括号。如果你的当前人设没有强制要求使用括号，请尽量少用。]'
 
 /**
- * 模型是否选择了潜水（v2.0 第十四步）。
- * 允许带标点 / 空白 / 全角括号：`<silent>`、`<silent>。`、`（<silent>）` 都算。
+ * 全局清洗 `<silent>` 标记（v2.0 第十六步）。
+ *
+ * 真机 Bug：模型在正常回复后又跟了一段 `<silent>`（甚至带换行），旧判定只认
+ * 「整段就是 <silent>」，于是把标记当正文发进 QQ 群。这里把标记连同紧邻标点
+ * 一起删掉；删完为空 = 纯潜水，调用方直接丢弃。
+ *
+ * 兼容半角 / 全角尖括号与大小写：`<silent>`、`＜SILENT＞`、`< silent >`。
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripSilentMarkers(text) {
+  const stripped = String(text ?? '')
+    .replace(/[。！？!?，,、~～…]*[<＜]\s*silent\s*[>＞][。！？!?，,、~～…]*/giu, '')
+    .replace(/[ \t]{2,}/gu, ' ')
+    .replace(/ *\n */gu, '\n')
+    .trim()
+  // 只被括号 / 空白包住的标记（`（<silent>）`）= 没有正文，归一成空串。
+  return stripped.replace(/[（()）\s]/gu, '') === '' ? '' : stripped
+}
+
+/**
+ * 模型是否选择了潜水（v2.0 第十四步，第十六步收紧）。
+ *
+ * 判定规则：
+ *   · 含 `<silent>` 标记且清洗后为空 → 纯潜水；
+ *   · 只输出 `silent`（无尖括号）也按潜水处理（防模型漏写括号）；
+ *   · 正文里混了标记（如「收到<silent>」）不算潜水，由调用方清洗后正常发送。
  * @param {string} text
  * @returns {boolean}
  */
 export function isSilentReply(text) {
-  const probe = String(text ?? '')
-    .replace(/[\s。！？!?，,、~～…\.\(\)（）]+/gu, '')
-    .toLowerCase()
-  return probe === '<silent>' || probe === 'silent'
+  const raw = String(text ?? '')
+  if (/[<＜]\s*silent\s*[>＞]/iu.test(raw)) return stripSilentMarkers(raw) === ''
+  const probe = raw.replace(/[\s。！？!?，,、~～…\.\(\)（）]+/gu, '').toLowerCase()
+  return probe === 'silent'
 }
 
 /**
@@ -4411,25 +4436,41 @@ export class Bridge {
         // 发送前清洗模型自己编的「内部说明」（2026-10-27）：
         // 例如 `[无文字回复，已在同一条里发了表情包]` —— 那是模型学舌，不是我们要发的话。
         // 清洗后为空 = 这一轮只发了图，**不补任何占位文案**（用户明确要求）。
-        const cleaned = stripMetaNotes(reply)
-        // v2.0 第十四步：智能潜水。
-        // 1) 模型输出 <silent>（带不带标点都算）→ 静默丢弃，不发 QQ。
-        if (isSilentReply(cleaned)) {
+        let cleaned = stripMetaNotes(reply)
+        // v2.0 第十四步 / 第十六步：智能潜水。
+        // 1) 先全局清洗 <silent>：模型常在正常回复后又跟一段标记（带换行），
+        //    旧判定只看「整段」，标记就被当正文发进群里了。
+        let answer = cleaned
+        if (/[<＜]\s*silent\s*[>＞]/iu.test(answer)) {
+          const stripped = stripSilentMarkers(answer)
+          if (stripped === '') {
+            this.stats.silent++
+            this.logger.info?.(`模型选择潜水（<silent>），本轮不发送：${key}`)
+            this._noteReplied(key)
+            this._rateRecord(key)
+            return
+          }
+          this.logger.warn?.(`回复里混入 <silent> 标记，已清洗后发送：${stripped.slice(0, 40)}`)
+          answer = stripped
+        }
+        // 只输出 `silent`（漏写尖括号）也按潜水处理。
+        if (isSilentReply(answer)) {
           this.stats.silent++
-          this.logger.info?.(`模型选择潜水（<silent>），本轮不发送：${key}`)
+          this.logger.info?.(`模型选择潜水（silent），本轮不发送：${key}`)
           this._noteReplied(key)
           this._rateRecord(key)
           return
         }
         // 2) 关闭「括号内心戏」时，整段被 ()/（）包裹 = 非法潜水，直接丢弃。
         //    开启后不做任何括号清洗（尊重傲娇 / 旁白人设）。
-        if (this.live?.allowInnerMonologue !== true && isInnerMonologueReply(cleaned)) {
+        if (this.live?.allowInnerMonologue !== true && isInnerMonologueReply(answer)) {
           this.stats.silent++
-          this.logger.info?.(`整段括号内心戏（allowInnerMonologue=false），已丢弃：${cleaned.slice(0, 40)}`)
+          this.logger.info?.(`整段括号内心戏（allowInnerMonologue=false），已丢弃：${answer.slice(0, 40)}`)
           this._noteReplied(key)
           this._rateRecord(key)
           return
         }
+        cleaned = answer
         if (cleaned === '') {
           this.logger.info?.(`本轮没有可发送的文字（清洗后为空，模型只发了图/空回复）：${key}`)
           this._noteReplied(key)
@@ -6191,6 +6232,20 @@ export class Bridge {
 
   async _send(msg, text, { at = true } = {}) {
     const delay = this.config.sendDelayMs ?? 400
+    // v2.0 第十六步：发送入口统一兜底清洗 <silent>。
+    // 主路径已经在 _processBatch 拦过一次；这里兜住 poke / 工具回执等旁路，
+    // 保证任何路径都不会把标记写进 QQ 气泡。
+    let payloadText = String(text ?? '')
+    if (/[<＜]\s*silent\s*[>＞]/iu.test(payloadText)) {
+      const stripped = stripSilentMarkers(payloadText)
+      if (stripped === '') {
+        this.stats.silent++
+        this.logger.info?.(`发送前拦截：文本只剩 <silent>，已丢弃（${this.keyOf(msg)}）`)
+        return { ok: true, dropped: true }
+      }
+      this.logger.warn?.(`发送前清洗 <silent> 标记：${stripped.slice(0, 40)}`)
+      text = stripped
+    }
     const key = this.keyOf(msg)
     // 群聊引用（2026-10-27）：拿得到入站 message_id 就挂 `reply` 段，否则退回 @。
     // 只对群聊生效、只对「正常回复」生效（at:false 的插件通道发送不引用别人的原消息）。
