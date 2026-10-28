@@ -28,13 +28,6 @@ const DEFAULT_MERGE_MAX_CHARS = 15
 const MIN_FIRST_PIECE_CHARS = 6
 const DEFAULT_SEND_INTERVAL_MS = 500
 const DEFAULT_DEDUP_CAPACITY = 500
-/**
- * 引用解析（get_msg / get_forward_msg）的单次超时。
- *
- * 为什么不用 10s 的默认值：引用解析是**回复前的阻塞步骤**，NapCat 被风控时
- * 一个请求能挂到天黑。给 5s，超了就静默降级只发当前消息。
- */
-const QUOTE_FETCH_TIMEOUT_MS = 5_000
 // 打字延时分级：<10 → 200ms；10~14 → 450ms；15+ → 800ms。
 // 2026-10-23：三档的**字数边界**与**毫秒基准**都改成可配置（设置页 → 信息发送配置），
 // 这里的常量只作兜底，见 typingDelayFor 的第三参。
@@ -58,13 +51,12 @@ const WS_OPEN = 1
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-/** logger 可能为 undefined，字段也可能缺失；一律容错成空操作。
- *  debug 是后加的（2026-10-26，notice 事件只记 debug）：老 logger 没有这个方法时自动退化成空操作。 */
+/** logger 可能为 undefined，字段也可能缺失；一律容错成空操作。 */
 function makeLogger(logger) {
   const bind = (name) => (logger && typeof logger[name] === 'function'
     ? (msg) => { try { logger[name](msg) } catch { /* 日志自身出错不影响主链路 */ } }
     : () => {})
-  return { info: bind('info'), warn: bind('warn'), error: bind('error'), debug: bind('debug') }
+  return { info: bind('info'), warn: bind('warn'), error: bind('error') }
 }
 
 /** 日志里不能出现 access_token。 */
@@ -108,229 +100,10 @@ export function extractImages(message) {
   return out
 }
 
-/**
- * 抽出视频段（2026-10-26，插件联动契约 §6）。
- *
- * OneBot/NapCat 的 video 段通常带 `url`（可直接下载）和 `file`（文件名/本地路径），
- * 部分版本还带 `file_size`。这里只做结构提取，不在这里发网络请求——
- * 下载落盘在 bridge.mjs / plugin-hub.mjs，便于注入测试。
- *
- * @param {Array|string} message OneBot 消息段
- * @returns {Array<{url:string, file:string, fileSize:number}>}
- */
-export function extractVideos(message) {
-  if (!Array.isArray(message)) return []
-  const out = []
-  for (const seg of message) {
-    if (!seg || seg.type !== 'video') continue
-    const data = seg.data && typeof seg.data === 'object' ? seg.data : {}
-    const url = String(data.url ?? '').trim()
-    const file = String(data.file ?? '').trim()
-    if (!url && !file) continue
-    const size = Number(data.file_size)
-    out.push({
-      url: url || file,
-      file,
-      fileSize: Number.isFinite(size) && size > 0 ? size : 0,
-    })
-  }
-  return out
-}
-
-/**
- * 解析 CQ 码里的 `k=v,k=v` 参数段。
- *
- * 值里的逗号/方括号在 CQ 里会被转成 HTML 实体（`&#44;` `&#91;` `&#93;`），
- * 这里只还原这几种——URL 里的 `&` 也是实体，一并处理。
- * @param {string} body
- * @returns {Record<string, string>}
- */
-function parseCqParams(body) {
-  const out = {}
-  for (const part of String(body ?? '').split(',')) {
-    const eq = part.indexOf('=')
-    if (eq <= 0) continue
-    const key = part.slice(0, eq).trim().toLowerCase()
-    const value = part.slice(eq + 1).trim()
-      .replace(/&#91;/gu, '[')
-      .replace(/&#93;/gu, ']')
-      .replace(/&#44;/gu, ',')
-      .replace(/&amp;/gu, '&')
-    if (key) out[key] = value
-  }
-  return out
-}
-
-/**
- * 从 **CQ 码字符串**里抽图片（2026-10-27）。
- *
- * 为什么必须支持：`get_forward_msg` 返回的节点，`content` 在部分协议端里是
- * `[CQ:image,file=xxx,url=https://…]` 这种字符串，不是消息段数组。
- * 之前只处理数组，字符串走 `cqToText` 变成 `[图片]`、URL 整个丢掉——
- * 真机表现就是「聊天记录里的图模型完全看不到」。
- *
- * @param {string} text
- * @returns {Array<{url:string, file:string, summary:string, size:number}>}
- */
-export function extractImagesFromCq(text) {
-  const out = []
-  const source = String(text ?? '')
-  const re = /\[CQ:image,([^\]]*)\]/gi
-  let matched
-  while ((matched = re.exec(source)) !== null) {
-    const params = parseCqParams(matched[1])
-    const url = String(params.url ?? '').trim()
-    const file = String(params.file ?? '').trim()
-    if (!url && !file) continue
-    const size = Number(params.file_size)
-    out.push({
-      url: url || file,
-      file,
-      summary: String(params.summary ?? params.sub_type ?? '').trim(),
-      size: Number.isFinite(size) && size > 0 ? size : 0,
-    })
-  }
-  return out
-}
-
-/** 从 CQ 码字符串里抽视频（同 extractImagesFromCq，但 type 是 video）。 */
-export function extractVideosFromCq(text) {
-  const out = []
-  const source = String(text ?? '')
-  const re = /\[CQ:video,([^\]]*)\]/gi
-  let matched
-  while ((matched = re.exec(source)) !== null) {
-    const params = parseCqParams(matched[1])
-    const url = String(params.url ?? '').trim()
-    const file = String(params.file ?? '').trim()
-    if (!url && !file) continue
-    const size = Number(params.file_size)
-    out.push({
-      url: url || file,
-      file,
-      fileSize: Number.isFinite(size) && size > 0 ? size : 0,
-    })
-  }
-  return out
-}
-
-/**
- * 统一入口：数组走 `extractImages`，CQ 字符串走 `extractImagesFromCq`。
- * 调用方不用关心协议端给的是哪种形态（NapCat 各版本 / go-cqhttp 不一致）。
- * @param {Array|string} message
- * @returns {Array<{url:string, file:string, summary:string, size:number}>}
- */
-export function extractImagesFromMessage(message) {
-  if (Array.isArray(message)) return extractImages(message)
-  if (typeof message === 'string') return extractImagesFromCq(message)
-  return []
-}
-
-/** 统一入口：视频版。 */
-export function extractVideosFromMessage(message) {
-  if (Array.isArray(message)) return extractVideos(message)
-  if (typeof message === 'string') return extractVideosFromCq(message)
-  return []
-}
-
-/**
- * 从消息段里抽「被引用的消息 / 合并转发」的标识（2026-10-27）。
- *
- * 为什么要单独抽：`parseMessage` 解析时 reply 段必须被丢掉（否则正文会把被引用
- * 内容再念一遍），但桥接需要拿 id 去拉原文（get_msg）和聊天记录（get_forward_msg）。
- *
- * 支持的形态：
- *   · `type:'reply'`  → `data.id` / `data.message_id` = 被引用消息 id
- *   · `type:'forward'`→ `data.id` = 合并转发 id
- *   · `type:'node'`   → NapCat 有时把转发节点内联展开，没有 id，直接给内容
- *   · `type:'json'`   → 少数客户端的「聊天记录」分享会在 JSON 里带 forward_id
- *
- * @param {Array|string} message
- * @returns {{replyId:string, forwardIds:string[], inlineNodes:Array<object>}}
- */
-export function parseQuoteSegments(message) {
-  const out = { replyId: '', forwardIds: [], inlineNodes: [] }
-  if (!Array.isArray(message)) return out
-  for (const seg of message) {
-    if (!seg || typeof seg !== 'object') continue
-    const type = String(seg.type ?? '')
-    const data = seg.data && typeof seg.data === 'object' ? seg.data : {}
-    if (type === 'reply') {
-      const id = String(data.id ?? data.message_id ?? '').trim()
-      if (id && !out.replyId) out.replyId = id
-    } else if (type === 'forward') {
-      const id = String(data.id ?? data.forward_id ?? '').trim()
-      if (id) out.forwardIds.push(id)
-    } else if (type === 'node') {
-      if (data && typeof data === 'object') out.inlineNodes.push(data)
-    } else if (type === 'json') {
-      const id = findForwardIdInCard(data)
-      if (id) out.forwardIds.push(id)
-    }
-  }
-  return out
-}
-
-/**
- * 从 json 卡片里找「聊天记录」的 forward_id。
- *
- * 不确定各客户端把 id 放在哪层，直接在序列化后的文本里按字段名抓；
- * 抓不到就返回空串（静默，不影响卡片本身的文字化）。
- * @param {object} data json 段的 data
- * @returns {string}
- */
-function findForwardIdInCard(data) {
-  const payload = data.data ?? data.content ?? data.value ?? ''
-  if (!payload) return ''
-  let text = ''
-  try {
-    text = typeof payload === 'string' ? payload : JSON.stringify(payload)
-  } catch {
-    return ''
-  }
-  const matched = /"forward_id"\s*:\s*"([0-9A-Za-z_-]{4,})"/u.exec(text)
-  return matched ? matched[1] : ''
-}
-
-/**
- * 把 get_forward_msg 返回的一个节点压成纯文本描述。
- *
- * 节点形态在不同实现里不一样（`{data:{content}}` / `{sender, message}`），
- * 这里两条路都认；图片统一写成 `［图片］`（全角方括号是关键——半角 `[图片]`
- * 会被 bridge 的占位清理逻辑当成当前消息的占位删掉，见 `_buildPromptContent`）。
- *
- * @param {object} node
- * @returns {{name:string, userId:string, text:string, images:Array<object>}|null}
- */
-export function normalizeForwardNode(node) {
-  if (!node || typeof node !== 'object') return null
-  // 已经是规范化形态（`get_forward_msg` 内部转过一次，或测试里直接喂的假节点）：
-  // 原样返回。**必须**有这个 guard —— 规范化节点没有 content/message 字段，
-  // 再转一次会把 name/text/images 全部清空。
-  if (typeof node.text === 'string' && Array.isArray(node.images)) return node
-  const data = node.data && typeof node.data === 'object' ? node.data : node
-  const sender = (node.sender && typeof node.sender === 'object' ? node.sender : null)
-    ?? (data.sender && typeof data.sender === 'object' ? data.sender : {})
-  const name = String(data.name ?? sender.card ?? sender.nickname ?? sender.name ?? data.uin ?? '').trim()
-  const raw = data.content ?? data.message ?? node.message ?? ''
-  const message = Array.isArray(raw) ? raw : []
-  const text = parseMessage(message, typeof raw === 'string' ? raw : '').trim()
-  // 关键：节点内容可能是 CQ 字符串，必须用统一入口，否则图片 URL 会被丢掉
-  //（真机表现：聊天记录里的图全变成 `[图片]` 文本，模型看不到）。
-  const images = extractImagesFromMessage(raw)
-  const videos = extractVideosFromMessage(raw)
-  if (!text && images.length === 0 && videos.length === 0) return null
-  return {
-    name: name || '群友',
-    userId: String(data.uin ?? data.user_id ?? sender.user_id ?? ''),
-    text,
-    images,
-    videos,
-  }
-}
-
 /** 字符串格式消息里的 CQ 码转纯文本（array 格式不走这里）。 */
-export function cqToText(text) {  return String(text ?? '')    // @ 后面必须留一个空格：否则「@123你好」会被模型当成一个整体。
+export function cqToText(text) {
+  return String(text ?? '')
+    // @ 后面必须留一个空格：否则「@123你好」会被模型当成一个整体。
     .replace(/\[CQ:at,[^\]]*qq=([^,\]]+)[^\]]*\]/gi, (_, qq) => (String(qq) === 'all' ? '@全体成员 ' : `@${qq} `))
     .replace(/\[CQ:image[^\]]*\]/gi, '[图片]')
     .replace(/\[CQ:(?:m?face|sface)[^\]]*\]/gi, '[表情]')
@@ -344,155 +117,6 @@ export function cqToText(text) {  return String(text ?? '')    // @ 后面必须
     .replace(/&#91;/g, '[').replace(/&#93;/g, ']').replace(/&#44;/g, ',')
     .replace(/[ \t]{2,}/gu, ' ')
     .trim()
-}
-
-// ── 分享卡片（json / xml 消息段，2026-10-27）────────────────────────────
-//
-// 群友分享 B 站/小程序/网页时，NapCat 给的是 json 或 xml 段，里面是一整坨结构化数据。
-// 以前一律落成 `[卡片]`，模型只能回"卡片是空的"。这里把 title 和跳转链接抠出来，
-// 正文里留下 `[分享卡片: 标题 - 链接]`，模型能据此接话/问要不要展开。
-//
-// 兼容的常见形态：
-//   · 结构化消息 com.tencent.structmsg → meta.news / meta.detail_1 里的 title / jumpUrl
-//   · 小程序 com.tencent.miniapp_01  → meta.detail_1.title / qqdocurl / preview
-//   · 旧版 xml 卡片（<title>…</title> + <qqdocurl> / <url>）
-// 都解析不出来才退回 `[卡片]`，绝不把原始 JSON 塞进 prompt。
-
-const CARD_TITLE_MAX = 120
-const CARD_URL_MAX = 500
-/** URL 字段优先级：qqdocurl 是 QQ 文档/分享的跳转地址，最准。 */
-const CARD_URL_KEYS = ['qqdocurl', 'jumpurl', 'url', 'href', 'link']
-
-/** HTML/XML 实体解码（卡片标题里 &amp;&#39; 很常见）。 */
-function decodeCardEntities(text) {
-  return String(text ?? '')
-    .replace(/&amp;/gi, '&')
-    .replace(/&quot;/gi, '"')
-    .replace(/&apos;|&#39;/gi, "'")
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&#(?:x([0-9a-f]+)|(\d+));/gi, (whole, hex, dec) => {
-      const code = hex ? parseInt(hex, 16) : parseInt(dec, 10)
-      if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) return whole
-      try { return String.fromCodePoint(code) } catch { return whole }
-    })
-}
-
-function cleanCardTitle(value) {
-  const title = decodeCardEntities(String(value ?? ''))
-    .replace(/[\r\n\t]+/g, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .trim()
-  return title.length > CARD_TITLE_MAX ? `${title.slice(0, CARD_TITLE_MAX)}…` : title
-}
-
-function cleanCardUrl(value) {
-  const url = decodeCardEntities(String(value ?? '')).trim()
-  // 只认能点开的 http(s)；卡片里还有一堆 `xxx.png` / 内部 scheme。
-  if (!/^https?:\/\//i.test(url)) return ''
-  return url.length > CARD_URL_MAX ? url.slice(0, CARD_URL_MAX) : url
-}
-
-/** 递归收集卡片 JSON 里的标题/链接候选（卡片结构各平台不一样，按字段名找最稳）。 */
-function collectCardFields(node, depth, acc) {
-  if (!node || typeof node !== 'object' || depth > 8) return acc
-  if (Array.isArray(node)) {
-    for (const item of node) collectCardFields(item, depth + 1, acc)
-    return acc
-  }
-  for (const [key, value] of Object.entries(node)) {
-    if (value && typeof value === 'object') {
-      collectCardFields(value, depth + 1, acc)
-      continue
-    }
-    if (typeof value !== 'string') continue
-    const k = String(key).toLowerCase()
-    if (k === 'title') acc.titles.push(value)
-    else if (k === 'desc' || k === 'summary') acc.summaries.push(value)
-    if (CARD_URL_KEYS.includes(k)) acc.urls.push({ key: k, value })
-  }
-  return acc
-}
-
-/** xml 卡片：标签取值（容忍属性、CDATA）。 */
-function xmlTagValue(xml, tagName) {
-  const re = new RegExp(`<${tagName}[^>]*>([\\s\\S]*?)</${tagName}>`, 'i')
-  const match = re.exec(xml)
-  if (!match) return ''
-  const raw = match[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
-  return decodeCardEntities(raw).trim()
-}
-
-/**
- * 从 json / xml 消息段里抽分享卡片的标题和链接。
- *
- * @param {{type?:string, data?:object}} segment OneBot 消息段
- * @returns {{title:string, url:string}|null} 两者都抽不到返回 null
- */
-export function extractCardInfo(segment) {
-  if (!segment || typeof segment !== 'object') return null
-  const type = String(segment.type ?? '')
-  if (type !== 'json' && type !== 'xml') return null
-  const data = segment.data && typeof segment.data === 'object' ? segment.data : {}
-
-  // NapCat 的 json 段把整张卡片塞在 data 字符串里（字段名就是 data）。
-  const payload = data.data ?? data.content ?? data.value ?? ''
-  const text = typeof payload === 'string' ? payload : (payload ? JSON.stringify(payload) : '')
-
-  if (type === 'json') {
-    let parsed = null
-    if (payload && typeof payload === 'object') {
-      parsed = payload
-    } else if (text.trim()) {
-      const candidates = [text, decodeCardEntities(text)]
-      for (const candidate of candidates) {
-        try { parsed = JSON.parse(candidate); break } catch { /* 换下一种（实体转义后再试） */ }
-      }
-    }
-    if (!parsed || typeof parsed !== 'object') return null
-    const acc = { titles: [], summaries: [], urls: [] }
-    collectCardFields(parsed, 0, acc)
-    const title = cleanCardTitle(acc.titles.find((item) => cleanCardTitle(item)) || acc.summaries.find((item) => cleanCardTitle(item)) || '')
-    const url = pickCardUrl(acc.urls)
-    if (!title && !url) return null
-    return { title, url }
-  }
-
-  // xml：标题 + 链接标签，链接常见 <qqdocurl> / <url> / <jumpUrl>。
-  if (!text.trim()) return null
-  const title = cleanCardTitle(xmlTagValue(text, 'title'))
-  let url = ''
-  for (const tag of ['qqdocurl', 'jumpUrl', 'url', 'href']) {
-    url = cleanCardUrl(xmlTagValue(text, tag))
-    if (url) break
-  }
-  if (!title && !url) return null
-  return { title, url }
-}
-
-/** 按 qqdocurl > jumpUrl > url … 的优先级挑一个能点开的链接。 */
-function pickCardUrl(urls) {
-  for (const key of CARD_URL_KEYS) {
-    for (const item of urls) {
-      if (item.key !== key) continue
-      const url = cleanCardUrl(item.value)
-      if (url) return url
-    }
-  }
-  return ''
-}
-
-/**
- * 卡片段 → 正文里的文字。
- *
- * @param {{type?:string, data?:object}} segment
- * @returns {string} 解析成功返回 `[分享卡片: 标题 - 链接]`，失败返回 `[卡片]`
- */
-export function formatCardSegment(segment) {
-  const card = extractCardInfo(segment)
-  if (!card) return '[卡片]'
-  if (card.title && card.url) return `[分享卡片: ${card.title} - ${card.url}]`
-  return card.title ? `[分享卡片: ${card.title}]` : `[分享卡片: ${card.url}]`
 }
 
 /**
@@ -509,26 +133,6 @@ export function formatCardSegment(segment) {
  * @param {{resolveAtName?: (qq:string) => string|undefined}} [options]
  *   昵称解析器：由 OneBotClient 用「群成员发言缓存」实现（不额外打 API）。
  */
-/**
- * 剥掉消息**开头**的连续 @（v2.0 第十九步）。
- *
- * 群里先 @bot 再发指令时，`parseMessage` 会把 at 段转成 `@小鱼 `，
- * 文本变成 `@小鱼 /归纳` → `startsWith('/')` 判定失败，指令被当普通聊天。
- * 这里只剥开头、不碰正文里的 @；@ 昵称遇到 `/` 即停，兼容 `@小鱼/归纳` 无空格写法。
- *
- * @param {string} text
- * @returns {string}
- */
-export function stripLeadingMentions(text) {
-  let out = String(text ?? '')
-  for (;;) {
-    const next = out.replace(/^\s*@[^\s@/]+\s*/u, '')
-    if (next === out) break
-    out = next
-  }
-  return out.trim()
-}
-
 export function parseMessage(message, rawMessage = '', options = {}) {
   const resolveAtName = typeof options?.resolveAtName === 'function' ? options.resolveAtName : null
   if (Array.isArray(message)) {
@@ -555,7 +159,7 @@ export function parseMessage(message, rawMessage = '', options = {}) {
         case 'video': parts.push('[视频]'); break
         case 'file': parts.push('[文件]'); break
         case 'forward': parts.push('[合并转发]'); break
-        case 'json': case 'xml': parts.push(formatCardSegment(seg)); break
+        case 'json': case 'xml': parts.push('[卡片]'); break
         // 这些段没有文本价值，直接丢掉（reply 尤其不该把被引用内容重复一遍）
         case 'reply': case 'poke': case 'shake': case 'anonymous': case 'rps': case 'dice': break
         default: parts.push(`[${type}]`)
@@ -817,27 +421,16 @@ function mergeFragments(frags, bubbleMax, mergeMax) {
   return out
 }
 
-/**
- * 超硬上限的代码块/日志块：优先按换行切。
- *
- * v2.0 第二十步修复：以前单行超过 hard（例如一行 5000 字的代码块）会整条返回，
- * 超过 QQ 单条上限直接发送失败。现在对超长单行再用 `splitText` 兜底切到 hard 以内
- * （优先标点、切不动硬切，不劈代理对）。
- */
+/** 超硬上限的代码块/日志块：按换行切。 */
 function splitByLines(text, hard) {
   const out = []
-  const flush = (value) => {
-    if (value === '') return
-    if (charCount(value) <= hard) { out.push(value); return }
-    out.push(...splitText(value, hard))
-  }
   let buf = ''
   for (const line of String(text).split('\n')) {
     if (!buf) { buf = line; continue }
     if (charCount(buf) + 1 + charCount(line) <= hard) buf += '\n' + line
-    else { flush(buf); buf = line }
+    else { out.push(buf); buf = line }
   }
-  flush(buf)
+  if (buf) out.push(buf)
   return out
 }
 
@@ -913,87 +506,6 @@ export function normalizeTypingMsTiers(source) {
  * @param {object|number} [opts]
  * @returns {string[]}
  */
-/** 极短气泡阈值（v2.0 第十九步）：单个泡小于这个码点数时，尝试与相邻行合并。 */
-export const MIN_BUBBLE_CHARS = 4
-
-/**
- * 无标点超长行的降级阈值（v2.0 第二十一步）。
- *
- * 一行超过这个长度且**一个标点都没有**（乱码 / 无断句的长串）时，
- * 放弃「拟人短句」切分，改用 chunkSize 发大块 —— 否则 4500 字会切成
- * 150 条 30 字消息，既刷屏又容易触发风控。
- */
-export const LONG_LINE_NO_PUNCT_CHARS = 500
-
-/** 判断一行里有没有任何断句标点（中文 / 英文都算）。 */
-const HAS_SENTENCE_PUNCT = /[。！？!?；;…，,、：:]/u
-
-/** 独立应答词：即使是极短行也**不合并**（模型可能就是想单发一个「嗯」）。 */
-const STANDALONE_SHORT = new Set([
-  '嗯', '嗯嗯', '哦', '噢', '好', '好的', '行', '行吧', '对', '是', '在', '在的', '收到', '知道了', '明白',
-  '哈哈', '哈', '嘿', '嗨', '诶', '欸', '草', '来了', '？', '！', '…',
-])
-
-/** 极短行只有和「下一行的长句」组合时才合并（2~3 字话题标签 + 正文），下一行至少这么长。 */
-const NEXT_LINE_MIN_CHARS = 6
-
-/** 片头标点：出现时并入上一泡（去掉标点），避免「，继续」单独成泡。 */
-const LEADING_PUNCT = /^[，,、；;：:]+/u
-
-/**
- * 跨行后处理（v2.0 第十九步）：**只处理「明显不该断开」的相邻行**，
- * 原生换行仍是强边界。
- *
- *   ① 下一行以逗号类标点开头 → 去标点并入上一行（「收到\n，马上来」→「收到马上来」）；
- *   ② 某行只有一个极短片段（< MIN_BUBBLE_CHARS）且不是独立应答词 →
- *      优先并入上一行；没有上一行则前置到下一行（「帽子\n今天天气不错」→ 一个泡）；
- *   ③ 上一行以句末标点结尾时不合并（尊重刻意断句）。
- *
- * @param {string[][]} groups 每行的片段数组
- * @param {{bubbleMax:number, minBubble:number}} opts
- * @returns {string[]}
- */
-function mergeAcrossLines(groups, { bubbleMax, minBubble }) {
-  const list = groups.map((pieces) => [...pieces])
-  const endsSentence = (text) => /[。！？!?…]$/u.test(text)
-
-  // 第一轮：片头标点 → 并入上一行
-  for (let i = 0; i < list.length; i++) {
-    if (list[i].length === 0) continue
-    const raw = list[i][0]
-    const stripped = raw.replace(LEADING_PUNCT, '')
-    if (stripped === raw) continue
-    const prev = i > 0 ? list[i - 1] : null
-    const prevLast = prev?.[prev.length - 1]
-    if (prevLast && !endsSentence(prevLast)
-      && charCount(prevLast) + charCount(stripped) <= bubbleMax) {
-      prev[prev.length - 1] = prevLast + stripped
-      list[i].shift()
-    } else {
-      list[i][0] = stripped
-    }
-  }
-
-  // 第二轮：极短行（2~3 字）后面紧跟长句 → 视为「话题标签 + 正文」，前置合并。
-  // 刻意断开的短句（「收到」「嗯」「第一句」这类）保持独立：
-  //   · 1 字不参与；独立应答词不参与；下一行太短（< NEXT_LINE_MIN_CHARS）不参与。
-  for (let i = 0; i < list.length; i++) {
-    if (list[i].length !== 1) continue
-    const short = list[i][0]
-    const shortChars = charCount(short)
-    if (shortChars < 2 || shortChars >= minBubble) continue
-    if (STANDALONE_SHORT.has(short.trim())) continue
-    const next = i + 1 < list.length ? list[i + 1] : null
-    if (!next || next.length === 0) continue
-    if (charCount(next[0]) < NEXT_LINE_MIN_CHARS) continue
-    if (shortChars + charCount(next[0]) > bubbleMax) continue
-    next[0] = short + next[0]
-    list[i] = []
-  }
-
-  return list.flat().filter((x) => x.length > 0)
-}
-
 export function splitBubbles(text, opts = {}) {
   const o = typeof opts === 'number' ? { chunkSize: opts } : (opts ?? {})
   const hard = Number.isFinite(o.chunkSize) && o.chunkSize >= 1 ? Math.floor(o.chunkSize) : DEFAULT_CHUNK_SIZE
@@ -1019,27 +531,16 @@ export function splitBubbles(text, opts = {}) {
     }
     // 关键：seg.lines 是**模型原生换行**，每一行都是强边界 → 各自独立成泡。
     // 逐行处理，绝不跨行合并（模型写 `收到\n马上来` 就是想发两条）。
-    // v2.0 第十九步：只对「明显不该断开」的相邻行做后处理（见 mergeAcrossLines）。
-    const lineGroups = []
     for (const line of seg.lines) {
-      // v2.0 第二十一步：无标点超长行（乱码 / 长串）降级成 chunkSize 大块，
-      // 不再按 30 字拟人短句切，避免 4500 字变 150 条刷屏。
-      if (charCount(line) > LONG_LINE_NO_PUNCT_CHARS && !HAS_SENTENCE_PUNCT.test(line)) {
-        for (const chunk of splitText(line, hard)) lineGroups.push([chunk])
-        continue
-      }
       // 桥接硬切出的碎片允许合并，防止「短。短。短。」刷屏
       const pieces = mergeFragments(splitLineSemantic(line, bubbleMax, MIN_FIRST_PIECE_CHARS), bubbleMax, mergeMax)
-      const cleaned = []
       for (const piece of pieces) {
         if (doTrim) {
           const t = trimEndPunctuation(piece, keep, false)
-          if (t) cleaned.push(t)
-        } else if (piece) cleaned.push(piece)
+          if (t) out.push(t)
+        } else if (piece) out.push(piece)
       }
-      if (cleaned.length > 0) lineGroups.push(cleaned)
     }
-    out.push(...mergeAcrossLines(lineGroups, { bubbleMax, minBubble: MIN_BUBBLE_CHARS }))
   }
   return out.filter((x) => x.length > 0)
 }
@@ -1056,37 +557,6 @@ export function imageFileVia(file) {
   if (/^https?:\/\//i.test(ref)) return 'url'
   if (/^base64:\/\//i.test(ref)) return 'base64'
   return 'file'
-}
-
-/** 取前 24 个 base64 字符解码，看是不是 GIF 魔数（GIF87a / GIF89a）。 */
-function base64HeadIsGif(text) {
-  try {
-    const head = Buffer.from(String(text ?? '').slice(0, 24), 'base64')
-    return head.length >= 3 && head.subarray(0, 3).toString('ascii') === 'GIF'
-  } catch {
-    return false
-  }
-}
-
-/**
- * 这个图片引用是不是 GIF（只看后缀与魔数，不打网络）。
- *
- * 为什么要判：`sub_type:1` 的表情段里，GIF 还要带 `summary:'[动画表情]'`，
- * QQ 才按动画表情渲染；静态图不需要这个字段，多给反而可能干扰。
- * @param {string} file 图片地址（url / data: / base64:// / file:/// / 绝对路径）
- * @returns {boolean}
- */
-export function imageRefLooksGif(file) {
-  const ref = String(file ?? '').trim()
-  if (!ref) return false
-  if (/^base64:\/\//i.test(ref)) return base64HeadIsGif(ref.slice('base64://'.length))
-  if (/^data:/i.test(ref)) {
-    const comma = ref.indexOf(',')
-    return comma >= 0 && base64HeadIsGif(ref.slice(comma + 1))
-  }
-  // http(s) / file:/// / 绝对路径：只看路径部分的扩展名（忽略 ?query / #hash）。
-  const pathPart = ref.split(/[?#]/)[0]
-  return /\.gif$/i.test(pathPart)
 }
 
 export class OneBotClient {
@@ -1166,9 +636,6 @@ export class OneBotClient {
     this._pending = new Map() // echo -> {resolve, reject, timer, action}
     this._seq = 0
     this._handlers = new Set()
-    // notice 处理器（2026-10-26，戳一戳）：和消息处理器分开，避免桥接的 message
-    // 回调被通知事件串到（签名也不同）。
-    this._noticeHandlers = new Set()
     this._seen = new Set()
     this._seenOrder = []
     // 群成员昵称缓存（2026-10-23）：@ 段通常只有 QQ 号，没有昵称。
@@ -1238,44 +705,6 @@ export class OneBotClient {
     return () => this._handlers.delete(handler)
   }
 
-  /**
-   * 注册 notice 处理器（2026-10-26，目前只有戳一戳）。
-   * handler({ kind:'poke', userId, targetId, groupId, selfId, time, raw })
-   * @returns {Function} 注销函数
-   */
-  onNotice(handler) {
-    if (typeof handler !== 'function') throw new TypeError('onNotice 需要一个函数')
-    this._noticeHandlers.add(handler)
-    return () => this._noticeHandlers.delete(handler)
-  }
-
-  /**
-   * 已知昵称查询（群成员 / 好友缓存），取不到返回 ''。
-   *
-   * 缓存本身由消息事件顺手填（`_rememberName`），这里只是暴露给桥接（戳一戳文案
-   * 要拿戳的人昵称）。scopeKey 容错两种写法：
-   *   · OneBot 原生作用域：群号 / `'u'`（私聊只有一个桶）；
-   *   · 桥接的会话 key：`g:<群号>` / `u:<QQ号>`（bridge.keyOf 的格式）。
-   * 这样 §5.3 里不管桥接传哪种都能取到名字，取不到就让调用方退回 QQ 号。
-   * @param {string} scopeKey
-   * @param {string|number} qq
-   * @returns {string}
-   */
-  nameOf(scopeKey, qq) {
-    const scope = String(scopeKey ?? '').trim()
-    const id = String(qq ?? '').trim()
-    if (!scope || !id) return ''
-    const candidates = [scope]
-    if (/^g:/iu.test(scope)) candidates.push(scope.slice(2))
-    else if (/^u:/iu.test(scope)) candidates.push('u')
-    else if (/^\d+$/u.test(scope)) candidates.push('u') // 私聊只有一个桶，群号是数字时也兜一下
-    for (const key of candidates) {
-      const name = this._nameOf(key, id)
-      if (name) return name
-    }
-    return ''
-  }
-
   /** 建立连接并开始自动重连。返回后不代表已连上。 */
   async start() {
     // _stopped 是「已主动停止」标志，与 _started 分开——stop() 之后可以再 start()。
@@ -1312,26 +741,20 @@ export class OneBotClient {
    * 通用 OneBot API 调用（echo 关联 + 超时）。
    * 解析为完整响应对象 {status, retcode, data, echo}；status='failed' 也照样 resolve，
    * 由调用方自己看 retcode。只有传输层问题（未连接 / 发送失败 / 超时）才 reject。
-   *
-   * @param {string} action
-   * @param {object} [params]
-   * @param {{timeoutMs?:number}} [options] 单次超时覆盖（引用解析用短超时，
-   *   不能让它拖住正常回复；见 bridge 的 QUOTE_FETCH_* 常量）。
    */
-  async call(action, params = {}, options = {}) {
+  async call(action, params = {}) {
     const name = String(action ?? '')
     if (!name) throw new Error('call: action 不能为空')
     const ws = this._ws
     if (!ws || ws.readyState !== WS_OPEN) throw new Error(`call ${name}: WebSocket 未连接`)
-    const timeoutMs = Number(options?.timeoutMs) > 0 ? Number(options.timeoutMs) : this.callTimeoutMs
 
     const echo = `dshqq-${++this._seq}`
     const payload = JSON.stringify({ action: name, params: params ?? {}, echo })
     return await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._pending.delete(echo)
-        reject(new Error(`call ${name} 超时（${timeoutMs}ms）`))
-      }, timeoutMs)
+        reject(new Error(`call ${name} 超时（${this.callTimeoutMs}ms）`))
+      }, this.callTimeoutMs)
       this._pending.set(echo, { resolve, reject, timer, action: name })
       try {
         ws.send(payload)
@@ -1343,151 +766,9 @@ export class OneBotClient {
     })
   }
 
-  /**
-   * 拉一条历史消息的完整内容（引用解析用，2026-10-27）。
-   *
-   * 为什么需要：被引用原消息里的图片/视频/合并转发**不会**随当前消息一起下发，
-   * 只给一个 reply 段 id。不主动 get_msg，模型就只看到「引用了一条消息」。
-   *
-   * 永不抛：超时/撤回/风控一律返回 `{ ok:false, reason }`，由调用方静默降级。
-   * @param {string|number} messageId
-   * @returns {Promise<{ok:boolean, reason?:string, messageId?:string, userId?:string,
-   *   senderName?:string, text?:string, images?:Array<object>, videos?:Array<object>,
-   *   quote?:{replyId:string,forwardIds:string[],inlineNodes:Array<object>}, raw?:object}>}
-   */
-  async getMessage(messageId) {
-    const id = String(messageId ?? '').trim()
-    if (!/^\d+$/u.test(id)) return { ok: false, reason: `非法的 message_id：${id.slice(0, 40)}` }
-    try {
-      const res = await this.call('get_msg', { message_id: Number(id) }, { timeoutMs: QUOTE_FETCH_TIMEOUT_MS })
-      const data = res?.data && typeof res.data === 'object' ? res.data : null
-      if (!data) return { ok: false, reason: `get_msg 返回空（retcode=${res?.retcode}）` }
-      const raw = data.message ?? data.raw_message ?? ''
-      const message = Array.isArray(raw) ? raw : (typeof raw === 'string' && raw ? raw : [])
-      const sender = data.sender && typeof data.sender === 'object' ? data.sender : {}
-      // @ 昵称解析用消息所在群的缓存；私聊用 'u'（和 _parseMessageEvent 一致）。
-      const scopeKey = data.group_id == null ? 'u' : String(data.group_id)
-      return {
-        ok: true,
-        messageId: id,
-        userId: String(data.user_id ?? sender.user_id ?? ''),
-        senderName: String(sender.card || sender.nickname || ''),
-        text: parseMessage(message, data.raw_message, {
-          resolveAtName: (qq) => this._nameOf(scopeKey, qq),
-        }).trim(),
-        images: extractImagesFromMessage(raw),
-        videos: extractVideosFromMessage(raw),
-        quote: parseQuoteSegments(message),
-        raw: data,
-      }
-    } catch (error) {
-      return { ok: false, reason: error?.message ?? String(error) }
-    }
-  }
-
-  /**
-   * 拉一条合并转发（聊天记录）的内容（2026-10-27）。
-   *
-   * 返回的节点已压成 `{ name, userId, text, images }`，拼接格式由 bridge 决定。
-   * 同样永不抛：失败返回 `{ ok:false, nodes: [] }`。
-   * @param {string} forwardId
-   * @returns {Promise<{ok:boolean, reason?:string, nodes:Array<object>}>}
-   */
-  async getForwardMsg(forwardId) {
-    const id = String(forwardId ?? '').trim()
-    if (!id) return { ok: false, reason: '空的 forward_id', nodes: [] }
-    try {
-      const res = await this.call('get_forward_msg', { id }, { timeoutMs: QUOTE_FETCH_TIMEOUT_MS })
-      const data = res?.data ?? res
-      const list = Array.isArray(data?.messages) ? data.messages
-        : Array.isArray(data?.message) ? data.message
-          : Array.isArray(data) ? data
-            : []
-      const nodes = list.map((node) => normalizeForwardNode(node)).filter(Boolean)
-      return { ok: true, nodes }
-    } catch (error) {
-      return { ok: false, reason: error?.message ?? String(error), nodes: [] }
-    }
-  }
-
-  /**
-   * 拉群历史消息（`get_group_msg_history`，NapCat 的 go-cqhttp 兼容动作，2026-10-28）。
-   *
-   * NapCat 侧语义（packages/napcat-onebot/action/go-cqhttp/GetGroupMsgHistory.ts）：
-   *   · 不给 `message_seq` → `getAioFirstViewLatestMsgs(count)`，即**最近 count 条**；
-   *   · 给 `message_seq` → 以该序号为起点往回拉 count 条；
-   *   · 群号在 schema 里是 `Type.String`，必须按字符串传；
-   *   · 空历史 / 序号不存在时**直接抛错**（`消息X不存在`），不是返回空列表。
-   *
-   * 返回的 `messages` 是完整 OB11 消息对象；**顺序不保证**，由调用方按时间重排。
-   *
-   * @param {string|number} groupId
-   * @param {number} [count] 1..500
-   * @param {{timeoutMs?:number, messageSeq?:string|number}} [opts]
-   *   `messageSeq` 是**游标**：不传拿最新 count 条；传了就从该序号往前拉
-   *   （v2.0 翻页拉取用，见 unread-summary 的 fetchHistoryPaged）。
-   * @returns {Promise<{ok:boolean, messages:Array<object>, reason?:string}>}
-   */
-  async getGroupMsgHistory(groupId, count = 200, { timeoutMs = 15_000, messageSeq = '' } = {}) {
-    const gid = String(groupId ?? '').trim()
-    if (!/^\d+$/u.test(gid)) return { ok: false, messages: [], reason: `非法的群号：${gid.slice(0, 20)}` }
-    const size = Math.min(500, Math.max(1, Math.trunc(Number(count) || 200)))
-    const cursor = String(messageSeq ?? '').trim()
-    // NapCat 的 schema 里 message_seq 是数字；空串表示「从最新开始」，绝不能传 ""。
-    const seq = cursor !== '' && /^\d+$/u.test(cursor) ? Number(cursor) : undefined
-    try {
-      const res = await this.call('get_group_msg_history', {
-        group_id: gid,
-        count: size,
-        ...(seq === undefined ? {} : { message_seq: seq }),
-      }, { timeoutMs })
-      if (res?.status && res.status !== 'ok') {
-        return { ok: false, messages: [], reason: `retcode=${res?.retcode ?? '?'} ${res?.wording ?? ''}`.trim() }
-      }
-      const data = res?.data
-      const list = Array.isArray(data?.messages) ? data.messages : Array.isArray(data) ? data : []
-      return { ok: true, messages: list }
-    } catch (error) {
-      const message = error?.message ?? String(error)
-      // 「没有消息」在这条动作里是抛错，不是空数组：不当失败处理。
-      if (/不存在/u.test(message)) return { ok: true, messages: [] }
-      return { ok: false, messages: [], reason: message }
-    }
-  }
-
-  /**
-   * 发群合并转发（`send_group_forward_msg`，2026-10-28）。
-   *
-   * 约束（NapCat `SendMsg.ts:138-142`）：一条消息里**只能全是 node**，
-   * 混普通消息段会被直接拒；节点 schema 见 `OB11MessageNodeSchema`
-   * （`nickname` 必填，`user_id` / `uin` 可省，`content` 是 OB11MessageMixType）。
-   *
-   * @param {string|number} groupId
-   * @param {Array<object>} nodes buildForwardNodes() 的产物
-   * @param {{timeoutMs?:number}} [opts]
-   * @returns {Promise<{ok:boolean, messageId?:string, reason?:string}>}
-   */
-  async sendGroupForward(groupId, nodes, { timeoutMs = 15_000 } = {}) {
-    const gid = String(groupId ?? '').trim()
-    if (!/^\d+$/u.test(gid)) return { ok: false, reason: `非法的群号：${gid.slice(0, 20)}` }
-    if (!Array.isArray(nodes) || nodes.length === 0) return { ok: false, reason: '空的合并转发节点' }
-    try {
-      const res = await this.call('send_group_forward_msg', { group_id: gid, messages: nodes }, { timeoutMs })
-      const retcode = res?.retcode === undefined ? null : Number(res.retcode)
-      if (res?.status === 'failed' || (retcode !== null && retcode !== 0)) {
-        const detail = res?.wording ?? res?.message ?? ''
-        return { ok: false, reason: `retcode=${res?.retcode ?? '?'} ${detail}`.trim() }
-      }
-      const id = res?.data?.message_id ?? res?.data?.messageId
-      return { ok: true, messageId: id === undefined ? undefined : String(id) }
-    } catch (error) {
-      return { ok: false, reason: error?.message ?? String(error) }
-    }
-  }
-
   /** 私聊发送（自动分片，逐条，固定 sendIntervalMs 兜底）。 */
-  async sendPrivate(userId, text, opts = {}) {
-    return await this._sendText('private', userId, text, opts)
+  async sendPrivate(userId, text) {
+    return await this._sendText('private', userId, text)
   }
 
   /**
@@ -1497,78 +778,11 @@ export class OneBotClient {
    * @param {object} [opts]
    * @param {string} [opts.atUserId] 要 @ 的 QQ 号（发送者）；不传则不 @
    * @param {'first'|'last'} [opts.atPosition='last'] 只在哪一片 @（一条回复可能多片，全 @ 会刷屏）
-   * @param {string} [opts.replyTo] 要引用的原消息 `message_id`（群聊）；
-   *   只挂在第一片，且排在 at 之前（NapCat 要求 reply 段在最前面）
    */
   async sendGroup(groupId, text, opts = {}) {
     // 总开关兜底：即使调用方传了 atUserId，groupAtReply=false 也一律不带 @。
     const at = this.groupAtReply ? opts : { ...opts, atUserId: undefined }
     return await this._sendText('group', groupId, text, at)
-  }
-
-  /**
-   * 回戳（戳一戳，2026-10-26）。
-   *
-   * NapCat 的戳一戳 action 名声不统一，按「首选 + 兜底」两段打：
-   *   · 群聊：`group_poke` `{group_id, user_id}` → 失败再试 `send_poke` `{user_id, group_id}`；
-   *   · 私聊：`friend_poke` `{user_id}` → 失败再试 `send_poke` `{user_id}`。
-   * 「失败」包括 retcode 非 0 / status 非 ok / 传输层抛错。**永不抛**：全部失败
-   * 也返回对象，由桥接自己决定只 warn 还是提示（戳一戳失败不该影响主链路）。
-   *
-   * @param {'private'|'group'} kind
-   * @param {string|number} target 群号（group）或对方 QQ 号（private）
-   * @param {{userId?:string|number}} [opts] 被戳的人（回戳时就是戳你的人）
-   * @returns {Promise<{ok:boolean, action:string, retcode:number|null, error?:string}>}
-   */
-  async sendPoke(kind, target, { userId } = {}) {
-    const isGroup = kind === 'group'
-    const targetId = String(target ?? '').trim()
-    const poker = String(userId ?? (isGroup ? '' : targetId)).trim()
-    if (!/^\d+$/u.test(targetId) || targetId === '0') {
-      return {
-        ok: false, action: '',
-        error: `${isGroup ? 'group_id' : 'user_id'} 必须是正整数：${target}`,
-        retcode: null,
-      }
-    }
-    if (!/^\d+$/u.test(poker) || poker === '0') {
-      return { ok: false, action: '', error: `user_id 必须是正整数：${userId}`, retcode: null }
-    }
-
-    // 首选按协议扩展分叉；兜底统一走 send_poke（部分实现只有这一个）。
-    const attempts = isGroup
-      ? [
-        { action: 'group_poke', params: { group_id: Number(targetId), user_id: Number(poker) } },
-        { action: 'send_poke', params: { user_id: Number(poker), group_id: Number(targetId) } },
-      ]
-      : [
-        { action: 'friend_poke', params: { user_id: Number(poker) } },
-        { action: 'send_poke', params: { user_id: Number(poker) } },
-      ]
-
-    const failures = []
-    let lastRetcode = null
-    let lastAction = ''
-    for (const attempt of attempts) {
-      lastAction = attempt.action
-      try {
-        const res = await this.call(attempt.action, attempt.params)
-        const retcode = Number.isFinite(Number(res?.retcode)) ? Number(res.retcode) : null
-        const ok = res?.status === 'ok' && retcode === 0
-        if (ok) {
-          this.log.info(`回戳成功（${attempt.action} ${isGroup ? `group:${targetId}` : `private:${targetId}`} → ${poker}）`)
-          return { ok: true, action: attempt.action, retcode }
-        }
-        lastRetcode = retcode
-        failures.push(`${attempt.action}: retcode=${res?.retcode} status=${res?.status}`)
-        this.log.warn(`回戳被拒（${attempt.action}）：retcode=${res?.retcode} status=${res?.status}，尝试兜底 action`)
-      } catch (err) {
-        lastRetcode = null
-        failures.push(`${attempt.action}: ${err?.message ?? String(err)}`)
-        this.log.warn(`回戳异常（${attempt.action}）：${err?.message ?? err}，尝试兜底 action`)
-      }
-    }
-    return { ok: false, action: lastAction, error: failures.join('；'), retcode: lastRetcode }
   }
 
   /**
@@ -1584,14 +798,11 @@ export class OneBotClient {
    * @param {'private'|'group'} kind
    * @param {string|number} targetId QQ 号 / 群号
    * @param {string} file 图片地址（url / file:/// / base64:// / 绝对路径）
-   * @param {{atUserId?:string, subType?:0|1, position?:'before'|'after'}} [opts]
-   *   群聊可带 @（发图片默认不 @，见 _applyImageOp）；
-   *   `subType`：0=普通图片，1=表情（NapCat 按 `sub_type` 升成表情包，GIF 再补 summary）；
-   *   `position`：只写进回执 detail 便于排障，不改变发送时机（见 p2-contract，避免引入队列等待）。
+   * @param {{atUserId?:string}} [opts] 群聊可带 @（发图片默认不 @，见 _applyImageOp）
    * @returns {Promise<{ok:boolean, messageIds:string[], error?:string,
    *   retcode:number|null, status:string, via:'url'|'file'|'base64'|''}>}
    */
-  async sendImage(kind, targetId, file, { atUserId, subType, position } = {}) {
+  async sendImage(kind, targetId, file, { atUserId } = {}) {
     const id = String(targetId ?? '').trim()
     const ref = String(file ?? '').trim()
     const via = imageFileVia(ref)
@@ -1610,12 +821,7 @@ export class OneBotClient {
       message.push({ type: 'at', data: { qq: String(atUserId).trim() } })
       message.push({ type: 'text', data: { text: ' ' } })
     }
-    // sub_type 只在调用方明确给了 0/1 时下发：缺省保持老消息段形状，不改变既有行为。
-    const hasSubType = subType === 0 || subType === 1
-    const imageData = { file: ref, ...(hasSubType ? { sub_type: subType } : {}) }
-    // 表情 + GIF 才补 summary：NapCat 认这个字段，静态图加了反而可能被当成表情包。
-    if (subType === 1 && imageRefLooksGif(ref)) imageData.summary = '[动画表情]'
-    message.push({ type: 'image', data: imageData })
+    message.push({ type: 'image', data: { file: ref } })
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg'
     const params = kind === 'private' ? { user_id: Number(id), message } : { group_id: Number(id), message }
     try {
@@ -1751,26 +957,19 @@ export class OneBotClient {
    *   `[CQ:` 转义问题影响，也不用手工拼 `&#91;` 之类的实体）。
    * @returns {string|Array<object>}
    */
-  _buildSegments(kind, text, { atUserId, atPosition, replyTo } = {}) {
+  _buildSegments(kind, text, { atUserId, atPosition } = {}) {
     const needAt = kind === 'group'
       && atUserId !== undefined && atUserId !== null
       && /^\d+$/.test(String(atUserId).trim())
-    // 引用回复（2026-10-27）：`reply` 段必须挂在**段数组最前面**（at 之前），
-    // 否则 QQ 客户端认不出来；只对群聊生效（私聊没有「引用」这一说）。
-    // id 用入站事件的 message_id 原值，NapCat 侧按它找回原消息。
-    const replyId = kind === 'group' && replyTo !== undefined && replyTo !== null
-      ? String(replyTo).trim()
-      : ''
-    if (!needAt && !replyId) return escapeCqText(text)
+    if (!needAt) return escapeCqText(text)
     // at 放文本**前面**：QQ 客户端里 @ 会高亮成「@昵称」，正文跟在其后读起来自然。
     // at 与正文之间必须有一个空格（2026-10-23 修）：OneBot 的 at 段本身不负责空白，
     // 两个段紧挨着渲染出来就是「@群友你好」，模型和群友都会看错。
     const body = escapeCqText(String(text ?? '').replace(/^[ \t]+/u, ''))
-    const segments = []
-    if (replyId) segments.push({ type: 'reply', data: { id: replyId } })
-    if (needAt) segments.push({ type: 'at', data: { qq: String(atUserId).trim() } })
-    segments.push({ type: 'text', data: { text: needAt ? ' ' + body : body } })
-    return segments
+    return [
+      { type: 'at', data: { qq: String(atUserId).trim() } },
+      { type: 'text', data: { text: ' ' + body } },
+    ]
   }
 
   /** 决定第 index 片是否要挂 @。 */
@@ -1781,7 +980,7 @@ export class OneBotClient {
     return pos === 'first' ? index === 0 : index === total - 1
   }
 
-  async _sendText(kind, targetId, text, { atUserId, atPosition = 'last', replyTo, singleBubble = false } = {}) {
+  async _sendText(kind, targetId, text, { atUserId, atPosition = 'last' } = {}) {
     const id = String(targetId ?? '').trim()
     if (!/^\d+$/.test(id) || id === '0') {
       return { ok: false, messageIds: [], error: `${kind === 'private' ? 'user_id' : 'group_id'} 必须是正整数：${targetId}` }
@@ -1789,9 +988,9 @@ export class OneBotClient {
     const body = String(text ?? '').trim()
     if (!body) return { ok: false, messageIds: [], error: '消息内容为空' }
 
-    // 总开关关闭 / 调用方要求整条：不分片、不延时、整条合并发送
+    // 总开关关闭：不分片、不延时、整条合并发送
     //（审计仍在上游对全文做，顺序不变）。
-    const chunks = (this.typingDelayEnabled && singleBubble !== true)
+    const chunks = this.typingDelayEnabled
       ? splitBubbles(body, {
         chunkSize: this.chunkSize,
         bubbleMaxChars: this.bubbleMaxChars,
@@ -1809,15 +1008,7 @@ export class OneBotClient {
     for (let i = 0; i < chunks.length; i++) {
       // @ 只挂一片（first/last），避免多个气泡全 @ 刷屏。
       const withAt = this._shouldAt(kind, i, chunks.length, atUserId, atPosition)
-      // 引用也只挂**第一片**：分片回复后面几条纯文本，不然每个气泡都顶着一个引用很刷屏。
-      const withReply = kind === 'group' && i === 0 && replyTo !== undefined && replyTo !== null
-        && String(replyTo).trim() !== ''
-        ? String(replyTo).trim()
-        : ''
-      const message = this._buildSegments(kind, chunks[i], {
-        ...(withAt ? { atUserId, atPosition } : {}),
-        ...(withReply ? { replyTo: withReply } : {}),
-      })
+      const message = this._buildSegments(kind, chunks[i], withAt ? { atUserId, atPosition } : {})
       const params = kind === 'private'
         ? { user_id: Number(id), message }
         : { group_id: Number(id), message }
@@ -1935,8 +1126,18 @@ export class OneBotClient {
     ws.addEventListener('open', () => { if (this._ws === ws) this._onOpen() })
     ws.addEventListener('message', (ev) => { if (this._ws === ws) this._onRaw(ev?.data) })
     ws.addEventListener('error', (ev) => {
-      // close 会紧跟其后，重连逻辑放在 _onClose，这里只记一笔
+      if (this._ws !== ws) return
       this.log.warn(`WebSocket 错误：${ev?.message ?? ev?.error?.message ?? '未知'}`)
+      // 握手失败（如 NapCat 重启瞬间的 non-101 / network error）时，部分运行时
+      // 只发 error 不发 close。若不在这里兜底，this._ws 会一直指向这条死连接，
+      // 下次 _connect() 首行 `if (this._ws) return` 直接短路 → 永久失联，只能重启容器。
+      // 这里主动清理状态并进入退避重连；若 close 随后到达，它的守卫会跳过，不会重复调度。
+      this._ws = null
+      this._health.online = null
+      this._health.onlineSource = null
+      this._health.good = null
+      this._rejectAll('连接已断开')
+      this._scheduleReconnect()
     })
     ws.addEventListener('close', (ev) => { if (this._ws === ws) this._onClose(ev) })
   }
@@ -2104,14 +1305,7 @@ export class OneBotClient {
       return
     }
 
-    // 通知事件（2026-10-26，戳一戳）：必须放在「非 message 直接 return」之前，
-    // 否则 notice 全被吞掉。只认 notify/poke，其余交给 _dispatchNotice 静默。
-    if (postType === 'notice') {
-      this._dispatchNotice(packet)
-      return
-    }
-
-    if (postType !== 'message') return // request 等事件暂不处理
+    if (postType !== 'message') return // notice / request 暂不处理
 
     const kind = packet.message_type
     if (kind !== 'private' && kind !== 'group') return
@@ -2140,57 +1334,6 @@ export class OneBotClient {
     }
   }
 
-  /**
-   * notice 事件分发（2026-10-26，戳一戳）。
-   *
-   * 只认 `notice_type === 'notify' && sub_type === 'poke'`，其他通知只记 debug 并丢弃
-   * —— 通知类事件绝不能抛错把消息主链路带崩（`_onRaw` 在 WS 回调里同步调用）。
-   *
-   * 字段容错（NapCat 各版本 / go-cqhttp 系实现不一致）：
-   *   · 戳的人：`user_id`，老实现可能只给 `sender_id`；
-   *   · 被戳的人：`target_id`，缺了就空串（桥接侧再判是不是自己）；
-   *   · 机器人自己：`self_id`，缺了回落到 get_login_info 得到的 `_selfId`。
-   * 自戳（`userId === selfId`）直接丢：NapCat 会把机器人自己的操作也回灌成事件。
-   * @param {object} packet
-   */
-  _dispatchNotice(packet) {
-    const noticeType = String(packet.notice_type ?? '')
-    const subType = String(packet.sub_type ?? '')
-    if (noticeType !== 'notify' || subType !== 'poke') {
-      this.log.debug(`忽略通知事件：notice_type=${noticeType || '?'} sub_type=${subType || '?'}`)
-      return
-    }
-    const userId = String(packet.user_id ?? packet.sender_id ?? '')
-    const selfId = String(packet.self_id ?? this._selfId ?? '')
-    if (!userId) {
-      this.log.debug('戳一戳事件缺 user_id/sender_id，已忽略')
-      return
-    }
-    if (selfId && userId === selfId) {
-      this.log.debug(`自己戳自己已忽略（${userId}）`)
-      return
-    }
-    const event = {
-      kind: 'poke',
-      userId,
-      targetId: String(packet.target_id ?? ''),
-      groupId: packet.group_id == null ? null : String(packet.group_id),
-      selfId,
-      time: Number.isFinite(Number(packet.time)) ? Number(packet.time) : null,
-      raw: packet,
-    }
-    for (const handler of this._noticeHandlers) {
-      try {
-        const ret = handler(event)
-        if (ret && typeof ret.then === 'function') {
-          ret.catch((err) => this.log.error(`notice 处理器异常：${err?.message ?? err}`))
-        }
-      } catch (err) {
-        this.log.error(`notice 处理器异常：${err?.message ?? err}`)
-      }
-    }
-  }
-
   _parseMessageEvent(packet, kind) {
     const rawSender = packet.sender && typeof packet.sender === 'object' ? packet.sender : {}
     const userId = String(packet.user_id ?? rawSender.user_id ?? '')
@@ -2199,12 +1342,6 @@ export class OneBotClient {
     // 「@1000000001」变成「@小明」。私聊用 'u' 作为作用域。
     const scopeKey = kind === 'group' ? String(packet.group_id ?? '') : 'u'
     const senderName = String(rawSender.card || rawSender.nickname || '')
-    // 群成员身份（v2.0 第十步）：NapCat 的 sender.role 是 owner/admin/member。
-    // 只在群聊里认；私聊一律空串，避免把好友当成群主。
-    const roleRaw = String(rawSender.role ?? '').toLowerCase()
-    const senderRole = kind === 'group' && (roleRaw === 'owner' || roleRaw === 'admin' || roleRaw === 'member')
-      ? roleRaw
-      : ''
     if (scopeKey) this._rememberName(scopeKey, userId, senderName)
     const message = packet.message
     return {
@@ -2216,17 +1353,9 @@ export class OneBotClient {
       }),
       // 图片段单独抽出来：text 里仍保留 [图片] 占位（审计/日志用），
       // 但桥接要拿 url 去下载，喂给支持多模态的模型（2026-10-23，任务 5）。
-      // 用统一入口：NapCat 少数版本给的是 CQ 码字符串，只处理数组会丢图。
-      images: extractImagesFromMessage(message),
-      // 视频段同理（契约 §6）：桥接据 url 下载到 state/media/，追加本地路径给模型。
-      videos: extractVideosFromMessage(message),
-      // 引用 / 合并转发的标识（2026-10-27）：桥接拿 id 去 get_msg / get_forward_msg
-      // 拉原文，把被引用的图片与聊天记录补进上下文。这里只抽 id，不发请求。
-      quote: parseQuoteSegments(message),
+      images: extractImages(message),
       messageId: packet.message_id === undefined || packet.message_id === null ? '' : String(packet.message_id),
       senderName,
-      // 群身份（owner/admin/member；私聊为空）。Prompt 里按它打前缀，模型才不会瞎认群主。
-      senderRole,
       sender: rawSender,
       selfId: packet.self_id === undefined || packet.self_id === null ? null : String(packet.self_id),
       time: Number.isFinite(Number(packet.time)) ? Number(packet.time) : null,
