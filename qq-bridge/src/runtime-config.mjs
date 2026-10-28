@@ -105,6 +105,8 @@ const HOT_KEYS = [
   // v2.0 第十三步：模板六项字段下沉，选中模板变化要热同步。
   'personaPresets',
   'personaPresetId',
+  // v2.0 第十四步：括号内心戏开关（默认关）。
+  'allowInnerMonologue',
 ]
 
 /**

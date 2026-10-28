@@ -727,7 +727,7 @@ await check('下载失败（源不存在）：只 warn，保持原 [视频] 占�
   }, { logger: logs.logger })
   await b.handleMessage(privMsg('[视频]', { videos: [{ url: path.join(tmpDir('video-missing'), 'nope.mp4') }] }))
   assert.equal(calls.prompts.length, 1)
-  assert.equal(calls.prompts[0].text, '[视频]')
+  assert.ok(calls.prompts[0].text.startsWith('[视频]'))
   assert.ok(logs.logs.warns.some((line) => line.includes('视频下载失败')))
 })
 
@@ -743,7 +743,7 @@ await check('超过 maxBytes：不落盘（失败只 warn）', async () => {
     video: { enabled: true, maxBytes: 1024, timeoutMs: 2000 },
   })
   await b.handleMessage(privMsg('[视频]', { videos: [{ url: sourceFile }] }))
-  assert.equal(calls.prompts[0].text, '[视频]')
+  assert.ok(calls.prompts[0].text.startsWith('[视频]'))
 })
 
 // ── 视频抽帧（2026-10-27 真机 Bug：发 MP4 模型只看到「[视频]」）────────────────

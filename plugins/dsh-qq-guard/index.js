@@ -684,6 +684,11 @@ const Config = Schema.object({
   personaAutoUpdate: Schema.boolean()
     .description('每小时把本群聊天记录交给模型归纳、自动补充人设（仍受「锁定人设」约束）。')
     .default(true).volatile(),
+  // v2.0 第十四步（2026-10-28）：智能潜水。默认关闭括号内心戏；关掉时
+  // 「整段被 ()/（）包裹」的回复会被判定为非法潜水直接丢弃。
+  allowInnerMonologue: Schema.boolean()
+    .description('允许模型用括号写内心戏（如「(等一下)」）。关闭时整段括号回复会被丢弃，不发 QQ。')
+    .default(false).volatile(),
   // 戳一戳：回戳还是发文字/表情，由桥接侧的 notice 处理决定（这里只是开关与文案）。
   poke: Schema.object({
     enabled: Schema.boolean()

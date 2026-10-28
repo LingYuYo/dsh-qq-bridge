@@ -1725,7 +1725,7 @@ await check('管理员发 / 指令：放行投递 DSH', async () => {
   const { b, calls } = makeBridge({ rhythm: { debounceWindowMs: 0 }, allow: { admins: ['1000000001'] } })
   await b.handleMessage(privMsg('/clear', 'cmd2'))
   assert.equal(calls.prompts.length, 1, '管理员指令应进 prompt')
-  assert.equal(calls.prompts[0].text, '/clear')
+  assert.ok(calls.prompts[0].text.startsWith('/clear'))
   assert.equal(b.stats.commandsBlocked, 0)
 })
 await check('管理员身份不绕过白名单：不在 allow.private 里仍被拦', async () => {
@@ -2795,7 +2795,7 @@ await check('hook message：改写文本后再入队（入队前生效）', asyn
   })
   await b.handleMessage(privMsg('原始文本', 'p2-1'))
   assert.equal(calls.prompts.length, 1)
-  assert.equal(calls.prompts[0].text, '改写后的文本')
+  assert.ok(calls.prompts[0].text.startsWith('改写后的文本'))
   const msgEvent = seen.find((s) => s.event === 'message')
   assert.equal(msgEvent.payload.key, 'u:1000000001')
   assert.equal(msgEvent.payload.text, '原始文本')
@@ -2819,12 +2819,12 @@ await check('hook 失败/抛错 → 原样放行，聊天不中断', async () =>
   const { b, calls } = hookedBridge(() => { throw new Error('hook down') })
   await b.handleMessage(privMsg('还是正常聊', 'p2-3'))
   assert.equal(calls.prompts.length, 1)
-  assert.equal(calls.prompts[0].text, '还是正常聊')
+  assert.ok(calls.prompts[0].text.startsWith('还是正常聊'))
 })
 await check('hook 返回 ok:false → 原样放行', async () => {
   const { b, calls } = hookedBridge(() => ({ ok: false, modules: [], error: 'HTTP 500' }))
   await b.handleMessage(privMsg('照常', 'p2-4'))
-  assert.equal(calls.prompts[0].text, '照常')
+  assert.ok(calls.prompts[0].text.startsWith('照常'))
 })
 await check('hook before-context：text 替换正文 + sections 按序追加到正文之后', async () => {
   const { b, calls } = hookedBridge((event) => (event === 'before-context'
@@ -2839,15 +2839,17 @@ await check('hook before-context：text 替换正文 + sections 按序追加到�
     : { ok: true, modules: ['demo.ext'] }))
   await b.handleMessage(privMsg('原始', 'p2-5'))
   assert.equal(calls.prompts.length, 1)
-  assert.equal(calls.prompts[0].text,
-    '替换后的正文\n\n[外部上下文：记忆]\n用户喜欢短句\n\n[外部上下文：天气]\n今天晴')
+  assert.ok(calls.prompts[0].text.startsWith(
+    '替换后的正文\n\n[外部上下文：记忆]\n用户喜欢短句\n\n[外部上下文：天气]\n今天晴',
+  ), calls.prompts[0].text.slice(0, 120))
 })
 await check('hook before-context：只给 sections 时追加在原文之后（不替换）', async () => {
   const { b, calls } = hookedBridge((event) => (event === 'before-context'
     ? { ok: true, modules: ['demo.ext'], sections: [{ title: '笔记', text: '甲' }] }
     : { ok: true, modules: ['demo.ext'] }))
   await b.handleMessage(privMsg('原文', 'p2-6'))
-  assert.equal(calls.prompts[0].text, '原文\n\n[外部上下文：笔记]\n甲')
+  assert.ok(calls.prompts[0].text.startsWith('原文\n\n[外部上下文：笔记]\n甲'),
+    calls.prompts[0].text.slice(0, 120))
 })
 await check('没有启用外部插件 → 一条 hook 都不发', async () => {
   const { b } = makeBridge({ rhythm: { debounceWindowMs: 0 } })

@@ -2518,6 +2518,16 @@ window.__ModuleLoader__.load({
             checked: get('personaAutoUpdate') !== false, disabled: !writable,
             ariaLabel: '每小时提取动态记忆', onChange: (v) => write('personaAutoUpdate', v),
           })),
+        // v2.0 第十四步：智能潜水 / 括号内心戏（默认关 = 整段括号回复直接丢弃）。
+        h(Field, {
+          label: '允许括号内心戏',
+          desc: '关闭时，模型整段被 ()/（）包裹的回复（如「(等一下)」）会被判定为潜水直接丢弃；'
+            + '开启则原样放行，适合傲娇 / 旁白人设。',
+        },
+          h(Switch, {
+            checked: get('allowInnerMonologue') === true, disabled: !writable,
+            ariaLabel: '允许括号内心戏', onChange: (v) => write('allowInnerMonologue', v),
+          })),
         open
           ? h(PersonaModal, {
             key: `persona-${botName}-${participation}-${[...coreIdentity].length}`,

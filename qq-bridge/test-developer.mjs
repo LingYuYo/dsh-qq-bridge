@@ -217,7 +217,9 @@ await check('context：注入统计按会话记录', () => {
   for (let i = 0; i < 4; i++) b._noteChatLog('g:123456', groupMsg(`第${i}条`), `第${i}条`, [], '')
   b._entryOf('g:123456').lastAt = 1
   const sections = b._contextSections('g:123456')
-  assert.equal(sections.length, 1)
+  // v2.0 第十四步：每轮固定追加潜水指令 → 记忆段 + 指令段。
+  assert.equal(sections.length, 2)
+  assert.match(sections.at(-1), /<silent>/u)
   const row = b.sessionViews().find((item) => item.key === 'g:123456')
   assert.equal(row.context.enabled, true)
   assert.equal(row.context.budget, 128000)

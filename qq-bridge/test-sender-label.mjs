@@ -99,7 +99,7 @@ await check('昵称为空 → 用 QQ 号当昵称（格式不变）', async () =
 await check('私聊不加标签（保持原样）', async () => {
   const { b, calls } = makeBridge()
   await b.handleMessage(privMsg('私聊的一句话'))
-  assert.equal(calls.prompts[0].text, '私聊的一句话')
+  assert.ok(calls.prompts[0].text.startsWith('私聊的一句话'))
 })
 
 await check('标签格式严格：英文冒号 + 一个空格', async () => {

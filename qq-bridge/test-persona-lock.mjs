@@ -147,7 +147,7 @@ await check('私聊不触发这条指令（照常投递给模型）', async () =
   const { b, calls } = makeBridge({ personaLocked: false })
   await b.handleMessage(privMsg('你要改成更凶一点'))
   assert.equal(calls.prompts.length, 1, '私聊应走正常投递')
-  assert.equal(calls.prompts[0].text, '你要改成更凶一点')
+  assert.ok(calls.prompts[0].text.startsWith('你要改成更凶一点'))
   assert.equal(b.state.sessions['u:1000000001'].personaDelta, '')
 })
 
