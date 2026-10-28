@@ -382,6 +382,64 @@ await check('POST /status 会话行带 activityLevel（端到端不丢）', asyn
   assert.equal(row.persona, '单人设', '★ 单人设回填也要存活')
 })
 
+console.log('\n— v2.0 会话详情字段（只读上报，任务一）—')
+await check('sanitizeSessionRow：recent / context / summary / modelRoute 全部白名单收敛', () => {
+  const { sanitizeSessionRow } = mod
+  const row = sanitizeSessionRow({
+    key: 'g:1',
+    modelRoute: 'deepseek-account/deepseek-flash',
+    context: { budget: 128000, enabled: true, turns: 5, tokens: 1234, dropped: 2 },
+    summary: { lastAt: 1700000000000, runs: 3, lastError: '  boom\n' },
+    recent: Array.from({ length: 15 }, (_, i) => ({
+      at: 1700000000000 + i, name: ' 群友 ', qq: ' 1001 ', kind: 'group',
+      text: 'x'.repeat(500), quote: 'y'.repeat(500),
+    })),
+    raw: { at: 1700000000000, json: 'z'.repeat(5000) },
+  })
+  assert.equal(row.modelRoute, 'deepseek-account/deepseek-flash')
+  assert.equal(row.context.budget, 128000)
+  assert.equal(row.context.turns, 5)
+  assert.equal(row.context.dropped, 2)
+  assert.equal(row.summary.runs, 3)
+  assert.equal(row.summary.lastError, 'boom', 'lastError 压成单行并 trim')
+  assert.equal(row.recent.length, 10, '★ 最多 10 条')
+  assert.equal(row.recent[0].name, '群友', '昵称单行 trim')
+  assert.equal(row.recent[0].text.length, 200, '正文截断 200')
+  assert.equal(row.recent[0].quote.length, 160, '引用截断 160')
+  assert.equal(row.raw.json.length, 2200, 'raw 封顶 2200')
+})
+await check('sanitizeSessionRow：明细缺省时不写键（区分「不在活跃窗口」和「没有消息」）', () => {
+  const { sanitizeSessionRow } = mod
+  const row = sanitizeSessionRow({ key: 'u:1' })
+  assert.equal(Object.prototype.hasOwnProperty.call(row, 'recent'), false)
+  assert.equal(Object.prototype.hasOwnProperty.call(row, 'raw'), false)
+  assert.equal(row.modelRoute, '')
+  assert.deepEqual(row.context, { budget: 0, enabled: true, turns: 0, tokens: 0, dropped: 0 })
+})
+
+console.log('\n— 三阶权限与开发者特权的 Config 默认值（fail-closed）—')
+await check('allow.developers / deny / developer 默认值', () => {
+  const plain = mod.plainConfig(Config({ role: 'settings' })) ?? {}
+  assert.deepEqual(plain.allow.developers, [], '开发者名单默认空（缺省降级为主人 + 管理员）')
+  assert.deepEqual(plain.allow.deny.private, [], '私聊黑名单默认空')
+  assert.deepEqual(plain.allow.deny.groups, [], '群黑名单默认空')
+  const dev = plain.developer ?? {}
+  assert.equal(dev.enabled, false, '★ 暗号开关默认关')
+  assert.deepEqual(dev.keywords, ['/dev', '/admin'])
+  assert.equal(dev.prompt, '')
+  assert.equal(dev.strangerReply, false, '普通群友命中默认静默')
+  assert.equal(dev.debugPayload, false)
+  assert.deepEqual(dev.memoryNotes, [], '动态记忆预览默认空')
+  const card = (plain.skills ?? []).find((item) => item && item.id === 'sk-developer')
+  assert.ok(card, '默认技能清单里要有 sk-developer')
+  assert.equal(card.enabled, false, '★ 技能卡默认关（双闸）')
+  assert.equal(mod.readFeatureFlags({ role: 'settings', skills: [] }).developer, false,
+    '老清单里没有这张卡 → 不能凭空打开')
+  assert.equal(mod.readFeatureFlags({
+    role: 'settings', skills: [{ id: 'sk-developer', enabled: true }],
+  }).developer, true)
+})
+
 console.log('\n— 动态人设 section（替代 preset 里的静态 persona 行）—')
 await check('guard 注册 deployment:persona-prefix，complete:true + 动态 text', () => {
   const sections = []
@@ -442,6 +500,8 @@ await check('readFeatureFlags：把开关聚合成桥接/guard 共用的布尔',
     voice: true, image: true, vision: true, search: true, time: true, memory: true,
     // 2026-10-28（v2.0 第一步）：未读归纳，老清单缺项按开启。
     unread: true,
+    // 2026-10-28（v2.0 第二步）：开发者特权，缺项按**关闭**（提权通道 fail-closed）。
+    developer: false,
     guard: true, debounce: true, rateLimit: true,
   })
 })

@@ -300,6 +300,10 @@ const DEFAULT_SKILLS = [
   // 廉价模型把这段时间的群聊整理成摘要，再用合并转发发回群里。
   { id: 'sk-unread', name: '未读归纳', icon: 'search', tag: '内置', ver: '1.0.0', enabled: true,
     desc: '主人发 /归纳 [条数]：拉群历史 → 廉价模型总结 → 合并转发发回群里（失败降级纯文本）。' },
+  // 2026-10-28（v2.0 第二步）：开发者特权。默认**关闭**（提权通道 fail-closed），
+  // 只有清单里明确 enabled !== false 且 developer.enabled=true 才生效。
+  { id: 'sk-developer', name: '开发者特权', icon: 'code', tag: '内置', ver: '1.0.0', enabled: false,
+    desc: '开发者 QQ 命中暗号时，把专属 Prompt 追加到本轮尾部；不进系统提示词、不改工具白名单。' },
   { id: 'sk-remind', name: '定时提醒', icon: 'clock', tag: '内置', ver: '1.1.0', enabled: false,
     desc: '按 cron 或「每天早上八点」这类自然语言创建提醒，到点私聊推送。' },
   { id: 'sk-weather', name: '天气查询', icon: 'spark', tag: '实验', ver: '0.9.3', enabled: false,
@@ -811,11 +815,63 @@ const Config = Schema.object({
     owners: Schema.array(Schema.string())
       .description('主人 QQ 号：管理员全部权限 + 触发后台动作（/归纳）。')
       .default([]).volatile(),
+    // 开发者（2026-10-28 v2.0）：三阶权限最高一档（开发者 > 主人 > 管理员）。
+    // 开发者自动算主人与管理员，另加一项：命中暗号（developer.keywords）时
+    // 把 developer.prompt 追加到本轮 Prompt **尾部**。
+    // ⚠️ 数组缺省 / 非数组时桥接自动降级为主人 + 管理员，不会报错。
+    developers: Schema.array(Schema.string())
+      .description('开发者 QQ 号：主人全部权限 + 暗号提权（尾部追加专属 Prompt）。')
+      .default([]).volatile(),
+    // 黑名单（v2.0）：桥接侧 _allow() 一直在读 deny.private / deny.groups，
+    // 但 Config 一直没声明 —— 设置页的「黑名单」按钮以前写不进去。
+    // 语义：deny 优先于 allow（见 bridge.isAllowed）。
+    deny: Schema.object({
+      private: Schema.array(Schema.string())
+        .description('私聊黑名单 QQ 号：命中直接忽略，优先于私聊白名单。')
+        .default([]).volatile(),
+      groups: Schema.array(Schema.string())
+        .description('群黑名单群号：命中直接忽略，优先于群白名单。')
+        .default([]).volatile(),
+    }).description('黑名单（优先于白名单）').default({}),
     allowAllWhenEmpty: Schema.boolean()
       .description('白名单为空时是否放行所有人。默认 false（fail-closed，安全）。')
       .default(false).volatile(),
   }).description('白名单').default({}),
 
+  // ── 开发者特权（v2.0，2026-10-28）──────────────────────────────
+  //
+  // 三阶权限（开发者 > 主人 > 管理员）里最高一档的**唯一**特权出口。
+  // 红线：
+  //   · 只认 allow.developers 里的 QQ 号（isDeveloper，不看昵称/正文/模型输出）；
+  //   · 命中触发词时只把 prompt 追加在发给 DSH 的 Prompt **尾部**，
+  //     **绝不**写系统提示词 / 人设 section / 工具白名单；
+  //   · 默认关闭（fail-closed），并且还要技能卡 sk-developer 同时开着才生效。
+  developer: Schema.object({
+    enabled: Schema.boolean()
+      .description('启用特权暗号：关闭时触发词完全不参与判定（消息原样走普通链路）。默认关。')
+      .default(false).volatile(),
+    keywords: Schema.array(Schema.string())
+      .description('触发关键词（以它开头才算命中，如 /dev、/admin）。区分大小写不敏感由桥接归一。')
+      .default(['/dev', '/admin']).volatile(),
+    prompt: Schema.string()
+      .description('专属 Prompt：命中时追加到本轮 Prompt 尾部（多行，绝不动前缀缓存）。')
+      .default('').volatile(),
+    strangerReply: Schema.boolean()
+      .description('普通群友命中暗号时是否回一句固定文案。默认关 = 静默丢弃，不暴露机制存在。')
+      .default(false).volatile(),
+    debugPayload: Schema.boolean()
+      .description('调试：把每个会话最近一条原始入站 Payload 留在桥接内存并上报（设置页「调试信息」用）。'
+        + '默认关；只存内存、截断 2000 字、不落盘。')
+      .default(false).volatile(),
+    // 只读预览（v2.0 任务三）：模型自动提取的开发者偏好。
+    // 当前先留 UI 接口，底层写入逻辑后续补；UI 只读展示，不提供编辑。
+    memoryNotes: Schema.array(Schema.object({
+      at: Schema.number().default(0),
+      text: Schema.string().default(''),
+      source: Schema.string().default(''),
+    })).description('开发者动态记忆（模型自动提取的偏好，只读预览；底层后续补写入）。')
+      .default([]).volatile(),
+  }).description('开发者特权（暗号提权）').default({}),
   // ── OneBot 连接（为 4B 做准备）────────────────────────────────
   // 只读展示为主；改了也要重启桥接（WS 连接在启动时建立）。
   onebot: Schema.object({
@@ -1188,6 +1244,8 @@ export function readFeatureFlags(config = featureState.source) {
     // 未读归纳（2026-10-28）：老用户的 skills 数组里没有这张卡，但默认**开启**，
     // 与 sk-time-aware / sk-image 同一条兼容规则（缺项不等于用户关掉了它）。
     unread: itemEnabledOr(config, 'sk-unread', true),
+    // 开发者特权（v2.0）：与其它新卡相反 —— 缺项按**关闭**，提权通道必须 fail-closed。
+    developer: itemEnabledOr(config, 'sk-developer', false),
     guard: itemEnabledIn(config, 'pl-guard', 'plugin'),
     debounce: itemEnabledIn(config, 'pl-debounce', 'plugin'),
     rateLimit: itemEnabledIn(config, 'pl-ratelimit', 'plugin'),
@@ -2897,6 +2955,92 @@ function sanitizeSessionRow(row) {
     // 单群响应档位：**null = 跟随全局**，是一个有意义的取值，必须原样保留；
     // 绝不能走上面的 num()（它会把 0 和 null 都压成 0，"仅艾特"和"跟随全局"就分不清了）。
     activityLevel: normalizeActivityLevelInput(row.activityLevel),
+    // ── v2.0（2026-10-28）会话详情上报 ──────────────────────────────
+    // 轻量字段：每条会话都带。
+    modelRoute: text(row.modelRoute, 160),
+    context: sanitizeSessionContext(row.context),
+    summary: sanitizeSessionSummary(row.summary),
+    // 重字段：桥接只给最近活跃的 12 个会话带；缺省时**不写键**，
+    // 前端据此区分「不在活跃窗口」和「确实没有消息」。
+    ...(Array.isArray(row.recent) ? { recent: sanitizeRecentRows(row.recent) } : {}),
+    ...(row.raw && typeof row.raw === 'object' ? { raw: sanitizeRawPayload(row.raw) } : {}),
+  }
+}
+
+/**
+ * 收敛「记忆注入预算 / 最近一轮实际注入」。
+ * 全部字段都是展示用数字，非法值一律归零，绝不把 NaN 传给前端。
+ * @param {unknown} value
+ */
+function sanitizeSessionContext(value) {
+  const src = value && typeof value === 'object' ? value : {}
+  const num = (input, max) => {
+    const n = Number(input)
+    return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), max) : 0
+  }
+  return {
+    budget: num(src.budget, 10_000_000),
+    enabled: src.enabled !== false,
+    turns: num(src.turns, 1000),
+    tokens: num(src.tokens, 10_000_000),
+    dropped: num(src.dropped, 100_000),
+  }
+}
+
+/**
+ * 收敛「未读归纳水位」。lastError 是给排障看的，压成单行 + 截断。
+ * @param {unknown} value
+ */
+function sanitizeSessionSummary(value) {
+  const src = value && typeof value === 'object' ? value : {}
+  const num = (input, max) => {
+    const n = Number(input)
+    return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), max) : 0
+  }
+  return {
+    lastAt: num(src.lastAt, 8.64e15),
+    runs: num(src.runs, 100_000),
+    lastError: typeof src.lastError === 'string'
+      ? src.lastError.replace(/\s+/gu, ' ').trim().slice(0, 200)
+      : '',
+  }
+}
+
+/**
+ * 收敛「最近入站消息」数组（最多 10 条）。
+ *
+ * 顺序是**最新在前**（桥接侧已经倒序），这里不再重排；
+ * 每条正文 / 引用各自截断，防止桥接未来改大后把状态 POST 撑爆。
+ * @param {unknown[]} rows
+ */
+function sanitizeRecentRows(rows) {
+  const text = (value, max) => (typeof value === 'string' ? value.replace(/\s+/gu, ' ').trim().slice(0, max) : '')
+  const out = []
+  for (const row of rows.slice(0, 10)) {
+    if (!row || typeof row !== 'object') continue
+    const at = Number(row.at)
+    out.push({
+      at: Number.isFinite(at) && at > 0 ? Math.min(Math.floor(at), 8.64e15) : 0,
+      name: text(row.name, 80),
+      qq: text(row.qq, 40),
+      kind: row.kind === 'private' ? 'private' : 'group',
+      text: text(row.text, 200),
+      quote: text(row.quote, 160),
+    })
+  }
+  return out
+}
+
+/**
+ * 收敛「原始入站 Payload」。只接受字符串，长度封顶 2200（桥接截断在 2000）。
+ * @param {unknown} value
+ */
+function sanitizeRawPayload(value) {
+  const src = value && typeof value === 'object' ? value : {}
+  const at = Number(src.at)
+  return {
+    at: Number.isFinite(at) && at > 0 ? Math.min(Math.floor(at), 8.64e15) : 0,
+    json: typeof src.json === 'string' ? src.json.slice(0, 2200) : '',
   }
 }
 
@@ -4007,7 +4151,9 @@ function applySettings(ctx, config) {
         }
         // UI 入队：{ op, key, text?, level? }
         const op = typeof body?.op === 'string' ? body.op : ''
-        if (!['clear', 'delete', 'persona', 'activity'].includes(op)) {
+        // summarize（v2.0）：设置页「记忆与摘要」的快捷按钮，由桥接按群 key 触发归纳。
+        // 它不是 QQ 消息，桥接侧标 origin=console，**不冒充主人**（权限仍只认事件 QQ 号）。
+        if (!['clear', 'delete', 'persona', 'activity', 'summarize'].includes(op)) {
           sendJson(res, 400, { ok: false, reason: 'unknown-op', detail: `未知操作：${op || '(空)'}` })
           return
         }
@@ -5030,14 +5176,15 @@ function applySettings(ctx, config) {
         // 只接受本机桥接进程上报：它没有浏览器 Cookie，所以不做 origin 校验，
         // 改为限制请求体大小 + 只收白名单字段（不允许任意写）。
         //
-        // 64KB：除了 5 个进程级计数，现在还带一份会话列表（未读/昵称/最近消息），
-        // 100 个会话约 15~25KB，留一倍余量。超过即拒绝，绝不无限收。
+        // 128KB（v2.0）：除了 5 个进程级计数与会话列表，现在还带「最近入站消息」明细
+        // （桥接只给最近活跃的 12 个会话带，单条 200 字内）。100 个会话的基础行约 25KB，
+        // 明细部分约 30KB，128KB 留一倍余量。超过即拒绝，绝不无限收。
         const chunks = []
         let size = 0
         let aborted = false
         req.on('data', (c) => {
           size += c.length
-          if (size > 65536) { aborted = true; try { req.destroy() } catch { /* 已断开就忽略 */ } return }
+          if (size > 131072) { aborted = true; try { req.destroy() } catch { /* 已断开就忽略 */ } return }
           chunks.push(c)
         })
         req.on('end', () => {

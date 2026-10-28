@@ -513,9 +513,9 @@ await check('POST /status 不带 sessions 时不写 sessions 键（区分「没�
   assert.equal('sessions' in (r.body.status ?? {}), false)
 })
 
-await check('POST /status 超过 64KB 直接 413', async () => {
+await check('POST /status 超过 128KB 直接 413（v2.0 上限上调，明细则由 12 条窗口限流）', async () => {
   const { routes } = makeHarness({ config: {} })
-  const huge = JSON.stringify({ counts: {}, sessions: [{ key: 'u:1', lastText: 'x'.repeat(70000) }] })
+  const huge = JSON.stringify({ counts: {}, sessions: [{ key: 'u:1', lastText: 'x'.repeat(140000) }] })
   const r = await call(routes.get('/dsh-qq-guard/status'), { method: 'POST', body: huge })
   assert.equal(r.status, 413)
 })
