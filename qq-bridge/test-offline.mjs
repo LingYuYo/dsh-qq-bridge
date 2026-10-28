@@ -328,7 +328,16 @@ await check('刻意断开的应答词 / 短句 / 1 字不合并', () => {
   assert.deepEqual(splitBubbles('第一句\n第二句\n第三句'), ['第一句', '第二句', '第三句'])
   assert.deepEqual(splitBubbles('甲\r\n乙\r丙'), ['甲', '乙', '丙'])
 })
-// v2.0 第二十步：超长单行代码块必须切到 chunkSize 以内，不能整条超 QQ 上限。
+// v2.0 第二十一步：无标点超长行降级大块，避免 4500 字切成 150 条刷屏。
+await check('无标点超长行降级成 chunkSize 大块（4500 字 → 5 条）', () => {
+  const parts = splitBubbles('x'.repeat(4500))
+  assert.equal(parts.length, 5, `实际 ${parts.length} 条`)
+  assert.ok(parts.every((p) => charCount(p) <= 1000), parts.map((p) => charCount(p)).join('/'))
+  // 没到阈值仍按拟人短句切
+  assert.equal(splitBubbles('x'.repeat(450)).length, 15)
+  // 有标点的长文保持短句切分（不被降级影响）
+  assert.ok(splitBubbles('内容。'.repeat(750)).length > 50)
+})
 await check('单行 5000 字代码块 → 按硬上限切开，不整条发', () => {
   const parts = splitBubbles('```\n' + 'x'.repeat(5000) + '\n```', { chunkSize: 1000 })
   assert.ok(parts.length >= 5, `应至少 5 条，实际 ${parts.length}`)

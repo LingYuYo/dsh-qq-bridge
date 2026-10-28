@@ -916,6 +916,18 @@ export function normalizeTypingMsTiers(source) {
 /** 极短气泡阈值（v2.0 第十九步）：单个泡小于这个码点数时，尝试与相邻行合并。 */
 export const MIN_BUBBLE_CHARS = 4
 
+/**
+ * 无标点超长行的降级阈值（v2.0 第二十一步）。
+ *
+ * 一行超过这个长度且**一个标点都没有**（乱码 / 无断句的长串）时，
+ * 放弃「拟人短句」切分，改用 chunkSize 发大块 —— 否则 4500 字会切成
+ * 150 条 30 字消息，既刷屏又容易触发风控。
+ */
+export const LONG_LINE_NO_PUNCT_CHARS = 500
+
+/** 判断一行里有没有任何断句标点（中文 / 英文都算）。 */
+const HAS_SENTENCE_PUNCT = /[。！？!?；;…，,、：:]/u
+
 /** 独立应答词：即使是极短行也**不合并**（模型可能就是想单发一个「嗯」）。 */
 const STANDALONE_SHORT = new Set([
   '嗯', '嗯嗯', '哦', '噢', '好', '好的', '行', '行吧', '对', '是', '在', '在的', '收到', '知道了', '明白',
@@ -1010,6 +1022,12 @@ export function splitBubbles(text, opts = {}) {
     // v2.0 第十九步：只对「明显不该断开」的相邻行做后处理（见 mergeAcrossLines）。
     const lineGroups = []
     for (const line of seg.lines) {
+      // v2.0 第二十一步：无标点超长行（乱码 / 长串）降级成 chunkSize 大块，
+      // 不再按 30 字拟人短句切，避免 4500 字变 150 条刷屏。
+      if (charCount(line) > LONG_LINE_NO_PUNCT_CHARS && !HAS_SENTENCE_PUNCT.test(line)) {
+        for (const chunk of splitText(line, hard)) lineGroups.push([chunk])
+        continue
+      }
       // 桥接硬切出的碎片允许合并，防止「短。短。短。」刷屏
       const pieces = mergeFragments(splitLineSemantic(line, bubbleMax, MIN_FIRST_PIECE_CHARS), bubbleMax, mergeMax)
       const cleaned = []
