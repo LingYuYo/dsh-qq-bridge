@@ -338,10 +338,13 @@ await check('每会话最多 80 条（旧的先丢）', async () => {
   assert.equal(b._chatLog.get('g:123456').length, 80)
 })
 
-await check('私聊不进归纳缓冲', async () => {
+await check('私聊也进聊天缓冲，但每小时人设归纳只读群会话', async () => {
   const { b } = makeBridge()
   await b.handleMessage(privMsg('私聊一句话'))
-  assert.equal(b._chatLog.size, 0)
+  // 2026-10-27 起私聊也记（messageTurns 需要私聊上下文）；归纳侧按 g: 键过滤。
+  assert.equal(b._chatLog.get('u:1000000001')?.length, 1, '私聊要进缓冲')
+  const groupKeys = [...b._chatLog.keys()].filter((key) => key.startsWith('g:'))
+  assert.equal(groupKeys.length, 0, '归纳只遍历 g: 键，私聊不会被拿去归纳')
 })
 
 console.log('\n联动：热配置白名单 / DSH 归纳客户端：')

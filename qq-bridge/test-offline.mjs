@@ -2441,6 +2441,8 @@ await check('features：Host 下发的派生值优先；缺字段按默认补', 
   assert.deepEqual(normalizeFeatures({ vision: false, search: false }), {
     voice: true, vision: false, search: false, guard: true, debounce: true, rateLimit: true,
     image: true, time: true, memory: true, unread: true,
+    // v2.0：开发者特权缺字段按关闭（提权通道 fail-closed），不是「缺项按开启」。
+    developer: false,
   })
   assert.equal(featuresFromManifests({ skills: [{ id: 'sk-vision', enabled: false }] }).vision, false)
   assert.equal(featuresFromManifests({ skills: [] }).vision, false, '清单里没有 = 关闭')

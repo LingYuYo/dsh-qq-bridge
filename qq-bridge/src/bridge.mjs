@@ -229,6 +229,10 @@ export const DEFAULT_FEATURES = Object.freeze({
   // 「未读归纳」（sk-unread，2026-10-28 v2.0 第一步）：同样缺项按开启；
   // 真正能不能跑还取决于 unreadSummary.enabled 与**主人**身份（见 isOwner）。
   unread: true,
+  // 「开发者特权」（sk-developer，2026-10-28 v2.0）：**缺项按关闭**，与其它新卡相反。
+  // 理由：这是提权通道（暗号 + 专属 Prompt），默认必须 fail-closed；
+  // 老配置里没有这张卡时绝不能凭空打开。
+  developer: false,
 })
 
 /** 归一化 features：缺字段按默认值补，非布尔忽略。 */
@@ -246,6 +250,7 @@ export function normalizeFeatures(source) {
     time: bool(raw.time, DEFAULT_FEATURES.time),
     memory: bool(raw.memory, DEFAULT_FEATURES.memory),
     unread: bool(raw.unread, DEFAULT_FEATURES.unread),
+    developer: bool(raw.developer, DEFAULT_FEATURES.developer),
   }
 }
 
@@ -279,6 +284,11 @@ export function featuresFromManifests({ skills, plugins } = {}) {
     unread: !Array.isArray(skills) || !skills.some((item) => item && item.id === 'sk-unread')
       ? DEFAULT_FEATURES.unread
       : pick(skills, 'sk-unread', DEFAULT_FEATURES.unread),
+    // 「开发者特权」：老清单里没有这张卡 → **默认关闭**（提权通道 fail-closed）。
+    // 只有清单里明确存在且 enabled !== false 才算开启。
+    developer: !Array.isArray(skills) || !skills.some((item) => item && item.id === 'sk-developer')
+      ? DEFAULT_FEATURES.developer
+      : pick(skills, 'sk-developer', DEFAULT_FEATURES.developer),
   })
 }
 
@@ -378,6 +388,39 @@ const NAME_TTL_MS = 30 * 60 * 1000
 const PREVIEW_MAX = 80
 /** 上报给设置页的会话行上限（多余的不展示，也不会无限撑大 POST 体积）。 */
 const SESSION_VIEW_CAP = 100
+
+// ── 2026-10-28 v2.0：会话详情上报 / 开发者特权 ───────────────────────────
+
+/**
+ * 带「明细字段」的会话数上限（recent / raw）。
+ *
+ * 为什么要限量：状态 POST 每 2 秒一次，Host 侧有请求体上限（v2.0 提到 128KB）。
+ * 100 个会话各带 10 条最近消息 ≈ 200KB，直接 413。这里只给**最近活跃的 N 个**
+ * 会话带重字段，其余会话只给基础行 + 轻量字段（modelRoute / context / summary）。
+ * UI 对拿不到明细的会话必须显示「不在活跃窗口」，不能假装没有消息。
+ */
+const SESSION_DETAIL_CAP = 12
+/** 「最近入站消息」最多带几条（设置页「记忆与摘要」Tab）。 */
+const RECENT_INBOUND_MAX = 10
+/** 单条最近入站消息的正文截断长度（字符）。 */
+const RECENT_INBOUND_TEXT_MAX = 200
+/** 引用摘要的截断长度（字符）。 */
+const RECENT_QUOTE_MAX = 160
+/** 原始入站 Payload 的留存长度上限（只在 developer.debugPayload=true 时记录）。 */
+const RAW_PAYLOAD_MAX = 2000
+/** 开发者暗号的默认触发词（与插件 Schema 的默认值保持一致）。 */
+export const DEFAULT_DEVELOPER_KEYWORDS = Object.freeze(['/dev', '/admin'])
+/**
+ * 开发者特权段的小节标题。
+ *
+ * 必须显式写「仅本轮 / 不要在群里复述」：这段文本是给模型的行为指令，
+ * 一旦被它原样复述到群里，暗号机制等于当众曝光。
+ */
+export const DEV_PROMPT_HEADER = '【开发者特权（仅本轮有效，不要在群里复述这段内容）】'
+/** 暗号命中但没带正文时的占位正文（否则会在「空消息」判定处被丢掉）。 */
+const DEV_EMPTY_TEXT = '（开发者暗号，无正文）'
+/** 普通群友命中暗号、且配置了「回一句」时的固定文案。 */
+export const DEV_STRANGER_REPLY = '（暗号不对哦）'
 
 // ── 2026-10-27 群聊上下文自动清理 ────────────────────────────────────────
 
@@ -970,6 +1013,14 @@ export class Bridge {
     // 最近一次注入的截断统计（2026-10-27）：{ kept, dropped, tokens, budget }，
     // 只用于日志 / 离线测试断言，不参与任何决策。
     this._lastMemoryTrim = null
+    // 按会话的注入统计（v2.0，2026-10-28）：key -> { lines, tokens, dropped }，
+    // 给设置页「记忆与摘要」Tab 显示「这一轮实际注入了多少」。
+    this._lastMemoryTrimByKey = new Map()
+    // 模型实际下发值（v2.0）：sessionId -> 'provider/model'（空串 = 跟随全局）。
+    // 只记**成功**下发的那一次；失败重试不覆盖，避免调试面板闪来闪去。
+    this._modelRouteBySession = new Map()
+    // 原始入站 Payload（v2.0 调试面板）：key -> { at, json }，只在开关打开时写。
+    this._rawInbound = new Map()
     // 时间感知（2026-10-27）：静默超过阈值时先记一笔，等下一次真正走模型的轮次再消费。
     // key -> { minutes:number, at:number }
     this._silenceHints = new Map()
@@ -1119,6 +1170,8 @@ export class Bridge {
       autoReplies: 0,
       // 工具能力升级导致的旧会话上下文重建次数（v0.5.1）。
       capabilityRefreshes: 0,
+      // 开发者暗号（v2.0）：命中次数 / 非开发者命中被忽略的次数。
+      devTriggers: 0, devDenied: 0,
     }
   }
 
@@ -1361,6 +1414,11 @@ export class Bridge {
       // 主人（2026-10-28）：比管理员高一阶，能触发后台动作（未读归纳）。
       // 主人**自动视同管理员**（见 isAdmin），否则他连 `/` 指令都发不进来。
       owners: norm(source.owners),
+      // 开发者（2026-10-28 v2.0，三阶权限最高一档）：能触发暗号提权（尾部专属 Prompt）。
+      // 开发者视同主人（见 isOwner）与管理员（见 isAdmin）。
+      // ⚠️ 缺省 / 非数组 / 老配置文件里没有这个键 → norm() 返回空数组，
+      //    权限自动降级为主人 + 管理员，**不抛错、不改任何既有行为**。
+      developers: norm(source.developers),
       deny: {
         private: norm(source.deny?.private),
         groups: norm(source.deny?.groups),
@@ -1400,28 +1458,106 @@ export class Bridge {
     const sender = String(msg?.userId ?? '')
     if (!sender) return false
     const allow = this._allow()
-    return allow.admins.includes(sender) || allow.owners.includes(sender)
+    return allow.admins.includes(sender)
+      || allow.owners.includes(sender)
+      || allow.developers.includes(sender)
   }
 
   /**
    * 发送者是否是主人（`allow.owners`，2026-10-28 新增的第一阶之上）。
    *
-   * 权限分阶（现状）：
+   * 权限分阶（v2.0，2026-10-28 三阶）：
    *   · 普通群友：只能聊天，不能发 `/` 指令；
    *   · 管理员（`allow.admins`）：能发 `/` 指令（清空 / 删除 / 模型等）；
-   *   · 主人（`allow.owners`）：管理员全部权限 + 触发后台动作（`/归纳`，会花 token 调模型）。
-   * 开发者暗号提权仍在 Roadmap，未实装 —— 所以这里**只认事件里的 QQ 号**，
-   * 不认昵称、消息文本或模型输出。
+   *   · 主人（`allow.owners`）：管理员全部权限 + 触发后台动作（`/归纳`，会花 token 调模型）；
+   *   · 开发者（`allow.developers`）：主人全部权限 + 暗号提权（尾部专属 Prompt）。
+   *
+   * 高阶层**自动继承**低阶层：开发者算主人也算管理员，主人算管理员。
+   * 这条继承只能单向（管理员绝不是主人），否则权限就名存实亡。
+   * 判定**只认事件里的 QQ 号**，不认昵称、消息文本或模型输出。
    * @param {object} msg
    */
   isOwner(msg) {
     const sender = String(msg?.userId ?? '')
     if (!sender) return false
-    return this._allow().owners.includes(sender)
+    const allow = this._allow()
+    return allow.owners.includes(sender) || allow.developers.includes(sender)
   }
 
   /**
-   * 取（必要时创建）某会话的 state 条目，并保证是对象形态。
+   * 发送者是否是开发者（`allow.developers`，v2.0 三阶权限最高一档）。
+   *
+   * 只用于**暗号提权**这一件事：命中触发词时把 `developer.prompt` 追加到 Prompt 尾部。
+   * 不做任何其它特权（不改工具白名单、不改系统提示词、不冒充主人触发后台动作）。
+   * @param {object} msg
+   */
+  isDeveloper(msg) {
+    const sender = String(msg?.userId ?? '')
+    if (!sender) return false
+    return this._allow().developers.includes(sender)
+  }
+
+  /**
+   * 现读「开发者特权」配置（设置页热同步优先，config.json 兜底）。
+   *
+   * 与其它 `_xxxConfig()` 保持同一个口径：**每次现读**热配置，不缓存 ——
+   * 用户在设置页关掉暗号后，下一条消息就要失效。
+   *
+   * 三个闸门同时成立才算开启：`features.developer`（技能卡总开关）、
+   * `developer.enabled`（卡内暗号开关）、`allow.developers` 非空（见 isDeveloper）。
+   * 前两个任意一个关着 → 暗号完全不参与判定，也不会吞掉消息。
+   *
+   * @returns {{enabled:boolean, keywords:string[], prompt:string,
+   *   strangerReply:boolean, debugPayload:boolean}}
+   */
+  _developerConfig() {
+    const hot = this.live?.developer
+    const source = (hot && typeof hot === 'object' && !Array.isArray(hot))
+      ? hot
+      : (this.config?.developer ?? {})
+    const rawKeywords = Array.isArray(source.keywords) && source.keywords.length > 0
+      ? source.keywords
+      : DEFAULT_DEVELOPER_KEYWORDS
+    const keywords = rawKeywords
+      .map((item) => String(item ?? '').trim())
+      .filter((item) => item !== '')
+      // 长词优先：同时配了 `/adm` 与 `/admin` 时，`/admin x` 必须按长词剥，
+      // 否则会剥出一个 `in x` 的残句。
+      .sort((left, right) => right.length - left.length)
+    return {
+      enabled: source.enabled === true,
+      keywords,
+      prompt: String(source.prompt ?? '').trim(),
+      strangerReply: source.strangerReply === true,
+      debugPayload: source.debugPayload === true,
+    }
+  }
+
+  /**
+   * 开发者暗号匹配：只有**以关键词开头**才算命中。
+   *
+   * 为什么是「开头」而不是「包含」：群里随口一句「今天 /dev 挂了吗」不该触发提权。
+   * 关键词后面必须跟空白或标点，避免 `/admin` 把 `/administrator` 吃掉。
+   *
+   * @param {string} text 原始消息正文（未拼引用块）
+   * @param {{enabled:boolean, keywords:string[]}} conf
+   * @returns {{keyword:string, text:string}|null} text = 剥掉关键词后的正文
+   */
+  _matchDeveloperTrigger(text, conf) {
+    const source = String(text ?? '').trim()
+    if (source === '' || conf?.enabled !== true) return null
+    for (const keyword of conf.keywords ?? []) {
+      if (source === keyword) return { keyword, text: '' }
+      if (!source.startsWith(keyword)) continue
+      const rest = source.slice(keyword.length)
+      // 分隔符：空白、任意 Unicode 标点 / 符号（含全角括号、冒号、破折号）。
+      // 只认分隔符是为了不让 `/admin` 把 `/administrator` 吃掉。
+      if (/^(?:\s|[\p{P}\p{S}])/u.test(rest)) return { keyword, text: rest.trim() }
+    }
+    return null
+  }
+
+  /** 取（必要时创建）某会话的 state 条目，并保证是对象形态。
    *
    * 为什么不在各处直接 `state.sessions[key]`：旧文件里可能是字符串，
    * 混用两种形态会让 `entry.unread++` 静默写坏数据。
@@ -1625,8 +1761,9 @@ export class Bridge {
    * @param {object} msg
    * @param {string} text
    * @param {Array<object>} [images]
+   * @param {string} [quote] 已解析的引用摘要（v2.0：设置页「记忆与摘要」用，不参与注入）
    */
-  _noteChatLog(key, msg, text, images = []) {
+  _noteChatLog(key, msg, text, images = [], quote = '') {
     // 2026-10-27：私聊也记（messageTurns 需要私聊上下文）；每小时归纳只读 g: 键，
     // 所以这里放开不会把私聊内容混进群人设归纳。
     if (msg?.kind !== 'group' && msg?.kind !== 'private') return
@@ -1636,12 +1773,15 @@ export class Bridge {
     if (!line) return
     const now = Date.now()
     const list = (this._chatLog.get(key) ?? []).filter((item) => now - item.at < CHAT_LOG_WINDOW_MS)
+    const quoted = String(quote ?? '').replace(/\s+/gu, ' ').trim()
     list.push({
       name: String(msg.senderName ?? '').trim(),
       qq: String(msg.userId ?? ''),
       kind: msg.kind,
       text: line,
       at: now,
+      // 引用摘要：只给 UI 展示（v2.0）。旧记录没有这个字段 → 缺省即可，读取方按空串处理。
+      ...(quoted === '' ? {} : { quote: quoted.slice(0, RECENT_QUOTE_MAX) }),
       // 自增序号：messageTurns 注入时用它把「本轮自己」排除掉，避免同一条消息出现两遍。
       seq: ++this._chatLogSeq,
     })
@@ -1649,17 +1789,47 @@ export class Bridge {
   }
 
   /**
+   * 留存一条原始入站 Payload（v2.0 调试面板）。
+   *
+   * 边界：
+   *   · **只在** `developer.debugPayload === true` 时由 handleMessage 调用；
+   *   · 每会话只留最近一条（调试看的是「刚进去的这条长什么样」）；
+   *   · 截断 {@link RAW_PAYLOAD_MAX} 字，只存在内存，**绝不落盘**；
+   *   · 序列化失败（循环引用等）静默放弃，绝不影响收发。
+   *
+   * @param {string} key
+   * @param {object} msg
+   */
+  _noteRawInbound(key, msg) {
+    try {
+      const json = JSON.stringify(msg)
+      if (typeof json !== 'string') return
+      this._rawInbound.set(key, {
+        at: Date.now(),
+        json: json.length > RAW_PAYLOAD_MAX ? `${json.slice(0, RAW_PAYLOAD_MAX)}…（已截断）` : json,
+      })
+    } catch { /* 调试字段，失败就算了 */ }
+  }
+
+  /**
    * 给设置页「会话管理」用的真实列表数据。
    *
    * 只读、纯数据（不含任何凭据）；按最近活动倒序，最多 {@link SESSION_VIEW_CAP} 条。
-   * @returns {Array<{key:string, sessionId:string, kind:string, qq:string,
-   *   name:string, title:string, unread:number, lastAt:number, lastText:string,
-   *   persona:string, activityLevel:number|null}>}
+   *
+   * v2.0（2026-10-28）新增的明细字段分两档：
+   *   · **轻量**（每条会话都带）：`modelRoute` / `context` / `summary`；
+   *   · **重字段**（最近活跃的 {@link SESSION_DETAIL_CAP} 条才带）：`recent` / `raw`。
+   * 限量的原因见常量注释：状态 POST 每 2 秒一次，100 个会话各带 10 条最近消息会超 Host 的请求体上限。
+   *
+   * @returns {Array<object>}
    */
   sessionViews() {
     const rows = []
     for (const [key, raw] of Object.entries(this.state.sessions ?? {})) {
       const entry = normalizeSessionEntry(key, raw)
+      const memory = this._memoryConfig()
+      const trim = this._lastMemoryTrimByKey.get(key) ?? null
+      const summary = this.state.unreadSummary?.[key]
       rows.push({
         key,
         sessionId: entry.sessionId,
@@ -1674,10 +1844,60 @@ export class Bridge {
         persona: entry.persona,
         // 单群活跃系数：null = 跟随全局；设置页用它回填档位选择器。
         activityLevel: entry.activityLevel,
+        // v2.0（轻量）：模型实际下发值。空串 = 跟随全局默认（没有无痕覆写）。
+        modelRoute: this._modelRouteBySession.get(entry.sessionId) ?? '',
+        // v2.0（轻量）：记忆注入预算与最近一轮实际注入量（桥接侧可观测的那部分）。
+        context: {
+          budget: Math.max(0, Math.round(Number(memory.maxContextTokens) || 0)),
+          enabled: memory.enabled !== false,
+          turns: Number(trim?.lines ?? 0),
+          tokens: Math.max(0, Math.round(Number(trim?.tokens) || 0)),
+          dropped: Math.max(0, Math.round(Number(trim?.dropped) || 0)),
+        },
+        // v2.0（轻量）：未读归纳水位（设置页显示「上次归纳」）。
+        summary: {
+          lastAt: Number(summary?.lastSummaryAt) || 0,
+          runs: Number(summary?.runs) || 0,
+          lastError: typeof summary?.lastError === 'string' ? summary.lastError.slice(0, 200) : '',
+        },
+        _heavy: {
+          recent: this._recentInboundViews(key),
+          raw: this._rawInbound.get(key) ?? null,
+        },
       })
     }
     rows.sort((left, right) => (right.lastAt || 0) - (left.lastAt || 0))
-    return rows.slice(0, SESSION_VIEW_CAP)
+    const capped = rows.slice(0, SESSION_VIEW_CAP)
+    // 重字段只发给最近活跃的 N 条；其余会话不带 recent / raw（前端显示「不在活跃窗口」）。
+    return capped.map((row, index) => {
+      const { _heavy: heavy, ...base } = row
+      if (index >= SESSION_DETAIL_CAP) return base
+      return {
+        ...base,
+        ...(heavy.recent.length > 0 ? { recent: heavy.recent } : {}),
+        ...(heavy.raw ? { raw: heavy.raw } : {}),
+      }
+    })
+  }
+
+  /**
+   * 最近 {@link RECENT_INBOUND_MAX} 条入站消息（设置页「记忆与摘要」用）。
+   *
+   * 只读 `_chatLog`（内存环形缓冲，不落盘）；倒序给最新在前，正文按
+   * {@link RECENT_INBOUND_TEXT_MAX} 截断，防止把状态 POST 撑大。
+   * @param {string} key
+   */
+  _recentInboundViews(key) {
+    const now = Date.now()
+    const list = (this._chatLog.get(key) ?? []).filter((item) => now - item.at < CHAT_LOG_WINDOW_MS)
+    return list.slice(-RECENT_INBOUND_MAX).reverse().map((item) => ({
+      at: Number(item.at) || 0,
+      name: String(item.name ?? ''),
+      qq: String(item.qq ?? ''),
+      kind: item.kind === 'private' ? 'private' : 'group',
+      text: String(item.text ?? '').slice(0, RECENT_INBOUND_TEXT_MAX),
+      quote: String(item.quote ?? '').slice(0, RECENT_QUOTE_MAX),
+    }))
   }
 
   /**
@@ -2013,6 +2233,9 @@ export class Bridge {
       this.stats.modelPushes++
       this._modelRouteWarned = false
       const want = provider && model ? `${provider}/${model}` : '跟随全局默认'
+      // v2.0：设置页「调试信息」显示实际下发值。空串 / 「跟随全局默认」都归一成空串，
+      // 前端据此显示「跟随全局」而不是把中文文案当模型名。
+      this._modelRouteBySession.set(sessionId, provider && model ? want : '')
       if (this._lastAppliedModel !== `${want}|${entry?.model ?? ''}`) {
         this._lastAppliedModel = `${want}|${entry?.model ?? ''}`
         this.logger.info?.(`会话 ${sessionId} 模型：${want}${fallbacks.length > 0 ? `（备用 ${fallbacks.length} 个）` : ''}`)
@@ -2119,7 +2342,10 @@ export class Bridge {
     const action = String(op?.op ?? '')
     // voice / image 任务由 guard 工具按 sessionId 入队（没有 QQ 会话 key），
     // 不能走 _entryOf('')，否则会在 state.sessions 里留下一个空 key 的垃圾行。
-    const entry = (action === 'voice' || action === 'image') ? null : this._entryOf(key)
+    // summarize（v2.0）：由设置页按钮按群 key 触发，也不该顺手建占位空会话。
+    const entry = (action === 'voice' || action === 'image' || action === 'summarize')
+      ? null
+      : this._entryOf(key)
 
     if (action === 'persona') {      entry.persona = String(op?.text ?? '').slice(0, 20000)
       this._saveState()
@@ -2179,6 +2405,35 @@ export class Bridge {
     // 「发图片」技能（P2）：guard 里的 qq_send_image 只负责入队，真正的图片发送在这里做。
     if (action === 'image') {
       return await this._applyImageOp(op)
+    }
+
+    // 「生成未读归纳」按钮（v2.0，2026-10-28）：设置页「记忆与摘要」Tab 触发。
+    //
+    // 为什么要单独一个 op 而不是伪造一条主人的 QQ 消息：
+    // 权限红线是「只认事件里的 QQ 号」，控制台入队没有 QQ 号，**不冒充主人**。
+    // 这里走的是「控制台触发」这条独立入口，日志会明确标 origin=console；
+    // 归纳结果仍然发回群里（和水位推进逻辑完全共用 _runUnreadSummary）。
+    if (action === 'summarize') {
+      if (!key.startsWith('g:')) {
+        return { ok: false, error: 'not-a-group', action: 'summarize', key,
+          detail: '未读归纳只能在群会话上触发' }
+      }
+      const conf = this._summaryConfig()
+      if (!conf.enabled || this._features().unread === false) {
+        return { ok: false, error: 'summary-disabled', action: 'summarize', key,
+          detail: '未读归纳已关闭（设置 → 技能与插件 → 未读归纳）' }
+      }
+      if (this._summaryRuns.has(key)) {
+        return { ok: false, error: 'summary-running', action: 'summarize', key,
+          detail: '上一次归纳还没跑完，稍等一下' }
+      }
+      const count = Math.min(SUMMARY_HARD_LIMIT, conf.maxMessages)
+      // 合成一条最小 msg：只给 _send / _displayName 需要的字段，userId 故意留空
+      // （= 这条不是任何 QQ 用户发的，日志里一眼能分辨）。
+      const msg = { kind: 'group', groupId: key.slice(2), userId: '', senderName: '控制台' }
+      this.logger.info?.(`未读归纳由控制台触发（origin=console）：${key} count=${count}`)
+      void this._runUnreadSummary({ msg, key, count, conf })
+      return { ok: true, action: 'summarize', key, detail: `已开始归纳最近 ${count} 条` }
     }
 
     return { ok: false, error: 'unknown-op', action }
@@ -3000,6 +3255,9 @@ export class Bridge {
       return
     }
     const key = this.keyOf(msg)
+    // 原始入站 Payload（v2.0 调试面板）：只在设置页开了 developer.debugPayload 时留存。
+    // 每会话只留最近一条、截断 2000 字、**不落盘**（进程重启即清空）。
+    if (this._developerConfig().debugPayload) this._noteRawInbound(key, msg)
     let text = (msg.text ?? '').trim()
     // 图片段（2026-10-23）：纯图片消息也要能进模型，不再因为 text 为空直接丢弃。
     const images = Array.isArray(msg.images) ? msg.images : []
@@ -3022,7 +3280,39 @@ export class Bridge {
     // 引用 / 合并转发深度解析（2026-10-27）：必须在空消息判定**之前**——
     // 「只引用了别人的图、自己没打字」也是一条要回的消息。
     // 聊天记录缓冲（每小时人设归纳）仍用原文与原始图片，别让引用内容污染归纳。
-    const chatText = text
+    //
+    // 0.1) 开发者暗号（v2.0，2026-10-28）：三阶权限里最高的一档。
+    //      顺序必须在 `/` 指令门禁（下面 isCommand）**之前**：默认触发词 `/dev` 本身
+    //      以 `/` 开头，先过指令门禁会被当成「非管理员指令」回绝，暗号永远到不了这里。
+    //      命中后**剥掉关键词再往下走**：DSH 把 `/` 开头的 prompt 当指令，带进去本轮直接废。
+    //      提权文本只经由 devPrompt 往 Prompt **尾部**追加，绝不进系统提示词 / 人设。
+    const devConf = this._developerConfig()
+    // 三道闸同时成立才算「暗号功能在线」：技能卡开关（features）、卡内开关、名单非空。
+    // 任一不成立 → devHit 直接为 null，消息按普通链路走（不剥词、不吞消息）。
+    const devOnline = devConf.enabled && this._features().developer === true
+    const devHit = devOnline ? this._matchDeveloperTrigger(text, devConf) : null
+    let devPrompt = ''
+    let chatText = text
+    if (devHit) {
+      if (this.isDeveloper(msg)) {
+        devPrompt = devConf.prompt
+        chatText = devHit.text
+        text = devHit.text === '' && images.length === 0 ? DEV_EMPTY_TEXT : devHit.text
+        this.stats.devTriggers++
+        this.logger.info?.(`开发者暗号命中：${key} keyword=${devHit.keyword}`
+          + `（尾部追加 ${devPrompt.length} 字）`)
+      } else {
+        // 普通群友（含主人 / 管理员）命中暗号：默认静默丢弃，绝不进 DSH、绝不提权。
+        // 可选回一句固定文案（developer.strangerReply）；无论哪种都不暴露提示词内容。
+        this.stats.devDenied++
+        this.logger.info?.(`非开发者命中暗号，已忽略：${key} sender=${msg.userId}`)
+        if (devConf.strangerReply) {
+          const sent = await this._send(msg, DEV_STRANGER_REPLY)
+          if (!(sent && sent.ok === false)) this._noteReplied(key)
+        }
+        return
+      }
+    }
     const chatImageCount = images.length
     // 斜杠指令不拼引用块：DSH 只认**以 `/` 开头**的 prompt，前面加一行 `[引用…]`
     // 会让 `/clear` 之类的指令直接失效（省一次 get_msg，也少一次误触发）。
@@ -3074,7 +3364,8 @@ export class Bridge {
     // logSince 是「本条消息即将拿到的序号」：messageTurns 注入时只取 < 它的记录，
     // 这样本轮自己的话不会被拼进 prompt 里重复一遍。
     const logSince = this._chatLogSeq + 1
-    this._noteChatLog(key, msg, chatText, images.slice(0, chatImageCount))
+    // 第 5 个参数 = 引用摘要（v2.0 会话详情用）。只影响 UI 展示，不参与任何上下文拼装。
+    this._noteChatLog(key, msg, chatText, images.slice(0, chatImageCount), quoted.text)
     // 1) `/` 开头的指令：只有 allow.admins 里的人能执行。
     //    非管理员直接回一句提示并丢弃，**不投递 DSH**（省 token，也不给模型被诱导的机会）。
     //    管理员指令不过响应档位（私聊/群聊都算），但白名单仍然有效——见 isAllowed。
@@ -3123,7 +3414,7 @@ export class Bridge {
         )
       }
     }
-    await this._enqueue(key, msg, text, images, { beforeSeq: logSince })
+    await this._enqueue(key, msg, text, images, { beforeSeq: logSince, devPrompt })
   }
 
   /**
@@ -3191,13 +3482,18 @@ export class Bridge {
       void this._flushDebounce(key)
         .catch((e) => this.logger.error?.(`处理 ${key} 失败：${e?.message ?? e}`))
     }
-    const entry = this._debounce.get(key) ?? { texts: [], images: [], msg: null, timer: null, beforeSeq: undefined }
+    const entry = this._debounce.get(key) ?? {
+      texts: [], images: [], msg: null, timer: null, beforeSeq: undefined, devPrompt: '',
+    }
     // 一轮里只认**第一条**消息的序号上界：后面同批的消息本来就该被当前 prompt 覆盖。
     if (entry.beforeSeq === undefined && Number.isFinite(Number(options?.beforeSeq))) {
       entry.beforeSeq = Number(options.beforeSeq)
     }
     if (labelled) entry.texts.push(labelled)
     if (images.length > 0) entry.images.push(...images)
+    // 开发者特权文本跟着这一批走：同一个人在防抖窗口里连发两条暗号，
+    // 后一条的提示词覆盖前一条（内容一样，只是幂等更新）。
+    if (options?.devPrompt) entry.devPrompt = String(options.devPrompt)
     entry.msg = msg // 同一发送者的最后一条：引用 / @ 都指向它
     if (entry.timer) clearTimeout(entry.timer)
     entry.timer = setTimeout(() => {
@@ -3231,7 +3527,10 @@ export class Bridge {
     const turnMsg = { ...entry.msg }
     const texts = [...entry.texts]
     const images = [...entry.images]
-    return await this._processBatch(key, turnMsg, texts, images, { beforeSeq: entry.beforeSeq })
+    return await this._processBatch(key, turnMsg, texts, images, {
+      beforeSeq: entry.beforeSeq,
+      devPrompt: entry.devPrompt,
+    })
   }
 
   /**
@@ -3311,6 +3610,26 @@ export class Bridge {
         if (contextSections.length > 0) {
           promptText = `${promptText}\n\n${contextSections.join('\n\n')}`
           // 多模态时正文在 content[0].text 里，必须同步（否则模型只收到图片 + 原始正文）。
+          if (built.images > 0 && Array.isArray(built.content) && built.content[0]?.type === 'text') {
+            const markers = Array.isArray(built.rawMarkers) ? built.rawMarkers : []
+            built.content[0] = {
+              type: 'text',
+              text: markers.length > 0
+                ? `${promptText}\n\n${markers.map((token) => `[[qqimg:${token}]]`).join('\n')}`
+                : promptText,
+            }
+          }
+          if (built.images === 0) built.fallbackText = promptText
+        }
+        // 0.95) 开发者特权（v2.0，2026-10-28）：**只追加在 Prompt 尾部**。
+        //
+        // 红线（README「前缀缓存保护」）：系统提示词 / 人设 / 记忆前缀一个字都不能动，
+        // 那是缓存命中的主体；这段文本每轮都可能变（关掉暗号就没了），
+        // 天生只能活在尾部 —— 和「时间感知 / 记忆小节」同一层，顺序也排在它们之后。
+        const devText = String(options?.devPrompt ?? '').trim()
+        if (devText !== '') {
+          promptText = `${promptText}\n\n${DEV_PROMPT_HEADER}\n${devText}`
+          // 多模态：正文在 content[0].text 里，不同步 = 模型只收到图片 + 原始正文。
           if (built.images > 0 && Array.isArray(built.content) && built.content[0]?.type === 'text') {
             const markers = Array.isArray(built.rawMarkers) ? built.rawMarkers : []
             built.content[0] = {
@@ -4349,6 +4668,13 @@ export class Bridge {
       })
       if (lines.length > 0) {
         const trim = this._lastMemoryTrim ?? {}
+        // v2.0：按会话留一份，设置页「记忆与摘要」用它显示「这一轮实际注入了多少」。
+        // 只记真实发生的注入（lines=0 时保留上一次的值，避免面板忽然归零）。
+        this._lastMemoryTrimByKey.set(key, {
+          lines: lines.length,
+          tokens: Number(trim.tokens) || 0,
+          dropped: Number(trim.dropped) || 0,
+        })
         if (Number(trim.dropped) > 0) {
           this.logger.info?.(`记忆与上下文：注入 ${lines.length} 条，按上限截断 ${trim.dropped} 条`
             + `（预估 ${trim.tokens} token / 预算 ${trim.budget}，${key}）`)
