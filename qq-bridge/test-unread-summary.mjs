@@ -26,9 +26,11 @@ import {
   SUMMARY_TIME_LIMIT_MINUTES,
   buildForwardNodes,
   buildSummaryPrompt,
+  conversationFromEvents,
   fetchHistoryPaged,
   formatTranscript,
   forwardNodeText,
+  mergeBriefingHistory,
   nextWatermark,
   normalizeHistoryMessage,
   normalizeSummary,
@@ -76,7 +78,7 @@ function rawMsg({ id = 1, qq = '20001', name = '群友A', text = '你好', time 
 /** 假 OneBot + 假 DSH：只实现这条链路用到的几个方法。 */
 function fakeRuntime(bridge, {
   history = [], reply = '主线：大家在聊搬家。\n---\n有人提到周末下雨。', forwardOk = true,
-  promptError = null,
+  promptError = null, dshEvents = null,
 } = {}) {
   const sent = []
   const privates = []
@@ -120,6 +122,8 @@ function fakeRuntime(bridge, {
       return reply
     },
     async archiveSession(id) { archive.push(id); events.push(['archive', id]) },
+    // v2.0 第九步：DSH 历史快照（只有显式传了 dshEvents 才挂，模拟「旧版/读不到」）。
+    ...(dshEvents === null ? {} : { async snapshotEvents() { return dshEvents } }),
   }
   return { sent, privates, forwards, archive, personas, events }
 }
@@ -803,6 +807,123 @@ await check('并发保护：同一会话正在截断时拒绝第二次', async (
   const result = await b.applySessionOp({ op: 'manual-summarize', key })
   assert.equal(result.ok, false)
   assert.equal(result.error, 'manual-running')
+})
+
+console.log('\n— 提前截断从 DSH 历史捞底料（v2.0 第九步，2026-10-28）—')
+
+const dshUser = (seq, text, time) => ({
+  type: 'user/message', seq, time,
+  data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] },
+})
+const dshAssistant = (seq, text, time) => ({
+  type: 'assistant/message', seq, time,
+  data: { message: { role: 'assistant', content: [{ type: 'text', text }] } },
+})
+
+await check('conversationFromEvents：只留真人与助手文本，过滤系统注入', () => {
+  const events = [
+    dshUser(1, '真人第一句', 1700000000),
+    {
+      type: 'user/message', seq: 2, time: 1700000001,
+      data: { role: 'user', source: { kind: 'runtime-context' }, content: [{ type: 'text', text: '系统上下文' }] },
+    },
+    {
+      type: 'user/message', seq: 3, time: 1700000002,
+      data: { role: 'user', source: { kind: 'agent-instructions' }, content: [{ type: 'text', text: 'AGENTS.md' }] },
+    },
+    dshAssistant(4, '助手回复', 1700000003),
+    {
+      type: 'assistant/message', seq: 5, time: 1700000004,
+      data: { message: { role: 'assistant', content: [{ type: 'reasoning', text: '思考' }, { type: 'tool-call', name: 'x' }] } },
+    },
+    dshUser(6, '真人第二句', 1700000005),
+  ]
+  const out = conversationFromEvents(events, { limit: 50 })
+  assert.equal(out.length, 3)
+  assert.deepEqual(out.map((item) => item.role), ['user', 'assistant', 'user'])
+  assert.ok(!out.some((item) => /系统上下文|AGENTS\.md|思考/u.test(item.text)))
+})
+
+await check('conversationFromEvents：limit 只保留最近 N 条', () => {
+  const events = Array.from({ length: 10 }, (_, i) => dshUser(i + 1, `m${i}`, 1700000000 + i))
+  const out = conversationFromEvents(events, { limit: 3 })
+  assert.deepEqual(out.map((item) => item.text), ['m7', 'm8', 'm9'])
+})
+
+await check('mergeBriefingHistory：DSH 在前、L1 在后，同文去重且保留 L1 昵称', () => {
+  const dsh = [
+    { text: '第一条', at: 1000 },
+    { text: '重复那条', at: 2000 },
+  ]
+  const l1 = [
+    { text: '重复那条', at: 3000, name: '小明', qq: '1001' },
+    { text: '最新的', at: 4000, name: '小红', qq: '1002' },
+  ]
+  const merged = mergeBriefingHistory(dsh, l1)
+  assert.deepEqual(merged.map((item) => item.text), ['第一条', '重复那条', '最新的'])
+  assert.equal(merged.find((item) => item.text === '重复那条').name, '小明', '★ 同文保留 L1 的昵称')
+})
+
+await check('e2e：L1 为空时从 DSH 历史生成提要（不再直接失忆）', async () => {
+  const b = makeBridge()
+  const key = `g:${GROUP}`
+  b.state.sessions[key] = normalizeSessionEntry(key, { sessionId: 'sess-old', name: '测试群' })
+  const dshEvents = Array.from({ length: 40 }, (_, i) => (i % 2 === 0
+    ? dshUser(i + 1, `历史消息 ${i}`, 1700000000 + i)
+    : dshAssistant(i + 1, `回复 ${i}`, 1700000000 + i)))
+  const fake = fakeRuntime(b, { dshEvents, reply: '· 群里前 40 条消息主要在聊搬家，定周六。' })
+  const created = []
+  b.dsh.createSession = async () => {
+    const id = created.length === 0 ? 'sess-summary-1' : 'sess-new-1'
+    created.push(id)
+    return id
+  }
+  const result = await b.applySessionOp({ op: 'manual-summarize', key })
+  assert.equal(result.ok, true)
+  assert.ok(result.briefingChars > 0, '★ 有 DSH 历史就必须生成提要')
+  assert.match(b._lastPrompt, /历史消息 0/u, '提要 prompt 要含 DSH 历史正文')
+  assert.ok(b.state.sessions[key].contextBriefing?.text.includes('搬家'))
+  assert.equal(b._chatLog.has(key), false)
+  assert.equal(fake.forwards.length, 0, '截断不发 QQ 消息')
+})
+
+await check('e2e：DSH 与 L1 都为空才跳过提要，并留日志', async () => {
+  const b = makeBridge()
+  const key = `g:${GROUP}`
+  b.state.sessions[key] = normalizeSessionEntry(key, { sessionId: 'sess-old' })
+  const fake = fakeRuntime(b, { dshEvents: [] })
+  const created = []
+  b.dsh.createSession = async () => {
+    const id = created.length === 0 ? 'sess-summary-1' : 'sess-new-1'
+    created.push(id)
+    return id
+  }
+  const result = await b.applySessionOp({ op: 'manual-summarize', key })
+  assert.equal(result.ok, true)
+  assert.equal(result.briefingChars, 0)
+  assert.equal(b.state.sessions[key].contextBriefing, null)
+  assert.ok(b._opLog.some((row) => row.text.includes('无任何历史记录')), '日志要写明「无任何历史记录」')
+})
+
+await check('e2e：DSH 读取失败时仍用 L1 生成提要', async () => {
+  const b = makeBridge()
+  const key = `g:${GROUP}`
+  b.state.sessions[key] = normalizeSessionEntry(key, { sessionId: 'sess-old', name: '测试群' })
+  b._noteChatLog(key, { kind: 'group', userId: '20001', senderName: '小明' }, '周末搬家', [], '')
+  b._noteChatLog(key, { kind: 'group', userId: '20002', senderName: '小红' }, '我有空', [], '')
+  const fake = fakeRuntime(b, { reply: '· 在聊周末搬家。' })
+  fake.snapshotEvents = undefined
+  b.dsh.snapshotEvents = async () => { throw new Error('session/follow 超时') }
+  const created = []
+  b.dsh.createSession = async () => {
+    const id = created.length === 0 ? 'sess-summary-1' : 'sess-new-1'
+    created.push(id)
+    return id
+  }
+  const result = await b.applySessionOp({ op: 'manual-summarize', key })
+  assert.equal(result.ok, true)
+  assert.ok(result.briefingChars > 0, 'DSH 挂了也要用 L1 生成提要')
+  assert.ok(b._opLog.some((row) => row.text.includes('读取 DSH 历史失败')), '要记一条 warn')
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

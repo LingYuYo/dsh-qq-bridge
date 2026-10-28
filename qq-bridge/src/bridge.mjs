@@ -36,9 +36,11 @@ import {
   buildBriefingPrompt,
   buildForwardNodes,
   buildSummaryPrompt,
+  conversationFromEvents,
   fetchHistoryPaged,
   formatTranscript,
   forwardNodeText,
+  mergeBriefingHistory,
   nextWatermark,
   normalizeSummary,
   parseSummaryCommand,
@@ -2579,16 +2581,28 @@ export class Bridge {
         const log = (this._chatLog.get(key) ?? [])
           .filter((item) => Date.now() - (Number(item?.at) || 0) < CHAT_LOG_WINDOW_MS)
         const conf = this._summaryConfig()
-        let briefing = ''
-        if (log.length > 0) {
+        // 先读 DSH 持久化历史（v2.0 第九步）：L1 只有 1 小时窗口，很可能已经空了，
+        // 只靠它会让「提前截断」直接失忆。DSH 快照拿得到整段会话，必须作为主底料。
+        let dshItems = []
+        if (target.sessionId) {
           try {
-            briefing = await this._generateBriefing(key, log, conf)
+            dshItems = await this._readDshConversation(target.sessionId, 50)
+          } catch (error) {
+            this._logOp('warn', `提前截断：读取 DSH 历史失败（${error?.message ?? error}），只用 L1`)
+          }
+        }
+        const merged = mergeBriefingHistory(dshItems, log, { limit: 60 })
+        let briefing = ''
+        if (merged.length === 0) {
+          // 保底：刚新建的群 / 两边都空，才允许跳过提要。
+          this._logOp('info', `提前截断：${key} 无任何历史记录（L1 与 DSH 都为空），跳过提要直接归档`)
+        } else {
+          try {
+            briefing = await this._generateBriefing(key, merged, conf)
           } catch (error) {
             // 提要失败不卡住按钮：仍然归档新建（等同 clear），日志里说明。
             this._logOp('warn', `提前截断：前情提要生成失败，继续归档（${error?.message ?? error}）`)
           }
-        } else {
-          this._logOp('info', `提前截断：${key} 没有 L1 记录，跳过提要直接归档`)
         }
         const cleared = log.length
         this._chatLog.delete(key)
@@ -2601,7 +2615,9 @@ export class Bridge {
         // 只写日志，不发 QQ（用户明确要求）。
         this._logOp('info',
           `手动提前截断完成：${key} ${rebuilt.oldId || '(无会话)'} → ${rebuilt.sessionId}`
-          + `（归档=${rebuilt.archived}，清空 L1 ${cleared} 条，前情提要 ${briefing.length} 字）`)
+          + `（归档=${rebuilt.archived}，清空 L1 ${cleared} 条，`
+          + `底料 L1 ${log.length} + DSH ${dshItems.length} → 去重 ${merged.length} 条，`
+          + `前情提要 ${briefing.length} 字）`)
         return {
           ok: true, action: 'manual-summarize', key,
           sessionId: rebuilt.sessionId, archived: rebuilt.archived,
@@ -5508,22 +5524,45 @@ export class Bridge {
   }
 
   /**
-   * 把桥接层 L1（聊天记录环形缓冲）压成一段前情提要（v2.0 第五步）。
+   * 读 DSH 会话的持久化对话（v2.0 第九步，2026-10-28）。
    *
-   * 只读内存里的 `_chatLog`，不碰 DSH 会话历史 —— DSH 的历史在归档后自然消失，
-   * 这段提要就是新会话接续对话的唯一线索。
+   * 走桥接已有的 `dsh.snapshotEvents`（`session/follow` 快照，官方接口），
+   * 拿到原始事件后用 `conversationFromEvents` 筛出真人消息与助手回复。
+   * 这条通道比「自己解多帧 zstd」稳：不受会话格式升级、路径规则变化影响。
+   *
+   * @param {string} sessionId
+   * @param {number} [limit] 最多取多少条对话
+   * @returns {Promise<Array<{text:string, name:string, qq:string, at:number}>>}
+   */
+  async _readDshConversation(sessionId, limit = 50) {
+    const id = String(sessionId ?? '').trim()
+    if (id === '' || typeof this.dsh?.snapshotEvents !== 'function') return []
+    const events = await this.dsh.snapshotEvents(id, { maxMessages: 500 })
+    return conversationFromEvents(events, { limit }).map((item) => ({
+      text: item.text,
+      name: item.role === 'user' ? '群友' : '助手',
+      qq: '',
+      at: Number(item.at) || 0,
+    }))
+  }
+
+  /**
+   * 把合并后的历史压成一段前情提要（v2.0 第五步，第九步改造）。
+   *
+   * 底料来自两处：DSH 持久化历史（主）+ 桥接 L1（最新）。调用方已经合并去重，
+   * 这里只负责拼转写、叫管家模型、清洗输出。
    *
    * 失败策略：调用方（手动截断）会捕获异常并继续归档（没有提要也不能卡住按钮），
    * 所以这里不吞错，让上层决定。
    *
    * @param {string} key
-   * @param {Array<object>} log `_chatLog` 里的条目
+   * @param {Array<{text:string, name?:string, qq?:string, at?:number}>} history
    * @param {object} conf
    * @returns {Promise<string>} 已清洗的提要文本（可能为空串）
    */
-  async _generateBriefing(key, log, conf) {
+  async _generateBriefing(key, history, conf) {
     const entry = this.state.sessions?.[key]
-    const items = (Array.isArray(log) ? log : []).map((item) => ({
+    const items = (Array.isArray(history) ? history : []).map((item) => ({
       text: String(item?.text ?? ''),
       name: String(item?.name ?? ''),
       userId: String(item?.qq ?? ''),

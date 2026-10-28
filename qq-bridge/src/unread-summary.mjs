@@ -341,6 +341,86 @@ export function normalizeHistoryMessage(raw, { selfId = '' } = {}) {
 }
 
 /**
+ * 从 DSH 的原始会话事件里提取「真实对话」（v2.0 第九步，2026-10-28）。
+ *
+ * 为什么需要它：手动提前截断不能只靠桥接内存的 `_chatLog`（1 小时窗口，
+ * 很可能已经空了）。DSH 的 `session/follow` 快照能拿到整段会话事件，
+ * 这里把 user/message 与 assistant/message 压成纯文本对话，作为提要的底料。
+ *
+ * 过滤规则：
+ *   · user/message 只收 `source.kind === 'user'`（真人发的）；
+ *     `runtime-context` / `agent-instructions` / 工具结果都是系统注入，不能进提要；
+ *   · assistant/message 只取 text 块，reasoning 与 tool-call 跳过；
+ *   · 每条截断 2000 字，最终取最近 limit 条（正序）。
+ *
+ * @param {Array<object>} events DSH 事件数组（含 type / seq / time / data）
+ * @param {{limit?:number}} [options]
+ * @returns {Array<{role:'user'|'assistant', text:string, at:number}>} 时间正序
+ */
+export function conversationFromEvents(events, { limit = 50 } = {}) {
+  const list = Array.isArray(events) ? events : []
+  const takeText = (content) => (Array.isArray(content) ? content : [])
+    .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text.trim())
+    .filter((text) => text !== '')
+    .join('\n')
+    .slice(0, 2000)
+  const out = []
+  for (const event of list) {
+    if (!event || typeof event !== 'object') continue
+    const time = Number(event.time)
+    // time 可能是秒也可能是毫秒：> 1e12 按毫秒，否则按秒。
+    const at = Number.isFinite(time) && time > 0
+      ? (time > 1e12 ? Math.floor(time) : Math.floor(time * 1000))
+      : 0
+    if (event.type === 'user/message') {
+      const kind = typeof event.data?.source?.kind === 'string' ? event.data.source.kind : ''
+      if (kind !== '' && kind !== 'user') continue
+      const text = takeText(event.data?.content)
+      if (text !== '') out.push({ role: 'user', text, at })
+      continue
+    }
+    if (event.type === 'assistant/message') {
+      const text = takeText(event.data?.message?.content)
+      if (text !== '') out.push({ role: 'assistant', text, at })
+    }
+  }
+  const cap = Math.max(1, Math.trunc(Number(limit) || 50))
+  return out.slice(-cap)
+}
+
+/**
+ * 把 DSH 历史与桥接 L1 合并成一份提要底料（v2.0 第九步）。
+ *
+ * 同一条消息往往两边都有（L1 是最近 1 小时的镜像），按「正文前 40 字」去重：
+ * DSH 在前（更早）、L1 在后（更新），重复时**保留 L1**（它带昵称与真实时间）。
+ *
+ * @param {Array<{text:string, at?:number, name?:string, qq?:string}>} dshItems
+ * @param {Array<{text:string, at?:number, name?:string, qq?:string}>} l1Items
+ * @param {{limit?:number}} [options]
+ * @returns {Array<object>} 时间正序、去重后的条目
+ */
+export function mergeBriefingHistory(dshItems, l1Items, { limit = 60 } = {}) {
+  const norm = (text) => String(text ?? '').replace(/\s+/gu, ' ').trim()
+  const keyOf = (item) => norm(item?.text).slice(0, 40)
+  const merged = new Map()
+  for (const item of Array.isArray(dshItems) ? dshItems : []) {
+    const key = keyOf(item)
+    if (key === '') continue
+    merged.set(key, { ...item, text: norm(item.text), at: Number(item.at) || 0 })
+  }
+  // L1 覆盖同文条目：昵称 / 时间更准。
+  for (const item of Array.isArray(l1Items) ? l1Items : []) {
+    const key = keyOf(item)
+    if (key === '') continue
+    merged.set(key, { ...item, text: norm(item.text), at: Number(item.at) || 0 })
+  }
+  const list = [...merged.values()].sort((left, right) => (left.at || 0) - (right.at || 0))
+  const cap = Math.max(1, Math.trunc(Number(limit) || 60))
+  return list.slice(-cap)
+}
+
+/**
  * 按水位挑出「上次归纳之后」的消息。
  *
  * 水位是 `(lastSummaryAt, lastSummarySeq)` 二元组：先用时间比，时间相同再比序号。
