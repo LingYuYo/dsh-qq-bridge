@@ -1301,15 +1301,24 @@ export class OneBotClient {
    *
    * @param {string|number} groupId
    * @param {number} [count] 1..500
-   * @param {{timeoutMs?:number}} [opts]
+   * @param {{timeoutMs?:number, messageSeq?:string|number}} [opts]
+   *   `messageSeq` 是**游标**：不传拿最新 count 条；传了就从该序号往前拉
+   *   （v2.0 翻页拉取用，见 unread-summary 的 fetchHistoryPaged）。
    * @returns {Promise<{ok:boolean, messages:Array<object>, reason?:string}>}
    */
-  async getGroupMsgHistory(groupId, count = 200, { timeoutMs = 15_000 } = {}) {
+  async getGroupMsgHistory(groupId, count = 200, { timeoutMs = 15_000, messageSeq = '' } = {}) {
     const gid = String(groupId ?? '').trim()
     if (!/^\d+$/u.test(gid)) return { ok: false, messages: [], reason: `非法的群号：${gid.slice(0, 20)}` }
     const size = Math.min(500, Math.max(1, Math.trunc(Number(count) || 200)))
+    const cursor = String(messageSeq ?? '').trim()
+    // NapCat 的 schema 里 message_seq 是数字；空串表示「从最新开始」，绝不能传 ""。
+    const seq = cursor !== '' && /^\d+$/u.test(cursor) ? Number(cursor) : undefined
     try {
-      const res = await this.call('get_group_msg_history', { group_id: gid, count: size }, { timeoutMs })
+      const res = await this.call('get_group_msg_history', {
+        group_id: gid,
+        count: size,
+        ...(seq === undefined ? {} : { message_seq: seq }),
+      }, { timeoutMs })
       if (res?.status && res.status !== 'ok') {
         return { ok: false, messages: [], reason: `retcode=${res?.retcode ?? '?'} ${res?.wording ?? ''}`.trim() }
       }

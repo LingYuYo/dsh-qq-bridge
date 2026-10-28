@@ -159,24 +159,135 @@ export function normalizeSummary(source) {
   }
 }
 
-const SUMMARY_COMMANDS = /^\/(归纳|总结|未读|summary|unread)(?:\s+(\d{1,4}))?\s*$/iu
+/** 时间窗上限：`/归纳 24h` 封顶，防止有人写 999h 把接口翻穿。 */
+export const SUMMARY_TIME_LIMIT_MINUTES = 24 * 60
+/**
+ * `/归纳 [条数 | 时间窗]`。
+ *
+ * 两种写法都认：`/归纳 50`、`/归纳 1h`、`/归纳 30m`、`/归纳 2 小时`、`/归纳 30 分钟`。
+ * 时间窗是给「机器人停机两小时、群里积压几百条」准备的：按条数只能取到最新几十条，
+ * 按时间窗会一直翻页到起点（硬上限仍是 {@link SUMMARY_HARD_LIMIT}）。
+ */
+const SUMMARY_COMMANDS = /^\/(归纳|总结|未读|summary|unread)(?:\s+(\d{1,4})(?:\s*条)?|\s+(\d{1,3})\s*(h|小时|hours?|m|分钟|minutes?))?\s*$/iu
 
 /**
- * 解析 `/归纳 [N]`。只认**整条消息就是指令**，后面带闲聊不算（避免误触发）。
+ * 解析 `/归纳 [N | 1h]`。只认**整条消息就是指令**，后面带闲聊不算（避免误触发）。
  *
  * @param {string} text
- * @returns {{matched:boolean, count:number}} count=0 表示用配置里的默认条数
+ * @returns {{matched:boolean, count:number, windowMinutes:number}}
+ *   count=0 表示用配置里的默认条数；windowMinutes=0 表示不是时间窗模式
  */
 export function parseSummaryCommand(text) {
   const source = String(text ?? '').trim()
-  if (!source.startsWith('/')) return { matched: false, count: 0 }
+  if (!source.startsWith('/')) return { matched: false, count: 0, windowMinutes: 0 }
   const hit = SUMMARY_COMMANDS.exec(source)
-  if (!hit) return { matched: false, count: 0 }
+  if (!hit) return { matched: false, count: 0, windowMinutes: 0 }
   const wanted = Number(hit[2] ?? 0)
+  const windowRaw = Number(hit[3] ?? 0)
+  const unit = String(hit[4] ?? '').toLowerCase()
+  const isHour = unit === 'h' || unit === '小时' || unit.startsWith('hour')
   const count = Number.isFinite(wanted) && wanted > 0
     ? Math.min(SUMMARY_HARD_LIMIT, Math.trunc(wanted))
     : 0
-  return { matched: true, count }
+  const windowMinutes = Number.isFinite(windowRaw) && windowRaw > 0
+    ? Math.min(SUMMARY_TIME_LIMIT_MINUTES, Math.max(1, Math.trunc(windowRaw * (isHour ? 60 : 1))))
+    : 0
+  return { matched: true, count, windowMinutes }
+}
+
+/**
+ * 消息去重键：优先 message_id，其次 message_seq，最后时间 + 正文前缀。
+ * 翻页时相邻两页常常会重叠一条（接口按「起点那条」算），不去重会把它算两遍。
+ */
+function historyKey(raw) {
+  const id = raw?.message_id
+  if (id !== undefined && id !== null && String(id) !== '') return `id:${String(id)}`
+  const seq = raw?.message_seq
+  if (seq !== undefined && seq !== null && String(seq) !== '') return `seq:${String(seq)}`
+  return `time:${Number(raw?.time) || 0}:${String(raw?.raw_message ?? '').slice(0, 40)}`
+}
+
+/** 排序 / 游标用的序号：message_seq 优先，退回 message_id。 */
+function historySeq(raw) {
+  return Number(raw?.message_seq ?? raw?.message_id) || 0
+}
+
+/**
+ * 游标翻页拉群历史（v2.0 第四步，2026-10-28）。
+ *
+ * 为什么必须翻页：`get_group_msg_history` 一次只给一页（NapCat 上限 500）。
+ * 机器人停机两小时、群里积压两三百条时，只拉一页会漏掉大量更早的消息，
+ * 总结出来就成了「只说了最后几句」。
+ *
+ * 循环规则（对应用户要求，逐条可测）：
+ *   ① 每次取回一页，找出**最早的一条**的 `message_seq` 作为下一页游标；
+ *   ② 翻到「最早一条的 time < startTimeSec」或凑够 `limit` 条为止；
+ *   ③ 空数组立刻 break（没有更早的消息）；
+ *   ④ 游标必须推进：下一页游标为空或与当前相同 → break（接口忽略参数时防死循环）；
+ *   ⑤ 结果统一按时间正序返回，超过 `limit` 只保留**最新**的那部分。
+ *
+ * 中途任何一页失败都整体返回 `ok:false`（调用方据此不推水位，下次还能补）。
+ *
+ * @param {object} options
+ * @param {(cursor:string, count:number) => Promise<{ok:boolean, messages?:Array<object>, reason?:string}>} options.fetchPage
+ * @param {number} [options.limit] 总条数硬上限（≤ 500）
+ * @param {number} [options.startTimeSec] 时间窗起点（秒）；0 = 不限
+ * @param {number} [options.pageSize] 单页条数（1..500）
+ * @param {number} [options.maxPages] 页数防呆上限
+ * @returns {Promise<{ok:boolean, messages:Array<object>, pages:number, reason:string}>}
+ */
+export async function fetchHistoryPaged({
+  fetchPage,
+  limit = SUMMARY_HARD_LIMIT,
+  startTimeSec = 0,
+  pageSize = 200,
+  maxPages = 100,
+} = {}) {
+  if (typeof fetchPage !== 'function') {
+    throw new TypeError('fetchHistoryPaged 需要 fetchPage(cursor, count)')
+  }
+  const cap = Math.min(SUMMARY_HARD_LIMIT, Math.max(1, Math.trunc(Number(limit) || SUMMARY_HARD_LIMIT)))
+  const size = Math.min(500, Math.max(1, Math.trunc(Number(pageSize) || 200)))
+  const floor = Math.max(0, Math.floor(Number(startTimeSec) || 0))
+  const pagesCap = Math.max(1, Math.trunc(Number(maxPages) || 100))
+  const seen = new Map()
+  let cursor = ''
+  let pages = 0
+  while (pages < pagesCap) {
+    if (seen.size >= cap) break
+    const want = Math.min(size, cap - seen.size)
+    pages += 1
+    const res = await fetchPage(cursor, want)
+    if (!res || res.ok === false) {
+      return { ok: false, messages: [], pages, reason: res?.reason ?? '拉取群历史失败' }
+    }
+    const list = Array.isArray(res.messages) ? res.messages : []
+    // ④ 空页：没有更早的消息（或已经翻到头），立刻退出，绝不空转。
+    if (list.length === 0) break
+    let oldest = null
+    for (const raw of list) {
+      if (!raw || typeof raw !== 'object') continue
+      seen.set(historyKey(raw), raw)
+      const time = Number(raw.time) || 0
+      const seq = historySeq(raw)
+      if (!oldest || time < oldest.time || (time === oldest.time && seq < oldest.seq)) {
+        oldest = { time, seq }
+      }
+    }
+    // ② 已经翻到时间窗起点之前：更早的页不用再拉。
+    if (floor > 0 && oldest && oldest.time > 0 && oldest.time < floor) break
+    // ① 下一页游标 = 本页最早一条的 message_seq。
+    const next = oldest && oldest.seq > 0 ? String(oldest.seq) : ''
+    // ④ 游标没推进（空 / 与当前相同）→ 立刻退出，防死循环。
+    if (next === '' || next === cursor) break
+    cursor = next
+  }
+  const messages = [...seen.values()].sort((left, right) => {
+    const byTime = (Number(left.time) || 0) - (Number(right.time) || 0)
+    return byTime !== 0 ? byTime : historySeq(left) - historySeq(right)
+  })
+  // ⑤ 反序拉到的数据统一排序成正序；超上限时保留最新的一段。
+  return { ok: true, messages: messages.slice(-cap), pages, reason: '' }
 }
 
 /**

@@ -23,8 +23,10 @@ import {
   SUMMARY_NODE_NAME,
   SUMMARY_OVERRIDE_NOTE,
   SUMMARY_PERSONA,
+  SUMMARY_TIME_LIMIT_MINUTES,
   buildForwardNodes,
   buildSummaryPrompt,
+  fetchHistoryPaged,
   formatTranscript,
   forwardNodeText,
   nextWatermark,
@@ -154,6 +156,15 @@ await check('不整条匹配就不算指令（避免闲聊误触发）', () => {
   assert.equal(parseSummaryCommand('归纳一下').matched, false)
   assert.equal(parseSummaryCommand('/归纳 一下').matched, false)
   assert.equal(parseSummaryCommand('/clear').matched, false)
+})
+
+await check('时间窗写法：/归纳 1h / 30m / 2 小时', () => {
+  assert.equal(parseSummaryCommand('/归纳 1h').windowMinutes, 60)
+  assert.equal(parseSummaryCommand('/归纳 30m').windowMinutes, 30)
+  assert.equal(parseSummaryCommand('/归纳 2 小时').windowMinutes, 120)
+  assert.equal(parseSummaryCommand('/归纳 45 分钟').windowMinutes, 45)
+  assert.equal(parseSummaryCommand('/归纳 999h').windowMinutes, SUMMARY_TIME_LIMIT_MINUTES, '时间窗也有上限')
+  assert.equal(parseSummaryCommand('/归纳 50').windowMinutes, 0, '条数模式没有时间窗')
 })
 
 console.log('\n── 二、配置归一化 ───────────────────────────────')
@@ -595,6 +606,140 @@ await check('端到端：模型直接拒答 → 不发内容、走失败兜底',
   assert.equal(fake.forwards.length, 0, '拒答不能当总结发出去')
   assert.equal(b._summaryState(`g:${GROUP}`).lastSummarySeq, 0, '失败不推水位')
   assert.match(fake.sent.at(-1).text, /没跑成功/u)
+})
+
+console.log('\n— 游标翻页拉历史（v2.0 第四步，2026-10-28）—')
+
+/** 造一页 raw 消息：id 从 startId 递增、time 从 baseTime 递增。 */
+function pageMessages({ count, startId, baseTime }) {
+  return Array.from({ length: count }, (_, i) => rawMsg({
+    id: startId + i,
+    text: `消息${startId + i}`,
+    time: baseTime + i,
+  }))
+}
+
+await check('两次翻页：最新 20 + 更早 20 → 合并 40 条且正序', async () => {
+  const now = Math.floor(Date.now() / 1000)
+  const latest = pageMessages({ count: 20, startId: 2000, baseTime: now - 100 })
+  const earlier = pageMessages({ count: 20, startId: 1000, baseTime: now - 400 })
+  const calls = []
+  const result = await fetchHistoryPaged({
+    limit: 500,
+    pageSize: 20,
+    fetchPage: async (cursor, count) => {
+      calls.push({ cursor, count })
+      if (cursor === '') return { ok: true, messages: latest }
+      if (cursor === '2000') return { ok: true, messages: earlier }
+      return { ok: true, messages: [] }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.messages.length, 40, '★ 两页必须合并成 40 条')
+  assert.equal(result.pages, 3, '第三次空页用于确认翻到头')
+  assert.deepEqual(calls.map((item) => item.cursor), ['', '2000', '1000'],
+    '游标应按「本页最早一条的 message_seq」推进')
+  const times = result.messages.map((message) => Number(message.time))
+  assert.deepEqual([...times].sort((a, b) => a - b), times, '★ 输出必须是正序')
+})
+
+await check('空页立刻停（不空转）', async () => {
+  let calls = 0
+  const result = await fetchHistoryPaged({
+    limit: 500,
+    pageSize: 20,
+    fetchPage: async () => { calls += 1; return { ok: true, messages: [] } },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.messages.length, 0)
+  assert.equal(calls, 1, '★ 空数组必须立刻 break')
+})
+
+await check('游标不推进 → 立刻 break（防死循环）', async () => {
+  let calls = 0
+  const same = pageMessages({ count: 5, startId: 3000, baseTime: 1000 })
+  const result = await fetchHistoryPaged({
+    limit: 500,
+    pageSize: 20,
+    fetchPage: async () => { calls += 1; return { ok: true, messages: same } },
+  })
+  assert.equal(result.messages.length, 5)
+  assert.ok(calls <= 2, `接口忽略游标时最多再打一次，实际 ${calls} 次`)
+})
+
+await check('达到 limit 就停，且只保留最新的一段', async () => {
+  const pages = {
+    '': pageMessages({ count: 20, startId: 5000, baseTime: 500 }),
+    5000: pageMessages({ count: 20, startId: 4000, baseTime: 400 }),
+  }
+  let calls = 0
+  const result = await fetchHistoryPaged({
+    limit: 25,
+    pageSize: 20,
+    fetchPage: async (cursor) => {
+      calls += 1
+      return { ok: true, messages: pages[cursor] ?? [] }
+    },
+  })
+  assert.equal(result.messages.length, 25, '★ 不能超过 limit')
+  assert.equal(calls, 2)
+  const ids = result.messages.map((message) => Number(message.message_id))
+  assert.ok(ids.includes(5000) && ids.includes(5019), '最新一页要保留')
+  assert.ok(!ids.includes(4000), '更旧的被截掉')
+})
+
+await check('翻到 startTime 之前就停（时间窗模式）', async () => {
+  const pages = {
+    '': pageMessages({ count: 20, startId: 7000, baseTime: 2000 }),
+    7000: pageMessages({ count: 20, startId: 6000, baseTime: 1000 }),
+  }
+  let calls = 0
+  const result = await fetchHistoryPaged({
+    limit: 500,
+    pageSize: 20,
+    startTimeSec: 1500,
+    fetchPage: async (cursor) => {
+      calls += 1
+      return { ok: true, messages: pages[cursor] ?? [] }
+    },
+  })
+  assert.equal(calls, 2, '第二页已越过起点，不该再请求第三页')
+  assert.equal(result.messages.length, 40, '越界那页仍保留（交给水位再筛）')
+})
+
+await check('中途某页失败 → ok:false，不返回半截数据', async () => {
+  const result = await fetchHistoryPaged({
+    limit: 100,
+    pageSize: 20,
+    fetchPage: async (cursor) => (cursor === ''
+      ? { ok: true, messages: pageMessages({ count: 20, startId: 1, baseTime: 1 }) }
+      : { ok: false, messages: [], reason: 'retcode=1200' }),
+  })
+  assert.equal(result.ok, false)
+  assert.deepEqual(result.messages, [], '半截数据会让水位误推进，必须整次失败')
+  assert.match(result.reason, /1200/u)
+})
+
+await check('端到端：/归纳 1h 翻两页，40 条都进 prompt', async () => {
+  const b = makeBridge()
+  const now = Math.floor(Date.now() / 1000)
+  const latest = pageMessages({ count: 20, startId: 2000, baseTime: now - 100 })
+  const earlier = pageMessages({ count: 20, startId: 1000, baseTime: now - 400 })
+  const calls = []
+  const fake = fakeRuntime(b, { history: [], reply: STRUCTURED_REPLY })
+  b.qq.getGroupMsgHistory = async (gid, count, opts = {}) => {
+    const cursor = String(opts.messageSeq ?? '')
+    calls.push({ gid, count, cursor })
+    if (cursor === '') return { ok: true, messages: latest }
+    if (cursor === '2000') return { ok: true, messages: earlier }
+    return { ok: true, messages: [] }
+  }
+  await b._handleUnreadSummaryCommand(ownerMsg({ text: '/归纳 1h' }), '/归纳 1h', `g:${GROUP}`)
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.match(fake.sent[0].text, /1 小时/u, 'ack 要说清楚是时间窗')
+  assert.equal(fake.forwards.length, 1)
+  assert.match(b._lastPrompt, /【消息条数】40/u, '★ 两页 40 条都要进 prompt')
+  assert.deepEqual(calls.map((item) => item.cursor), ['', '2000', '1000'])
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)

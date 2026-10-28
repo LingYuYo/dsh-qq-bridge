@@ -299,7 +299,7 @@ const DEFAULT_SKILLS = [
   // 2026-10-28（v2.0 第一步）：未读归纳。主人在群里发 /归纳，旁路临时会话里的
   // 廉价模型把这段时间的群聊整理成摘要，再用合并转发发回群里。
   { id: 'sk-unread', name: '未读归纳', icon: 'search', tag: '内置', ver: '1.0.0', enabled: true,
-    desc: '主人发 /归纳 [条数]：拉群历史 → 廉价模型总结 → 合并转发发回群里（失败降级纯文本）。' },
+    desc: '主人发 /归纳 [条数|1h]：拉群历史（游标翻页，上限 500 条）→ 廉价模型总结 → 合并转发发回群里。' },
   // 2026-10-28（v2.0 第二步）：开发者特权。默认**关闭**（提权通道 fail-closed），
   // 只有清单里明确 enabled !== false 且 developer.enabled=true 才生效。
   { id: 'sk-developer', name: '开发者特权', icon: 'code', tag: '内置', ver: '1.0.0', enabled: false,

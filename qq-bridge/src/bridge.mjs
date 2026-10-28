@@ -33,6 +33,7 @@ import {
   SUMMARY_PERSONA,
   buildForwardNodes,
   buildSummaryPrompt,
+  fetchHistoryPaged,
   formatTranscript,
   forwardNodeText,
   nextWatermark,
@@ -5060,7 +5061,7 @@ export class Bridge {
     const parsed = parseSummaryCommand(text)
     if (!parsed.matched) return false
     if (msg.kind !== 'group') {
-      const sent = await this._send(msg, '未读归纳只能在群里用：在群里发 /归纳 [条数]。')
+      const sent = await this._send(msg, '未读归纳只能在群里用：在群里发 /归纳 [条数|1h]。')
       if (!(sent && sent.ok === false)) this._noteReplied(key)
       return true
     }
@@ -5081,12 +5082,21 @@ export class Bridge {
       await this._send(msg, '上一次归纳还没跑完，稍等一下。')
       return true
     }
-    // 条数：指令里的优先，其次配置；一律钳在 500 以内（NapCat 侧一次拉这么多就够呛了）。
-    const count = Math.min(SUMMARY_HARD_LIMIT, parsed.count > 0 ? parsed.count : conf.maxMessages)
-    const ack = await this._send(msg, `收到，正在归纳最近 ${count} 条，稍后发到这里。`)
+    // 条数 / 时间窗：指令里的优先，其次配置；一律钳在 500 以内。
+    //   `/归纳 50` → 最近 50 条；`/归纳 1h` → 最近 1 小时（翻页直到越过起点）。
+    const hasWindow = parsed.windowMinutes > 0
+    const count = hasWindow
+      ? SUMMARY_HARD_LIMIT
+      : Math.min(SUMMARY_HARD_LIMIT, parsed.count > 0 ? parsed.count : conf.maxMessages)
+    const windowLabel = hasWindow
+      ? (parsed.windowMinutes % 60 === 0 ? `${parsed.windowMinutes / 60} 小时` : `${parsed.windowMinutes} 分钟`)
+      : ''
+    const ack = await this._send(msg, hasWindow
+      ? `收到，正在翻取最近 ${windowLabel} 的消息并归纳，稍后发到这里。`
+      : `收到，正在归纳最近 ${count} 条，稍后发到这里。`)
     if (!(ack && ack.ok === false)) this._noteReplied(key)
     // 后台跑：不 await。异常在 _runUnreadSummary 内部兜住，不会冒到 handleMessage。
-    void this._runUnreadSummary({ msg, key, count, conf })
+    void this._runUnreadSummary({ msg, key, count, conf, windowMinutes: parsed.windowMinutes })
     return true
   }
 
@@ -5096,7 +5106,7 @@ export class Bridge {
    * 流程：拉历史 → 按水位筛 → 拼转写 → 建临时会话 → 廉价模型总结 → 切节点 →
    * 合并转发（失败降级纯文本）→ 成功才推水位 → 归档临时会话。
    */
-  async _runUnreadSummary({ msg, key, count, conf }) {
+  async _runUnreadSummary({ msg, key, count, conf, windowMinutes = 0 }) {
     const groupId = String(msg.groupId ?? '')
     const startedAt = Date.now()
     this._summaryRuns.add(key)
@@ -5104,9 +5114,25 @@ export class Bridge {
     try {
       const groupName = await this._displayName(key, msg).catch(() => '')
       const selfId = this.qq?.selfId ? String(this.qq.selfId) : ''
-      const history = await this.qq.getGroupMsgHistory(groupId, count)
-      if (!history.ok) throw summaryError('HISTORY_FAILED', `拉群历史失败：${history.reason ?? '未知原因'}`)
       const prev = this._summaryState(key)
+      // 游标翻页（v2.0 第四步，2026-10-28）：机器人停机期间可能积压几百条，
+      // 只拉一页会漏掉大量消息。这里按 message_seq 一页页往前翻：
+      //   · 时间窗模式（`/归纳 1h`）→ 一直翻到早于 startTime；
+      //   · 条数模式（`/归纳 50`）→ 翻到凑够 count 条；
+      //   · 两种情况都硬顶 SUMMARY_HARD_LIMIT 与页数上限，空页 / 游标不推进立刻停。
+      const pageLimit = Math.min(SUMMARY_HARD_LIMIT, Math.max(1, count))
+      const startTimeSec = windowMinutes > 0
+        ? Math.floor(Date.now() / 1000) - windowMinutes * 60
+        : Math.floor((Number(prev.lastSummaryAt) || 0) / 1000)
+      const history = await fetchHistoryPaged({
+        limit: pageLimit,
+        startTimeSec,
+        pageSize: 200,
+        fetchPage: (cursor, pageCount) => this.qq.getGroupMsgHistory(groupId, pageCount, { messageSeq: cursor }),
+      })
+      if (!history.ok) throw summaryError('HISTORY_FAILED', `拉群历史失败：${history.reason ?? '未知原因'}`)
+      this.logger.info?.(`未读归纳：翻页 ${history.pages} 次，合并 ${history.messages.length} 条`
+        + `（上限 ${pageLimit}${startTimeSec > 0 ? `，起点 ${new Date(startTimeSec * 1000).toLocaleString('zh-CN')}` : ''}）`)
       const unread = pickUnread(history.messages, {
         lastSeq: prev.lastSummarySeq,
         lastAt: prev.lastSummaryAt,

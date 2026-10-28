@@ -949,7 +949,7 @@ window.__ModuleLoader__.load({
      */
     const DEFAULT_UNREAD_SKILL = {
       id: 'sk-unread', name: '未读归纳', icon: 'search', tag: '内置', ver: '1.0.0', enabled: true,
-      desc: '主人发 /归纳 [条数]：拉群历史 → 廉价模型总结 → 合并转发发回群里（失败降级纯文本）。',
+      desc: '主人发 /归纳 [条数|1h]：拉群历史（游标翻页，上限 500 条）→ 廉价模型总结 → 合并转发发回群里。',
     }
 
     /**
