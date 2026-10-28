@@ -27,6 +27,7 @@ import {
 } from './onebot.mjs'
 import { DshClient } from './dsh.mjs'
 import { GlobalMemory } from './global-memory.mjs'
+import { Scheduler, TaskQueue, parseCron } from './scheduler.mjs'
 import { synthesize, TTS_MAX_CHARS, DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER } from './tts.mjs'
 import { ExternalHooksClient } from './external-hooks.mjs'
 import { DSH_IMAGE_LIMITS, MAX_TILES, prepareImageParts } from './image-prep.mjs'
@@ -465,6 +466,30 @@ export const IMPERSONATION_RE = /(?:我是|我就是|我才是|我其实是)\s*(
 function maskQq(value) {
   const text = String(value ?? '')
   return text.length <= 5 ? text : `${text.slice(0, 3)}***${text.slice(-2)}`
+}
+
+/**
+ * 解析模型返回的定时任务 JSON（容忍代码围栏与前后废话）。
+ * @param {string} text
+ * @returns {{cron:string, prompt:string}|null}
+ */
+export function parseTaskJson(text) {
+  const raw = String(text ?? '')
+    .replace(/^```(?:json)?\s*/iu, '')
+    .replace(/```\s*$/u, '')
+    .trim()
+  const start = raw.indexOf('{')
+  const end = raw.lastIndexOf('}')
+  if (start < 0 || end <= start) return null
+  try {
+    const parsed = JSON.parse(raw.slice(start, end + 1))
+    const cron = String(parsed?.cron ?? '').trim().slice(0, 80)
+    const prompt = String(parsed?.prompt ?? '').trim().slice(0, 200)
+    if (cron === '' || prompt === '') return null
+    return { cron, prompt }
+  } catch {
+    return null
+  }
 }
 
 /** 潜水指令（每轮追加在 Prompt 最末尾，明确告诉模型可以闭嘴）。 */
@@ -1227,6 +1252,16 @@ export class Bridge {
       dir: path.dirname(this.statePath),
       logger: this.logger,
     }).load()
+    // 全局定时任务（v2.0 第二十四步）：任务定义/运行态独立文件；执行动作由本类提供。
+    this.scheduler = new Scheduler({
+      dir: path.dirname(this.statePath),
+      exec: (task) => this._runScheduledTask(task),
+      logger: this.logger,
+    }).load()
+    // 任务发送队列：单并发 + 间隔 + 抖动 + 每分钟上限，防止多群齐发触发风控。
+    this.taskQueue = new TaskQueue()
+    // 口述任务的待确认缓存：key -> { cron, targets, prompt, at, by, atMs }（10 分钟过期）。
+    this._pendingTasks = new Map()
     this.queues = new SerialQueues()
     this.inflight = new Map() // 会话 key -> 正在处理的 Promise
     // 节奏运行时状态（Phase 4）：全是内存态，不落盘。
@@ -2966,9 +3001,26 @@ export class Bridge {
     // summarize（v2.0）：由设置页按钮按群 key 触发，也不该顺手建占位空会话。
     // manual-summarize：key 校验通过后分支内部才取 entry，非法 key 不留垃圾行。
     const entry = (action === 'voice' || action === 'image' || action === 'summarize'
-      || action === 'manual-summarize')
+      || action === 'manual-summarize' || action === 'global-memory' || action === 'task')
       ? null
       : this._entryOf(key)
+
+    // v2.0 第二十四步：删除跨群记忆 / 定时任务（设置页列表用）。
+    // 不碰会话 state，不需要 entry。
+    if (action === 'global-memory') {
+      const id = String(op?.id ?? '').trim()
+      if (id === '') return { ok: false, error: 'bad-id', action, key }
+      const removed = this.globalMemory.remove(id)
+      this._logOp('info', `跨群记忆已删除：${id}（${removed} 条）`)
+      return { ok: removed > 0, action, key, removed }
+    }
+    if (action === 'task') {
+      const id = String(op?.id ?? '').trim()
+      if (id === '') return { ok: false, error: 'bad-id', action, key }
+      const removed = this.scheduler.removeTask(id)
+      this._logOp('info', `定时任务已删除：${id}（${removed ? '成功' : '未找到'}）`)
+      return { ok: removed, action, key, removed }
+    }
 
     if (action === 'persona') {      entry.persona = String(op?.text ?? '').slice(0, 20000)
       this._saveState()
@@ -4231,7 +4283,13 @@ export class Bridge {
       // 未读归纳（v2.0 第一步，2026-10-28）：主人专属。命中即异步开跑并 return，
       // 不阻塞后面的消息，也不进 DSH 会话（归纳走的是旁路临时会话）。
       if (await this._handleUnreadSummaryCommand(msg, commandText, key)) return
+      // v2.0 第二十四步：跨群记忆写入 / 定时任务（均限主人与开发者）。
+      if (await this._handleRememberCommand(msg, commandText, key)) return
+      if (await this._handleTaskCommand(msg, commandText, key)) return
     }
+    // 口述建任务（不带 `/`）：「@小鱼 定时任务：每天9点发早安」。
+    // 必须在投递 DSH **之前**拦截：普通群友发的一律拒绝，绝不让模型去解析。
+    if (!isCommand && (await this._handleTaskUtterance(msg, commandText, key))) return
     // 2) 禁言指令：命中即静音该会话，自己也不回复（否则「闭嘴」还在说话）。
     if (this._handleMuteCommand(key, chatText)) return
     // 3) 静音期内一律不回复、不建会话。
@@ -6073,6 +6131,234 @@ export class Bridge {
   }
 
   /**
+   * `/记住 [标题] [内容]`：写入跨群记忆（v2.0 第二十四步）。
+   *
+   * 只限主人 / 开发者；标题是纯数字 QQ 时记为 person（该 QQ 在任何群说话都会带上），
+   * 否则记为 fact（手动写入，默认全局可见）。
+   */
+  async _handleRememberCommand(msg, text, key) {
+    const hit = /^\/记住\s+(\S+)\s+([\s\S]+)$/u.exec(String(text ?? '').trim())
+    if (!hit) return false
+    if (!this.isOwner(msg)) {
+      const sent = await this._send(msg, '⚠️ 权限不足，只有主人 / 开发者能记住跨群信息。')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    const title = hit[1].slice(0, 60)
+    const content = hit[2].trim().slice(0, 500)
+    if (content === '') {
+      await this._send(msg, '内容不能为空：/记住 [标题] [内容]')
+      return true
+    }
+    const isQq = /^\d{5,15}$/u.test(title)
+    const saved = this.globalMemory.upsert({
+      kind: isQq ? 'person' : 'fact',
+      key: isQq ? `qq:${title}` : `manual:${title}`,
+      qq: isQq ? title : '',
+      title: isQq ? `群友${title}` : title,
+      text: content,
+      tags: [],
+      scope: { global: true, groups: [] },
+      confidence: 0.9,
+      source: { group: key, by: 'command' },
+    })
+    this._logOp('info', `跨群记忆已写入：${saved?.key ?? title}`)
+    const sent = await this._send(msg, `已记住「${title}」，跨群可见（${content.length} 字）。`)
+    if (!(sent && sent.ok === false)) this._noteReplied(key)
+    return true
+  }
+
+  /** 口述建任务：「定时任务：每天 9 点发早安」——权限校验在模型解析之前。 */
+  async _handleTaskUtterance(msg, text, key) {
+    const hit = /^(?:定时任务|建个?定时任务|新建定时任务|加个?定时任务)[：:]\s*([\s\S]+)$/u
+      .exec(String(text ?? '').trim())
+    if (!hit) return false
+    return await this._createPendingTask(msg, key, hit[1])
+  }
+
+  /** 斜杠形式：/定时任务 …、/确认任务、/取消任务 [id]、/任务列表。 */
+  async _handleTaskCommand(msg, text, key) {
+    const trimmed = String(text ?? '').trim()
+    if (trimmed === '/任务列表') {
+      if (!this.isOwner(msg)) {
+        await this._send(msg, '⚠️ 权限不足，只有主人 / 开发者能查看定时任务。')
+        return true
+      }
+      const rows = this.scheduler.list()
+      if (rows.length === 0) {
+        await this._send(msg, '当前没有定时任务。')
+        return true
+      }
+      const lines = rows.slice(0, 10).map((task) => {
+        const targets = task.targets.length > 0 ? task.targets.join(',') : '所有群'
+        const next = task.nextRunAt > 0 ? new Date(task.nextRunAt).toLocaleString('zh-CN') : '—'
+        return `· ${task.id.slice(0, 12)}｜${task.cron}｜${targets}｜${task.prompt.slice(0, 20)}｜下次 ${next}`
+      })
+      await this._send(msg, `定时任务（${rows.length} 个）：\n${lines.join('\n')}`)
+      return true
+    }
+    if (trimmed.startsWith('/确认任务')) {
+      if (!this.isOwner(msg)) {
+        await this._send(msg, '⚠️ 权限不足，只有主人 / 开发者能确认任务。')
+        return true
+      }
+      const pending = this._pendingTasks.get(key)
+      if (!pending || Date.now() - pending.atMs > 10 * 60 * 1000) {
+        this._pendingTasks.delete(key)
+        await this._send(msg, '没有待确认的任务（或已过期）。先发「定时任务：…」让我解析。')
+        return true
+      }
+      const created = this.scheduler.addTask({
+        cron: pending.cron,
+        targets: pending.targets,
+        prompt: pending.prompt,
+        at: pending.at,
+        createdBy: pending.by,
+      })
+      this._pendingTasks.delete(key)
+      if (!created) {
+        await this._send(msg, '任务写入失败（cron 或内容不合法）。')
+        return true
+      }
+      const next = created.nextRunAt > 0 ? new Date(created.nextRunAt).toLocaleString('zh-CN') : '—'
+      this._logOp('info', `定时任务已创建：${created.id} ${created.cron}`)
+      await this._send(msg, `✅ 任务已创建：${created.id.slice(0, 12)}｜${created.cron}｜下次 ${next}`)
+      return true
+    }
+    if (trimmed.startsWith('/取消任务')) {
+      if (!this.isOwner(msg)) {
+        await this._send(msg, '⚠️ 权限不足，只有主人 / 开发者能取消任务。')
+        return true
+      }
+      const id = trimmed.slice('/取消任务'.length).trim()
+      if (id === '') {
+        const had = this._pendingTasks.delete(key)
+        await this._send(msg, had ? '已取消待确认的任务。' : '没有待确认的任务。')
+        return true
+      }
+      const removed = this.scheduler.removeTask(id) || this.scheduler.removeTask(this._findTaskById(id))
+      await this._send(msg, removed ? '已取消该定时任务。' : '没找到这个任务 id。')
+      return true
+    }
+    const hit = /^\/定时任务\s+([\s\S]+)$/u.exec(trimmed)
+    if (!hit) return false
+    return await this._createPendingTask(msg, key, hit[1])
+  }
+
+  /** 解析 + 权限校验 + 预览（真正写入要等 `/确认任务`）。 */
+  async _createPendingTask(msg, key, raw) {
+    if (!this.isOwner(msg)) {
+      const sent = await this._send(msg, '⚠️ 权限不足：只有主人 / 开发者能建定时任务。')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    const wantsGlobal = /全局|所有群|全部群/u.test(raw)
+    if (wantsGlobal && !this.isDeveloper(msg)) {
+      const sent = await this._send(msg, '⚠️ 全局任务只有开发者能建；主人只能建当前群的任务。')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    const parsed = await this._parseTaskWithModel(raw, key)
+    const cron = String(parsed?.cron ?? '').trim()
+    const prompt = String(parsed?.prompt ?? '').trim().slice(0, 200)
+    if (cron === '' || prompt === '' || !parseCron(cron)) {
+      await this._send(msg, '没解析出合法时间，换个说法试试，例如：\n定时任务：每天 9 点发早安')
+      return true
+    }
+    const targets = wantsGlobal ? [] : [key]
+    this._pendingTasks.set(key, {
+      cron,
+      targets,
+      prompt,
+      at: false,
+      by: this.isDeveloper(msg) ? 'developer' : 'owner',
+      atMs: Date.now(),
+    })
+    const targetText = wantsGlobal ? '所有白名单群' : (key.startsWith('g:') ? `本群 ${key}` : key)
+    await this._send(msg, `请确认：\n· 时间：${cron}（本地时区）\n· 目标：${targetText}\n· 内容：${prompt}\n`
+      + '发 /确认任务 才会真正创建；发 /取消任务 放弃。')
+    return true
+  }
+
+  /** 让模型把自然语言解析成 { cron, prompt }（JSON）。 */
+  async _parseTaskWithModel(raw, key) {
+    const conf = this._summaryConfig()
+    let sessionId = ''
+    try {
+      sessionId = await this._createSummarySession(conf)
+      const prompt = [
+        '把下面这句话解析成一条定时任务，只输出一个 JSON 对象，不要解释、不要代码围栏：',
+        '{"cron":"分 时 日 月 周","prompt":"到点要生成的消息主题"}',
+        '要求：cron 用标准五段式（本地时区 Asia/Shanghai）；不支持「每天」以外的自然语言。',
+        'prompt 是给模型到点生成内容用的主题，不要写具体时间。',
+        `这句话：${raw}`,
+      ].join('\n')
+      const reply = await this.dsh.promptAndWait(sessionId, prompt, { timeoutMs: conf.timeoutMs })
+      return parseTaskJson(reply)
+    } catch (error) {
+      this.logger.warn?.(`口述任务解析失败：${error?.message ?? error}`)
+      return null
+    } finally {
+      await this._disposeSummarySession(sessionId).catch(() => {})
+    }
+  }
+
+  /** 按 id 前缀查找任务（用户只记前 12 位）。 */
+  _findTaskById(idOrPrefix) {
+    const prefix = String(idOrPrefix ?? '')
+    if (prefix === '') return ''
+    const hit = this.scheduler.list().find((task) => task.id === prefix || task.id.startsWith(prefix))
+    return hit ? hit.id : ''
+  }
+
+  /**
+   * 定时任务执行入口（由 Scheduler.exec 调用）。
+   * 每个目标群单独入队：单并发 + 间隔 + 抖动 + 每分钟上限。
+   */
+  async _runScheduledTask(task) {
+    const keys = Array.isArray(task.targets) && task.targets.length > 0
+      ? task.targets
+      : this._allow().groups.map((group) => `g:${group}`)
+    if (keys.length === 0) return { ok: false, error: '没有可发送的群（白名单为空）' }
+    let sent = 0
+    let failed = 0
+    for (const key of keys.slice(0, 20)) {
+      await this.taskQueue.enqueue(async () => {
+        const groupId = String(key).replace(/^g:/u, '')
+        if (!/^\d+$/u.test(groupId)) return
+        const content = await this._generateScheduledText(task, key)
+        if (content === '') { failed += 1; return }
+        const msg = { kind: 'group', groupId, userId: '', senderName: '' }
+        const result = await this._send(msg, content, { at: false })
+        if (result && result.ok === false) failed += 1
+        else sent += 1
+      })
+    }
+    this._logOp(failed > 0 ? 'warn' : 'info', `定时任务 ${task.id} 执行：发送 ${sent} 个群，失败 ${failed}`)
+    return { ok: failed === 0, error: failed > 0 ? `${failed} 个群发送失败` : '' }
+  }
+
+  /** 让模型按任务主题生成一句要发的话（临时会话，不污染正式会话）。 */
+  async _generateScheduledText(task, key) {
+    const conf = this._summaryConfig()
+    let sessionId = ''
+    try {
+      sessionId = await this._createSummarySession(conf)
+      const prompt = [
+        `请为群聊写一条定时消息。主题：${task.prompt}`,
+        '要求：只输出要发的正文（1-3 句），不要解释、不要加引号、不要 @ 任何人、不要输出 (思考过程)。',
+      ].join('\n')
+      const reply = await this.dsh.promptAndWait(sessionId, prompt, { timeoutMs: conf.timeoutMs })
+      return stripMonologueLines(String(reply ?? '')).trim().slice(0, 500)
+    } catch (error) {
+      this.logger.warn?.(`定时任务 ${task.id} 生成内容失败：${error?.message ?? error}`)
+      return ''
+    } finally {
+      await this._disposeSummarySession(sessionId).catch(() => {})
+    }
+  }
+
+  /**
    * 真正干活的那一段（后台）。
    *
    * 流程：拉历史 → 按水位筛 → 拼转写 → 建临时会话 → 廉价模型总结 → 切节点 →
@@ -6450,6 +6736,8 @@ export class Bridge {
       void this._summarizePersonas()
     }, SUMMARIZE_INTERVAL_MS)
     if (typeof this._summarizeTimer.unref === 'function') this._summarizeTimer.unref()
+    // 全局定时任务调度器：load 时已把「错过太久」的任务顺延，启动 tick 会补跑宽限内的。
+    this.scheduler.start()
     // 只做只读探活，确认 DSH 可达；不可达时桥接仍会启动，等 DSH 恢复。
     try {
       await this.dsh.call('agentPresets/list', {})
@@ -6473,6 +6761,7 @@ export class Bridge {
     this._opLogCleanupTimer = null
     // 跨群记忆：把检索累加的 hits 落盘（延迟写，退出前补一次）。
     try { this.globalMemory?.flush?.() } catch { /* 退出路径不抛 */ }
+    this.scheduler?.stop?.()
     await this.qq.stop?.()
   }
 }

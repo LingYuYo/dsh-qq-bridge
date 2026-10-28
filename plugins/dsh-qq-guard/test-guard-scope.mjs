@@ -581,6 +581,34 @@ await check('session-ops：放行 briefing，text / reset 能下发', async () =
   assert.equal(second[0].reset, true)
 })
 
+await check('session-ops：放行 global-memory / task 删除，缺 id 拒绝', async () => {
+  const { ctx, calls } = makeCtx({ presetId: undefined, hasWebServer: true, settingsAvailable: true })
+  apply(ctx, Config({ role: 'settings' }))
+  const route = calls.webRoutes.find((r) => r.path === '/dsh-qq-guard/session-ops')
+  const post = async (payload) => {
+    const req = {
+      method: 'POST', headers: { 'sec-fetch-site': 'same-origin' },
+      on(evt, fn) {
+        if (evt === 'data') fn(Buffer.from(JSON.stringify(payload)))
+        if (evt === 'end') fn()
+      },
+    }
+    const res = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+    route.handler(req, res)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    return res
+  }
+  const bad = await post({ op: 'global-memory', key: 'g:1' })
+  assert.equal(bad.status, 400, '缺 id 要拒绝')
+  await post({ op: 'global-memory', key: 'g:1', id: 'gm_1' })
+  await post({ op: 'task', key: 'g:1', id: 'task_1' })
+  const getRes = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+  route.handler({ method: 'GET', headers: {} }, getRes)
+  const ops = JSON.parse(getRes.body).ops
+  assert.equal(ops.find((op) => op.op === 'global-memory').id, 'gm_1')
+  assert.equal(ops.find((op) => op.op === 'task').id, 'task_1')
+})
+
 console.log('\n— 接入总闸（v2.0 第七步）—')
 await check('Config：bridgeEnabled 默认开启；日志配置默认值不变', () => {
   const plain = mod.plainConfig(Config({ role: 'settings' })) ?? {}

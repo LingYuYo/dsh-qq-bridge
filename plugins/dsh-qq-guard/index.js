@@ -1479,6 +1479,8 @@ function enqueueSessionOp(op, key, text = '', extra = {}) {
       : {}),
     // v2.0 第十八步：L2 摘要重置（恢复自动生成的原文）。
     ...(extra.reset === true ? { reset: true } : {}),
+    // v2.0 第二十四步：删除跨群记忆 / 定时任务（id）。
+    ...(typeof extra.id === 'string' && extra.id !== '' ? { id: extra.id } : {}),
     at: Date.now(), lease: 0,
   })
   while (sessionOpsQueue.size > SESSION_OPS_CAP) {
@@ -3054,6 +3056,48 @@ function sanitizeOpLogRow(row) {
 }
 
 /**
+ * 收敛桥接上报的跨群记忆条目（v2.0 第二十四步）。
+ * @param {unknown} value
+ */
+function sanitizeGlobalMemoryRow(value) {
+  if (!value || typeof value !== 'object') return null
+  const text = (input, max) => (typeof input === 'string' ? input.replace(/\s+/gu, ' ').trim().slice(0, max) : '')
+  const id = text(value.id, 80)
+  if (id === '') return null
+  return {
+    id,
+    kind: ['person', 'fact', 'preference'].includes(value.kind) ? value.kind : 'fact',
+    title: text(value.title, 60),
+    text: text(value.text, 300),
+    qq: text(value.qq, 20),
+    updatedAt: Number(value.updatedAt) || 0,
+  }
+}
+
+/**
+ * 收敛桥接上报的定时任务（v0.0 第二十四步）。
+ * @param {unknown} value
+ */
+function sanitizeTaskRow(value) {
+  if (!value || typeof value !== 'object') return null
+  const text = (input, max) => (typeof input === 'string' ? input.replace(/\s+/gu, ' ').trim().slice(0, max) : '')
+  const id = text(value.id, 80)
+  if (id === '') return null
+  return {
+    id,
+    cron: text(value.cron, 80),
+    prompt: text(value.prompt, 200),
+    targets: Array.isArray(value.targets)
+      ? value.targets.slice(0, 20).map((item) => text(item, 40)).filter(Boolean)
+      : [],
+    enabled: value.enabled !== false,
+    nextRunAt: Number(value.nextRunAt) || 0,
+    lastRunAt: Number(value.lastRunAt) || 0,
+    lastResult: text(value.lastResult, 200),
+  }
+}
+
+/**
  * 收敛桥接上报的单条会话数据。
  *
  * 桥接是自己人，但**这条路由原则上是「只收白名单字段」**：任何字段、任何长度
@@ -4348,6 +4392,7 @@ function applySettings(ctx, config) {
               ...(op.removeProfile ? { removeProfile: op.removeProfile } : {}),
               // v2.0 第十八步：L2 摘要重置标记（text 走通用 text 字段）。
               ...(op.reset === true ? { reset: true } : {}),
+              ...(typeof op.id === 'string' && op.id !== '' ? { id: op.id } : {}),
             })
           }
           sendJson(res, 200, { ok: true, ops })
@@ -4383,7 +4428,8 @@ function applySettings(ctx, config) {
         // manual-summarize（v2.0 第五步）：同一位置的「提前截断」按钮，
         // 桥接侧会生成前情提要 → 归档旧会话 → 新建同名会话。
         // 两者都不是 QQ 消息，桥接侧标 origin=console，**不冒充主人**（权限仍只认事件 QQ 号）。
-        if (!['clear', 'delete', 'persona', 'activity', 'summarize', 'manual-summarize', 'dynamic', 'briefing'].includes(op)) {
+        if (!['clear', 'delete', 'persona', 'activity', 'summarize', 'manual-summarize', 'dynamic', 'briefing',
+          'global-memory', 'task'].includes(op)) {
           sendJson(res, 400, { ok: false, reason: 'unknown-op', detail: `未知操作：${op || '(空)'}` })
           return
         }
@@ -4431,6 +4477,15 @@ function applySettings(ctx, config) {
         }
         // v2.0 第十八步：L2 摘要重置（不传 text 时恢复自动生成的原文）。
         if (op === 'briefing' && body?.reset === true) extra.reset = true
+        // v2.0 第二十四步：删除跨群记忆 / 定时任务，只接受明确 id。
+        if (op === 'global-memory' || op === 'task') {
+          const id = typeof body?.id === 'string' ? body.id.trim().slice(0, 80) : ''
+          if (id === '') {
+            sendJson(res, 400, { ok: false, reason: 'id required' })
+            return
+          }
+          extra.id = id
+        }
         const id = enqueueSessionOp(
           op, key,
           op === 'persona' || op === 'briefing' ? text : '',
@@ -5521,6 +5576,13 @@ function applySettings(ctx, config) {
                 ? { dshBaseUrl: body.dshBaseUrl.slice(0, 200) }
                 : {}),
               ...(typeof body?.wsUrl === 'string' ? { wsUrl: body.wsUrl.slice(0, 200) } : {}),
+              // v2.0 第二十四步：跨群记忆 / 定时任务列表（只读展示与删除用）。
+              ...(Array.isArray(body?.globalMemory)
+                ? { globalMemory: body.globalMemory.slice(0, 50).map(sanitizeGlobalMemoryRow).filter(Boolean) }
+                : {}),
+              ...(Array.isArray(body?.tasks)
+                ? { tasks: body.tasks.slice(0, 50).map(sanitizeTaskRow).filter(Boolean) }
+                : {}),
             }
             lastStatusAt = Date.now()
             sendJson(res, 200, { ok: true })

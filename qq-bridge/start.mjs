@@ -201,6 +201,9 @@ const stopPolling = startConfigPolling({
     sessions: bridge.sessionViews(),
     // 操作日志（v2.0 第六步）：内存最近 50 条，设置页「系统日志」直接展示。
     opLog: bridge.opLogViews(),
+    // 跨群记忆 / 定时任务（v2.0 第二十四步）：设置页列表用。
+    globalMemory: bridge.globalMemory?.list?.() ?? [],
+    tasks: bridge.scheduler?.list?.() ?? [],
     // 接入总闸 + 实际连接地址（v2.0 第七步，系统日志 → 高级面板用）。
     enabled: bridge._bridgeEnabled(),
     dshBaseUrl: String(bridge.dsh?.baseUrl ?? ''),

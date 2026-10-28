@@ -3976,7 +3976,7 @@ window.__ModuleLoader__.load({
                 onClick: () => setDetailTab(tab.id),
               }, tab.label))),
             detailTab === 'memory'
-              ? h(SessionMemoryTab, { key: cur.key, session: cur })
+              ? h(SessionMemoryTab, { key: cur.key, session: cur, live })
               : detailTab === 'privilege'
                 ? h(SessionPrivilegeTab, { key: cur.key, session: cur, get, write, writable })
                 : detailTab === 'debug'
@@ -4476,7 +4476,7 @@ window.__ModuleLoader__.load({
     }
 
     /** Tab 2 · 记忆与摘要：上下文占用 + 最近 10 条入站 + 未读归纳快捷键。 */
-    function SessionMemoryTab({ session }) {
+    function SessionMemoryTab({ session, live }) {
       const [busy, setBusy] = React.useState(false)
       const [note, setNote] = React.useState(null)
       // 提前截断（v2.0 第五步）：确认弹窗 / 提交中 / 结果提示。
@@ -4488,6 +4488,35 @@ window.__ModuleLoader__.load({
       const [briefingDraft, setBriefingDraft] = React.useState('')
       const [briefingResetOpen, setBriefingResetOpen] = React.useState(false)
       const [briefingBusy, setBriefingBusy] = React.useState(false)
+      // 跨群记忆 / 定时任务（v2.0 第二十四步）：列表来自 status，删除走 session-op。
+      const [memBusy, setMemBusy] = React.useState(false)
+      const [memNote, setMemNote] = React.useState(null)
+      const globalMemories = Array.isArray(live?.globalMemory) ? live.globalMemory : []
+      const scheduledTasks = Array.isArray(live?.tasks) ? live.tasks : []
+      const removeGlobalMemory = async (id) => {
+        setMemBusy(true)
+        setMemNote(null)
+        try {
+          await postSessionOp({ op: 'global-memory', key: session.key, id })
+          setMemNote({ kind: 'ok', text: '已删除，列表会在 2 秒内刷新。' })
+        } catch (error) {
+          setMemNote({ kind: 'err', text: '删除失败：' + (error?.message ?? error) })
+        } finally {
+          setMemBusy(false)
+        }
+      }
+      const removeScheduledTask = async (id) => {
+        setMemBusy(true)
+        setMemNote(null)
+        try {
+          await postSessionOp({ op: 'task', key: session.key, id })
+          setMemNote({ kind: 'ok', text: '任务已删除，列表会在 2 秒内刷新。' })
+        } catch (error) {
+          setMemNote({ kind: 'err', text: '删除失败：' + (error?.message ?? error) })
+        } finally {
+          setMemBusy(false)
+        }
+      }
       const [briefingNote, setBriefingNote] = React.useState(null)
       const context = session.context ?? {}
       const summary = session.summary ?? {}
@@ -4696,6 +4725,57 @@ window.__ModuleLoader__.load({
           briefingNote
             ? h('div', { className: 'qqg-status' + (briefingNote.kind === 'err' ? ' qqg-status-err' : '') },
               briefingNote.text)
+            : null),
+        h(Panel, {
+          title: '跨群特别记忆',
+          desc: '跨群 / 全局的关键信息；检索命中才注入 Prompt。最多显示 20 条，删除立即生效。',
+          right: h('span', { className: 'qqg-pill' }, globalMemories.length + ' 条'),
+        },
+          globalMemories.length === 0
+            ? h('div', { className: 'qqg-hint' },
+              '还没有跨群记忆。让主人发 /记住 [标题] [内容] 写入（例如 /记住 2677321941 喜欢被叫小鱼）。')
+            : h('div', { className: 'qqg-list' }, globalMemories.slice(0, 20).map((item) => h('div', {
+              key: item.id, className: 'qqg-profile-row',
+            },
+            h('span', { className: 'qqg-profile-who' },
+              item.kind === 'person' && item.qq
+                ? `群友 ${item.title || item.qq}(${item.qq})`
+                : (item.title || item.id)),
+            h('span', { className: 'qqg-profile-tags' }, item.text),
+            h('button', {
+              type: 'button', className: 'qqg-chip-x', title: '删除这条跨群记忆',
+              'aria-label': '删除跨群记忆 ' + item.id,
+              disabled: memBusy,
+              onClick: () => removeGlobalMemory(item.id),
+            }, '×')))),
+          memNote
+            ? h('div', { className: 'qqg-status' + (memNote.kind === 'err' ? ' qqg-status-err' : '') },
+              memNote.text)
+            : null),
+        h(Panel, {
+          title: '定时任务',
+          desc: '到点由模型生成一句话，经单并发队列发送（每分钟最多 6 条，防多群齐发风控）。',
+          right: h('span', { className: 'qqg-pill' }, scheduledTasks.length + ' 个'),
+        },
+          scheduledTasks.length === 0
+            ? h('div', { className: 'qqg-hint' },
+              '还没有定时任务。让主人/开发者发「定时任务：每天 9 点发早安」，确认后写入。')
+            : h('div', { className: 'qqg-list' }, scheduledTasks.slice(0, 20).map((task) => h('div', {
+              key: task.id, className: 'qqg-profile-row',
+            },
+            h('span', { className: 'qqg-profile-who' }, task.cron),
+            h('span', { className: 'qqg-profile-tags' },
+              (task.targets.length > 0 ? task.targets.join(',') : '所有群') + ' · ' + task.prompt),
+            h('span', { className: 'qqg-profile-old' },
+              task.nextRunAt > 0 ? '下次 ' + sessionTime(task.nextRunAt) : '已停用'),
+            h('button', {
+              type: 'button', className: 'qqg-chip-x', title: '删除这个定时任务',
+              'aria-label': '删除定时任务 ' + task.id,
+              disabled: memBusy,
+              onClick: () => removeScheduledTask(task.id),
+            }, '×')))),
+          memNote
+            ? null
             : null),
         h(Panel, {
           title: '未读归纳',

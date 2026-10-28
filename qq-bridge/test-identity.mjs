@@ -6,6 +6,7 @@
  * 不连 QQ、不启 DSH：只验 bridge 的纯逻辑与 state 行为。
  */
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
@@ -20,13 +21,16 @@ const check = async (name, fn) => {
 }
 
 function makeBridge({ core, allow } = {}) {
+  // 每个实例独立目录：GlobalMemory / Scheduler 都落在 state 目录里，
+  // 共用 os.tmpdir() 会让跨用例互相污染（记忆被累积）。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-identity-'))
   return new Bridge({
     config: {
       dsh: { baseUrl: 'http://127.0.0.1:1', sessionCwd: '.', workspaceTitle: 'x', agentPreset: 'qq-chat' },
       onebot: { wsUrl: 'ws://127.0.0.1:1', accessToken: 't' },
       allow: { private: [], groups: [], allowAllWhenEmpty: false, ...(allow ?? {}) },
       ...(core ? { personaCore: core } : {}),
-      stateFile: path.join(os.tmpdir(), `qq-identity-${process.pid}-${Math.random().toString(36).slice(2)}.json`),
+      stateFile: path.join(dir, 'sessions.json'),
     },
     logger: { info() {}, warn() {}, error() {}, debug() {} },
   })
@@ -436,6 +440,83 @@ await check('注入位置：动态记忆之后、潜水指令之前', () => {
   const crossIndex = sections.findIndex((item) => /跨群特别记忆/u.test(item))
   assert.ok(dynamicIndex >= 0 && crossIndex > dynamicIndex, sections.join(' | '))
   assert.ok(crossIndex < sections.indexOf(SILENT_INSTRUCTION), '跨群记忆应在潜水指令之前')
+})
+
+console.log('\n— L3 写入 / 定时任务指令（v2.0 第二十四步）—')
+const fakeQq = (b) => {
+  const sent = []
+  b.qq = {
+    groupAtReply: false,
+    async sendGroup(groupId, text) { sent.push(text); return { ok: true } },
+    async sendPrivate(userId, text) { sent.push(text); return { ok: true } },
+  }
+  return sent
+}
+
+await check('/记住：主人可写，非主人被拒且不落盘', async () => {
+  const b = makeBridge({ allow: { owners: ['1001'] } })
+  const sent = fakeQq(b)
+  const ownerHit = await b._handleRememberCommand(
+    groupMsg('/记住 2677321941 喜欢被叫小鱼'), '/记住 2677321941 喜欢被叫小鱼', 'g:1',
+  )
+  assert.equal(ownerHit, true)
+  assert.equal(b.globalMemory.list().length, 1)
+  assert.equal(b.globalMemory.list()[0].qq, '2677321941')
+
+  const denied = await b._handleRememberCommand(
+    groupMsg('/记住 x y', { userId: '2002' }), '/记住 x y', 'g:1',
+  )
+  assert.equal(denied, true)
+  assert.equal(b.globalMemory.list().length, 1, '★ 非主人不能写入')
+  assert.match(sent.at(-1), /权限不足/u)
+})
+
+await check('口述任务：非主人被拒且不调模型；主人得到预览', async () => {
+  const b = makeBridge({ allow: { owners: ['1001'] } })
+  const sent = fakeQq(b)
+  let parsed = 0
+  b._parseTaskWithModel = async () => { parsed += 1; return { cron: '0 9 * * *', prompt: '早安' } }
+
+  const denied = await b._handleTaskUtterance(
+    groupMsg('定时任务：每天9点发早安', { userId: '2002' }), '定时任务：每天9点发早安', 'g:1',
+  )
+  assert.equal(denied, true)
+  assert.equal(parsed, 0, '★ 普通群友绝不能触发模型解析')
+  assert.match(sent.at(-1), /权限不足/u)
+
+  const owner = await b._handleTaskUtterance(groupMsg('定时任务：每天9点发早安'), '定时任务：每天9点发早安', 'g:1')
+  assert.equal(owner, true)
+  assert.equal(parsed, 1)
+  assert.match(sent.at(-1), /请确认/u)
+  assert.equal(b._pendingTasks.has('g:1'), true)
+})
+
+await check('全局任务：主人被拒，开发者可建（targets 为空=所有群）', async () => {
+  const owner = makeBridge({ allow: { owners: ['1001'] } })
+  const ownerSent = fakeQq(owner)
+  let ownerParsed = 0
+  owner._parseTaskWithModel = async () => { ownerParsed += 1; return { cron: '0 9 * * *', prompt: '早安' } }
+  await owner._handleTaskUtterance(groupMsg('定时任务：每天9点给所有群发早安'), '定时任务：每天9点给所有群发早安', 'g:1')
+  assert.equal(ownerParsed, 0)
+  assert.match(ownerSent.at(-1), /全局任务只有开发者/u)
+
+  const dev = makeBridge({ allow: { developers: ['1001'] } })
+  fakeQq(dev)
+  dev._parseTaskWithModel = async () => ({ cron: '0 9 * * *', prompt: '早安' })
+  await dev._handleTaskUtterance(groupMsg('定时任务：每天9点给所有群发早安'), '定时任务：每天9点给所有群发早安', 'g:1')
+  assert.equal(dev._pendingTasks.get('g:1').targets.length, 0, '空 targets = 所有白名单群')
+})
+
+await check('/确认任务：写入 scheduler 并清 pending', async () => {
+  const b = makeBridge({ allow: { owners: ['1001'] } })
+  fakeQq(b)
+  b._parseTaskWithModel = async () => ({ cron: '0 9 * * *', prompt: '早安' })
+  await b._handleTaskUtterance(groupMsg('定时任务：每天9点发早安'), '定时任务：每天9点发早安', 'g:1')
+  const ok = await b._handleTaskCommand(groupMsg('/确认任务'), '/确认任务', 'g:1')
+  assert.equal(ok, true)
+  assert.equal(b.scheduler.list().length, 1)
+  assert.equal(b._pendingTasks.has('g:1'), false)
+  b.scheduler.removeTask(b.scheduler.list()[0].id)
 })
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
