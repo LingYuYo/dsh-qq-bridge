@@ -2440,7 +2440,7 @@ await check('字数档位：非法/倒挂的边界被归一化成单调递增', 
 await check('features：Host 下发的派生值优先；缺字段按默认补', () => {
   assert.deepEqual(normalizeFeatures({ vision: false, search: false }), {
     voice: true, vision: false, search: false, guard: true, debounce: true, rateLimit: true,
-    image: true,
+    image: true, time: true, memory: true, unread: true,
   })
   assert.equal(featuresFromManifests({ skills: [{ id: 'sk-vision', enabled: false }] }).vision, false)
   assert.equal(featuresFromManifests({ skills: [] }).vision, false, '清单里没有 = 关闭')
@@ -2450,6 +2450,19 @@ await check('features：Host 下发的派生值优先；缺字段按默认补', 
   assert.equal(featuresFromManifests({ skills: [{ id: 'sk-voice', enabled: true }] }).image, true,
     '老配置没有 sk-image 时按默认开启')
   assert.equal(featuresFromManifests({ skills: [{ id: 'sk-image', enabled: false }] }).image, false)
+})
+await check('features.memory：新卡 / 老卡 / 缺项三种清单都算对（2026-10-27 合并）', () => {
+  // 缺项（升级前什么都没存）→ 按默认开启。
+  assert.equal(featuresFromManifests({ skills: [{ id: 'sk-voice', enabled: true }] }).memory, true)
+  assert.equal(featuresFromManifests({}).memory, true)
+  // 只有旧卡 sk-context → 沿用用户当时的选择。
+  assert.equal(featuresFromManifests({ skills: [{ id: 'sk-context', enabled: true }] }).memory, true)
+  assert.equal(featuresFromManifests({ skills: [{ id: 'sk-context', enabled: false }] }).memory, false)
+  // 新卡优先。
+  assert.equal(featuresFromManifests({
+    skills: [{ id: 'sk-context', enabled: false }, { id: 'sk-memory', enabled: true }],
+  }).memory, true)
+  assert.equal(featuresFromManifests({ skills: [{ id: 'sk-memory', enabled: false }] }).memory, false)
 })
 await check('能力说明只包含开启的技能', () => {
   const lines = capabilityLines({ vision: false, search: true, voice: false, image: false })

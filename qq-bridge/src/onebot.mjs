@@ -1288,6 +1288,72 @@ export class OneBotClient {
     }
   }
 
+  /**
+   * 拉群历史消息（`get_group_msg_history`，NapCat 的 go-cqhttp 兼容动作，2026-10-28）。
+   *
+   * NapCat 侧语义（packages/napcat-onebot/action/go-cqhttp/GetGroupMsgHistory.ts）：
+   *   · 不给 `message_seq` → `getAioFirstViewLatestMsgs(count)`，即**最近 count 条**；
+   *   · 给 `message_seq` → 以该序号为起点往回拉 count 条；
+   *   · 群号在 schema 里是 `Type.String`，必须按字符串传；
+   *   · 空历史 / 序号不存在时**直接抛错**（`消息X不存在`），不是返回空列表。
+   *
+   * 返回的 `messages` 是完整 OB11 消息对象；**顺序不保证**，由调用方按时间重排。
+   *
+   * @param {string|number} groupId
+   * @param {number} [count] 1..500
+   * @param {{timeoutMs?:number}} [opts]
+   * @returns {Promise<{ok:boolean, messages:Array<object>, reason?:string}>}
+   */
+  async getGroupMsgHistory(groupId, count = 200, { timeoutMs = 15_000 } = {}) {
+    const gid = String(groupId ?? '').trim()
+    if (!/^\d+$/u.test(gid)) return { ok: false, messages: [], reason: `非法的群号：${gid.slice(0, 20)}` }
+    const size = Math.min(500, Math.max(1, Math.trunc(Number(count) || 200)))
+    try {
+      const res = await this.call('get_group_msg_history', { group_id: gid, count: size }, { timeoutMs })
+      if (res?.status && res.status !== 'ok') {
+        return { ok: false, messages: [], reason: `retcode=${res?.retcode ?? '?'} ${res?.wording ?? ''}`.trim() }
+      }
+      const data = res?.data
+      const list = Array.isArray(data?.messages) ? data.messages : Array.isArray(data) ? data : []
+      return { ok: true, messages: list }
+    } catch (error) {
+      const message = error?.message ?? String(error)
+      // 「没有消息」在这条动作里是抛错，不是空数组：不当失败处理。
+      if (/不存在/u.test(message)) return { ok: true, messages: [] }
+      return { ok: false, messages: [], reason: message }
+    }
+  }
+
+  /**
+   * 发群合并转发（`send_group_forward_msg`，2026-10-28）。
+   *
+   * 约束（NapCat `SendMsg.ts:138-142`）：一条消息里**只能全是 node**，
+   * 混普通消息段会被直接拒；节点 schema 见 `OB11MessageNodeSchema`
+   * （`nickname` 必填，`user_id` / `uin` 可省，`content` 是 OB11MessageMixType）。
+   *
+   * @param {string|number} groupId
+   * @param {Array<object>} nodes buildForwardNodes() 的产物
+   * @param {{timeoutMs?:number}} [opts]
+   * @returns {Promise<{ok:boolean, messageId?:string, reason?:string}>}
+   */
+  async sendGroupForward(groupId, nodes, { timeoutMs = 15_000 } = {}) {
+    const gid = String(groupId ?? '').trim()
+    if (!/^\d+$/u.test(gid)) return { ok: false, reason: `非法的群号：${gid.slice(0, 20)}` }
+    if (!Array.isArray(nodes) || nodes.length === 0) return { ok: false, reason: '空的合并转发节点' }
+    try {
+      const res = await this.call('send_group_forward_msg', { group_id: gid, messages: nodes }, { timeoutMs })
+      const retcode = res?.retcode === undefined ? null : Number(res.retcode)
+      if (res?.status === 'failed' || (retcode !== null && retcode !== 0)) {
+        const detail = res?.wording ?? res?.message ?? ''
+        return { ok: false, reason: `retcode=${res?.retcode ?? '?'} ${detail}`.trim() }
+      }
+      const id = res?.data?.message_id ?? res?.data?.messageId
+      return { ok: true, messageId: id === undefined ? undefined : String(id) }
+    } catch (error) {
+      return { ok: false, reason: error?.message ?? String(error) }
+    }
+  }
+
   /** 私聊发送（自动分片，逐条，固定 sendIntervalMs 兜底）。 */
   async sendPrivate(userId, text) {    return await this._sendText('private', userId, text)
   }

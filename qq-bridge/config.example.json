@@ -14,15 +14,27 @@
     "accessToken": "CHANGE_ME_随机令牌"
   },
   "allow": {
+    "_comment": "admins 能发 / 开头的指令；owners 在管理员之上，另有 /归纳 这类要花 token 的后台动作权限，且自动算管理员。昵称/消息文本/模型输出都提不了权。",
     "private": [],
     "groups": [],
     "admins": [],
+    "owners": [],
     "deny": { "private": [], "groups": [] },
     "allowAllWhenEmpty": false
   },
   "replyTimeoutMs": 20000,
   "maxContextTurns": 30,
   "contextClearStrategy": "compact",
+  "vision": {
+    "_comment": "可选：覆盖 DSH 附件的源图准入上限（默认 8192 / 64MP / 20MB，与 dsh-attachment-local 一致）。只在 DSH 侧改过 maxImageDimension 这类配置时才需要跟着改，一般留空。",
+    "imageLimits": {
+      "maxDimension": 8192,
+      "maxPixels": 67108864,
+      "maxBytes": 20971520,
+      "normalizedPixels": 4194304,
+      "maxImagesPerMessage": 20
+    }
+  },
   "sendDelayMs": 400,
   "chunkSize": 1000,
   "bubbleMaxChars": 30,
@@ -50,6 +62,36 @@
     "batchIntervalMs": 2500,
     "rateLimit": { "perMin": 12, "burst": 3, "silent": true },
     "mute": { "enabled": true, "words": ["闭嘴", "安静", "别刷屏"], "seconds": 60 }
+  },
+  "memory": {
+    "_comment": "记忆与上下文（2026-10-27 合并了原 contextAware）：pokeMaxTurns 默认 15；messageMaxTurns 默认 0 = 交给 DSH 原生上下文；maxContextTokens 是两者共用的一次注入 token 预算（128K~1M，默认 128000），超了从最老的记录开始截断。设置页改这几项会热覆盖这里。",
+    "enabled": true,
+    "pokeMaxTurns": 15,
+    "messageMaxTurns": 0,
+    "maxContextTokens": 128000,
+    "smartMatch": true
+  },
+  "timeAware": {
+    "_comment": "静默超过 silentMinutes 后有人说话，就在 prompt 末尾注入 promptText（N / {minutes} 会替换成实际分钟数）。",
+    "enabled": true,
+    "silentMinutes": 30,
+    "promptText": "[系统提示：群聊已经安静了 N 分钟，刚刚有人说话了，请表现得像刚回过神一样]"
+  },
+  "unreadSummary": {
+    "_comment": "v2.0 第一步：主人在群里发 /归纳 [条数]。拉群历史（硬上限 500）→ 旁路临时会话里的廉价模型总结 → 多个 node 合并转发发回群里，失败降级纯文本。水位（lastSummarySeq/lastSummaryAt）存在 state/sessions.json，重启不会重复归纳也不会漏。",
+    "enabled": true,
+    "includeImages": false,
+    "maxMessages": 200,
+    "maxImages": 4,
+    "budgetTokens": 24000,
+    "perMessageChars": 300,
+    "maxNodes": 6,
+    "nodeChars": 400,
+    "timeoutMs": 150000,
+    "notifyOwners": true,
+    "notifyCooldownMs": 3600000,
+    "provider": "",
+    "model": ""
   },
   "stateFile": "./state/sessions.json"
 }

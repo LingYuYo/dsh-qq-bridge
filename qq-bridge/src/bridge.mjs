@@ -25,6 +25,19 @@ import { OneBotClient, normalizeTypingCharTiers, normalizeTypingMsTiers, normali
 import { DshClient } from './dsh.mjs'
 import { synthesize, TTS_MAX_CHARS, DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER } from './tts.mjs'
 import { ExternalHooksClient } from './external-hooks.mjs'
+import { DSH_IMAGE_LIMITS, MAX_TILES, prepareImageParts } from './image-prep.mjs'
+import { estimateTokens, truncateChatLine } from './tokens.mjs'
+import {
+  SUMMARY_HARD_LIMIT,
+  buildForwardNodes,
+  buildSummaryPrompt,
+  formatTranscript,
+  nextWatermark,
+  normalizeSummary,
+  parseSummaryCommand,
+  pickUnread,
+  splitSummaryNodes,
+} from './unread-summary.mjs'
 
 /**
  * 非管理员说话时追加到人设末尾的安全提示。
@@ -142,11 +155,29 @@ export function auditReply(text, secrets = []) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+/**
+ * 带 code 的错误（未读归纳用）。code 只出现在日志与主人私聊里，
+ * 群里永远只说人话 —— 这条和「超时文案绝不回传英文报错」是同一条红线。
+ */
+function summaryError(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
+
 // ── 图片识别（Phase 6 / 任务 5）──────────────────────────────────────────
-/** 单张图片上限：再大就不是聊天截图了，喂给模型也会被 DSH 拒。 */
-const IMAGE_MAX_BYTES = 8 * 1024 * 1024
+/**
+ * 单张图片下载上限。
+ *
+ * 与 DSH 附件的源图字节上限对齐（20MB）。以前的 8MB 会在长截图还没进
+ * 「切条/缩放」之前就把它当下载失败丢掉（2026-10-27 修）。
+ * 超过 DSH 上限的由 {@link prepareImageParts} 重新编码，不在这里拦。
+ */
+const IMAGE_MAX_BYTES = DSH_IMAGE_LIMITS.maxBytes
 /** 一条消息最多处理几张图：群聊刷图时不至于把一轮请求撑爆。 */
 const IMAGE_MAX_COUNT = 4
+/** 一条 prompt 里最多几个 image part（DSH 的 maxImagesPerMessage 默认 20；切条会成倍增加）。 */
+const IMAGE_MAX_PARTS = DSH_IMAGE_LIMITS.maxImagesPerMessage
 const IMAGE_FETCH_TIMEOUT_MS = 8_000
 /** 图片预取缓存 TTL（P2）：60 秒内同一地址不重复下载。 */
 const IMAGE_CACHE_TTL_MS = 60_000
@@ -154,6 +185,13 @@ const IMAGE_CACHE_TTL_MS = 60_000
 const IMAGE_CACHE_MAX = 32
 /** 预取并发上限：不要为了几张图把网络打满。 */
 const IMAGE_PREFETCH_CONCURRENCY = 2
+/**
+ * 多模态能力判定的缓存时长（2026-10-27）：
+ *   · 正面结论缓存 10 分钟（目录一般不会中途变）；
+ *   · 负面结论只缓存 30 秒 —— 目录可能过时，也怕再把「图被拒」误读成「模型不行」。
+ */
+const VISION_CACHE_TTL_MS = 10 * 60_000
+const VISION_NEGATIVE_TTL_MS = 30_000
 /** 会话存在性正结果缓存时长（P2）：30 秒内不重复查。 */
 const SESSION_EXISTS_TTL_MS = 30_000
 
@@ -182,6 +220,15 @@ export const DEFAULT_FEATURES = Object.freeze({
   voice: true, vision: true, search: true, guard: true, debounce: true, rateLimit: true,
   // P2「发图片」（sk-image）：老配置里没有这个技能时按默认开启（契约 3.1）。
   image: true,
+  // 「时间感知」（sk-time-aware，2026-10-27）：老配置里没有这张卡时按默认开启，
+  // 实际是否注入还取决于 timeAware.enabled（齿轮里的开关）。
+  time: true,
+  // 「记忆与上下文」（sk-memory，2026-10-27 合并版）：同理按默认开启，
+  // 实际是否注入取决于 memory.enabled 与两个条数。
+  memory: true,
+  // 「未读归纳」（sk-unread，2026-10-28 v2.0 第一步）：同样缺项按开启；
+  // 真正能不能跑还取决于 unreadSummary.enabled 与**主人**身份（见 isOwner）。
+  unread: true,
 })
 
 /** 归一化 features：缺字段按默认值补，非布尔忽略。 */
@@ -196,6 +243,9 @@ export function normalizeFeatures(source) {
     debounce: bool(raw.debounce, DEFAULT_FEATURES.debounce),
     rateLimit: bool(raw.rateLimit, DEFAULT_FEATURES.rateLimit),
     image: bool(raw.image, DEFAULT_FEATURES.image),
+    time: bool(raw.time, DEFAULT_FEATURES.time),
+    memory: bool(raw.memory, DEFAULT_FEATURES.memory),
+    unread: bool(raw.unread, DEFAULT_FEATURES.unread),
   }
 }
 
@@ -218,7 +268,34 @@ export function featuresFromManifests({ skills, plugins } = {}) {
     image: !Array.isArray(skills) || !skills.some((item) => item && item.id === 'sk-image')
       ? DEFAULT_FEATURES.image
       : pick(skills, 'sk-image', DEFAULT_FEATURES.image),
+    // 「时间感知」同理：老配置没有这张卡 → 按默认开启；明确 enabled:false 才算关闭。
+    time: !Array.isArray(skills) || !skills.some((item) => item && item.id === 'sk-time-aware')
+      ? DEFAULT_FEATURES.time
+      : pick(skills, 'sk-time-aware', DEFAULT_FEATURES.time),
+    // 「记忆与上下文」（2026-10-27 合并）：新卡是 sk-memory；升级前的老清单里
+    // 拆成 sk-context + sk-memory 两条，任一开启都算开启。
+    memory: memoryFromSkills(skills),
+    // 「未读归纳」：老清单里没有这张卡 → 默认开启（与 sk-image / sk-time-aware 同一条兼容规则）。
+    unread: !Array.isArray(skills) || !skills.some((item) => item && item.id === 'sk-unread')
+      ? DEFAULT_FEATURES.unread
+      : pick(skills, 'sk-unread', DEFAULT_FEATURES.unread),
   })
+}
+
+/**
+ * 由技能清单推导 `features.memory`（2026-10-27 合并版的兼容规则）。
+ *
+ * 顺序：新卡 `sk-memory` 存在 → 看它；只有旧卡 `sk-context` → 沿用用户的开关；
+ * 两个都没有（老配置 / 空清单）→ 按默认开启，不能因为缺项把功能关死。
+ * @param {Array<{id?:string, enabled?:boolean}>|undefined} skills
+ */
+function memoryFromSkills(skills) {
+  if (!Array.isArray(skills)) return DEFAULT_FEATURES.memory
+  const hit = skills.find((item) => item && item.id === 'sk-memory')
+  if (hit) return hit.enabled !== false
+  const legacy = skills.find((item) => item && item.id === 'sk-context')
+  if (legacy) return legacy.enabled !== false
+  return DEFAULT_FEATURES.memory
 }
 
 /** 技能开启时追加在系统提示词里的能力说明（模型得知道自己有什么工具）。 */
@@ -357,6 +434,34 @@ const POKE_DELAY_DEFAULT_MAX = 500
 /** 延迟配置的硬上限（配置填错也不至于把一条戳一戳拖到分钟级）。 */
 const POKE_DELAY_MAX_MS = 10_000
 
+/* ── 记忆与上下文（2026-10-27 合并）──────────────────────────────
+ *
+ * 原「上下文感知」与「记忆提取」合成一张卡。注入聊天记录时做**双重限制**：
+ *   ① 条数上限（maxTurns：戳一戳 / 普通消息各一个）；
+ *   ② token 预算（maxContextTokens，两处共用）。
+ * 两条上限取交集：任一条先到就从**最老的记录**开始砍，保证塞给模型的内容不超限。
+ */
+/** 条数上限的硬顶（与插件 Schema、client.js 的 MEMORY_MAX_TURNS 保持一致）。 */
+const MEMORY_MAX_TURNS = 50
+/** 戳一戳「模型回复」默认注入条数（与 Config 默认值一致）。 */
+const DEFAULT_POKE_MAX_TURNS = 15
+/** 普通消息默认不额外注入（交给 DSH 原生上下文）。 */
+const DEFAULT_MESSAGE_MAX_TURNS = 0
+/** 一次注入的默认 token 预算 128K（与 Config 默认值一致）。 */
+const DEFAULT_MAX_CONTEXT_TOKENS = 128000
+/** token 预算的下限 / 上限：下限 128K，上限 1M（与 Config 的 min / max 一致）。 */
+const MEMORY_CONTEXT_TOKENS_MIN = 128000
+const MEMORY_CONTEXT_TOKENS_MAX = 1000000
+/**
+ * 注入小节标题行预留的 token（`【本会话最近 N 条聊天记录…】` / `【戳一戳】…`）。
+ * 预算判断时先扣掉它，避免标题本身把「正好卡满」的记录挤掉。
+ */
+const MEMORY_SECTION_HEADER_TOKENS = 64
+
+// token 估算与单行截断抽到 ./tokens.mjs：未读归纳也要按同一套预算裁，
+// 放在本文件里会和 unread-summary.mjs 形成循环 import。
+export { estimateTokens, truncateChatLine }
+
 /* ── 引用消息深度解析（2026-10-27）──────────────────────────────
  *
  * 引用回复时 OneBot 只给一个 `reply` 段（message_id），被引用原消息里的图片、
@@ -393,6 +498,18 @@ const QUOTE_FORWARD_IMAGE_CAP = 10
  * 一条往前扫，遇到超过这个间隔就断开，只带当前这一轮聊天的上下文。
  */
 const CONTEXT_SMART_GAP_MS = 5 * 60 * 1000
+/**
+ * 时间感知（2026-10-27）。
+ *
+ * 每个 chatKey 的「最后活跃时间」其实就是 `state.sessions[key].lastAt`（收到消息就更新，
+ * 已经随 state 落盘），所以重启不会把静默时长算错。静默超过阈值时先记一笔 hint，
+ * 等下一次真正走模型的轮次再注入，避免消息被档位跳过时白算。
+ */
+const DEFAULT_TIME_AWARE_PROMPT = '[系统提示：群聊已经安静了 N 分钟，刚刚有人说话了，请表现得像刚回过神一样]'
+/** 默认静默阈值（分钟）：与插件 Config 的 timeAware.silentMinutes 默认值一致。 */
+const DEFAULT_SILENT_MINUTES = 30
+/** 静默提示的保鲜期：消息进来超过这么久还没走模型，就别再拿旧时长说事。 */
+const SILENCE_HINT_TTL_MS = 2 * 60 * 1000
 /**
  * B 站网页解析（2026-10-27）。
  *
@@ -836,6 +953,8 @@ export class Bridge {
     this._quoteCache = new Map()
     // B 站视频信息缓存（2026-10-27）：bvid -> { at, info }，同上，10 分钟。
     this._biliCache = new Map()
+    // 未读归纳（v2.0，2026-10-28）：正在跑归纳的会话 key，防同群重复触发。
+    this._summaryRuns = new Set()
     // fetch 可注入：测试里替换掉它，B 站 API / 短链跳转的解析就能确定性断言。
     this.fetchImpl = typeof globalThis.fetch === 'function' ? globalThis.fetch : null
     // 图文顺序（2026-10-27）：正在跑模型的那一轮会把 key 记在这里。
@@ -843,8 +962,17 @@ export class Bridge {
     // 否则 QQ 上会先弹表情包、后弹文字，看着像发错顺序。
     this._turnActive = new Set()        // key
     this._pendingImages = new Map()     // key -> [{ source, subType, position, kind, target }]
-    // 每小时归纳的聊天记录缓冲：key -> [{ name, qq, text, at }]（群聊才有）。
+    // 每小时归纳的聊天记录缓冲：key -> [{ name, qq, text, at, kind, seq }]
+    // 2026-10-27 起群聊/私聊都记（messageTurns 需要私聊上下文）；归纳只读 g: 键。
     this._chatLog = new Map()
+    // 聊天记录自增序号：用来把「本轮消息之前」的记录和本轮自己分开（避免把自己注入两遍）。
+    this._chatLogSeq = 0
+    // 最近一次注入的截断统计（2026-10-27）：{ kept, dropped, tokens, budget }，
+    // 只用于日志 / 离线测试断言，不参与任何决策。
+    this._lastMemoryTrim = null
+    // 时间感知（2026-10-27）：静默超过阈值时先记一笔，等下一次真正走模型的轮次再消费。
+    // key -> { minutes:number, at:number }
+    this._silenceHints = new Map()
     // 归纳定时器（start 里建、stop 里清）与并发保护（一轮 60s 超时内不叠第二轮）。
     this._summarizeTimer = null
     this._summarizing = false
@@ -882,6 +1010,8 @@ export class Bridge {
       // 技能 / 插件开关（Phase 6）：Host 侧算好的派生布尔，桥接每 2 秒热同步。
       // 没同步到之前用 config.json 的 features（没有就全开，与插件默认清单一致）。
       features: normalizeFeatures(config.features),
+      // 未读归纳（v2.0 第一步，2026-10-28）：条数 / 预算 / 节点数 / 摘要模型。
+      unreadSummary: normalizeSummary(config.unreadSummary),
       // 语音合成配置（Phase 6）：provider / baseUrl / apiKey / voice，桥接现读。
       voice: { ...(config.voice ?? {}) },
       // 白名单：每次判定时现读（见 isAllowed），这里给初值。
@@ -890,6 +1020,8 @@ export class Bridge {
         groups: Array.isArray(config.allow?.groups) ? config.allow.groups.map(String) : [],
         // 管理员：只有名单里的人能发 `/` 开头的指令（见 handleMessage）。
         admins: Array.isArray(config.allow?.admins) ? config.allow.admins.map(String) : [],
+        // 主人（2026-10-28）：管理员之上再一阶，能触发后台动作（`/归纳`）。
+        owners: Array.isArray(config.allow?.owners) ? config.allow.owners.map(String) : [],
         deny: {
           private: Array.isArray(config.allow?.deny?.private) ? config.allow.deny.private.map(String) : [],
           groups: Array.isArray(config.allow?.deny?.groups) ? config.allow.deny.groups.map(String) : [],
@@ -1181,6 +1313,12 @@ export class Bridge {
         // 上下文自动清理次数（2026-10-27，排障用）：压缩成功 / 归档重建各记一份。
         contextCompacts: Number.isFinite(Number(parsed.contextCompacts)) ? Number(parsed.contextCompacts) : 0,
         contextResets: Number.isFinite(Number(parsed.contextResets)) ? Number(parsed.contextResets) : 0,
+        // 未读归纳水位（2026-10-28）：g:<群号> -> { lastSummarySeq, lastSummaryAt, runs, lastError }
+        // 必须落盘：这是「重启后不重复归纳、也不漏消息」的唯一依据。
+        unreadSummary: parsed.unreadSummary && typeof parsed.unreadSummary === 'object'
+          && !Array.isArray(parsed.unreadSummary) ? parsed.unreadSummary : {},
+        // 主人错误通知的节流时间戳（ms）：0 = 从没通知过。
+        unreadNotifyAt: Number.isFinite(Number(parsed.unreadNotifyAt)) ? Number(parsed.unreadNotifyAt) : 0,
       }
     } catch {
       return {
@@ -1191,6 +1329,8 @@ export class Bridge {
         capabilityRefreshes: 0,
         contextCompacts: 0,
         contextResets: 0,
+        unreadSummary: {},
+        unreadNotifyAt: 0,
       }
     }
   }
@@ -1218,6 +1358,9 @@ export class Bridge {
       private: norm(source.private),
       groups: norm(source.groups),
       admins: norm(source.admins),
+      // 主人（2026-10-28）：比管理员高一阶，能触发后台动作（未读归纳）。
+      // 主人**自动视同管理员**（见 isAdmin），否则他连 `/` 指令都发不进来。
+      owners: norm(source.owners),
       deny: {
         private: norm(source.deny?.private),
         groups: norm(source.deny?.groups),
@@ -1246,16 +1389,35 @@ export class Bridge {
   }
 
   /**
-   * 发送者是否是管理员（allow.admins）。
+   * 发送者是否是管理员（`allow.admins` 或 `allow.owners`）。
    *
    * 管理员身份**只对 `/` 开头的指令生效**，不改变白名单判定：
    * 管理员如果不在 allow.private/groups 里，普通聊天仍然会被白名单挡掉。
+   * 主人自动算管理员 —— 不然「主人能触发后台动作、却连 `/` 都发不进来」会自相矛盾。
    * @param {object} msg
    */
   isAdmin(msg) {
     const sender = String(msg?.userId ?? '')
     if (!sender) return false
-    return this._allow().admins.includes(sender)
+    const allow = this._allow()
+    return allow.admins.includes(sender) || allow.owners.includes(sender)
+  }
+
+  /**
+   * 发送者是否是主人（`allow.owners`，2026-10-28 新增的第一阶之上）。
+   *
+   * 权限分阶（现状）：
+   *   · 普通群友：只能聊天，不能发 `/` 指令；
+   *   · 管理员（`allow.admins`）：能发 `/` 指令（清空 / 删除 / 模型等）；
+   *   · 主人（`allow.owners`）：管理员全部权限 + 触发后台动作（`/归纳`，会花 token 调模型）。
+   * 开发者暗号提权仍在 Roadmap，未实装 —— 所以这里**只认事件里的 QQ 号**，
+   * 不认昵称、消息文本或模型输出。
+   * @param {object} msg
+   */
+  isOwner(msg) {
+    const sender = String(msg?.userId ?? '')
+    if (!sender) return false
+    return this._allow().owners.includes(sender)
   }
 
   /**
@@ -1396,11 +1558,47 @@ export class Bridge {
    */
   _noteIncoming(key, text) {
     const entry = this._entryOf(key)
+    const now = Date.now()
+    // 时间感知（2026-10-27）：先拿**更新前**的 lastAt 算静默时长，再写新时间。
+    // 这里覆盖所有通过白名单的消息（包括被档位/静音跳过的），语义才是「群聊安静了多久」；
+    // 如果只按「bot 回复」算，群里一直有人在聊、只是没叫 bot，也会误报「安静了半小时」。
+    const previous = Number(entry.lastAt)
+    const aware = this._timeAwareConfig()
+    if (aware.enabled && Number.isFinite(previous) && previous > 0) {
+      const gapMs = now - previous
+      if (gapMs >= aware.silentMinutes * 60_000) {
+        this._silenceHints.set(key, {
+          minutes: Math.max(1, Math.round(gapMs / 60_000)),
+          at: now,
+        })
+        this.logger.info?.(`会话 ${key} 静默 ${Math.round(gapMs / 60_000)} 分钟，下一轮注入时间提示`)
+      }
+    }
     entry.unread = Math.max(0, Number(entry.unread) || 0) + 1
-    entry.lastAt = Date.now()
+    entry.lastAt = now
     const preview = String(text ?? '').replace(/\s+/gu, ' ').trim()
     if (preview) entry.lastText = preview.slice(0, PREVIEW_MAX)
     this._saveState()
+  }
+
+  /**
+   * 取走该会话待注入的「静默提示」（时间感知）。
+   *
+   * 只消费一次；超过 {@link SILENCE_HINT_TTL_MS} 没走模型就丢弃——消息被档位跳过 /
+   * 自动回复接走时，下一个模型轮次再说「安静了 40 分钟」就不合时宜了。
+   * @param {string} key
+   * @returns {string} 已替换好分钟数的提示词；没有则空串
+   */
+  _consumeSilenceHint(key) {
+    const hint = this._silenceHints.get(key)
+    if (!hint) return ''
+    this._silenceHints.delete(key)
+    if (Date.now() - hint.at > SILENCE_HINT_TTL_MS) return ''
+    const aware = this._timeAwareConfig()
+    if (!aware.enabled) return ''
+    return aware.promptText
+      .replace(/\{minutes\}/gu, String(hint.minutes))
+      .replace(/\bN\b/gu, String(hint.minutes))
   }
 
   /** 真的把回复发到 QQ 了：未读清零。 */
@@ -1429,7 +1627,9 @@ export class Bridge {
    * @param {Array<object>} [images]
    */
   _noteChatLog(key, msg, text, images = []) {
-    if (msg?.kind !== 'group') return
+    // 2026-10-27：私聊也记（messageTurns 需要私聊上下文）；每小时归纳只读 g: 键，
+    // 所以这里放开不会把私聊内容混进群人设归纳。
+    if (msg?.kind !== 'group' && msg?.kind !== 'private') return
     const body = String(text ?? '').trim()
     if (body.startsWith('/')) return
     const line = body || (Array.isArray(images) && images.length > 0 ? '[图片]' : '')
@@ -1439,8 +1639,11 @@ export class Bridge {
     list.push({
       name: String(msg.senderName ?? '').trim(),
       qq: String(msg.userId ?? ''),
+      kind: msg.kind,
       text: line,
       at: now,
+      // 自增序号：messageTurns 注入时用它把「本轮自己」排除掉，避免同一条消息出现两遍。
+      seq: ++this._chatLogSeq,
     })
     this._chatLog.set(key, list.slice(-CHAT_LOG_MAX))
   }
@@ -2868,6 +3071,9 @@ export class Bridge {
     }
     // 每小时归纳的上下文缓冲：通过白名单的群聊消息都算（`/` 指令由 _noteChatLog 自己排除）。
     // 2026-10-27：用 chatText（原文）而不是拼了引用的 text —— 引用别人的话进归纳会串味。
+    // logSince 是「本条消息即将拿到的序号」：messageTurns 注入时只取 < 它的记录，
+    // 这样本轮自己的话不会被拼进 prompt 里重复一遍。
+    const logSince = this._chatLogSeq + 1
     this._noteChatLog(key, msg, chatText, images.slice(0, chatImageCount))
     // 1) `/` 开头的指令：只有 allow.admins 里的人能执行。
     //    非管理员直接回一句提示并丢弃，**不投递 DSH**（省 token，也不给模型被诱导的机会）。
@@ -2882,6 +3088,9 @@ export class Bridge {
         return
       }
       this.logger.info?.(`管理员指令放行：${key} text=${chatText.slice(0, 60)}`)
+      // 未读归纳（v2.0 第一步，2026-10-28）：主人专属。命中即异步开跑并 return，
+      // 不阻塞后面的消息，也不进 DSH 会话（归纳走的是旁路临时会话）。
+      if (await this._handleUnreadSummaryCommand(msg, chatText, key)) return
     }
     // 2) 禁言指令：命中即静音该会话，自己也不回复（否则「闭嘴」还在说话）。
     if (this._handleMuteCommand(key, chatText)) return
@@ -2914,7 +3123,7 @@ export class Bridge {
         )
       }
     }
-    await this._enqueue(key, msg, text, images)
+    await this._enqueue(key, msg, text, images, { beforeSeq: logSince })
   }
 
   /**
@@ -2958,7 +3167,7 @@ export class Bridge {
    *   · 图片段一起攒（同一窗口里先发文字再补图，应该进同一轮）；
    *   · 「防抖合并」插件开关（pl-debounce）关掉时直接投递，不再攒。
    */
-  async _enqueue(key, msg, text, images = []) {
+  async _enqueue(key, msg, text, images = [], options = {}) {
     // 群聊发送人标签：**每条消息各自打**（不同人各带各的标签），合并后仍按行拼。
     const labelled = this._labelForModel(msg, text)
     // 防抖窗口优先级：高级参数 antiDebounceMs（0=不启用）> 节奏里的 debounceWindowMs。
@@ -2968,7 +3177,7 @@ export class Bridge {
     // 0 = 关闭防抖，或「防抖合并」插件被关掉：立即投递（保持旧行为，也让测试可控）。
     if (!(windowMs > 0) || !this._features().debounce) {
       // 快照本轮身份：一轮只会引用**这条消息**的 message_id。
-      return await this._processBatch(key, { ...msg }, [labelled], images)
+      return await this._processBatch(key, { ...msg }, [labelled], images, options)
     }
 
     const prev = this._debounce.get(key)
@@ -2982,7 +3191,11 @@ export class Bridge {
       void this._flushDebounce(key)
         .catch((e) => this.logger.error?.(`处理 ${key} 失败：${e?.message ?? e}`))
     }
-    const entry = this._debounce.get(key) ?? { texts: [], images: [], msg: null, timer: null }
+    const entry = this._debounce.get(key) ?? { texts: [], images: [], msg: null, timer: null, beforeSeq: undefined }
+    // 一轮里只认**第一条**消息的序号上界：后面同批的消息本来就该被当前 prompt 覆盖。
+    if (entry.beforeSeq === undefined && Number.isFinite(Number(options?.beforeSeq))) {
+      entry.beforeSeq = Number(options.beforeSeq)
+    }
     if (labelled) entry.texts.push(labelled)
     if (images.length > 0) entry.images.push(...images)
     entry.msg = msg // 同一发送者的最后一条：引用 / @ 都指向它
@@ -3018,14 +3231,14 @@ export class Bridge {
     const turnMsg = { ...entry.msg }
     const texts = [...entry.texts]
     const images = [...entry.images]
-    return await this._processBatch(key, turnMsg, texts, images)
+    return await this._processBatch(key, turnMsg, texts, images, { beforeSeq: entry.beforeSeq })
   }
 
   /**
    * 合并后的文本 → 串行队列。同一 key 的投递绝不并发（回复否则会串线）。
    * 限频、会话建立、投递、审计、发送都在这里收口。
    */
-  async _processBatch(key, msg, texts, images = []) {
+  async _processBatch(key, msg, texts, images = [], options = {}) {
     const rawText = texts.map((t) => String(t ?? '')).filter(Boolean).join('\n').trim()
     if (!rawText && images.length === 0) return
     // B 站链接解析（2026-10-27）：模型直接抓 bilibili.com 会撞验证码页，
@@ -3065,7 +3278,7 @@ export class Bridge {
         // 多模态（2026-10-23）：图片只在「图片理解」开启且模型声明支持时随消息带上；
         // 否则退回纯文本 + 一句诚实说明（绝不让模型假装看见了图）。
         const built = await this._buildPromptContent(text, images)
-        let promptText = built.fallbackText || text
+        let promptText = built.headText ?? (built.fallbackText || text)
         // 外部插件 hook（P2）：prompt 之前的 before-context。可替换本轮正文、按顺序
         // 追加「外部上下文」小节到正文之后；**不改人设**（人设走 setSessionPersona）。
         // best-effort：失败/超时按原上下文继续，绝不影响本轮回复。
@@ -3090,7 +3303,24 @@ export class Bridge {
               : promptText
             built.content[0] = { type: 'text', text }
           }
-          built.fallbackText = promptText
+          if (built.images === 0) built.fallbackText = promptText
+        }
+        // 上下文感知 messageTurns + 时间感知（2026-10-27）：都只往 prompt 里**追加**小节，
+        // 不改正文本身。放在 hook 之后拼，保证外部插件看到的还是原始正文。
+        const contextSections = this._contextSections(key, { beforeSeq: options?.beforeSeq })
+        if (contextSections.length > 0) {
+          promptText = `${promptText}\n\n${contextSections.join('\n\n')}`
+          // 多模态时正文在 content[0].text 里，必须同步（否则模型只收到图片 + 原始正文）。
+          if (built.images > 0 && Array.isArray(built.content) && built.content[0]?.type === 'text') {
+            const markers = Array.isArray(built.rawMarkers) ? built.rawMarkers : []
+            built.content[0] = {
+              type: 'text',
+              text: markers.length > 0
+                ? `${promptText}\n\n${markers.map((token) => `[[qqimg:${token}]]`).join('\n')}`
+                : promptText,
+            }
+          }
+          if (built.images === 0) built.fallbackText = promptText
         }
         const promptOpts = {
           // 优先级：设置页热改的 replyTimeoutMs > config.json > 20s 默认。
@@ -3105,18 +3335,14 @@ export class Bridge {
         let reply
         try {
           reply = await this.dsh.promptAndWait(sessionId, promptText, promptOpts)
+          // 图片真的投递成功 = 最硬的「模型能看图」证据：顺手纠正可能过时的负面缓存。
+          if (built.images > 0) this._noteVisionResult(true)
         } catch (error) {
-          // DSH 在 admission 阶段会按**当前会话选择**的模型校验图片能力；
-          // 我们的无痕覆写只改请求、不改会话选择，所以可能被拒。
-          // 被拒时不必让用户干等：把这一轮降级成纯文本重试（消息尚未入队，不会重复）。
-          const message = String(error?.message ?? error)
-          if (built.images > 0 && /MODEL_DOES_NOT_SUPPORT_IMAGES|attachment-invalid/i.test(message)) {
-            this._visionProbe = { at: Date.now(), ok: false }
-            this.logger.warn?.('模型不支持图片输入，本轮退回纯文本（图片内容不会给模型）')
-            reply = await this.dsh.promptAndWait(sessionId, built.fallbackText || text, promptOpts)
-          } else {
-            throw error
-          }
+          // DSH 在 admission 阶段会按**当前会话选择**的模型校验图片；我们的无痕覆写
+          // 只改请求、不改会话选择，所以可能被拒。被拒时降级成纯文本重试一次。
+          reply = await this._promptWithImageFallback({
+            sessionId, built, text, promptText, promptOpts, error,
+          })
         }
         // 发送前清洗模型自己编的「内部说明」（2026-10-27）：
         // 例如 `[无文字回复，已在同一条里发了表情包]` —— 那是模型学舌，不是我们要发的话。
@@ -3200,34 +3426,52 @@ export class Bridge {
     const rawMarkers = []
     const rawRelays = []
     if (list.length === 0) {
-      return { content: [{ type: 'text', text: plain }], fallbackText: plain, images: 0 }
+      return { content: [{ type: 'text', text: plain }], fallbackText: plain, headText: plain, images: 0 }
     }
     const note = (line) => (plain ? `${plain}\n\n${line}` : line)
     const features = this._features()
     if (!features.vision) {
       const fallbackText = note(`（对方发来 ${list.length} 张图片，但「图片理解」技能未开启，你看不到图片内容，别编造。）`)
-      return { content: [{ type: 'text', text: fallbackText }], fallbackText, images: 0 }
+      return { content: [{ type: 'text', text: fallbackText }], fallbackText, headText: fallbackText, images: 0 }
     }
     if (!(await this._modelSupportsImages())) {
       const fallbackText = note(`（对方发来 ${list.length} 张图片，但当前模型不支持图片输入，你看不到图片内容，别编造。）`)
-      return { content: [{ type: 'text', text: fallbackText }], fallbackText, images: 0 }
+      return { content: [{ type: 'text', text: fallbackText }], fallbackText, headText: fallbackText, images: 0 }
     }
-    const { parts, failed } = await this._loadImageParts(list, (value) => {
-      // 每张成功下载的图：先生成短 token（同步、不 await），再 fire-and-forget 把
-      // **原始字节**转交给 qq-sticker 的原始图池（GIF 动画保真，见 _relayRawImage）。
-      // token 先落进 markers，POST 失败只是插件那边 peek 不到 → 自然回落到附件路径。
+    const { parts, failed, oversized } = await this._loadImageParts(list, (value) => {
+      // 每个成功交给模型的 image part：先生成短 token（同步、不 await），再
+      // fire-and-forget 把**这一块的字节**转交给 qq-sticker 的原始图池（GIF 动画保真）。
+      // ⚠️ 长图切条后会变成 N 个 part，token 也必须一一对应：插件是「第 k 个 token →
+      //    第 k 个 image 块」按顺序对齐的，少一个 token 后面的图就会错位。
       const token = randomUUID().replace(/-/g, '').slice(0, 16)
       rawMarkers.push(token)
       rawRelays.push(this._relayRawImage(token, value))
     })
     if (parts.length === 0) {
-      // 全部失败（多半是腾讯临时签名过期）：把文本里的占位改写成「链接已过期」，
-      // 别让模型对着一堆 `［图片］` 猜图里是什么（2026-10-27 真机踩过）。
-      const marked = this._markExpiredImagePlaceholders(plain, { allFailed: true })
-      const fallbackText = marked
-        ? `${marked}\n\n（图片链接已过期或下载失败，你看不到图片内容，别编造。）`
-        : '（对方发来图片，但下载或解码失败，你看不到图片内容，别编造。）'
-      return { content: [{ type: 'text', text: fallbackText }], fallbackText, images: 0 }
+      // 全部失败。三种原因要说三种不同的话（2026-10-27）：
+      //   · 太长了/太大了：让模型如实告诉用户「拆成几张再发」；
+      //   · 链接过期/下载失败：沿用原来的「链接已过期」；
+      //   · 两者都有：都说。
+      const marked = this._markExpiredImagePlaceholders(plain, { allFailed: failed.length > 0 })
+      const lines = []
+      if (marked) lines.push(marked)
+      if (failed.length > 0) lines.push('（图片链接已过期或下载失败，你看不到图片内容，别编造。）')
+      if (oversized.length > 0) {
+        lines.push(`（${oversized.length} 张图片太长或太大，模型收不下，你看不到图片内容，别编造。`
+          + '请如实告诉对方：图片太长/太大，拆成几张再发。）')
+      }
+      if (lines.length === 0) lines.push('（对方发来图片，但下载或解码失败，你看不到图片内容，别编造。）')
+      const fallbackText = note(lines.join('\n'))
+      return {
+        content: [{ type: 'text', text: fallbackText }],
+        fallbackText,
+        headText: fallbackText,
+        // 附件层拒绝时用它重试：明确告诉模型「这是图片太长，不是模型不支持」。
+        tooBigText: oversized.length > 0
+          ? note('（图片太长/太大，这一轮没能作为图像交给模型。请如实告诉对方：图片太长或太大，拆成几张再发；不要编造图片内容。）')
+          : fallbackText,
+        images: 0,
+      }
     }
     // 等 POST 落定（每张上限 RAW_IMAGE_TIMEOUT_MS、并发发出）：插件只认池子里**真的存在**
     // 的 token（peek），不等就等于标记白写。
@@ -3242,11 +3486,12 @@ export class Bridge {
     // 免得它把占位符当成「看不到」的证据。纯图片消息则补一句中性说明。
     const cleaned = plain.replace(/\[图片\]/gu, '').trim()
     // 部分失败：逐张替换对不上号（文本占位与 images 数组不是严格同序），
-    // 改成在正文末尾如实说还有几张看不到。
+    // 改成在正文末尾如实说还有几张看不到。太长/太大要单独说，别混成「下载失败」。
+    const notes = []
+    if (failed.length > 0) notes.push(`另有 ${failed.length} 张图片链接已过期或下载失败，你看不到`)
+    if (oversized.length > 0) notes.push(`另有 ${oversized.length} 张图片太长/太大，模型收不下，你看不到`)
     const head = (cleaned || '（对方只发了图片，没有文字）')
-      + (failed.length > 0
-        ? `\n（另有 ${failed.length} 张图片链接已过期或下载失败，你看不到）`
-        : '')
+      + (notes.length > 0 ? `\n（${notes.join('；')}）` : '')
     // 标记只进**发给 DSH 的 prompt content**（插件按文本顺序对齐 image 块），
     // 不影响 QQ 里显示的文本（那是消息本身，不经这里）。
     const headWithMarkers = keepMarkers.length > 0
@@ -3256,9 +3501,52 @@ export class Bridge {
     return {
       content: [{ type: 'text', text: headWithMarkers }, ...parts],
       fallbackText,
+      // 正文（不含 [[qqimg:]] 标记）：外部 hook / 上下文小节要在这个基础上追加。
+      headText: head,
+      tooBigText: oversized.length > 0
+        ? note('（有一张图片太长/太大，这一轮没能作为图像交给模型。请如实告诉对方：图片太长或太大，拆成几张再发；不要编造图片内容。）')
+        : fallbackText,
       images: parts.length,
       rawMarkers: keepMarkers,
     }
+  }
+
+  /**
+   * 带图 prompt 被拒时的降级：去掉图片、纯文本重试一次。
+   *
+   * ⚠️ 2026-10-27 真机事故复盘：
+   *   ① 原来只要错误里带 `attachment-invalid` 就判定「模型不支持图片」，
+   *      还写进**全局 60 秒**缓存。一张超长截图被附件层按尺寸拒掉后，
+   *      接下来一分钟所有图片都被说成「当前模型不支持图片输入」——纯甩锅。
+   *   ② 原来的「降级」把带 `content` 的 opts 原样再发一次，同一批图会被再拒，
+   *      等于没降级。现在必须显式删掉 content。
+   *
+   * 只有 `MODEL_DOES_NOT_SUPPORT_IMAGES` 才改模型能力判定；尺寸/字节/格式问题
+   * 只影响这一张图，报「图片太长/太大，拆开再发」。
+   *
+   * @param {{sessionId:string, built:object, text:string, promptText:string, promptOpts:object, error:any}} params
+   * @returns {Promise<string>}
+   */
+  async _promptWithImageFallback({ sessionId, built, text, promptText, promptOpts, error }) {
+    const failure = this._classifyPromptImageError(error)
+    if (!(built?.images > 0) || failure.kind === '') throw error
+    if (failure.kind === 'NO_VISION') {
+      this._noteVisionResult(false)
+      this.logger.warn?.('模型确实不支持图片输入，本轮退回纯文本（图片内容不会给模型）')
+    } else {
+      this.logger.warn?.(
+        `图片被附件准入拒绝（${failure.reason || failure.kind}）：`
+        + `${failure.message.slice(0, 160)}；本轮退回纯文本，模型能力判定不变`,
+      )
+    }
+    const fallbackOpts = { ...promptOpts }
+    delete fallbackOpts.content
+    const retryText = failure.kind === 'NO_VISION'
+      ? (built.fallbackText || promptText || text)
+      : failure.kind === 'IMAGE_TOO_BIG'
+        ? (built.tooBigText || built.fallbackText || promptText || text)
+        : (built.fallbackText || promptText || text)
+    return await this.dsh.promptAndWait(sessionId, retryText, fallbackOpts)
   }
 
   /**
@@ -3393,14 +3681,24 @@ export class Bridge {
 
   /**
    * 下载并转成 DSH prompt 需要的 image part；失败的单张跳过。
+   *
+   * 2026-10-27 起多一道「长图预处理」：DSH 附件准入对源图有硬上限（单边 8192、
+   * 64MP、20MB），1080×10000 这种长截图会被整张拒掉。这里先看文件头尺寸，
+   * 超限就解码 → 沿长边切条 → 每片重新编码成 PNG，再逐片交给模型。
+   * 实在切不了（渐进式 JPEG / WebP / 切完太长）记进 `oversized`，由调用方说人话。
+   *
    * @param {Array<{url?:string, file?:string}>} images
    * @param {(value:{base64:string, mediaType:string}) => void} [onLoaded]
-   *   每张**成功**下载的图回调一次（顺序 = 图片顺序）；用于把原始字节转交 qq-sticker。
+   *   每张**成功**交给模型的 image part 回调一次（顺序 = image part 顺序；
+   *   长图切条后一张原图会回调多次）；用于把字节转交 qq-sticker。
+   * @returns {Promise<{parts:Array<object>, failed:Array<object>, oversized:Array<object>}>}
    */
   async _loadImageParts(images, onLoaded) {
     const parts = []
     /** 下载/解码失败的图（index 是传入数组里的位置，用于回写占位说明）。 */
     const failed = []
+    /** 太长/太大、预处理也救不回来的图。 */
+    const oversized = []
     const seen = new Set()
     const list = images.slice(0, IMAGE_MAX_COUNT)
     for (let index = 0; index < list.length; index++) {
@@ -3411,17 +3709,68 @@ export class Bridge {
       // 与 ingress 预取共用同一个 Promise：预取过的这里不重复下载。
       const result = await this._loadImageRef(ref)
       if (result?.ok && result.value) {
-        parts.push({ type: 'image', data: result.value.base64, mediaType: result.value.mediaType })
-        // 回调自己不许抛：转交是可选增强，坏了也不能挡住这一轮聊天。
-        try { onLoaded?.(result.value) } catch { /* 忽略 */ }
+        const budget = IMAGE_MAX_PARTS - parts.length
+        if (budget <= 0) {
+          // 已经用满一条消息的 image part 配额（前面几张长图切得太多）：
+          // 如实记成「没放下」，不要静默丢图。
+          oversized.push({ index, ref, code: 'NO_QUOTA' })
+          this.logger.warn?.(`图片 part 配额已满（${IMAGE_MAX_PARTS} 张），这张没放进去`)
+          continue
+        }
+        let prepared
+        try {
+          prepared = prepareImageParts(
+            Buffer.from(String(result.value.base64 ?? ''), 'base64'),
+            result.value.mediaType,
+            { limits: this._imageLimits(), maxTiles: Math.min(MAX_TILES, budget) },
+          )
+        } catch (error) {
+          // 预处理失败 ≠ 模型不支持图片。单独记下来，调用方会给出准确的报错。
+          oversized.push({ index, ref, code: error?.code ?? 'PREP_FAILED' })
+          this.logger.warn?.(`图片预处理失败（太长/太大，已跳过）：${error?.message ?? error}`)
+          continue
+        }
+        if (prepared.transformed) {
+          this.logger.info?.(
+            `长图已切分：${prepared.width}x${prepared.height} → ${prepared.tiles} 片`
+            + `（缩放 ${(prepared.scale * 100).toFixed(0)}%，原始 ${(Buffer.from(result.value.base64, 'base64').length / 1048576).toFixed(1)}MB）`,
+          )
+        }
+        for (const part of prepared.parts) {
+          parts.push({ type: 'image', data: part.base64, mediaType: part.mediaType })
+          // 回调自己不许抛：转交是可选增强，坏了也不能挡住这一轮聊天。
+          try { onLoaded?.({ base64: part.base64, mediaType: part.mediaType }) } catch { /* 忽略 */ }
+        }
       } else if (result && result.ok === false) {
+        const message = String(result.error?.message ?? result.error ?? '')
+        if (/图片过大/u.test(message)) {
+          // 下载阶段就因为字节数被拦（> DSH 上限）：这属于「太大」，不是链接失效。
+          oversized.push({ index, ref, code: 'IMAGE_TOO_LARGE' })
+          this.logger.warn?.(`图片过大（下载阶段已拦）：${message}`)
+          continue
+        }
         // 2026-10-27：失败要记下来，调用方会把文本里的占位改写成「链接已过期」，
         // 免得模型对着一堆 `［图片］` 猜内容。
         failed.push({ index, ref })
         this.logger.warn?.(`图片下载失败（跳过）：${result.error?.message ?? result.error}`)
       }
     }
-    return { parts, failed }
+    return { parts, failed, oversized }
+  }
+
+  /**
+   * DSH 源图上限（可由 config.json 的 `vision.imageLimits` 覆盖，排障/特殊部署用）。
+   * @returns {typeof DSH_IMAGE_LIMITS}
+   */
+  _imageLimits() {
+    const raw = this.config?.vision?.imageLimits
+    if (!raw || typeof raw !== 'object') return DSH_IMAGE_LIMITS
+    const limits = { ...DSH_IMAGE_LIMITS }
+    for (const key of ['maxDimension', 'maxPixels', 'maxBytes', 'normalizedPixels', 'maxImagesPerMessage']) {
+      const value = Number(raw[key])
+      if (Number.isFinite(value) && value > 0) limits[key] = value
+    }
+    return limits
   }
 
   /**
@@ -3481,18 +3830,29 @@ export class Bridge {
   }
 
   /**
-   * 模型是否声明支持图片输入（查插件的 `/models` 目录，60 秒缓存）。
+   * 模型是否声明支持图片输入（查插件的 `/models` 目录）。
    *
    * 为什么需要：DSH 的 prompt admission 会按**会话当前选择**的模型校验
    * inputModalities；我们的无痕覆写不写会话选择，所以可能被拒。先查目录把
    * 「明显不支持」的情况挡在下载之前，省流量也省一次失败往返。
    * 查不到（插件旧 / 路由失败 / 模型未声明）时返回 true：先试，让 DSH 自己判，
    * 失败再走纯文本降级——比误判成不支持更不容易丢信息。
+   *
+   * 缓存语义（2026-10-27 修）：
+   *   · 按 `baseUrl|provider/model` 分键，换模型立刻失效；
+   *   · **正面结论**缓存 10 分钟（省 HTTP）；**负面结论只缓存 30 秒**，
+   *     因为目录可能过时、也可能是附件层错误被误读成能力问题；
+   *   · 任何一轮图片真的投递成功，都会通过 {@link _noteVisionResult} 把负面结论纠正掉。
    * @returns {Promise<boolean>}
    */
   async _modelSupportsImages() {
     const now = Date.now()
-    if (this._visionProbe && now - this._visionProbe.at < 60_000) return this._visionProbe.ok
+    const route = this._modelRoute()
+    const key = `${this.dsh?.baseUrl ?? this.config?.dsh?.baseUrl ?? ''}|${route}`
+    if (this._visionProbe && this._visionProbe.key === key) {
+      const ttl = this._visionProbe.ok ? VISION_CACHE_TTL_MS : VISION_NEGATIVE_TTL_MS
+      if (now - this._visionProbe.at < ttl) return this._visionProbe.ok
+    }
     let ok = true
     try {
       const base = String(this.dsh?.baseUrl ?? this.config?.dsh?.baseUrl ?? '').replace(/\/+$/, '')
@@ -3503,7 +3863,6 @@ export class Bridge {
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const body = await res.json()
-      const route = this._modelRoute()
       let providerId = ''
       let modelId = ''
       if (route.includes('/')) {
@@ -3531,8 +3890,52 @@ export class Bridge {
       this.logger.warn?.(`读取模型多模态能力失败（按未知处理，先尝试）：${error?.message ?? error}`)
       ok = true
     }
-    this._visionProbe = { at: now, ok }
+    this._visionProbe = { key, at: now, ok }
     return ok
+  }
+
+  /**
+   * 记录一次「实测」到的视觉能力，并纠正缓存。
+   * @param {boolean} ok
+   */
+  _noteVisionResult(ok) {
+    const key = `${this.dsh?.baseUrl ?? this.config?.dsh?.baseUrl ?? ''}|${this._modelRoute()}`
+    const previous = this._visionProbe
+    if (ok) {
+      // 成功是硬证据：不管目录怎么说，先按能用处理。
+      if (!previous || previous.key !== key || previous.ok !== true) {
+        this.logger.info?.('图片已成功交给模型，多模态判定更新为「支持」')
+      }
+      this._visionProbe = { key, at: Date.now(), ok: true }
+      return
+    }
+    this._visionProbe = { key, at: Date.now(), ok: false }
+  }
+
+  /**
+   * 把 prompt 抛出的图片相关错误分成「模型没视觉能力」和「图片本身被附件层拒了」。
+   *
+   * 为什么要分：DSH 的 `session/attachment-invalid` 同时承载两种完全不同的失败
+   * （模型不支持图片 / 图片超尺寸、超字节、坏 base64）。以前桥接一个正则全归成
+   * 前者，于是长截图被拒后，桥接会对用户说「模型不支持图片输入」——甩锅。
+   *
+   * @param {any} error
+   * @returns {{kind:''|'NO_VISION'|'IMAGE_TOO_BIG'|'IMAGE_INVALID', reason:string, message:string}}
+   */
+  _classifyPromptImageError(error) {
+    const message = String(error?.message ?? error)
+    const reason = String(error?.details?.reason ?? error?.reason ?? error?.code ?? '')
+    const hay = `${reason} ${message}`
+    const result = (kind, matched = '') => ({ kind, reason: reason || matched, message })
+    if (/MODEL_DOES_NOT_SUPPORT_IMAGES/i.test(hay)) return result('NO_VISION', 'MODEL_DOES_NOT_SUPPORT_IMAGES')
+    if (/IMAGE_DIMENSION_TOO_LARGE|IMAGE_TOO_MANY_PIXELS|IMAGE_TOO_LARGE|IMAGES_TOO_LARGE|TOO_MANY_IMAGES/i.test(hay)) {
+      return result('IMAGE_TOO_BIG')
+    }
+    if (/UNSUPPORTED_IMAGE_TYPE|INVALID_IMAGE_BASE64|INVALID_IMAGE|IMAGE_TYPE_MISMATCH|ATTACHMENT_WRITE_FAILED/i.test(hay)) {
+      return result('IMAGE_INVALID')
+    }
+    if (/attachment-invalid/i.test(hay)) return result('IMAGE_INVALID', 'attachment-invalid')
+    return { kind: '', reason, message }
   }
 
   /**
@@ -3683,19 +4086,68 @@ export class Bridge {
   }
 
   /**
-   * 现读「上下文感知」配置（`contextAware`）。
-   * @returns {{enabled:boolean, turns:number, smartMatch:boolean}}
-   *   turns = 注入的最近聊天条数（0~50；0 = 关闭）
-   *   smartMatch = 只取最近一段连续对话（5 分钟内有来有回的部分）
+   * 现读「记忆与上下文」配置（`memory`，2026-10-27 合并版）。
+   *
+   * 原「上下文感知」（contextAware）与「记忆提取」（sk-memory）合成一张卡，
+   * 配置面收敛成这组键。老配置的 `contextAware` 仍按旧字段名兜底读一次（兼容），
+   * 但新写盘一律走 `memory.*`。
+   *
+   * @returns {{enabled:boolean, pokeMaxTurns:number, messageMaxTurns:number,
+   *   maxContextTokens:number, smartMatch:boolean}}
+   *   pokeMaxTurns     = 戳一戳「模型回复」注入条数（0~50；0 = 不注入，默认 15）
+   *   messageMaxTurns  = 普通消息注入条数（0~50；0 = 交给 DSH 原生上下文，默认 0）
+   *   maxContextTokens = 一次注入的 token 预算（128K~1M，默认 128000），与条数同时生效
+   *   smartMatch       = 只取最近一段连续对话（5 分钟内有来有回的部分）
    */
-  _contextAwareConfig() {
-    const hot = this.live?.contextAware
-    const source = hot && typeof hot === 'object' && !Array.isArray(hot) ? hot : (this.config?.contextAware ?? {})
-    const raw = Number(source?.turns)
+  _memoryConfig() {
+    const hot = this.live?.memory
+    const legacyHot = this.live?.contextAware
+    const legacySource = legacyHot && typeof legacyHot === 'object' && !Array.isArray(legacyHot)
+      ? legacyHot
+      : (this.config?.contextAware ?? {})
+    const source = (hot && typeof hot === 'object' && !Array.isArray(hot) ? hot : null)
+      ?? this.config?.memory
+      ?? legacySource
+    const clampTurns = (value, fallback) => {
+      const n = Number(value)
+      return Number.isFinite(n) ? Math.min(MEMORY_MAX_TURNS, Math.max(0, Math.round(n))) : fallback
+    }
+    const rawTokens = Number(source?.maxContextTokens)
+    const tokens = Number.isFinite(rawTokens)
+      ? Math.min(MEMORY_CONTEXT_TOKENS_MAX, Math.max(MEMORY_CONTEXT_TOKENS_MIN, Math.round(rawTokens)))
+      : DEFAULT_MAX_CONTEXT_TOKENS
+    // 旧字段名（pokeTurns / messageTurns / turns）只在没有新字段时才用得上。
+    const legacyTurns = source?.turns
     return {
-      enabled: source?.enabled !== false,
-      turns: Number.isFinite(raw) ? Math.min(50, Math.max(0, Math.round(raw))) : 15,
+      // 卡片总开关（features.memory）与齿轮里的 memory.enabled 必须同时为真。
+      enabled: this._features().memory && source?.enabled !== false,
+      pokeMaxTurns: clampTurns(source?.pokeMaxTurns ?? source?.pokeTurns ?? legacyTurns, DEFAULT_POKE_MAX_TURNS),
+      messageMaxTurns: clampTurns(source?.messageMaxTurns ?? source?.messageTurns, DEFAULT_MESSAGE_MAX_TURNS),
+      maxContextTokens: tokens,
       smartMatch: source?.smartMatch !== false,
+    }
+  }
+
+  /**
+   * 现读「时间感知」配置（`timeAware`，2026-10-27）。
+   *
+   * 卡片总开关（features.time）与齿轮里的 `timeAware.enabled` 必须同时为真才生效：
+   * 前者是「技能列表里关掉这张卡」，后者是「卡片内细调」，两个都摆着就别互相打架。
+   *
+   * @returns {{enabled:boolean, silentMinutes:number, promptText:string}}
+   */
+  _timeAwareConfig() {
+    const hot = this.live?.timeAware
+    const source = hot && typeof hot === 'object' && !Array.isArray(hot) ? hot : (this.config?.timeAware ?? {})
+    const raw = Number(source?.silentMinutes)
+    const minutes = Number.isFinite(raw) ? Math.min(1440, Math.max(1, Math.round(raw))) : DEFAULT_SILENT_MINUTES
+    const promptText = typeof source?.promptText === 'string' && source.promptText.trim() !== ''
+      ? source.promptText.trim()
+      : DEFAULT_TIME_AWARE_PROMPT
+    return {
+      enabled: this._features().time && source?.enabled !== false,
+      silentMinutes: minutes,
+      promptText,
     }
   }
 
@@ -3797,34 +4249,118 @@ export class Bridge {
   }
 
   /**
-   * 取本会话最近的聊天记录（按会话 key 严格隔离）。
+   * 取本会话最近的聊天记录（按会话 key 严格隔离）+ **双重截断**（2026-10-27）。
    *
    * 数据源是 `_chatLog`（每小时人设归纳也用它）：1 小时窗口、每会话最多 80 条。
-   * 只收群聊正文，`/` 指令和纯空消息本来就没进缓冲。
+   * 2026-10-27 起群聊/私聊都记（普通消息注入需要私聊上下文），`/` 指令和纯空消息本来就没进缓冲。
    *
-   * 智能匹配（2026-10-27）：开启后从最后一条往前扫，只保留「连续对话」那一段
+   * 智能匹配：开启后从最后一条往前扫，只保留「连续对话」那一段
    * （相邻两条间隔 ≤ 5 分钟），避免把半小时前的另一段闲聊也带进来；关闭则纯取最近 N 条。
+   *
+   * 双重截断（取交集）：从**最新一条往回**累加，同时满足
+   *   ① 已收条数 < 条数上限；
+   *   ② 已收 token + 本条 token ≤ token 预算（先扣掉小节标题的预留）。
+   * 任一条件到顶就停 —— 效果就是「从最老的记录开始砍」。
+   * 最新一条自己就超预算时走 {@link truncateChatLine} 截正文，不整条丢。
    *
    * @param {string} key `g:<群号>` / `u:<QQ号>`
    * @param {number} turns 取多少条（0 = 不取）
-   * @param {{smartMatch?:boolean}} [options]
-   * @returns {string[]} 已格式化成 `[群友 昵称(QQ)]: 内容`
+   * @param {{smartMatch?:boolean, beforeSeq?:number, maxContextTokens?:number}} [options]
+   *   beforeSeq：只要序号小于它的记录（用于把「本轮刚发的消息」排除，避免注入两遍）
+   *   maxContextTokens：token 预算（不传 = 不按 token 限制，只按条数）
+   * @returns {string[]} 已格式化成 `[群友 昵称(QQ)]: 内容` / `[对方 昵称(QQ)]: 内容`，**按时间顺序**
    */
   _recentChatLines(key, turns, options = {}) {
-    const limit = Math.min(50, Math.max(0, Math.round(Number(turns) || 0)))
+    const limit = Math.min(MEMORY_MAX_TURNS, Math.max(0, Math.round(Number(turns) || 0)))
     if (limit === 0) return []
     const now = Date.now()
     let list = (this._chatLog.get(key) ?? []).filter((item) => now - item.at < CHAT_LOG_WINDOW_MS)
+    const beforeSeq = Number(options.beforeSeq)
+    if (Number.isFinite(beforeSeq)) list = list.filter((item) => !Number.isFinite(item.seq) || item.seq < beforeSeq)
     if (options.smartMatch === true && list.length > 1) {
       let start = list.length - 1
       while (start > 0 && list[start].at - list[start - 1].at <= CONTEXT_SMART_GAP_MS) start -= 1
       list = list.slice(start)
     }
-    return list.slice(-limit).map((item) => {
+    const candidates = list.map((item) => {
       const name = String(item.name ?? '').trim() || '群友'
       const qq = String(item.qq ?? '').trim()
-      return qq ? `[群友 ${name}(${qq})]: ${item.text}` : `[群友 ${name}]: ${item.text}`
-    })
+      const tag = item.kind === 'private' ? '对方' : '群友'
+      return qq ? `[${tag} ${name}(${qq})]: ${item.text}` : `[${tag} ${name}]: ${item.text}`
+    }).slice(-limit)
+
+    const rawBudget = Number(options.maxContextTokens)
+    if (!Number.isFinite(rawBudget) || rawBudget <= 0) {
+      this._lastMemoryTrim = { kept: candidates.length, dropped: 0, tokens: 0, budget: 0 }
+      return candidates
+    }
+    const budget = Math.max(1, Math.floor(rawBudget) - MEMORY_SECTION_HEADER_TOKENS)
+    const kept = []
+    let used = 0
+    // 从最新往回收；装不下就停（更老的整条丢弃）。
+    for (let i = candidates.length - 1; i >= 0; i -= 1) {
+      const line = candidates[i]
+      const cost = estimateTokens(line)
+      if (used + cost <= budget) {
+        kept.push(line)
+        used += cost
+        continue
+      }
+      // 最新一条自己就超预算 → 截正文保前缀，硬上限不破。
+      if (kept.length === 0) {
+        const fitted = truncateChatLine(line, Math.max(1, budget))
+        kept.push(fitted)
+        used += estimateTokens(fitted)
+      }
+      break
+    }
+    const lines = kept.reverse()
+    this._lastMemoryTrim = {
+      kept: lines.length,
+      dropped: candidates.length - lines.length,
+      tokens: used,
+      budget: Math.floor(rawBudget),
+    }
+    return lines
+  }
+
+  /**
+   * 本轮要额外拼进 prompt 的上下文小节（2026-10-27，配置源已合并为 `memory`）。
+   *
+   * 两类，各自独立、都可单独关掉：
+   *   ① 时间感知：静默超过阈值后注入一句「群聊已经安静了 N 分钟」；
+   *   ② 记忆与上下文：把最近 N 条记录拼进 prompt（0 = 不拼，交给 DSH 原生），
+   *      同时受条数与 token 预算双重限制（见 {@link _recentChatLines}）。
+   *
+   * 只返回**非空**小节；调用方负责拼到正文后面并同步给多模态的 text 段。
+   *
+   * @param {string} key
+   * @param {{beforeSeq?:number}} [options]
+   * @returns {string[]}
+   */
+  _contextSections(key, options = {}) {
+    const sections = []
+    const memory = this._memoryConfig()
+    if (memory.enabled && memory.messageMaxTurns > 0) {
+      const lines = this._recentChatLines(key, memory.messageMaxTurns, {
+        smartMatch: memory.smartMatch,
+        beforeSeq: options.beforeSeq,
+        maxContextTokens: memory.maxContextTokens,
+      })
+      if (lines.length > 0) {
+        const trim = this._lastMemoryTrim ?? {}
+        if (Number(trim.dropped) > 0) {
+          this.logger.info?.(`记忆与上下文：注入 ${lines.length} 条，按上限截断 ${trim.dropped} 条`
+            + `（预估 ${trim.tokens} token / 预算 ${trim.budget}，${key}）`)
+        }
+        sections.push(`【本会话最近 ${lines.length} 条聊天记录（按时间顺序，仅供参考，不要逐条复述）】\n`
+          + lines.join('\n'))
+      }
+    }
+    // 时间提示放最后：它是「本轮该怎么表现」的指令，越靠近生成越有效。
+    const silence = this._consumeSilenceHint(key)
+    if (silence) sections.push(silence)
+    return sections
   }
 
   /**
@@ -3832,7 +4368,8 @@ export class Bridge {
    *
    * 和 text 模式的取舍：
    *   · 走真实 DSH 会话（`ensureSession` + `promptAndWait`），会消耗 token；
-   *   · 上下文感知关掉 / turns=0 时退化成「有人戳了你，回一句」，不注入记录；
+   *   · 「记忆与上下文」关掉 / pokeMaxTurns=0 时退化成「有人戳了你，回一句」，不注入记录；
+   *   · 注入同样走条数 + token 双重截断（与普通消息共用 maxContextTokens 预算）；
    *   · 模型失败/超时 → 退回 `poke.replyText` 固定文案，绝不让一次戳一戳静默。
    *
    * @param {{kind:'private'|'group', groupId?:string|null, userId:string}} scope
@@ -3843,10 +4380,13 @@ export class Bridge {
    */
   async _pokeModelReply(scope, poker, key, poke) {
     const nick = String(this.qq?.nameOf?.(key, poker) ?? '').trim() || poker
-    const aware = this._contextAwareConfig()
-    // 私聊没有群聊缓冲（_chatLog 只记群聊），turns 给了也拿不到东西。
-    const lines = aware.enabled && scope.kind === 'group'
-      ? this._recentChatLines(key, aware.turns, { smartMatch: aware.smartMatch })
+    const memory = this._memoryConfig()
+    // 戳一戳的注入仍只对群聊生效（老行为）；私聊上下文由普通消息的注入负责。
+    const lines = memory.enabled && scope.kind === 'group'
+      ? this._recentChatLines(key, memory.pokeMaxTurns, {
+        smartMatch: memory.smartMatch,
+        maxContextTokens: memory.maxContextTokens,
+      })
       : []
     const prompt = lines.length > 0
       ? `【戳一戳】${nick} 戳了你一下。下面是这个会话最近 ${lines.length} 条聊天记录（按时间顺序）：\n`
@@ -3854,7 +4394,11 @@ export class Bridge {
         + '请用一句话回应这次戳一戳，语气自然。不要复述聊天记录，也不要提「聊天记录」这个词。'
       : `${nick} 戳了你一下，回一句。`
     if (lines.length > 0) {
-      this.logger.info?.(`戳一戳模型回复：注入 ${lines.length} 条聊天记录（${key}）`)
+      const trim = this._lastMemoryTrim ?? {}
+      this.logger.info?.(`戳一戳模型回复：注入 ${lines.length} 条聊天记录（${key}）`
+        + (Number(trim.dropped) > 0
+          ? `，按上限截断 ${trim.dropped} 条（预估 ${trim.tokens} token / 预算 ${trim.budget}）`
+          : ''))
     }
     let reply = ''
     try {
@@ -4142,6 +4686,253 @@ export class Bridge {
    * @param {string} text
    * @param {{at?:boolean}} [opts] `at:false` = 不 @ 人（插件通道发送用，契约 §2.1）
    */
+  /* ── 智能未读归纳（v2.0 第一步，2026-10-28）─────────────────────────
+   *
+   * 一句话：主人在群里发 `/归纳 [条数]`，桥接去拉群历史、按水位挑出没归纳过的部分，
+   * 交给一个**旁路临时会话**里的廉价模型整理，再把结果拼成多个 node 用
+   * `send_group_forward_msg` 发回群里；合并转发失败就降级成纯文本。
+   *
+   * 三道红线：
+   *   1. 只认 `allow.owners`（事件 QQ 号），管理员也不行；
+   *   2. 不碰 QQ 会话的上下文，也不写全局默认模型 —— 临时会话跑完就归档；
+   *   3. 水位只在**真的发出去**之后推进，失败不推进，下次还能补。
+   */
+
+  /** 现读未读归纳配置（设置页热同步优先，config.json 兜底）。 */
+  _summaryConfig() {
+    const hot = this.live?.unreadSummary
+    const source = hot && typeof hot === 'object' && !Array.isArray(hot)
+      ? hot
+      : (this.config?.unreadSummary ?? {})
+    return normalizeSummary(source)
+  }
+
+  /** 取（必要时创建）某群的归纳水位记录。 */
+  _summaryState(key) {
+    if (!this.state.unreadSummary || typeof this.state.unreadSummary !== 'object'
+      || Array.isArray(this.state.unreadSummary)) {
+      this.state.unreadSummary = {}
+    }
+    const current = this.state.unreadSummary[key]
+    const entry = current && typeof current === 'object' && !Array.isArray(current) ? current : {}
+    entry.lastSummarySeq = Number(entry.lastSummarySeq) || 0
+    entry.lastSummaryAt = Number(entry.lastSummaryAt) || 0
+    entry.runs = Number(entry.runs) || 0
+    entry.lastAt = Number(entry.lastAt) || 0
+    entry.lastError = typeof entry.lastError === 'string' ? entry.lastError : ''
+    this.state.unreadSummary[key] = entry
+    return entry
+  }
+
+  /**
+   * 处理 `/归纳`。命中返回 true（已消化），不命中返回 false（继续走普通链路）。
+   * @returns {Promise<boolean>}
+   */
+  async _handleUnreadSummaryCommand(msg, text, key) {
+    const parsed = parseSummaryCommand(text)
+    if (!parsed.matched) return false
+    if (msg.kind !== 'group') {
+      const sent = await this._send(msg, '未读归纳只能在群里用：在群里发 /归纳 [条数]。')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    if (!this.isOwner(msg)) {
+      this.stats.commandsBlocked++
+      this.logger.warn?.(`未读归纳：非主人触发被拒（${key} sender=${msg.userId}）`)
+      const sent = await this._send(msg, '⚠️ 权限不足，未读归纳只有主人能触发。')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    const conf = this._summaryConfig()
+    if (!conf.enabled || this._features().unread === false) {
+      const sent = await this._send(msg, '未读归纳已关闭（设置 → 技能与插件 → 未读归纳）。')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    if (this._summaryRuns.has(key)) {
+      await this._send(msg, '上一次归纳还没跑完，稍等一下。')
+      return true
+    }
+    // 条数：指令里的优先，其次配置；一律钳在 500 以内（NapCat 侧一次拉这么多就够呛了）。
+    const count = Math.min(SUMMARY_HARD_LIMIT, parsed.count > 0 ? parsed.count : conf.maxMessages)
+    const ack = await this._send(msg, `收到，正在归纳最近 ${count} 条，稍后发到这里。`)
+    if (!(ack && ack.ok === false)) this._noteReplied(key)
+    // 后台跑：不 await。异常在 _runUnreadSummary 内部兜住，不会冒到 handleMessage。
+    void this._runUnreadSummary({ msg, key, count, conf })
+    return true
+  }
+
+  /**
+   * 真正干活的那一段（后台）。
+   *
+   * 流程：拉历史 → 按水位筛 → 拼转写 → 建临时会话 → 廉价模型总结 → 切节点 →
+   * 合并转发（失败降级纯文本）→ 成功才推水位 → 归档临时会话。
+   */
+  async _runUnreadSummary({ msg, key, count, conf }) {
+    const groupId = String(msg.groupId ?? '')
+    const startedAt = Date.now()
+    this._summaryRuns.add(key)
+    let sessionId = ''
+    try {
+      const groupName = await this._displayName(key, msg).catch(() => '')
+      const selfId = this.qq?.selfId ? String(this.qq.selfId) : ''
+      const history = await this.qq.getGroupMsgHistory(groupId, count)
+      if (!history.ok) throw summaryError('HISTORY_FAILED', `拉群历史失败：${history.reason ?? '未知原因'}`)
+      const prev = this._summaryState(key)
+      const unread = pickUnread(history.messages, {
+        lastSeq: prev.lastSummarySeq,
+        lastAt: prev.lastSummaryAt,
+        maxMessages: count,
+        selfId,
+      })
+      if (unread.length === 0) {
+        this.logger.info?.(`未读归纳：${key} 水位之后没有新消息（${prev.lastSummaryAt}/${prev.lastSummarySeq}）`)
+        const sent = await this._send(msg, '没有未归纳的新消息。')
+        if (!(sent && sent.ok === false)) this._noteReplied(key)
+        return
+      }
+      const transcript = formatTranscript(unread, {
+        perMessageChars: conf.perMessageChars,
+        budgetTokens: conf.budgetTokens,
+      })
+      const prompt = buildSummaryPrompt({
+        groupName,
+        total: unread.length,
+        transcript: transcript.text,
+        nodeChars: conf.nodeChars,
+        maxNodes: conf.maxNodes,
+        includeImages: conf.includeImages,
+      })
+      this.logger.info?.(
+        `未读归纳开始：${key} 取 ${unread.length} 条（转写 ${transcript.kept} 条 / 约 ${transcript.tokens} token`
+        + `${transcript.dropped > 0 ? `，预算省略 ${transcript.dropped} 条` : ''}）`,
+      )
+
+      // 图片检索（默认关）：只有真拧开开关才把图交给摘要模型。
+      // 走的是聊天同一条预处理链路（超长截图会被切片），模型不吃图就降级纯文本重试。
+      let content = null
+      if (conf.includeImages && conf.maxImages > 0) {
+        const refs = []
+        for (const item of unread) for (const image of item.images ?? []) refs.push(image)
+        if (refs.length > 0) {
+          const loaded = await this._loadImageParts(refs.slice(0, conf.maxImages))
+          if (loaded.parts.length > 0) {
+            content = [{ type: 'text', text: prompt }, ...loaded.parts]
+            this.logger.info?.(`未读归纳：附上 ${loaded.parts.length} 张图片`)
+          }
+        }
+      }
+
+      // 旁路临时会话：独立上下文，跑完归档；模型按配置覆写，不动全局默认。
+      const { sessionCwd, workspaceTitle } = this.config.dsh
+      fs.mkdirSync(sessionCwd, { recursive: true })
+      const workspaceId = await this.dsh.ensureWorkspace(sessionCwd, workspaceTitle)
+      sessionId = await this.dsh.createSession(workspaceId, this.config.dsh.agentPreset)
+      if (conf.provider && conf.model) {
+        await this.dsh.setSessionModel({ sessionId, provider: conf.provider, model: conf.model })
+          .catch((error) => this.logger.warn?.(`未读归纳：摘要模型下发失败（继续用会话默认）：${error?.message ?? error}`))
+      }
+      let reply = ''
+      try {
+        reply = await this.dsh.promptAndWait(sessionId, prompt, { timeoutMs: conf.timeoutMs, content })
+      } catch (error) {
+        if (!content) throw error
+        // 模型不吃图 / 图片被附件准入拒：退回纯文本再跑一次，别让图片拖死整件事。
+        this.logger.warn?.(`未读归纳：带图请求失败，退回纯文本重试（${error?.message ?? error}）`)
+        reply = await this.dsh.promptAndWait(sessionId, prompt, { timeoutMs: conf.timeoutMs })
+      }
+
+      // 切节点 → 审计 → 合并转发 → 失败降级纯文本。
+      let nodes = splitSummaryNodes(reply, { maxNodes: conf.maxNodes, nodeChars: conf.nodeChars })
+      if (nodes.length === 0) throw summaryError('EMPTY_REPLY', '模型没有返回可用内容')
+      const audit = auditReply(nodes.join('\n\n'), [this.config.onebot?.accessToken])
+      if (!audit.ok) {
+        this.stats.blocked++
+        throw summaryError('AUDIT_BLOCKED', `归纳结果命中「${audit.label}」，整条不发`)
+      }
+      const forward = await this.qq.sendGroupForward(groupId, buildForwardNodes(nodes, {
+        botName: this.config.personaBotName || '群聊归纳',
+        botUin: selfId,
+      }))
+      let delivered = forward.ok === true
+      let via = delivered ? `合并转发 ${nodes.length} 段` : `合并转发失败（${forward.reason ?? '未知原因'}）`
+      if (!delivered) {
+        // 降级：纯文本一次性发（照走原有分片 / 打字延时）。不带引用、不 @ 任何人。
+        const sent = await this._send(msg, `【群聊归纳】\n${nodes.join('\n\n')}`, { at: false })
+        delivered = !(sent && sent.ok === false)
+        if (!delivered) throw summaryError('SEND_FAILED', sent?.error ?? '合并转发与纯文本都没发出去')
+        via = `${via} → 已降级纯文本`
+      }
+
+      // 只有真的发出去才推水位：失败不推进，下次还能补上（这就是「重启盲区」的解法）。
+      const next = nextWatermark(unread, prev)
+      prev.lastSummarySeq = next.lastSummarySeq
+      prev.lastSummaryAt = next.lastSummaryAt
+      prev.runs += 1
+      prev.lastAt = Date.now()
+      prev.lastError = ''
+      this._saveState()
+      this.stats.unreadSummaries = (Number(this.stats.unreadSummaries) || 0) + 1
+      this.logger.info?.(
+        `未读归纳完成：${key} ${via}（${Math.round((Date.now() - startedAt) / 1000)}s，`
+        + `水位 ${prev.lastSummaryAt}/${prev.lastSummarySeq}）`,
+      )
+    } catch (error) {
+      const code = error?.code ?? 'SUMMARY_FAILED'
+      const detail = String(error?.message ?? error)
+      this.logger.error?.(`未读归纳失败：${key} ${code} ${detail}`)
+      const prev = this._summaryState(key)
+      prev.lastError = `${code}: ${detail}`.slice(0, 200)
+      this._saveState()
+      await this._notifyOwners(`【未读归纳失败】\n群：${key}\n错误：${code}\n${detail}`)
+      // 群里只说人话，不透传错误原文。
+      try {
+        await this._send(msg, '这次归纳没跑成功，原因已经私聊告诉主人了。')
+      } catch { /* 发送失败就算了，别再抛 */ }
+    } finally {
+      this._summaryRuns.delete(key)
+      if (sessionId) {
+        // 临时会话用完即归档：不删历史，也不留在会话列表里碍眼。
+        try {
+          await this.dsh.archiveSession(sessionId, { stopActivity: true })
+        } catch (error) {
+          this.logger.warn?.(`未读归纳：临时会话归档失败（可手动清理）：${error?.message ?? error}`)
+        }
+      }
+    }
+  }
+
+  /**
+   * 后台失败时私聊通知主人（1 小时最多一条，防轰炸）。
+   *
+   * 为什么节流粒度是「全局」而不是「每群」：同一个故障（模型挂了 / DSH 没起）
+   * 往往会让所有群的归纳一起失败，按群通知等于刷屏。
+   */
+  async _notifyOwners(text) {
+    const conf = this._summaryConfig()
+    if (!conf.notifyOwners) return
+    const owners = this._allow().owners
+    if (owners.length === 0) {
+      this.logger.warn?.('未读归纳：没有配置主人（allow.owners），错误只写日志')
+      return
+    }
+    const now = Date.now()
+    const last = Number(this.state.unreadNotifyAt) || 0
+    if (now - last < conf.notifyCooldownMs) {
+      this.logger.info?.(`未读归纳：${Math.round((conf.notifyCooldownMs - (now - last)) / 60000)} 分钟内已通知过主人，本次只写日志`)
+      return
+    }
+    this.state.unreadNotifyAt = now
+    this._saveState()
+    for (const owner of owners) {
+      try {
+        await this.qq.sendPrivate(owner, text)
+      } catch (error) {
+        this.logger.warn?.(`未读归纳：通知主人 ${owner} 失败：${error?.message ?? error}`)
+      }
+    }
+  }
+
   async _send(msg, text, { at = true } = {}) {
     const delay = this.config.sendDelayMs ?? 400
     const key = this.keyOf(msg)

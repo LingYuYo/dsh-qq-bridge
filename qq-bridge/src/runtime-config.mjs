@@ -76,9 +76,14 @@ const HOT_KEYS = [
   'personaLocked',
   'personaAutoUpdate',
   'poke',
-  // 2026-10-27：合并转发读图上限 / 上下文感知（戳一戳「模型回复」注入聊天记录）。
+  // 2026-10-27：合并转发读图上限 / 记忆与上下文（注入条数 + token 预算）。
   'quote',
-  'contextAware',
+  'memory',
+  // 2026-10-27：时间感知（静默阈值 + 触发提示词），设置页改完下一条消息就生效。
+  'timeAware',
+  // 2026-10-28（v2.0 第一步）：未读归纳的条数 / 预算 / 节点数 / 摘要模型。
+  // 同样必须进白名单，否则设置页存得下、桥接永远收不到（pickHotConfig 静默丢键）。
+  'unreadSummary',
   // OneBot 连接信息只用于 UI 展示；WS 连接在启动时建立，改它仍需重启桥接。
   'onebot',
 ]
