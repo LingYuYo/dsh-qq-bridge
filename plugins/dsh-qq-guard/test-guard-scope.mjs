@@ -483,6 +483,10 @@ await check('sanitizeSessionRow：core / userProfiles / slang / contextBriefing 
       { qq: 'abc', nickname: '非法QQ' },
     ],
     slang: [{ term: ' 上车 ' }, { term: '' }, { term: '润了', meaning: '跑了' }],
+    personaOverride: {
+      templateId: ' p1 ', botName: ' 小鲸 ', groupName: '', participation: 'quiet',
+      core: { identity: ' 本群身份 ', boundary: '', style: '' },
+    },
     contextBriefing: '前情提要正文',
   })
   assert.equal(row.core.identity, '本群身份')
@@ -493,7 +497,12 @@ await check('sanitizeSessionRow：core / userProfiles / slang / contextBriefing 
   assert.deepEqual(row.slang.map((item) => item.term), ['上车', '润了'])
   assert.equal(row.slang[1].meaning, '跑了')
   assert.equal(row.slang[0].allowSearch, true)
+  assert.equal(row.personaOverride.templateId, 'p1')
+  assert.equal(row.personaOverride.botName, '小鲸')
+  assert.equal(row.personaOverride.core.identity, '本群身份')
   assert.equal(row.contextBriefing, '前情提要正文')
+  // 空覆盖 → null（继承全局）
+  assert.equal(sanitizeSessionRow({ key: 'g:2', personaOverride: {} }).personaOverride, null)
 })
 
 await check('session-ops：放行 dynamic，core/slang/removeProfile 能下发', async () => {
@@ -505,6 +514,10 @@ await check('session-ops：放行 dynamic，core/slang/removeProfile 能下发',
     key: 'g:123456',
     core: { identity: '本群身份', boundary: '边界', style: '' },
     slang: [{ term: '上车', meaning: '上车走' }],
+    personaOverride: {
+      templateId: 'p1', botName: '小鲸', groupName: '', participation: 'quiet',
+      core: { identity: '本群身份', boundary: '', style: '' },
+    },
     removeProfile: '123',
   })
   const req = {
@@ -526,6 +539,8 @@ await check('session-ops：放行 dynamic，core/slang/removeProfile 能下发',
   assert.deepEqual(hit.slang.map((item) => item.term), ['上车'])
   assert.equal(hit.slang[0].meaning, '上车走')
   assert.equal(hit.removeProfile, '123')
+  assert.equal(hit.personaOverride.templateId, 'p1')
+  assert.equal(hit.personaOverride.core.identity, '本群身份')
 })
 
 console.log('\n— 接入总闸（v2.0 第七步）—')

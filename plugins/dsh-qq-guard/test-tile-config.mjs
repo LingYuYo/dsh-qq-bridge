@@ -547,7 +547,8 @@ await check('详情头下方有四个分页，默认停在「基础配置」', (
   const labels = findAll(tree, (n) => n.tag === 'button' && n.props?.role === 'tab').map((n) => textOf(n).trim())
   eq(labels, ['基础配置', '记忆与摘要', '特权与权限', '调试信息'], '四个分页顺序')
   truthy(levelSelect(tree), '基础配置应包含响应档位')
-  truthy(btnAnywhere(tree, '保存静态核心'), '基础配置应包含静态核心保存')
+  // v2.0 第十二步：单群人设改成弹窗编辑（不是内联三框）。
+  truthy(btnAnywhere(tree, '编辑单群人设'), '基础配置应包含单群人设编辑入口')
   // v2.0 第十一步：黑话改为标签 + 弹窗编辑，不再有「保存动态记忆」大按钮。
   truthy(btnAnywhere(tree, '+ 添加词条'), '基础配置应包含黑话添加入口')
   eq(btnAnywhere(tree, '生成未读归纳'), undefined, '默认不该渲染记忆 Tab')

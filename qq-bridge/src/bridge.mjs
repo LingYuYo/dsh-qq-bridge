@@ -914,6 +914,11 @@ export function normalizeSessionEntry(key, raw) {
     contextBriefing: normalizeBriefing(value.contextBriefing),
     // 三段式静态核心（v2.0 第十步）：单群覆盖，空段 = 继承全局。
     core: normalizeCore(value.core),
+    // 单群人设覆盖（v2.0 第十二步）：{ templateId, botName, groupName, participation, core }。
+    // 旧 state 只有 core 时自动升级成覆盖对象，保证升级后行为不变。
+    personaOverride: normalizePersonaOverride(
+      value.personaOverride ?? (value.core ? { core: value.core } : null),
+    ),
     // 结构化群友档案：QQ -> { nickname, lastNickname, role, tags }，仅本群。
     userProfiles: normalizeUserProfiles(value.userProfiles),
     // 本群黑话词条（v2.0 第十一步）：对象数组，单群同名 term 覆盖全局。
@@ -926,6 +931,31 @@ function normalizeCore(value) {
   const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
   const str = (input) => (typeof input === 'string' ? input.slice(0, 4000) : '')
   return { identity: str(src.identity), boundary: str(src.boundary), style: str(src.style) }
+}
+
+/**
+ * 归一化单群人设覆盖（v2.0 第十二步，2026-10-28）。
+ *
+ * 明确结构：`{ templateId, botName, groupName, participation, core }`。
+ * 全部为空 / null / 空串 = 没有覆盖（继承全局），返回 null。
+ * @param {unknown} value
+ * @returns {{templateId:string,botName:string,groupName:string,participation:string,core:{identity:string,boundary:string,style:string}}|null}
+ */
+export function normalizePersonaOverride(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const str = (input, max) => (typeof input === 'string' ? input.trim().slice(0, max) : '')
+  const core = normalizeCore(value.core)
+  const override = {
+    templateId: str(value.templateId, 80),
+    botName: str(value.botName, 60),
+    groupName: str(value.groupName, 60),
+    participation: ['quiet', 'normal', 'active'].includes(value.participation) ? value.participation : '',
+    core,
+  }
+  const has = override.templateId !== '' || override.botName !== '' || override.groupName !== ''
+    || override.participation !== ''
+    || core.identity !== '' || core.boundary !== '' || core.style !== ''
+  return has ? override : null
 }
 
 /** 归一化群友档案：只认数字 QQ，字段全部收敛，防止 state 被写脏。 */
@@ -1347,14 +1377,17 @@ export class Bridge {
    * @param {object} [source] 默认读 this.live，测试可注入
    * @returns {string}
    */
-  buildPersonaPrompt(source = this.live, { core = null, selfId = '', selfName = '' } = {}) {
+  buildPersonaPrompt(source = this.live, {
+    core = null, botName = '', groupName = '', participation = '', selfId = '', selfName = '',
+  } = {}) {
     return composePersonaPrompt({
       systemPrompt: source?.personaSystemPrompt,
       baseText: source?.personaText,
       defaultText: this._defaultPersona(source),
-      botName: source?.personaBotName,
-      groupName: source?.personaGroupName,
-      participation: source?.personaParticipation,
+      // 单群覆盖：名字 / 展示名 / 参与度留空就继承全局。
+      botName: botName || source?.personaBotName,
+      groupName: groupName || source?.personaGroupName,
+      participation: participation || source?.personaParticipation,
       extraRules: source?.personaExtraRules,
       // 模型自我认知：跟 _applyModel 用同一套优先级，保证「人设里说的」和「实际请求的」一致。
       modelRoute: this._modelRoute(source),
@@ -1363,7 +1396,7 @@ export class Bridge {
       // 静态核心（全局 ← 单群按段覆盖）与自身信息（QQ 号 / 昵称）。
       core: this._effectiveCore(core, source),
       selfId: String(selfId || this.qq?.selfId || ''),
-      selfName: String(selfName || source?.personaGroupName || source?.personaBotName || ''),
+      selfName: String(selfName || groupName || source?.personaGroupName || source?.personaBotName || ''),
     })
   }
 
@@ -1895,13 +1928,19 @@ export class Bridge {
     //   单群整体覆盖（entry.persona，旧字段）> 三段式核心（单群按段覆盖全局，含全局 core）
     //   > start.mjs 推的全局人设 > 兜底拼装。
     // 这一段吃前缀缓存；动态记忆（群友档案 / 黑话 / 改名事件）绝不进这里。
-    // 单群静态核心只有**真的填了**才覆盖全局（否则沿用 start 推的全局人设，
-    // 不能因为拼装函数里多了自身信息就把管理员写的全局人设挤掉）。
-    const localCore = entry.core && typeof entry.core === 'object'
-      && (String(entry.core.identity ?? '').trim() !== ''
-        || String(entry.core.boundary ?? '').trim() !== ''
-        || String(entry.core.style ?? '').trim() !== '')
-    const corePrompt = localCore ? this.buildPersonaPrompt(this.live, { core: entry.core }) : ''
+    // 单群人设覆盖（v2.0 第十二步）：{ templateId, botName, groupName, participation, core }。
+    // 只有真的填了才覆盖全局；否则沿用 start 推的全局人设。
+    const override = entry.personaOverride && typeof entry.personaOverride === 'object'
+      ? entry.personaOverride
+      : null
+    const corePrompt = override
+      ? this.buildPersonaPrompt(this.live, {
+        core: override.core,
+        botName: override.botName,
+        groupName: override.groupName,
+        participation: override.participation,
+      })
+      : ''
     const base = String(entry.persona ?? '').trim()
       || corePrompt
       || this._globalPersona
@@ -2229,6 +2268,7 @@ export class Bridge {
         // v2.0 第十步：双轨制人设 —— 单群静态核心覆盖 + 动态记忆（档案/黑话）。
         // 只读快照，供「会话管理 → 基础配置」回填；不参与任何决策。
         core: entry.core,
+        personaOverride: entry.personaOverride ?? null,
         userProfiles: Object.entries(entry.userProfiles ?? {}).slice(0, 50).map(([qq, profile]) => ({
           qq,
           nickname: String(profile?.nickname ?? ''),
@@ -2756,6 +2796,13 @@ export class Bridge {
     // 双轨制人设（v2.0 第十步）：单群静态核心覆盖 + 动态记忆增删。
     // 只改本群 state；全局核心在 Config 里，不经过这条指令。
     if (action === 'dynamic') {
+      // 单群人设覆盖（v2.0 第十二步）：显式结构 { templateId, botName, groupName, participation, core }。
+      // 传 null / '' / 空对象 = 删除覆盖，重新继承全局。
+      if (op?.personaOverride !== undefined) {
+        const override = normalizePersonaOverride(op.personaOverride)
+        entry.personaOverride = override
+        entry.core = override ? override.core : normalizeCore({})
+      }
       if (op?.core && typeof op.core === 'object' && !Array.isArray(op.core)) {
         entry.core = normalizeCore(op.core)
       }
@@ -2772,6 +2819,7 @@ export class Bridge {
       return {
         ok: true, action: 'dynamic', key,
         core: entry.core,
+        personaOverride: entry.personaOverride,
         slang: Array.isArray(entry.slang) ? entry.slang.length : 0,
         profiles: Object.keys(entry.userProfiles ?? {}).length,
       }

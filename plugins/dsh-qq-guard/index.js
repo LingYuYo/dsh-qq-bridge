@@ -532,14 +532,14 @@ const Config = Schema.object({
   personaCore: Schema.object({
     identity: Schema.string()
       .description('身份定义与气质：你是谁、什么性格、怎么说话。')
-      .default('').volatile(),
+      .default(''),
     boundary: Schema.string()
       .description('边界与安全红线：绝对不能做什么、遇到什么要拒绝。')
-      .default('').volatile(),
+      .default(''),
     style: Schema.string()
       .description('交互策略与应对模式：被问到什么、被挑衅、冷场时分别怎么处理。')
-      .default('').volatile(),
-  }).description('三段式静态核心人设（全局默认底座）').default({}),
+      .default(''),
+  }).description('三段式静态核心人设（全局默认底座）').default({}).volatile(),
   // 全局黑话词条（v2.0 第十一步）：按需触发，平时不进 Prompt。
   slangGlobal: Schema.array(Schema.object({
     term: Schema.string().description('词条（必填）。').default(''),
@@ -1459,6 +1459,8 @@ function enqueueSessionOp(op, key, text = '', extra = {}) {
     // v2.0 第十步：动态记忆编辑（静态核心覆盖 / 黑话列表 / 删除群友档案）。
     ...(extra.core === undefined ? {} : { core: extra.core }),
     ...(extra.slang === undefined ? {} : { slang: extra.slang }),
+    // v2.0 第十二步：单群人设覆盖（null 也要保留 = 删除覆盖，重新继承全局）。
+    ...(extra.personaOverride === undefined ? {} : { personaOverride: extra.personaOverride }),
     ...(typeof extra.removeProfile === 'string' && extra.removeProfile !== ''
       ? { removeProfile: extra.removeProfile }
       : {}),
@@ -3094,8 +3096,32 @@ function sanitizeSessionRow(row) {
     // v2.0 第十一步：黑话词条（对象数组）+ 合并视图（全局 + 单群，单群覆盖）。
     slang: sanitizeSlang(row.slang),
     mergedSlang: sanitizeSlang(row.mergedSlang),
+    // v2.0 第十二步：单群人设覆盖 { templateId, botName, groupName, participation, core }。
+    personaOverride: sanitizePersonaOverride(row.personaOverride),
     contextBriefing: typeof row.contextBriefing === 'string' ? row.contextBriefing.slice(0, 4000) : '',
   }
+}
+
+/** 收敛单群人设覆盖（v2.0 第十二步）。空对象 = null（继承全局）。 */
+function sanitizePersonaOverride(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const text = (input, max) => (typeof input === 'string' ? input.trim().slice(0, max) : '')
+  // 覆盖对象按「已保存的配置」处理：首尾空白直接裁掉，避免单群把空格带进人设。
+  const core = {
+    identity: text(value.core?.identity, 4000),
+    boundary: text(value.core?.boundary, 4000),
+    style: text(value.core?.style, 4000),
+  }
+  const out = {
+    templateId: text(value.templateId, 80),
+    botName: text(value.botName, 60),
+    groupName: text(value.groupName, 60),
+    participation: ['quiet', 'normal', 'active'].includes(value.participation) ? value.participation : '',
+    core,
+  }
+  const has = out.templateId !== '' || out.botName !== '' || out.groupName !== ''
+    || out.participation !== '' || core.identity !== '' || core.boundary !== '' || core.style !== ''
+  return has ? out : null
 }
 
 /** 收敛黑话词条数组（v2.0 第十一步）。 */
@@ -4298,6 +4324,7 @@ function applySettings(ctx, config) {
               // v2.0 第十步：动态记忆编辑字段原样透传给桥接。
               ...(op.core === undefined ? {} : { core: op.core }),
               ...(op.slang === undefined ? {} : { slang: op.slang }),
+              ...(op.personaOverride === undefined ? {} : { personaOverride: op.personaOverride }),
               ...(op.removeProfile ? { removeProfile: op.removeProfile } : {}),
             })
           }
@@ -4372,6 +4399,12 @@ function applySettings(ctx, config) {
           }
           if (typeof body?.removeProfile === 'string' && /^\d{1,20}$/u.test(body.removeProfile.trim())) {
             extra.removeProfile = body.removeProfile.trim()
+          }
+          // v2.0 第十二步：单群人设覆盖。null / '' / 空对象 = 删除覆盖（重新继承全局）。
+          if (body?.personaOverride !== undefined) {
+            extra.personaOverride = (body.personaOverride === null || body.personaOverride === '')
+              ? null
+              : sanitizePersonaOverride(body.personaOverride)
           }
         }
         const id = enqueueSessionOp(

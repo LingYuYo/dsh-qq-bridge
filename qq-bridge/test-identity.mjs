@@ -169,5 +169,49 @@ await check('保存三段核心 / 黑话词条 / 删除档案', async () => {
   assert.equal(b.state.sessions[key].userProfiles['1001'], undefined)
 })
 
+console.log('\n— 单群人设覆盖（v2.0 第十二步）—')
+await check('dynamic：保存覆盖对象，人设拼装用单群名字/身份', async () => {
+  const b = makeBridge()
+  const key = 'g:9'
+  b.state.sessions[key] = normalizeSessionEntry(key, { sessionId: 'sess-1' })
+  const saved = await b.applySessionOp({
+    op: 'dynamic', key,
+    personaOverride: {
+      templateId: 'p1', botName: '小鲸', groupName: '鲸', participation: 'quiet',
+      core: { identity: '本群身份', boundary: '本群边界', style: '' },
+    },
+  })
+  assert.equal(saved.ok, true)
+  const entry = b.state.sessions[key]
+  assert.equal(entry.personaOverride.templateId, 'p1')
+  assert.equal(entry.personaOverride.botName, '小鲸')
+  assert.equal(entry.personaOverride.participation, 'quiet')
+  assert.equal(entry.personaOverride.core.identity, '本群身份')
+  // 单群覆盖生效：名字 / 参与度 / 身份都来自覆盖
+  const prompt = b.buildPersonaPrompt(b.live, {
+    core: entry.personaOverride.core,
+    botName: entry.personaOverride.botName,
+    groupName: entry.personaOverride.groupName,
+    participation: entry.personaOverride.participation,
+  })
+  assert.match(prompt, /你的名字是「小鲸」/u)
+  assert.match(prompt, /本群身份/u)
+})
+
+await check('dynamic：空串 / null / 空对象 = 删除覆盖，重新继承全局', async () => {
+  const b = makeBridge()
+  const key = 'g:10'
+  b.state.sessions[key] = normalizeSessionEntry(key, {
+    sessionId: 'sess-1',
+    personaOverride: { templateId: 'p1', core: { identity: '旧覆盖' } },
+  })
+  assert.equal(b.state.sessions[key].personaOverride.core.identity, '旧覆盖')
+  await b.applySessionOp({ op: 'dynamic', key, personaOverride: '' })
+  assert.equal(b.state.sessions[key].personaOverride, null)
+  assert.deepEqual(b.state.sessions[key].core, { identity: '', boundary: '', style: '' })
+  await b.applySessionOp({ op: 'dynamic', key, personaOverride: { templateId: '', core: {} } })
+  assert.equal(b.state.sessions[key].personaOverride, null, '空对象也算删除')
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) process.exitCode = 1

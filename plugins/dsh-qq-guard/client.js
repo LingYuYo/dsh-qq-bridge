@@ -2299,11 +2299,11 @@ window.__ModuleLoader__.load({
           { op: 'set', path: ['personaGroupName'], value: draft.groupName.trim() },
           { op: 'set', path: ['personaParticipation'], value: draft.participation },
           // v2.0 第十步：三段式静态核心；旧的大文本框清空，避免两套设定叠加。
-          { op: 'set', path: ['personaCore'], value: {
-            identity: draft.coreIdentity,
-            boundary: draft.coreBoundary,
-            style: draft.coreStyle,
-          } },
+          // 逐字段 set（不要整对象 set）：DSH 的 mutate 对 object 字段按子键校验，
+          // 整对象 set 会被 schema 拒绝 → 整组回滚（2026-10-28 实测的保存失败根因）。
+          { op: 'set', path: ['personaCore', 'identity'], value: draft.coreIdentity },
+          { op: 'set', path: ['personaCore', 'boundary'], value: draft.coreBoundary },
+          { op: 'set', path: ['personaCore', 'style'], value: draft.coreStyle },
           { op: 'set', path: ['personaText'], value: '' },
           { op: 'set', path: ['personaExtraRules'], value: draft.extraRules },
           { op: 'set', path: ['personaSystemPrompt'], value: draft.systemPrompt },
@@ -4069,14 +4069,140 @@ window.__ModuleLoader__.load({
         })))
     }
 
-    /** Tab 1 · 基础配置：响应档位 + 双轨制静态核心 + 动态记忆（档案 / 黑话标签）。 */
-    function SessionBasicTab({ session, persona, level, busy, get, write, writable }) {
-      // 双轨制（v2.0 第十步）：静态核心三框（单群覆盖，留空继承全局）+ 动态记忆（本群专属）。
-      const [coreDraft, setCoreDraft] = React.useState(() => ({
-        identity: String(session.core?.identity ?? ''),
-        boundary: String(session.core?.boundary ?? ''),
-        style: String(session.core?.style ?? ''),
+    /**
+     * 单群人设覆盖弹窗（v2.0 第十二步）。
+     *
+     * 与全局人设弹窗的区别：这里**只能选全局已存在的模板**（含默认内置），
+     * 没有「添加 / 删除模板」；选中后把模板内容回填到单群草稿，允许局部修改。
+     * 保存 = 写入 state.sessions[key].personaOverride；「恢复为继承全局」= 清空覆盖。
+     */
+    function SessionPersonaModal({ session, get, writable, busy, onClose, onSave, onReset }) {
+      const presets = Array.isArray(get?.('personaPresets')) ? get('personaPresets') : []
+      const existing = session.personaOverride && typeof session.personaOverride === 'object'
+        ? session.personaOverride
+        : null
+      const globalCore = {
+        identity: String(get?.('personaCore.identity') ?? ''),
+        boundary: String(get?.('personaCore.boundary') ?? ''),
+        style: String(get?.('personaCore.style') ?? ''),
+      }
+      const [draft, setDraft] = React.useState(() => ({
+        templateId: String(existing?.templateId ?? ''),
+        botName: String(existing?.botName ?? ''),
+        groupName: String(existing?.groupName ?? ''),
+        participation: String(existing?.participation ?? ''),
+        identity: String(existing?.core?.identity ?? ''),
+        boundary: String(existing?.core?.boundary ?? ''),
+        style: String(existing?.core?.style ?? ''),
       }))
+      const set = (key, value) => setDraft((prev) => ({ ...prev, [key]: value }))
+      const chooseTemplate = (id) => {
+        if (id === '') {
+          setDraft({ templateId: '', botName: '', groupName: '', participation: '', identity: '', boundary: '', style: '' })
+          return
+        }
+        const preset = presets.find((item) => String(item.id) === String(id))
+        // 选中模板 = 以「全局当前配置 + 模板正文」为起点，之后允许单群局部改。
+        setDraft({
+          templateId: String(id),
+          botName: String(get?.('personaBotName') ?? ''),
+          groupName: String(get?.('personaGroupName') ?? ''),
+          participation: String(get?.('personaParticipation') ?? 'normal'),
+          identity: String(preset?.text ?? '') || globalCore.identity,
+          boundary: globalCore.boundary,
+          style: globalCore.style,
+        })
+      }
+      const save = () => onSave({
+        templateId: draft.templateId,
+        botName: draft.botName.trim(),
+        groupName: draft.groupName.trim(),
+        participation: draft.participation,
+        core: { identity: draft.identity, boundary: draft.boundary, style: draft.style },
+      })
+      return h(Modal, {
+        open: true,
+        title: '单群人设（覆盖全局）',
+        desc: '下拉里只有全局模板；选中后自动回填，改哪项就覆盖哪项，其余继承全局。',
+        onClose,
+        footer: [
+          h('button', { key: 'c', type: 'button', className: 'qqg-btn', onClick: onClose }, '取消'),
+          h('button', {
+            key: 'r', type: 'button', className: 'qqg-btn',
+            disabled: !writable || busy,
+            onClick: onReset,
+          }, '恢复为继承全局'),
+          h('button', {
+            key: 's', type: 'button', className: 'qqg-btn qqg-btn-primary',
+            disabled: !writable || busy,
+            onClick: save,
+          }, '保存'),
+        ],
+      },
+      h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, '全局模板'),
+        h('select', {
+          className: 'qqg-input', value: draft.templateId,
+          'aria-label': '选择全局模板', disabled: busy,
+          onChange: (e) => chooseTemplate(e.target.value),
+        },
+        h('option', { value: '' }, '默认内置（继承全局）'),
+        presets.map((preset) => h('option', { key: String(preset.id), value: String(preset.id) },
+          preset.name || String(preset.id))))),
+      h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, '机器人名字'),
+        h('input', {
+          className: 'qqg-input', value: draft.botName, placeholder: '留空 = 继承全局',
+          'aria-label': '单群机器人名字', disabled: busy,
+          onChange: (e) => set('botName', e.target.value),
+        })),
+      h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, '群内展示名'),
+        h('input', {
+          className: 'qqg-input', value: draft.groupName, placeholder: '留空 = 继承全局',
+          'aria-label': '单群展示名', disabled: busy,
+          onChange: (e) => set('groupName', e.target.value),
+        })),
+      h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, '参与度'),
+        h('select', {
+          className: 'qqg-input', value: draft.participation,
+          'aria-label': '单群参与度', disabled: busy,
+          onChange: (e) => set('participation', e.target.value),
+        },
+        h('option', { value: '' }, '继承全局'),
+        PERSONA_PARTICIPATION.map((item) => h('option', { key: item.id, value: item.id }, item.label)))),
+      h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, '身份定义与气质'),
+        h('textarea', {
+          className: 'qqg-ai-input', rows: 4, value: draft.identity,
+          placeholder: '留空 = 继承全局；例如：你是这个群里的潜水员，说话很短……',
+          'aria-label': '单群身份定义', disabled: busy,
+          onChange: (e) => set('identity', e.target.value),
+        })),
+      h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, '边界与安全红线'),
+        h('textarea', {
+          className: 'qqg-ai-input', rows: 3, value: draft.boundary,
+          placeholder: '留空 = 继承全局',
+          'aria-label': '单群边界', disabled: busy,
+          onChange: (e) => set('boundary', e.target.value),
+        })),
+      h('label', { className: 'qqg-field' },
+        h('span', { className: 'qqg-field-label' }, '交互策略与应对模式'),
+        h('textarea', {
+          className: 'qqg-ai-input', rows: 3, value: draft.style,
+          placeholder: '留空 = 继承全局',
+          'aria-label': '单群策略', disabled: busy,
+          onChange: (e) => set('style', e.target.value),
+        })))
+    }
+
+    /** Tab 1 · 基础配置：响应档位 + 单群人设覆盖 + 动态记忆（档案 / 黑话标签）。 */
+    function SessionBasicTab({ session, persona, level, busy, get, write, writable }) {
+      // 单群人设覆盖（v2.0 第十二步）：{ templateId, botName, groupName, participation, core }。
+      // 弹窗编辑，不再内联三框；空 = 继承全局。
+      const [personaOpen, setPersonaOpen] = React.useState(false)
       // 黑话（v2.0 第十一步）：标签展示；点标签或「添加」打开编辑弹窗。
       const [slangEdit, setSlangEdit] = React.useState(null)
       const [dynBusy, setDynBusy] = React.useState(false)
@@ -4084,6 +4210,9 @@ window.__ModuleLoader__.load({
       const profiles = Array.isArray(session.userProfiles) ? session.userProfiles : []
       const mergedSlang = Array.isArray(session.mergedSlang) ? session.mergedSlang : []
       const localSlang = Array.isArray(session.slang) ? session.slang : []
+      const personaOverride = session.personaOverride && typeof session.personaOverride === 'object'
+        ? session.personaOverride
+        : null
       const globalSlang = () => (Array.isArray(get?.('slangGlobal')) ? get('slangGlobal') : [])
       const roleLabel = (role) => (role === 'owner' ? '群主' : role === 'admin' ? '管理员' : '群员')
 
@@ -4099,7 +4228,11 @@ window.__ModuleLoader__.load({
           setDynBusy(false)
         }
       }
-      const saveCore = () => submitDynamic({ core: coreDraft }, '静态核心')
+      const savePersonaOverride = async (payload) => {
+        await submitDynamic({ personaOverride: payload }, '单群人设')
+        setPersonaOpen(false)
+      }
+      const resetPersonaOverride = () => submitDynamic({ personaOverride: null }, '恢复继承全局')
       const removeProfile = (qq) => submitDynamic({ removeProfile: qq }, '删除群友档案')
 
       /** 按 term（不区分大小写）upsert 一条词条。 */
@@ -4133,17 +4266,12 @@ window.__ModuleLoader__.load({
         setSlangEdit(null)
       }
 
-      const coreField = (label, key, rows, placeholder) => h('label', { className: 'qqg-field' },
-        h('span', { className: 'qqg-field-label' }, label),
-        h('textarea', {
-          className: 'qqg-ai-input',
-          rows,
-          value: coreDraft[key],
-          placeholder,
-          'aria-label': label,
-          disabled: dynBusy,
-          onChange: (e) => setCoreDraft((prev) => ({ ...prev, [key]: e.target.value })),
-        }))
+      const overrideName = (() => {
+        if (!personaOverride) return '继承全局'
+        const presets = Array.isArray(get?.('personaPresets')) ? get('personaPresets') : []
+        const preset = presets.find((item) => String(item.id) === String(personaOverride.templateId))
+        return '覆盖：' + (preset?.name || personaOverride.templateId || '自定义')
+      })()
 
       return h('div', { className: 'qqg-dstack' },
         h(Panel, {
@@ -4178,21 +4306,48 @@ window.__ModuleLoader__.load({
               ? h(React.Fragment, null, h(Spinner), '提交中…')
               : '保存档位'))),
         h(Panel, {
-          title: '静态核心人格（单群覆盖）',
-          desc: '留空整段继承全局；填写后覆盖全局对应段。吃前缀缓存，动态记忆无权修改。',
-          right: h('span', { className: 'qqg-pill' },
-            session.core && (session.core.identity || session.core.boundary || session.core.style)
-              ? '单群覆盖' : '继承全局'),
+          title: '单群人设（覆盖全局）',
+          desc: '基于全局模板做局部修改，只影响这个群；不覆盖则完全继承全局。静态核心吃前缀缓存。',
+          right: h('span', { className: 'qqg-pill' + (personaOverride ? ' qqg-pill-accent' : '') },
+            overrideName),
         },
-          coreField('身份定义与气质', 'identity', 4, '留空 = 继承全局；例如：你是这个群里的潜水员，说话很短……'),
-          coreField('边界与安全红线', 'boundary', 3, '留空 = 继承全局；例如：不透露任何本机路径与凭据……'),
-          coreField('交互策略与应对模式', 'style', 3, '留空 = 继承全局；例如：被点名才接话，冷场时不主动刷屏……'),
+          h('div', { className: 'qqg-list' },
+            h('div', { className: 'qqg-kv' },
+              h('span', null, '机器人名字'),
+              h('b', null, personaOverride?.botName || '继承全局')),
+            h('div', { className: 'qqg-kv' },
+              h('span', null, '群内展示名'),
+              h('b', null, personaOverride?.groupName || '继承全局')),
+            h('div', { className: 'qqg-kv' },
+              h('span', null, '参与度'),
+              h('b', null, personaOverride?.participation
+                ? personaParticipationLabel(personaOverride.participation)
+                : '继承全局'))),
           h('div', { className: 'qqg-textarea-actions' },
             h('button', {
               type: 'button', className: 'qqg-btn qqg-btn-primary',
-              disabled: dynBusy || !session.sessionId,
-              onClick: saveCore,
-            }, dynBusy ? h(React.Fragment, null, h(Spinner), '提交中…') : '保存静态核心'))),
+              disabled: dynBusy,
+              onClick: () => setPersonaOpen(true),
+            }, '编辑单群人设'),
+            personaOverride
+              ? h('button', {
+                type: 'button', className: 'qqg-btn',
+                disabled: dynBusy,
+                onClick: resetPersonaOverride,
+              }, '恢复为继承全局')
+              : null),
+          personaOpen
+            ? h(SessionPersonaModal, {
+              key: session.key,
+              session,
+              get,
+              writable,
+              busy: dynBusy,
+              onClose: () => setPersonaOpen(false),
+              onSave: savePersonaOverride,
+              onReset: () => { resetPersonaOverride(); setPersonaOpen(false) },
+            })
+            : null),
         h(Panel, {
           title: '动态群聊记忆',
           desc: '只属于这个群：群友档案自动记录，黑话/梗可手动增删。拼在本轮 Prompt 最末尾，不进系统提示词。',
