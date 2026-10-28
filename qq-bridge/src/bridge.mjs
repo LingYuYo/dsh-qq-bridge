@@ -23,7 +23,7 @@ import { randomUUID } from 'node:crypto'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   OneBotClient, normalizeTypingCharTiers, normalizeTypingMsTiers, normalizeForwardNode,
-  stripLeadingMentions,
+  stripLeadingMentions, stripMonologueLines,
 } from './onebot.mjs'
 import { DshClient } from './dsh.mjs'
 import { synthesize, TTS_MAX_CHARS, DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER } from './tts.mjs'
@@ -469,6 +469,16 @@ function maskQq(value) {
 /** 潜水指令（每轮追加在 Prompt 最末尾，明确告诉模型可以闭嘴）。 */
 export const SILENT_INSTRUCTION = '[系统绝对指令：如果没有需要回复的新消息或你决定潜水，请必须只输出 <silent> '
   + '且不附带任何标点或括号。如果你的当前人设没有强制要求使用括号，请尽量少用。]'
+
+/**
+ * 禁止内心戏外溢（v2.0 第二十二步）。
+ *
+ * 真机实测：模型会把「(太长了，拆成几条吧…)」「（权衡：主人明确命令…）」这类
+ * 自我对话当正文发到群里。每轮压在 Prompt 最末尾，配合 `_send` 的整行清洗兜底。
+ */
+export const MONOLOGUE_BAN = '[绝对禁止] 最终回复里不要输出任何类似 (xxx) 的思考过程、权衡分析或自我备注'
+  + '（例如「(太长了，拆成几条吧)」「（权衡：…）」）。只输出真正要对群友说的话；'
+  + '代码直接给代码，不要解释你怎么想的。'
 
 /**
  * 全局清洗 `<silent>` 标记（v2.0 第十六步）。
@@ -5590,6 +5600,8 @@ export class Bridge {
     }
     // 潜水指令：每轮都在最末尾，明确允许模型用 <silent> 闭嘴。
     sections.push(SILENT_INSTRUCTION)
+    // 禁止内心戏外溢：同层固定指令，配合 _send 的整行清洗兜底。
+    sections.push(MONOLOGUE_BAN)
     return sections
   }
 
@@ -6319,6 +6331,17 @@ export class Bridge {
       }
       this.logger.warn?.(`发送前清洗 <silent> 标记：${stripped.slice(0, 40)}`)
       text = stripped
+    }
+    // v2.0 第二十二步：兜底剔除整行的内心戏 / 权衡 / 备注（主路径已提示过模型，
+    // 这里保证无论哪个发送入口都不会漏到 QQ）。
+    const withoutMonologue = stripMonologueLines(text)
+    if (withoutMonologue !== String(text ?? '').trim()) {
+      this.logger.warn?.(`发送前剔除内心戏/备注：${String(text ?? '').length - withoutMonologue.length} 字`)
+      if (withoutMonologue === '') {
+        this.stats.silent++
+        return { ok: true, dropped: true }
+      }
+      text = withoutMonologue
     }
     const key = this.keyOf(msg)
     // 群聊引用（2026-10-27）：拿得到入站 message_id 就挂 `reply` 段，否则退回 @。

@@ -748,13 +748,61 @@ function isLogLine(line) {
  * **在 splitBubbles 入口做**，原子块不进入语义切。
  * @returns {Array<{type:'atomic',kind:string,text:string}|{type:'text',lines:string[]}>}
  */
+/** 缩进行（4 空格 / Tab 开头）视为代码内容。 */
+function isIndentedCodeLine(line) {
+  const raw = String(line ?? '')
+  return raw.trim() !== '' && /^(?:\t| {4})/u.test(raw)
+}
+
+/** 代码关键字行（无围栏代码段的识别用）。 */
+const CODE_LINE_RE = /^(?:def |class |import |from \S+ import |return\b|if \b|for \b|while \b|try:|except\b|elif\b|else:|with \b|async def |function |const |let |var |export |public |private |protected |package |using |#include|#define|console\.|\}|\{|\)\s*\{|SELECT |INSERT |UPDATE |DELETE |CREATE )/u
+
+/** 这一行是否像代码（关键字 / 花括号 / 箭头函数 / 调用）。 */
+function looksLikeCodeLine(line) {
+  const t = String(line ?? '').trim()
+  if (t === '') return false
+  if (CODE_LINE_RE.test(t)) return true
+  return /[{};]$|\b=>\b|^\w+\(.*\)$/u.test(t) && /[{}();=]/u.test(t)
+}
+
+/** 去掉代码块首尾空行，**保留内部缩进**。 */
+function trimCodeBlock(lines) {
+  const list = [...lines]
+  while (list.length > 0 && String(list[0]).trim() === '') list.shift()
+  while (list.length > 0 && String(list[list.length - 1]).trim() === '') list.pop()
+  return list.join('\n')
+}
+
+/**
+ * 删掉整行包裹在括号里的「内心戏 / 权衡 / 备注」（v2.0 第二十二步）。
+ *
+ * 只删带明确元话语关键词的整行括号，正常括号内容（如「（笑）」）保留。
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripMonologueLines(text) {
+  const hints = /拆成|拆分|权衡|配图|备注|内心|思考|大纲|计划|太长|分条|拆开|自我|策略|分析|说明一下|先说明|补充说明|注：/u
+  return String(text ?? '')
+    .split('\n')
+    .filter((line) => {
+      const t = line.trim()
+      if (!/^[(（][\s\S]*[)）]$/u.test(t)) return true
+      return !hints.test(t)
+    })
+    .join('\n')
+    .trim()
+}
+
 export function segmentAtoms(lines) {
   const pre = []
   let run = []
   const flushRun = () => { if (run.length) { pre.push({ type: 'text', lines: run }); run = [] } }
+  // 普通文本行在交给下游前 trim；代码块内容保留原始缩进。
+  const plain = (line) => String(line ?? '').trim()
 
   for (let i = 0; i < lines.length; i++) {
-    const t = lines[i]
+    const t = plain(lines[i])
+    if (t === '') continue
     // 围栏代码块
     const fence = /^(```+|~~~+)/.exec(t)
     if (fence) {
@@ -764,12 +812,53 @@ export function segmentAtoms(lines) {
       let closed = false
       for (; j < lines.length; j++) {
         block.push(lines[j])
-        if (new RegExp(`^${marker === '`' ? '`' : '~'}{3,}`).test(lines[j])) { closed = true; j++; break }
+        if (new RegExp(`^${marker === '`' ? '`' : '~'}{3,}`).test(String(lines[j]).trim())) { closed = true; j++; break }
       }
       flushRun()
       pre.push({ type: 'atomic', kind: 'code', text: block.join('\n') })
       i = closed ? j - 1 : lines.length
       continue
+    }
+    // v2.0 第二十二步：无标记代码段（缩进块 / 连续代码关键字行）整体成原子块。
+    if (isIndentedCodeLine(lines[i])) {
+      const block = []
+      let j = i
+      for (; j < lines.length; j++) {
+        const raw = lines[j]
+        if (String(raw).trim() === '') { block.push(raw); continue }
+        if (!isIndentedCodeLine(raw)) break
+        block.push(raw)
+      }
+      // 至少 2 行缩进内容才算代码（单行缩进更可能是引用/排版）。
+      const nonEmpty = block.filter((line) => String(line).trim() !== '')
+      if (nonEmpty.length >= 2) {
+        // 函数/类定义行本身没有缩进（`def f():`），要跟代码块一起走。
+        let head = ''
+        if (run.length > 0 && looksLikeCodeLine(run[run.length - 1])) head = run.pop()
+        flushRun()
+        const full = head === '' ? block : [head, ...block]
+        pre.push({ type: 'atomic', kind: 'code-indent', text: trimCodeBlock(full) })
+        i = j - 1
+        continue
+      }
+    }
+    if (looksLikeCodeLine(t) && i + 2 < lines.length
+      && looksLikeCodeLine(plain(lines[i + 1])) && looksLikeCodeLine(plain(lines[i + 2]))) {
+      const block = []
+      let j = i
+      for (; j < lines.length; j++) {
+        const raw = lines[j]
+        if (String(raw).trim() === '') break
+        if (!looksLikeCodeLine(String(raw).trim())) break
+        // 保留原始行（含缩进），否则代码块会失去层级。
+        block.push(raw)
+      }
+      if (block.length >= 3) {
+        flushRun()
+        pre.push({ type: 'atomic', kind: 'code-loose', text: block.join('\n') })
+        i = j - 1
+        continue
+      }
     }
     // 行内代码独占整行
     if (/^`[^`]+`$/u.test(t)) { flushRun(); pre.push({ type: 'atomic', kind: 'inline-code', text: t }); continue }
@@ -1005,16 +1094,22 @@ export function splitBubbles(text, opts = {}) {
   const s = String(text ?? '').replace(/\r\n?/g, '\n')
   if (!s.trim()) return []
 
-  const lines = s.split('\n').map((l) => l.trim()).filter(Boolean)
+  // v2.0 第二十二步：保留原始行（含行首缩进），代码块要靠缩进识别；
+  // 普通聊天行的 trim 在 segmentAtoms / 行处理里做，不影响原有分片行为。
+  const lines = s.split('\n')
   const out = []
 
   for (const seg of segmentAtoms(lines)) {
     if (seg.type === 'atomic') {
       const kept = doTrim ? trimEndPunctuation(seg.text, keep, true) : seg.text
-      if (charCount(kept) > hard) {
-        if (seg.kind === 'url' || seg.kind === 'inline-code') out.push(kept)
-        else out.push(...splitByLines(kept, hard))
-      } else out.push(kept)
+      // 无标记代码段：发送时自动补 ``` 围栏，QQ 里才能保持等宽与缩进。
+      const wrapCode = seg.kind === 'code-indent' || seg.kind === 'code-loose'
+      const wrapped = wrapCode ? '```\n' + kept + '\n```' : kept
+      if (charCount(wrapped) > hard) {
+        if (seg.kind === 'url' || seg.kind === 'inline-code') out.push(wrapped)
+        else if (wrapCode) out.push(...splitByLines(kept, hard).map((part) => '```\n' + part + '\n```'))
+        else out.push(...splitByLines(wrapped, hard))
+      } else out.push(wrapped)
       continue
     }
     // 关键：seg.lines 是**模型原生换行**，每一行都是强边界 → 各自独立成泡。

@@ -18,7 +18,7 @@ import { planRenames } from './src/rename-plan.mjs'
 import {
   OneBotClient, parseMessage, splitText, splitBubbles, charCount, typingDelayFor,
   normalizeTypingCharTiers, normalizeTypingMsTiers, extractImages, imageFileVia,
-  extractCardInfo, formatCardSegment,
+  extractCardInfo, formatCardSegment, stripMonologueLines, stripLeadingMentions,
 } from './src/onebot.mjs'
 import { ExternalHooksClient } from './src/external-hooks.mjs'
 import { buildSsml, synthesizeOpenAI } from './src/tts.mjs'
@@ -328,7 +328,31 @@ await check('刻意断开的应答词 / 短句 / 1 字不合并', () => {
   assert.deepEqual(splitBubbles('第一句\n第二句\n第三句'), ['第一句', '第二句', '第三句'])
   assert.deepEqual(splitBubbles('甲\r\n乙\r丙'), ['甲', '乙', '丙'])
 })
-// v2.0 第二十一步：无标点超长行降级大块，避免 4500 字切成 150 条刷屏。
+// v2.0 第二十二步：无标记代码块（缩进 / 连续关键字）→ 原子块 + 自动围栏 + 保留缩进。
+await check('无标记缩进代码块 → 一个原子块，自动加围栏且保留缩进', () => {
+  const code = 'def f(x):\n    total = 0\n    for i in range(x):\n        total += i\n    return total'
+  const parts = splitBubbles(code)
+  assert.equal(parts.length, 1, `应 1 条，实际 ${parts.length}`)
+  assert.ok(parts[0].startsWith('```\n'), parts[0].slice(0, 20))
+  assert.ok(parts[0].includes('\n    total = 0'), '行首缩进必须保留')
+  assert.ok(parts[0].includes('\n        total += i'), '深层缩进必须保留')
+})
+
+await check('无围栏但连续代码关键字行 → 也当原子块', () => {
+  const parts = splitBubbles('import os\nimport sys\ndef main():\n    return 0')
+  assert.equal(parts.length, 1, `应 1 条，实际 ${parts.length}`)
+  assert.ok(parts[0].includes('def main()'))
+  assert.ok(parts[0].includes('\n    return 0'), 'return 的缩进要保留')
+})
+
+await check('stripMonologueLines：删内心戏整行，保留正常括号', () => {
+  assert.equal(
+    stripMonologueLines('好的\n(太长了，拆成几条吧...)\n普通回复\n（权衡：主人明确命令）'),
+    '好的\n普通回复',
+  )
+  assert.equal(stripMonologueLines('（笑）'), '（笑）', '正常括号不能误删')
+  assert.equal(stripLeadingMentions('@小鱼 /归纳'), '/归纳')
+})
 await check('无标点超长行降级成 chunkSize 大块（4500 字 → 5 条）', () => {
   const parts = splitBubbles('x'.repeat(4500))
   assert.equal(parts.length, 5, `实际 ${parts.length} 条`)
