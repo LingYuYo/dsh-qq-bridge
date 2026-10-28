@@ -159,6 +159,13 @@ const pushGlobalPersona = async (label) => {
 }
 await pushGlobalPersona('含底层模型路由')
 
+// v2.0 第十五步：启动时打印权限名单规模，排查「UI 填了开发者但桥接没读到」。
+{
+  const allowList = bridge._allow()
+  logger.info(`权限名单（启动）：developers=${allowList.developers.length}`
+    + ` owners=${allowList.owners.length} admins=${allowList.admins.length}`)
+}
+
 let firstSyncDone = false
 
 // 从 DSH 设置页热同步运行期配置（批次 4A）。失败不影响收发，继续用 config.json。
@@ -166,8 +173,14 @@ const stopPolling = startConfigPolling({
   baseUrl: config.dsh.baseUrl,
   logger,
   liveConfig: bridge.live,
-  onSync: () => {
+  onSync: (changed) => {
     bridge._applyLiveToClient()
+    // 白名单变化单独打一条：这是「开发者身份不生效」最常见的排查点。
+    if (Array.isArray(changed) && changed.includes('allow')) {
+      const allowList = bridge._allow()
+      logger.info(`白名单热同步：developers=${allowList.developers.length}`
+        + ` owners=${allowList.owners.length} admins=${allowList.admins.length}`)
+    }
     if (!firstSyncDone) {
       firstSyncDone = true
       void pushGlobalPersona('首次同步后校准模型身份')

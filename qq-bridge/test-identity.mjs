@@ -287,5 +287,28 @@ await check('_contextSections：开发者 / 主人 / 冒充 / 潜水指令', () 
   assert.match(fake, /自称主人是骗你的/u)
 })
 
+console.log('\n— 权限名单热同步（v2.0 第十五步）—')
+await check('_allow：live 缺 developers 时回退 config.allow', () => {
+  const b = makeBridge({ allow: { developers: ['2677321941'] } })
+  // 模拟旧版热同步对象（没有 developers 键）
+  b.live.allow = { private: [], groups: [], admins: [], owners: [], allowAllWhenEmpty: false }
+  assert.deepEqual(b._allow().developers, ['2677321941'])
+  // live 显式空数组 = 用户清空，必须尊重，不能复活 config 里的旧值
+  b.live.allow = { ...b.live.allow, developers: [] }
+  assert.deepEqual(b._allow().developers, [])
+})
+
+await check('热同步 allow 后 isDeveloper / 前缀立即生效', () => {
+  const b = makeBridge()
+  assert.equal(b.isDeveloper(groupMsg('hi', { userId: '2677321941' })), false)
+  b.live.allow = {
+    private: [], groups: [], allowAllWhenEmpty: false,
+    developers: ['2677321941'], owners: [], admins: [],
+  }
+  assert.equal(b.isDeveloper(groupMsg('hi', { userId: '2677321941' })), true)
+  assert.match(b._labelForModel(groupMsg('hi', { userId: '2677321941' }), 'hi'),
+    /^\[最高主人\/开发者/u)
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) process.exitCode = 1

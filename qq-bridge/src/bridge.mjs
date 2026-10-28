@@ -457,6 +457,12 @@ export const DEV_STRANGER_REPLY = '（暗号不对哦）'
  */
 export const IMPERSONATION_RE = /(?:我是|我就是|我才是|我其实是)\s*(?:你的|你)?\s*(?:主人|开发者|最高主人)|(?:主人|开发者)\s*(?:权限|身份|模式)\s*(?:在|是)?\s*我/u
 
+/** 日志脱敏：QQ 号只露前 3 后 2，避免整份日志泄漏群友号码。 */
+function maskQq(value) {
+  const text = String(value ?? '')
+  return text.length <= 5 ? text : `${text.slice(0, 3)}***${text.slice(-2)}`
+}
+
 /** 潜水指令（每轮追加在 Prompt 最末尾，明确告诉模型可以闭嘴）。 */
 export const SILENT_INSTRUCTION = '[系统绝对指令：如果没有需要回复的新消息或你决定潜水，请必须只输出 <silent> '
   + '且不附带任何标点或括号。如果你的当前人设没有强制要求使用括号，请尽量少用。]'
@@ -1757,18 +1763,24 @@ export class Bridge {
       ? hot
       : (this.config.allow ?? {})
     const norm = (list) => (Array.isArray(list) ? list.map(String) : [])
+    // 单个键兜底（v2.0 第十五步）：live.allow 若因旧热同步对象 / 局部 patch
+    // 少了某个键（例如 developers 是后加的），回退到 config.allow 的同名数组。
+    // 注意：live 里**显式**是数组（哪怕空数组）就尊重它，不能把用户清空的名单复活。
+    const listOf = (key) => (Array.isArray(source[key])
+      ? norm(source[key])
+      : norm(this.config.allow?.[key]))
     return {
-      private: norm(source.private),
-      groups: norm(source.groups),
-      admins: norm(source.admins),
+      private: listOf('private'),
+      groups: listOf('groups'),
+      admins: listOf('admins'),
       // 主人（2026-10-28）：比管理员高一阶，能触发后台动作（未读归纳）。
       // 主人**自动视同管理员**（见 isAdmin），否则他连 `/` 指令都发不进来。
-      owners: norm(source.owners),
+      owners: listOf('owners'),
       // 开发者（2026-10-28 v2.0，三阶权限最高一档）：能触发暗号提权（尾部专属 Prompt）。
       // 开发者视同主人（见 isOwner）与管理员（见 isAdmin）。
-      // ⚠️ 缺省 / 非数组 / 老配置文件里没有这个键 → norm() 返回空数组，
+      // ⚠️ 缺省 / 非数组 / 老配置文件里没有这个键 → 返回空数组，
       //    权限自动降级为主人 + 管理员，**不抛错、不改任何既有行为**。
-      developers: norm(source.developers),
+      developers: listOf('developers'),
       deny: {
         private: norm(source.deny?.private),
         groups: norm(source.deny?.groups),
@@ -3979,6 +3991,20 @@ export class Bridge {
     const chatImageCount = images.length
     // v2.0 第十四步：权限身份与冒充识别（只看名单 + 文本，不认模型输出）。
     const privileged = this.isDeveloper(msg) ? 'developer' : this.isOwner(msg) ? 'owner' : ''
+    // v2.0 第十五步：权限排查日志。命中打 info（只在白名单里的人发消息时出现）；
+    // 未命中且开了 debugPayload 时也打一条，方便对照「名单到底同步到了没有」。
+    {
+      const allowList = this._allow()
+      const who = maskQq(msg?.userId)
+      if (privileged !== '') {
+        this.logger.info?.(`权限命中：${who} → ${privileged}`
+          + `（名单 developers=${allowList.developers.length} owners=${allowList.owners.length}）`)
+      } else if (this._developerConfig().debugPayload) {
+        this.logger.info?.(`权限未命中：${who} 不在任何名单`
+          + `（developers=${allowList.developers.length} owners=${allowList.owners.length}`
+          + ` admins=${allowList.admins.length}）`)
+      }
+    }
     // 普通群友在文本里自称主人 / 开发者 → 每轮尾部给模型一条明确警告。
     const impersonation = privileged === '' && IMPERSONATION_RE.test(chatText)
     // 斜杠指令不拼引用块：DSH 只认**以 `/` 开头**的 prompt，前面加一行 `[引用…]`
