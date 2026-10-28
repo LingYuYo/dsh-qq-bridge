@@ -952,6 +952,9 @@ export function normalizeSessionEntry(key, raw) {
     name: typeof value.name === 'string' ? value.name : '',
     // title 记录「已经写给 DSH 的标题」，用于判断是否还需要再调一次 rename。
     title: typeof value.title === 'string' ? value.title : '',
+    // v2.0 第十七步：截断新建会话的标题后缀（如「-截断于2140」），
+    // 持久化后每次改名都会带上，不会被下一条消息洗掉。
+    titleSuffix: typeof value.titleSuffix === 'string' ? value.titleSuffix.slice(0, 40) : '',
     lastAt: Number.isFinite(lastAt) && lastAt > 0 ? lastAt : 0,
     lastText: typeof value.lastText === 'string' ? value.lastText : '',
     nameAt: Number.isFinite(nameAt) && nameAt > 0 ? nameAt : 0,
@@ -2007,11 +2010,14 @@ export class Bridge {
    * @param {object} [msg]
    * @param {{force?:boolean}} [opts]
    */
-  async _ensureSessionTitle(key, msg, { force = false } = {}) {
+  async _ensureSessionTitle(key, msg, { force = false, suffix } = {}) {
     const entry = this._entryOf(key)
     if (!entry.sessionId) return
     const name = await this._displayName(key, msg)
-    const title = sessionTitleFor(entry.kind, name, entry.qq)
+    // v2.0 第十七步：截断新建的会话带时间后缀，避免和旧会话同名。
+    // 后缀存在 state 里，之后每次改名都带上（否则下一条消息会把后缀洗掉）。
+    const tail = suffix === undefined ? String(entry.titleSuffix ?? '') : String(suffix)
+    const title = sessionTitleFor(entry.kind, name, entry.qq) + tail
     if (!force && entry.title === title) return
     try {
       entry.title = await this.dsh.renameSession(entry.sessionId, title)
@@ -2369,6 +2375,9 @@ export class Bridge {
         context: {
           budget: Math.max(0, Math.round(Number(memory.maxContextTokens) || 0)),
           enabled: memory.enabled !== false,
+          // v2.0 第十七步：0 = 不注入桥接记忆，交给 DSH 原生上下文托管。
+          // UI 用它区分「0 条因为是原生托管」和「0 条因为还没跑过」。
+          messageMaxTurns: Math.max(0, Math.round(Number(memory.messageMaxTurns) || 0)),
           turns: Number(trim?.lines ?? 0),
           tokens: Math.max(0, Math.round(Number(trim?.tokens) || 0)),
           dropped: Math.max(0, Math.round(Number(trim?.dropped) || 0)),
@@ -2576,10 +2585,11 @@ export class Bridge {
    *
    * @param {string} key QQ 会话 key
    * @param {object} entry state.sessions[key]
-   * @param {{reason?:string}} [opts] reason 只用于日志（manual / context-limit / compact-fallback）
+   * @param {{reason?:string, titleSuffix?:string}} [opts] reason 只用于日志；
+   *   titleSuffix 追加在会话标题末尾（手动截断带「-截断于HHMM」）
    * @returns {Promise<{sessionId:string, oldId:string, archived:boolean}>}
    */
-  async _rebuildSessionContext(key, entry, { reason = 'manual' } = {}) {
+  async _rebuildSessionContext(key, entry, { reason = 'manual', titleSuffix = '' } = {}) {
     const oldId = String(entry.sessionId ?? '').trim()
     let archived = false
     if (oldId) {
@@ -2600,6 +2610,7 @@ export class Bridge {
     // 新建即当前工具基线，记下 epoch（否则下一条消息会再触发一次「能力升级重建」）。
     entry.toolEpoch = String(this.live?.toolEpoch ?? '')
     entry.title = ''
+    entry.titleSuffix = titleSuffix
     entry.unread = 0
     entry.lastAt = 0
     entry.lastText = ''
@@ -2611,7 +2622,7 @@ export class Bridge {
     if (oldId) this._sessionKeys.delete(oldId)
     this._sessionKeys.set(sessionId, key)
     await this._applyModel(sessionId)
-    await this._ensureSessionTitle(key, undefined, { force: true })
+    await this._ensureSessionTitle(key, undefined, { force: true, suffix: titleSuffix })
     this.state.contextResets = (Number(this.state.contextResets) || 0) + 1
     this.logger.info?.(
       `上下文已重建（${reason}）：${key} ${oldId || '(无映射)'} -> ${sessionId}（归档=${archived}）`,
@@ -3061,7 +3072,15 @@ export class Bridge {
         target.unread = 0
         target.lastText = ''
         this._saveState()
-        const rebuilt = await this._rebuildSessionContext(key, target, { reason: 'manual-summarize' })
+        const hhmm = (() => {
+          const now = new Date()
+          return String(now.getHours()).padStart(2, '0') + String(now.getMinutes()).padStart(2, '0')
+        })()
+        const rebuilt = await this._rebuildSessionContext(key, target, {
+          reason: 'manual-summarize',
+          // v2.0 第十七步：新会话标题带时间后缀，避免和旧会话同名（用户点回 120k 老会话）。
+          titleSuffix: `-截断于${hhmm}`,
+        })
         // 只写日志，不发 QQ（用户明确要求）。
         this._logOp('info',
           `手动提前截断完成：${key} ${rebuilt.oldId || '(无会话)'} → ${rebuilt.sessionId}`

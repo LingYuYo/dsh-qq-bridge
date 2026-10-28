@@ -3195,6 +3195,8 @@ function sanitizeSessionContext(value) {
   return {
     budget: num(src.budget, 10_000_000),
     enabled: src.enabled !== false,
+    // v2.0 第十七步：0 = 不注入桥接记忆（交给 DSH 原生托管），UI 用它选文案。
+    messageMaxTurns: num(src.messageMaxTurns, 1000),
     turns: num(src.turns, 1000),
     tokens: num(src.tokens, 10_000_000),
     dropped: num(src.dropped, 100_000),

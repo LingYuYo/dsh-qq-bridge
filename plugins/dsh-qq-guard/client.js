@@ -4539,7 +4539,9 @@ window.__ModuleLoader__.load({
             h('div', { className: 'qqg-kv' }, h('span', null, '注入预算'),
               h('b', null, budget > 0 ? fmtNum(budget) + ' token' : '未设置')),
             h('div', { className: 'qqg-kv' }, h('span', null, '最近一轮注入'),
-              h('b', null, tokens > 0 ? fmtNum(tokens) + ' token / ' + turns + ' 条' : '（还没注入过）')),
+              h('b', null, Number(context.messageMaxTurns) === 0
+                ? '0 条（不注入，交由 DSH 原生托管）'
+                : (tokens > 0 ? fmtNum(tokens) + ' token / ' + turns + ' 条' : '（还没注入过）'))),
             h('div', { className: 'qqg-kv' }, h('span', null, '按预算截断'),
               h('b', null, dropped + ' 条'))),
           budget > 0

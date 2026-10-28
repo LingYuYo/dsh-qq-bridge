@@ -84,6 +84,7 @@ function fakeRuntime(bridge, {
   const privates = []
   const forwards = []
   const archive = []
+  const renamed = []
   // v2.0 第三步：记录临时会话的人设推送与调用顺序（断言「先换人设再提问」）。
   const personas = []
   const events = []
@@ -122,10 +123,12 @@ function fakeRuntime(bridge, {
       return reply
     },
     async archiveSession(id) { archive.push(id); events.push(['archive', id]) },
+    // v2.0 第十七步：标题改名的记录（截断新会话要带「-截断于HHMM」后缀）。
+    async renameSession(sessionId, title) { renamed.push({ sessionId, title }); return title },
     // v2.0 第九步：DSH 历史快照（只有显式传了 dshEvents 才挂，模拟「旧版/读不到」）。
     ...(dshEvents === null ? {} : { async snapshotEvents() { return dshEvents } }),
   }
-  return { sent, privates, forwards, archive, personas, events }
+  return { sent, privates, forwards, archive, personas, events, renamed }
 }
 
 /** 一条主人发的群指令消息（Bridge 内部看的那套字段）。 */
@@ -771,6 +774,9 @@ await check('归档旧会话 + 新建同名 + 前情提要写回 + 清空 L1', a
   assert.equal(result.archived, true, '旧会话必须归档')
   assert.ok(fake.archive.includes('sess-old'), '归档列表里要有旧会话')
   assert.equal(b.state.sessions[key].sessionId, 'sess-new-1', '★ 要换成新会话')
+  // v2.0 第十七步：新会话标题带「-截断于HHMM」，避免和旧会话同名。
+  const rename = fake.renamed.at(-1)
+  assert.match(rename.title, /^群聊-测试群\(.*\)-截断于\d{4}$/u, `标题不对：${rename.title}`)
   assert.equal(b._chatLog.has(key), false, '★ L1 必须清空')
   assert.equal(result.cleared, 2)
   assert.ok(b.state.sessions[key].contextBriefing?.text.includes('搬家'), '★ 前情提要要写进 state')

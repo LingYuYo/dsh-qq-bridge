@@ -516,7 +516,7 @@ const LIVE_DETAIL = {
       title: '群聊-摸鱼群(123456)', unread: 1, lastAt: 1700000000000, lastText: '今天这破网',
       persona: '', activityLevel: 2,
       modelRoute: 'deepseek-account/deepseek-flash',
-      context: { budget: 128000, enabled: true, turns: 2, tokens: 1234, dropped: 1 },
+      context: { budget: 128000, enabled: true, messageMaxTurns: 2, turns: 2, tokens: 1234, dropped: 1 },
       summary: { lastAt: 1700000000000, runs: 2, lastError: '' },
       recent: [
         { at: 1700000001000, name: '小明', qq: '1001', kind: 'group', text: '你好呀', quote: '[引用 小红] 原话' },
@@ -588,7 +588,7 @@ await check('Token 进度条：还没注入过显示 0 / 预算', () => {
   const live = {
     sessions: [{
       ...LIVE_DETAIL.sessions[0],
-      context: { budget: 128000, enabled: true, turns: 0, tokens: 0, dropped: 0 },
+      context: { budget: 128000, enabled: true, messageMaxTurns: 2, turns: 0, tokens: 0, dropped: 0 },
     }],
   }
   let tree = resetSessions(live)
@@ -598,6 +598,22 @@ await check('Token 进度条：还没注入过显示 0 / 预算', () => {
     '0 / 128k')
   eq(findAll(tree, (n) => String(n.props?.className ?? '').includes('qqg-tokenbar-fill'))[0].props.style.width,
     '0%')
+})
+
+await check('messageMaxTurns=0：文案写明「不注入，交由 DSH 原生托管」', () => {
+  reset()
+  const live = {
+    sessions: [{
+      ...LIVE_DETAIL.sessions[0],
+      context: { budget: 128000, enabled: true, messageMaxTurns: 0, turns: 0, tokens: 0, dropped: 0 },
+    }],
+  }
+  let tree = resetSessions(live)
+  tabBtn(tree, '记忆与摘要').props.onClick()
+  tree = render()
+  const joined = textOf(tree)
+  truthy(joined.includes('不注入，交由 DSH 原生托管'), `缺少托管文案：${joined}`)
+  truthy(!joined.includes('还没注入过'), '★ 原生托管时不能再显示「还没注入过」')
 })
 
 await check('Token 进度条：超预算铺满，但数值如实显示', () => {

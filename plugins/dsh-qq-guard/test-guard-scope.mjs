@@ -584,7 +584,9 @@ await check('sanitizeSessionRow：明细缺省时不写键（区分「不在活�
   assert.equal(Object.prototype.hasOwnProperty.call(row, 'recent'), false)
   assert.equal(Object.prototype.hasOwnProperty.call(row, 'raw'), false)
   assert.equal(row.modelRoute, '')
-  assert.deepEqual(row.context, { budget: 0, enabled: true, turns: 0, tokens: 0, dropped: 0 })
+  assert.deepEqual(row.context, {
+    budget: 0, enabled: true, messageMaxTurns: 0, turns: 0, tokens: 0, dropped: 0,
+  })
 })
 
 console.log('\n— 三阶权限与开发者特权的 Config 默认值（fail-closed）—')
