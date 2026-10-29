@@ -556,5 +556,60 @@ await check('休眠中消息直接丢弃：不进 L1、不调模型', async () =
   assert.equal(b._chatLog.has('g:123456'), false, '★ 休眠消息不能进归纳缓冲')
 })
 
+console.log('\n— 记忆治理（v2.0 第二十六步）—')
+await check('/遗忘 L2 + /撤销删除：删后不再注入，撤销后恢复', async () => {
+  const b = makeBridge({ allow: { owners: ['1001'] } })
+  const sent = fakeQq(b)
+  const entry = b._entryOf('g:1')
+  entry.contextBriefing = { text: '旧提要内容ABC', generatedText: '旧提要内容ABC', editedAt: 0 }
+  b._saveState()
+  assert.ok(b._contextSections('g:1').join('\n').includes('旧提要内容ABC'))
+
+  const forgot = await b._handleForgetCommand(groupMsg('/遗忘 L2'), '/遗忘 L2', 'g:1')
+  assert.equal(forgot, true)
+  assert.equal(b.state.sessions['g:1'].contextBriefing, null)
+  assert.ok(!b._contextSections('g:1').join('\n').includes('旧提要内容ABC'), '★ 删后不能再注入')
+  assert.equal(b.trash.list().length, 1, '要进回收站')
+  assert.match(sent.at(-1), /回收站/u)
+
+  const undo = await b._handleUndoForgetCommand(groupMsg('/撤销删除'), '/撤销删除', 'g:1')
+  assert.equal(undo, true)
+  assert.ok(b._contextSections('g:1').join('\n').includes('旧提要内容ABC'), '撤销后要恢复注入')
+})
+
+await check('/遗忘 L3 群友：删后检索 0 命中；非主人拒绝', async () => {
+  const b = makeBridge({ allow: { owners: ['1001'] } })
+  const sent = fakeQq(b)
+  b.globalMemory.upsert({
+    kind: 'person', key: 'qq:2677321941', qq: '2677321941', title: '翎羽', text: '喜欢被叫小鱼',
+  })
+  assert.equal(b.globalMemory.search({ text: '喜欢被叫小鱼', chatKey: 'g:1' }).length, 1)
+
+  const ok = await b._handleForgetCommand(
+    groupMsg('/遗忘 L3 群友 2677321941'), '/遗忘 L3 群友 2677321941', 'g:1',
+  )
+  assert.equal(ok, true)
+  assert.equal(b.globalMemory.search({ text: '喜欢被叫小鱼', chatKey: 'g:1' }).length, 0, '★ 删后搜不到')
+  assert.equal(b.trash.list()[0].kind, 'l3')
+
+  const denied = await b._handleForgetCommand(
+    groupMsg('/遗忘 L3 全部', { userId: '2002' }), '/遗忘 L3 全部', 'g:1',
+  )
+  assert.equal(denied, true)
+  assert.match(sent.at(-1), /权限不足/u)
+})
+
+await check('/遗忘 L1：清空本群缓冲 / 保留最近 N 条', async () => {
+  const b = makeBridge({ allow: { owners: ['1001'] } })
+  fakeQq(b)
+  b._chatLog.set('g:1', [{ seq: 1 }, { seq: 2 }])
+  await b._handleForgetCommand(groupMsg('/遗忘 L1'), '/遗忘 L1', 'g:1')
+  assert.equal(b._chatLog.has('g:1'), false)
+
+  b._chatLog.set('g:1', [{ seq: 1 }, { seq: 2 }, { seq: 3 }])
+  await b._handleForgetCommand(groupMsg('/遗忘 最近 1 条'), '/遗忘 最近 1 条', 'g:1')
+  assert.deepEqual(b._chatLog.get('g:1').map((item) => item.seq), [3])
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) process.exitCode = 1

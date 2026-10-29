@@ -28,6 +28,9 @@ import {
 import { DshClient } from './dsh.mjs'
 import { GlobalMemory } from './global-memory.mjs'
 import { Scheduler, TaskQueue, parseCron } from './scheduler.mjs'
+import {
+  TrashStore, createBackup, listBackups, restoreBackup,
+} from './memory-governance.mjs'
 import { synthesize, TTS_MAX_CHARS, DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER } from './tts.mjs'
 import { ExternalHooksClient } from './external-hooks.mjs'
 import { DSH_IMAGE_LIMITS, MAX_TILES, prepareImageParts } from './image-prep.mjs'
@@ -1267,6 +1270,12 @@ export class Bridge {
     this.taskQueue = new TaskQueue()
     // 口述任务的待确认缓存：key -> { cron, targets, prompt, at, by, atMs }（10 分钟过期）。
     this._pendingTasks = new Map()
+    // 记忆治理（v2.0 第二十六步）：回收站（两阶段删除）。
+    this.trash = new TrashStore({
+      dir: path.dirname(this.statePath),
+      logger: this.logger,
+    }).load()
+    this._memoryMaintenanceTimer = null
     this.queues = new SerialQueues()
     this.inflight = new Map() // 会话 key -> 正在处理的 Promise
     // 节奏运行时状态（Phase 4）：全是内存态，不落盘。
@@ -3010,9 +3019,46 @@ export class Bridge {
     // summarize（v2.0）：由设置页按钮按群 key 触发，也不该顺手建占位空会话。
     // manual-summarize：key 校验通过后分支内部才取 entry，非法 key 不留垃圾行。
     const entry = (action === 'voice' || action === 'image' || action === 'summarize'
-      || action === 'manual-summarize' || action === 'global-memory' || action === 'task')
+      || action === 'manual-summarize' || action === 'global-memory' || action === 'task'
+      || action === 'forget' || action === 'undo-forget' || action === 'restore-backup')
       ? null
       : this._entryOf(key)
+
+    // v2.0 第二十六步：记忆治理（设置页按钮用）。
+    if (action === 'forget') {
+      const spec = this._parseForgetSpec(op?.field ?? '')
+      if (!spec) return { ok: false, error: 'bad-field', action, key }
+      const result = this._forgetBySpec(spec, key)
+      this._logOp(result.ok ? 'info' : 'warn', `遗忘（UI）：${op?.field} → ${JSON.stringify(result)}`)
+      return { ...result, action, key }
+    }
+    if (action === 'undo-forget') {
+      const entryTaken = this.trash.take(String(op?.id ?? ''))
+      if (!entryTaken) return { ok: false, error: 'no-trash', action, key }
+      if (entryTaken.kind === 'l3') this.globalMemory.upsert(entryTaken.payload)
+      else {
+        const target = this._entryOf(entryTaken.chatKey || key)
+        target.contextBriefing = entryTaken.payload
+        this._saveState()
+      }
+      this._logOp('info', `撤销删除（UI）：${entryTaken.label || entryTaken.id}`)
+      return { ok: true, action, key, kind: entryTaken.kind, label: entryTaken.label }
+    }
+    if (action === 'restore-backup') {
+      const dir = path.dirname(this.statePath)
+      const result = restoreBackup({
+        dir,
+        file: String(op?.file ?? ''),
+        stateFile: this.statePath,
+        memoryFile: path.join(dir, 'global_memory.json'),
+      })
+      if (!result.ok) return { ok: false, error: 'restore-failed', detail: result.error, action, key }
+      this.state = this._loadState()
+      this.globalMemory.load()
+      this._personaSignatures?.clear?.()
+      this._logOp('info', `已恢复备份：${op?.file}（${JSON.stringify(result.restored)}）`)
+      return { ok: true, action, key, restored: result.restored }
+    }
 
     // v2.0 第二十四步：删除跨群记忆 / 定时任务（设置页列表用）。
     // 不碰会话 state，不需要 entry。
@@ -4305,6 +4351,9 @@ export class Bridge {
       // v2.0 第二十四步：跨群记忆写入 / 定时任务（均限主人与开发者）。
       if (await this._handleRememberCommand(msg, commandText, key)) return
       if (await this._handleTaskCommand(msg, commandText, key)) return
+      // v2.0 第二十六步：记忆治理（遗忘 / 撤销删除）。
+      if (await this._handleForgetCommand(msg, commandText, key)) return
+      if (await this._handleUndoForgetCommand(msg, commandText, key)) return
     }
     // 口述建任务（不带 `/`）：「@小鱼 定时任务：每天9点发早安」。
     // 必须在投递 DSH **之前**拦截：普通群友发的一律拒绝，绝不让模型去解析。
@@ -6207,6 +6256,198 @@ export class Bridge {
   }
 
   /**
+   * 解析 `/遗忘` 的范围。
+   *
+   *   L1 / L1 20     本群内存缓冲（清空 / 保留最近 N 条）
+   *   L2             本群前情提要
+   *   L3             本群来源的跨群记忆
+   *   L3 群友 <qq>   某个人的跨群记忆
+   *   L3 全部        所有跨群记忆
+   *   最近 N 条      等价于 L1 N
+   */
+  _parseForgetSpec(raw) {
+    const text = String(raw ?? '').trim()
+    if (/^l1$/iu.test(text)) return { kind: 'l1' }
+    const l1Keep = /^l1\s+(\d{1,4})$/iu.exec(text)
+    if (l1Keep) return { kind: 'l1', keep: Number(l1Keep[1]) }
+    if (/^l2$/iu.test(text)) return { kind: 'l2' }
+    if (/^l3$/iu.test(text)) return { kind: 'l3' }
+    if (/^l3\s+(?:全部|all)$/iu.test(text)) return { kind: 'l3', all: true }
+    const l3Qq = /^l3\s+群友\s+(\d{5,15})$/iu.exec(text)
+    if (l3Qq) return { kind: 'l3', qq: l3Qq[1] }
+    const l3Key = /^l3\s+(\S+)$/iu.exec(text)
+    if (l3Key) return { kind: 'l3', key: l3Key[1] }
+    const recent = /^最近\s+(\d{1,4})\s*条$/u.exec(text)
+    if (recent) return { kind: 'l1', keep: Number(recent[1]) }
+    return null
+  }
+
+  /** 删除后立刻做一次检索校验：L3 不能还能搜到，L2 不能还在注入。 */
+  _verifyForget(kind, text, key, qq = '') {
+    if (kind === 'l3') {
+      const probe = String(text ?? '').slice(0, 30)
+      if (probe.trim() === '') return { ok: true, hits: 0 }
+      const hits = this.globalMemory.search({ text: probe, senderQq: qq, chatKey: key, topK: 5 })
+      return { ok: hits.length === 0, hits: hits.length }
+    }
+    const probe = String(text ?? '').slice(0, 20)
+    if (probe.trim() === '') return { ok: true }
+    const sections = this._contextSections(key).join('\n')
+    return { ok: !sections.includes(probe) }
+  }
+
+  /**
+   * 执行遗忘（两阶段删除的第一步：移入回收站，可见层立即消失）。
+   * @param {{kind:'l1'|'l2'|'l3', keep?:number, all?:boolean, qq?:string, key?:string}} spec
+   * @param {string} key
+   */
+  _forgetBySpec(spec, key) {
+    if (spec.kind === 'l1') {
+      const list = this._chatLog.get(key) ?? []
+      const keep = Math.max(0, Number(spec.keep) || 0)
+      const next = keep > 0 ? list.slice(-keep) : []
+      if (next.length > 0) this._chatLog.set(key, next)
+      else this._chatLog.delete(key)
+      return { ok: true, kind: 'l1', removed: Math.max(0, list.length - next.length), verify: { ok: true } }
+    }
+    if (spec.kind === 'l2') {
+      const entry = this._entryOf(key)
+      const briefing = entry.contextBriefing
+      if (!briefing || typeof briefing.text !== 'string' || briefing.text.trim() === '') {
+        return { ok: false, error: 'no-briefing' }
+      }
+      const payload = JSON.parse(JSON.stringify(briefing))
+      const trashEntry = this.trash.add({ kind: 'l2', chatKey: key, label: `L2 摘要 ${key}`, payload })
+      entry.contextBriefing = null
+      this._saveState()
+      const verify = this._verifyForget('l2', payload.text, key)
+      return { ok: verify.ok, kind: 'l2', trashId: trashEntry.id, removed: 1, verify }
+    }
+    const items = this.globalMemory.list()
+    let targets = []
+    if (spec.all) targets = items
+    else if (spec.qq) targets = items.filter((item) => item.qq === spec.qq)
+    else if (spec.key) targets = items.filter((item) => item.key === spec.key || item.id === spec.key)
+    else targets = items.filter((item) => item.source?.group === key)
+    if (targets.length === 0) return { ok: false, error: 'no-match' }
+    let verifyOk = true
+    for (const item of targets) {
+      this.trash.add({ kind: 'l3', label: item.title || item.key, payload: item })
+      this.globalMemory.remove(item.id)
+      const verify = this._verifyForget('l3', item.text, key, item.qq)
+      if (!verify.ok) {
+        verifyOk = false
+        this._logOp('error', `遗忘校验失败：L3 ${item.key} 删除后仍能检索到 ${verify.hits} 条`)
+      }
+    }
+    return { ok: verifyOk, kind: 'l3', removed: targets.length, verify: { ok: verifyOk } }
+  }
+
+  /** `/遗忘 [范围]`：仅主人 / 开发者。 */
+  async _handleForgetCommand(msg, text, key) {
+    const hit = /^\/遗忘(?:\s+([\s\S]*))?$/u.exec(String(text ?? '').trim())
+    if (!hit) return false
+    if (!this.isOwner(msg)) {
+      const sent = await this._send(msg, '⚠️ 权限不足：只有主人 / 开发者能删除记忆。')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    const raw = String(hit[1] ?? '').trim()
+    if (raw === '') {
+      await this._send(msg, '用法：/遗忘 L1 [N]｜L2｜L3｜L3 群友 <QQ>｜L3 全部｜最近 N 条\n'
+        + '删除先进回收站，5 分钟内可 /撤销删除 恢复。')
+      return true
+    }
+    const spec = this._parseForgetSpec(raw)
+    if (!spec) {
+      await this._send(msg, '没认出范围。可用：L1 [N] / L2 / L3 / L3 群友 <QQ> / L3 全部 / 最近 N 条。')
+      return true
+    }
+    const result = this._forgetBySpec(spec, key)
+    if (!result.ok) {
+      if (result.error === 'no-match') {
+        await this._send(msg, '没有找到符合条件的记忆。')
+      } else if (result.error === 'no-briefing') {
+        await this._send(msg, '本群没有 L2 摘要可删。')
+      } else {
+        this._logOp('error', `遗忘失败或校验未通过：${raw} ${JSON.stringify(result.verify ?? {})}`)
+        await this._send(msg, '删除失败或校验未通过，详情已写日志。')
+      }
+      return true
+    }
+    this._logOp('info', `记忆遗忘：${raw}（${result.kind}，移除 ${result.removed} 条）`)
+    await this._send(msg, `已移入回收站（${result.removed} 条），5 分钟内可发 /撤销删除 恢复。`)
+    return true
+  }
+
+  /** `/撤销删除 [id]`：从回收站恢复最近一次（或指定）删除。 */
+  async _handleUndoForgetCommand(msg, text, key) {
+    const hit = /^\/撤销删除(?:\s+(\S+))?$/u.exec(String(text ?? '').trim())
+    if (!hit) return false
+    if (!this.isOwner(msg)) {
+      const sent = await this._send(msg, '⚠️ 权限不足：只有主人 / 开发者能撤销删除。')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    const entry = this.trash.take(hit[1] || '')
+    if (!entry) {
+      await this._send(msg, '回收站里没有可恢复的条目（或已超过 5 分钟被清理）。')
+      return true
+    }
+    if (entry.kind === 'l3') {
+      this.globalMemory.upsert(entry.payload)
+    } else {
+      const target = this._entryOf(entry.chatKey || key)
+      target.contextBriefing = entry.payload
+      this._saveState()
+    }
+    this._logOp('info', `已撤销删除：${entry.label || entry.id}`)
+    await this._send(msg, `已恢复：${entry.label || entry.id}`)
+    return true
+  }
+
+  /** 回收站过期清理 + 每日备份（启动即检查当天是否已有）。 */
+  _startMemoryMaintenance() {
+    const run = () => {
+      try {
+        const purged = this.trash.purgeExpired()
+        if (purged > 0) this.logger.info?.(`回收站清理 ${purged} 条过期删除意图`)
+      } catch (error) {
+        this.logger.warn?.(`回收站清理失败：${error?.message ?? error}`)
+      }
+      try {
+        this._maybeDailyBackup()
+      } catch (error) {
+        this.logger.warn?.(`每日备份失败：${error?.message ?? error}`)
+      }
+    }
+    run()
+    this._memoryMaintenanceTimer = setInterval(run, 60_000)
+    if (typeof this._memoryMaintenanceTimer.unref === 'function') this._memoryMaintenanceTimer.unref()
+  }
+
+  _maybeDailyBackup() {
+    const dir = path.dirname(this.statePath)
+    const now = new Date()
+    const pad = (value) => String(value).padStart(2, '0')
+    const prefix = `backup-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`
+    if (listBackups(dir).some((item) => item.name.startsWith(prefix))) return
+    const result = createBackup({
+      dir,
+      stateFile: this.statePath,
+      memoryFile: path.join(dir, 'global_memory.json'),
+      now: () => Date.now(),
+    })
+    if (result.ok) this._logOp('info', `记忆备份：${path.basename(result.file)}`)
+    else this._logOp('warn', `记忆备份失败：${result.error}`)
+  }
+
+  /** 设置页用：可用备份列表（新在前）。 */
+  memoryBackupsView() {
+    return listBackups(path.dirname(this.statePath))
+  }
+
+  /**
    * `/记住 [标题] [内容]`：写入跨群记忆（v2.0 第二十四步）。
    *
    * 只限主人 / 开发者；标题是纯数字 QQ 时记为 person（该 QQ 在任何群说话都会带上），
@@ -6814,6 +7055,8 @@ export class Bridge {
     if (typeof this._summarizeTimer.unref === 'function') this._summarizeTimer.unref()
     // 全局定时任务调度器：load 时已把「错过太久」的任务顺延，启动 tick 会补跑宽限内的。
     this.scheduler.start()
+    // 记忆治理：回收站过期清理（每分钟）+ 每日备份（启动即检查当天是否已有）。
+    this._startMemoryMaintenance()
     // 只做只读探活，确认 DSH 可达；不可达时桥接仍会启动，等 DSH 恢复。
     try {
       await this.dsh.call('agentPresets/list', {})
@@ -6838,6 +7081,8 @@ export class Bridge {
     // 跨群记忆：把检索累加的 hits 落盘（延迟写，退出前补一次）。
     try { this.globalMemory?.flush?.() } catch { /* 退出路径不抛 */ }
     this.scheduler?.stop?.()
+    if (this._memoryMaintenanceTimer) clearInterval(this._memoryMaintenanceTimer)
+    this._memoryMaintenanceTimer = null
     await this.qq.stop?.()
   }
 }

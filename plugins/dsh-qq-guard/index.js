@@ -1481,6 +1481,8 @@ function enqueueSessionOp(op, key, text = '', extra = {}) {
     ...(extra.reset === true ? { reset: true } : {}),
     // v2.0 第二十四步：删除跨群记忆 / 定时任务（id）。
     ...(typeof extra.id === 'string' && extra.id !== '' ? { id: extra.id } : {}),
+    ...(typeof extra.field === 'string' && extra.field !== '' ? { field: extra.field } : {}),
+    ...(typeof extra.file === 'string' && extra.file !== '' ? { file: extra.file } : {}),
     at: Date.now(), lease: 0,
   })
   while (sessionOpsQueue.size > SESSION_OPS_CAP) {
@@ -3098,6 +3100,21 @@ function sanitizeTaskRow(value) {
 }
 
 /**
+ * 收敛桥接上报的记忆备份行（v2.0 第二十六步）。
+ * @param {unknown} value
+ */
+function sanitizeBackupRow(value) {
+  if (!value || typeof value !== 'object') return null
+  const name = typeof value.name === 'string' ? value.name.trim().slice(0, 80) : ''
+  if (!/^backup-\d{8}-\d{6}\.json\.gz$/u.test(name)) return null
+  return {
+    name,
+    at: Number(value.at) || 0,
+    bytes: Math.max(0, Number(value.bytes) || 0),
+  }
+}
+
+/**
  * 收敛桥接上报的单条会话数据。
  *
  * 桥接是自己人，但**这条路由原则上是「只收白名单字段」**：任何字段、任何长度
@@ -4395,6 +4412,8 @@ function applySettings(ctx, config) {
               // v2.0 第十八步：L2 摘要重置标记（text 走通用 text 字段）。
               ...(op.reset === true ? { reset: true } : {}),
               ...(typeof op.id === 'string' && op.id !== '' ? { id: op.id } : {}),
+              ...(typeof op.field === 'string' && op.field !== '' ? { field: op.field } : {}),
+              ...(typeof op.file === 'string' && op.file !== '' ? { file: op.file } : {}),
             })
           }
           sendJson(res, 200, { ok: true, ops })
@@ -4431,7 +4450,7 @@ function applySettings(ctx, config) {
         // 桥接侧会生成前情提要 → 归档旧会话 → 新建同名会话。
         // 两者都不是 QQ 消息，桥接侧标 origin=console，**不冒充主人**（权限仍只认事件 QQ 号）。
         if (!['clear', 'delete', 'persona', 'activity', 'summarize', 'manual-summarize', 'dynamic', 'briefing',
-          'global-memory', 'task'].includes(op)) {
+          'global-memory', 'task', 'forget', 'undo-forget', 'restore-backup'].includes(op)) {
           sendJson(res, 400, { ok: false, reason: 'unknown-op', detail: `未知操作：${op || '(空)'}` })
           return
         }
@@ -4487,6 +4506,27 @@ function applySettings(ctx, config) {
             return
           }
           extra.id = id
+        }
+        // v2.0 第二十六步：记忆治理。
+        if (op === 'forget') {
+          const field = typeof body?.field === 'string' ? body.field.trim().slice(0, 40) : ''
+          if (field === '') {
+            sendJson(res, 400, { ok: false, reason: 'field required' })
+            return
+          }
+          extra.field = field
+        }
+        if (op === 'undo-forget') {
+          const id = typeof body?.id === 'string' ? body.id.trim().slice(0, 80) : ''
+          if (id !== '') extra.id = id
+        }
+        if (op === 'restore-backup') {
+          const file = typeof body?.file === 'string' ? body.file.trim().slice(0, 80) : ''
+          if (!/^backup-\d{8}-\d{6}\.json\.gz$/u.test(file)) {
+            sendJson(res, 400, { ok: false, reason: 'bad-backup-file' })
+            return
+          }
+          extra.file = file
         }
         const id = enqueueSessionOp(
           op, key,
@@ -5584,6 +5624,10 @@ function applySettings(ctx, config) {
                 : {}),
               ...(Array.isArray(body?.tasks)
                 ? { tasks: body.tasks.slice(0, 50).map(sanitizeTaskRow).filter(Boolean) }
+                : {}),
+              // v2.0 第二十六步：记忆备份列表（恢复用），最多 7 条。
+              ...(Array.isArray(body?.backups)
+                ? { backups: body.backups.slice(0, 7).map(sanitizeBackupRow).filter(Boolean) }
                 : {}),
             }
             lastStatusAt = Date.now()

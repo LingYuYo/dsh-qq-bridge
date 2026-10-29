@@ -611,6 +611,39 @@ await check('session-ops：放行 global-memory / task 删除，缺 id 拒绝', 
   assert.equal(ops.find((op) => op.op === 'task').id, 'task_1')
 })
 
+await check('session-ops：记忆治理（forget / undo-forget / restore-backup）', async () => {
+  const { ctx, calls } = makeCtx({ presetId: undefined, hasWebServer: true, settingsAvailable: true })
+  apply(ctx, Config({ role: 'settings' }))
+  const route = calls.webRoutes.find((r) => r.path === '/dsh-qq-guard/session-ops')
+  const post = async (payload) => {
+    const req = {
+      method: 'POST', headers: { 'sec-fetch-site': 'same-origin' },
+      on(evt, fn) {
+        if (evt === 'data') fn(Buffer.from(JSON.stringify(payload)))
+        if (evt === 'end') fn()
+      },
+    }
+    const res = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+    route.handler(req, res)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    return res
+  }
+  assert.equal((await post({ op: 'forget', key: 'g:1' })).status, 400, 'forget 缺 field 要拒绝')
+  assert.equal((await post({ op: 'restore-backup', key: 'g:1', file: '../../x' })).status, 400,
+    'restore-backup 只接受合法备份名')
+  assert.equal((await post({
+    op: 'restore-backup', key: 'g:1', file: 'backup-20260101-030000.json.gz',
+  })).status, 200)
+  await post({ op: 'forget', key: 'g:1', field: 'l2' })
+  await post({ op: 'undo-forget', key: 'g:1' })
+
+  const getRes = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
+  route.handler({ method: 'GET', headers: {} }, getRes)
+  const ops = JSON.parse(getRes.body).ops
+  assert.equal(ops.find((op) => op.op === 'forget').field, 'l2')
+  assert.equal(ops.find((op) => op.op === 'restore-backup').file, 'backup-20260101-030000.json.gz')
+})
+
 console.log('\n— 接入总闸（v2.0 第七步）—')
 await check('Config：bridgeEnabled 默认开启；日志配置默认值不变', () => {
   const plain = mod.plainConfig(Config({ role: 'settings' })) ?? {}

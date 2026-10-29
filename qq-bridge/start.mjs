@@ -204,6 +204,8 @@ const stopPolling = startConfigPolling({
     // 跨群记忆 / 定时任务（v2.0 第二十四步）：设置页列表用。
     globalMemory: bridge.globalMemory?.list?.() ?? [],
     tasks: bridge.scheduler?.list?.() ?? [],
+    // 记忆备份（v2.0 第二十六步）：设置页「记忆治理」恢复用。
+    backups: bridge.memoryBackupsView?.() ?? [],
     // 接入总闸 + 实际连接地址（v2.0 第七步，系统日志 → 高级面板用）。
     enabled: bridge._bridgeEnabled(),
     dshBaseUrl: String(bridge.dsh?.baseUrl ?? ''),

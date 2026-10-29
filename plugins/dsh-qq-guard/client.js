@@ -4509,6 +4509,60 @@ window.__ModuleLoader__.load({
       const [memNote, setMemNote] = React.useState(null)
       const globalMemories = Array.isArray(live?.globalMemory) ? live.globalMemory : []
       const scheduledTasks = Array.isArray(live?.tasks) ? live.tasks : []
+      // 记忆治理（v2.0 第二十六步）：备份列表 + 恢复确认。
+      const backups = Array.isArray(live?.backups) ? live.backups : []
+      const [restorePick, setRestorePick] = React.useState('')
+      const [restoreConfirm, setRestoreConfirm] = React.useState(false)
+      const restoreFile = restorePick || backups[0]?.name || ''
+      const forgetNow = async (field) => {
+        setMemBusy(true)
+        setMemNote(null)
+        try {
+          const result = await postSessionOp({ op: 'forget', key: session.key, field })
+          if (field === 'l1') {
+            setMemNote(result?.ok
+              ? { kind: 'ok', text: `已清空本群 L1 缓冲（${result.removed} 条）。` }
+              : { kind: 'err', text: '清空失败：' + (result?.error ?? 'unknown') })
+          } else {
+            setMemNote(result?.ok
+              ? { kind: 'ok', text: `已移入回收站（${result.removed} 条），5 分钟内可撤销。` }
+              : { kind: 'err', text: result?.error === 'no-briefing' ? '本群没有 L2 摘要。' : '删除失败：' + (result?.error ?? 'unknown') })
+          }
+        } catch (error) {
+          setMemNote({ kind: 'err', text: '删除失败：' + (error?.message ?? error) })
+        } finally {
+          setMemBusy(false)
+        }
+      }
+      const undoForget = async () => {
+        setMemBusy(true)
+        setMemNote(null)
+        try {
+          const result = await postSessionOp({ op: 'undo-forget', key: session.key })
+          setMemNote(result?.ok
+            ? { kind: 'ok', text: `已恢复：${result.label || '最近一次删除'}` }
+            : { kind: 'err', text: '没有可恢复的条目（或已超过 5 分钟）。' })
+        } catch (error) {
+          setMemNote({ kind: 'err', text: '撤销失败：' + (error?.message ?? error) })
+        } finally {
+          setMemBusy(false)
+        }
+      }
+      const restoreBackupNow = async () => {
+        setMemBusy(true)
+        setMemNote(null)
+        setRestoreConfirm(false)
+        try {
+          const result = await postSessionOp({ op: 'restore-backup', key: session.key, file: restoreFile })
+          setMemNote(result?.ok
+            ? { kind: 'ok', text: '已恢复备份，会话列表 2 秒内刷新（恢复前的文件已留存 .pre-restore）。' }
+            : { kind: 'err', text: '恢复失败：' + (result?.detail ?? result?.error ?? 'unknown') })
+        } catch (error) {
+          setMemNote({ kind: 'err', text: '恢复失败：' + (error?.message ?? error) })
+        } finally {
+          setMemBusy(false)
+        }
+      }
       const removeGlobalMemory = async (id) => {
         setMemBusy(true)
         setMemNote(null)
@@ -4743,6 +4797,46 @@ window.__ModuleLoader__.load({
               briefingNote.text)
             : null),
         h(Panel, {
+          title: '记忆治理',
+          desc: '删除先进回收站，5 分钟内可撤销；每日自动备份，保留最近 7 天。',
+          right: h('span', { className: 'qqg-pill' },
+            backups.length > 0 ? backups.length + ' 份备份' : '暂无备份'),
+        },
+          h('div', { className: 'qqg-row' },
+            h('button', {
+              type: 'button', className: 'qqg-btn', disabled: memBusy,
+              onClick: () => { void forgetNow('l1') },
+            }, '清空本群 L1'),
+            h('button', {
+              type: 'button', className: 'qqg-btn', disabled: memBusy,
+              onClick: () => { void forgetNow('l2') },
+            }, '遗忘 L2 摘要'),
+            h('button', {
+              type: 'button', className: 'qqg-btn', disabled: memBusy,
+              onClick: () => { void undoForget() },
+            }, '撤销最近删除')),
+          backups.length > 0
+            ? h('div', { className: 'qqg-row' },
+              h('select', {
+                className: 'qqg-input',
+                value: restoreFile,
+                onChange: (event) => setRestorePick(event.target.value),
+                'aria-label': '选择备份',
+              }, backups.map((item) => h('option', { key: item.name, value: item.name },
+                item.name.replace(/^backup-|\.json\.gz$/gu, '')
+                + ' · ' + Math.max(1, Math.round(item.bytes / 1024)) + ' KB'))),
+              h('button', {
+                type: 'button', className: 'qqg-btn qqg-btn-danger',
+                disabled: memBusy || restoreFile === '',
+                onClick: () => setRestoreConfirm(true),
+              }, '恢复备份'))
+            : h('div', { className: 'qqg-hint' },
+              '今天还没备份；桥接每天会自动备份一次（sessions.json + global_memory.json）。'),
+          memNote
+            ? h('div', { className: 'qqg-status' + (memNote.kind === 'err' ? ' qqg-status-err' : '') },
+              memNote.text)
+            : null),
+        h(Panel, {
           title: '跨群特别记忆',
           desc: '跨群 / 全局的关键信息；检索命中才注入 Prompt。最多显示 20 条，删除立即生效。',
           right: h('span', { className: 'qqg-pill' }, globalMemories.length + ' 条'),
@@ -4835,6 +4929,16 @@ window.__ModuleLoader__.load({
           danger: true,
           onCancel: () => setBriefingResetOpen(false),
           onConfirm: () => { void resetBriefing() },
+        }),
+        h(ConfirmModal, {
+          open: restoreConfirm,
+          title: '恢复这份备份？',
+          desc: '会用备份内容覆盖当前的 sessions.json 与 global_memory.json。'
+            + '恢复前会自动留存 .pre-restore 副本，但期间的新消息可能丢失。确定吗？',
+          confirmText: '覆盖恢复',
+          danger: true,
+          onCancel: () => setRestoreConfirm(false),
+          onConfirm: () => { void restoreBackupNow() },
         })
       )
     }

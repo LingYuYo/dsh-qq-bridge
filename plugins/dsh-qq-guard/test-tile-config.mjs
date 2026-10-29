@@ -834,5 +834,25 @@ await check('打开暗号但没有开发者 / Prompt 时，弹窗顶部有提示
   truthy(textOf(modalOf(tree)).includes('还没有配置开发者 QQ 号'), '缺少空名单提示')
 })
 
+/* ── 用例：记忆治理面板（v2.0 第二十六步）──────────────────── */
+console.log('\n记忆治理面板：')
+
+await check('记忆治理：清空 L1 / 遗忘 L2 / 撤销 / 恢复备份都能渲染', () => {
+  reset()
+  const live = {
+    sessions: [LIVE_DETAIL.sessions[0]],
+    backups: [{ name: 'backup-20260101-030000.json.gz', at: 1_767_229_200_000, bytes: 2048 }],
+  }
+  let tree = resetSessions(live)
+  tabBtn(tree, '记忆与摘要').props.onClick()
+  tree = render()
+  const text = textOf(tree)
+  truthy(text.includes('记忆治理'), '缺记忆治理面板')
+  truthy(text.includes('清空本群 L1'), '缺清空 L1 按钮')
+  truthy(text.includes('遗忘 L2 摘要'), '缺遗忘 L2 按钮')
+  truthy(text.includes('撤销最近删除'), '缺撤销按钮')
+  truthy(text.includes('恢复备份'), '缺恢复备份按钮')
+})
+
 /* ── 汇总 ──────────────────────────────────────────────────── */
 console.log(`\n结果：${pass} 通过 / ${process.exitCode === 1 ? '≥1' : 0} 失败`)
