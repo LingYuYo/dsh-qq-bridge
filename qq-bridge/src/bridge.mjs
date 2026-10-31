@@ -1705,9 +1705,11 @@ export class Bridge {
    */
   _proactiveConfig() {
     const base = normalizeProactive(this.live?.proactive ?? this.config?.proactive)
-    // 卡片关掉 = 引擎停摆（features 由 Host 按同一份 skills/plugins 算好推下来）。
-    if (this._features().proactive === false) return { ...base, engine: false }
-    return base
+    // 图层只决定**参数**；引擎跑不跑**只认插件卡片**（features.proactive）。
+    // 配置文件里的 proactive.engine 不再有发言权 —— 单一权威来源，避免
+    // 「卡片开了但配置里 engine:false 把引擎按住」这种自相矛盾的状态。
+    const engine = this._features().proactive === true
+    return { ...base, engine }
   }
 
   /**

@@ -659,6 +659,15 @@ await check('Config：bridgeEnabled 默认开启；日志配置默认值不变',
   assert.equal(plain.logDir, '')
 })
 
+await check('readFeatureFlags.proactive：只认 plugins 清单里的 pl-proactive 卡片', () => {
+  const base = mod.plainConfig(Config({ role: 'settings' })) ?? {}
+  const withCard = (enabled) => ({ ...base, plugins: [{ id: 'pl-proactive', name: '主动感知', enabled }] })
+  // ★ 这条曾经是 bug：漏传 kind='plugin' 会去 skills 里找，永远 false。
+  assert.equal(mod.readFeatureFlags(withCard(true)).proactive, true, '卡片开了必须是 true')
+  assert.equal(mod.readFeatureFlags(withCard(false)).proactive, false, '卡片关了必须是 false')
+  assert.equal(mod.readFeatureFlags({ ...base, plugins: [] }).proactive, false, '老配置没有这张卡也要 false')
+})
+
 console.log('\n— 主动感知（v2.0 第二十八步）—')
 await check('Config：proactive 默认关闭，时间窗口 9-23，甜区 30~120', () => {
   const plain = mod.plainConfig(Config({ role: 'settings' })) ?? {}

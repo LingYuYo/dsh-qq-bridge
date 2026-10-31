@@ -875,7 +875,7 @@ await check('特权与权限：群友黑名单卡片与已加入的 QQ', () => {
 /* ── 用例：单群主动感知 Tab（v2.0 第二十九步）──────────────── */
 console.log('\n单群主动感知 Tab：')
 
-await check('未授权时显示开关与「全局未开」防呆提示', () => {
+await check('总闸未开：开关置灰 + 明确提示去技能与插件开', () => {
   reset()
   const live = { sessions: [{ ...LIVE_DETAIL.sessions[0], proactiveEnabled: false }], presence: null }
   let tree = resetSessions(live)
@@ -883,12 +883,19 @@ await check('未授权时显示开关与「全局未开」防呆提示', () => {
   tree = render()
   const text = textOf(tree)
   truthy(text.includes('主动感知（本群）'), '缺本群主动感知卡片')
-  truthy(text.includes('开启本群主动感知'), '缺开关按钮')
-  truthy(text.includes('全局引擎未开启'), '★ 引擎没开时必须给防呆提示')
+  truthy(text.includes('请先在「技能与插件」中开启主动感知总闸'), '★ 总闸没开必须给防呆提示')
+  const btn = btnAnywhere(tree, '开启本群主动感知')
+  truthy(btn, '缺开关按钮')
+  eq(btn.props.disabled, true, '★ 总闸没开时开关必须置灰')
 })
 
-await check('已授权 + 演练中：显示演练提示与本群决策记录', () => {
+await check('总闸已开 + 演练中：开关可用，显示演练提示与本群决策记录', () => {
   reset()
+  // 总闸 = 配置里的插件卡片。这里显式把它打开（真机同理：先在卡片上开）。
+  VALUE.plugins = [
+    ...VALUE.plugins.filter((item) => item.id !== 'pl-proactive'),
+    { id: 'pl-proactive', name: '主动感知', icon: 'activity', tag: '本地', ver: '1.0.0', enabled: true, desc: '主动感知' },
+  ]
   const live = {
     sessions: [{ ...LIVE_DETAIL.sessions[0], proactiveEnabled: true }],
     presence: {
@@ -907,6 +914,54 @@ await check('已授权 + 演练中：显示演练提示与本群决策记录', (
   const text = textOf(tree)
   truthy(text.includes('演练模式'), '★ 演练状态必须提示')
   truthy(text.includes('安静 45 分钟'), '缺本群决策记录')
+  const btn = btnAnywhere(tree, '关闭本群主动感知')
+  truthy(btn, '总闸开了，开关应可用')
+  eq(btn.props.disabled, false, '★ 总闸开了开关不能置灰')
+})
+
+/* ── 用例：主动感知卡片出现在「技能与插件」（v2.0 第三十步）── */
+console.log('\n主动感知插件卡片：')
+
+await check('老配置没有 pl-proactive 时，卡片也会被补进插件列表', () => {
+  reset()
+  // 夹具里的 plugins 只有 pl-debounce / pl-ratelimit（模拟老配置）。
+  const tree = resetSkills()
+  const text = textOf(tree)
+  truthy(text.includes('主动感知'), '★ 老配置也必须能看到「主动感知」卡片')
+  truthy(text.includes('常驻 tick 感知群聊活跃度'), '缺卡片描述')
+})
+
+await check('卡片开关可点，写回 plugins 数组里的 pl-proactive', () => {
+  reset()
+  const tree = resetSkills()
+  const card = findAll(tree, (n) => n.tag === 'div'
+    && String(n.props?.className ?? '').split(' ').includes('qqg-tile')
+    && textOf(n).includes('主动感知'))[0]
+  truthy(card, '找不到主动感知卡片')
+  const sw = findAll(card, (n) => n.props?.['aria-label'] === '启用 主动感知')[0]
+    ?? findAll(card, (n) => typeof n.props?.onClick === 'function'
+      && String(n.props?.className ?? '').includes('switch'))[0]
+  truthy(sw, '找不到卡片开关')
+  sw.props.onClick()
+  const written = MUTATIONS.filter((m) => m.path === 'plugins').at(-1)
+  truthy(written, '开关必须写 plugins')
+  const row = written.value.find((item) => item.id === 'pl-proactive')
+  truthy(row, '写回数组里必须带上 pl-proactive')
+  eq(row.enabled, true, '点了之后应变成开启')
+})
+
+await check('齿轮里有 11 个参数表单字段', () => {
+  reset()
+  let tree = resetSkills()
+  openGear(tree, '主动感知')
+  tree = render()
+  const text = textOf(modalOf(tree))
+  for (const label of ['允许真实发送', '扫描间隔', '安静阈值·下限', '安静阈值·上限', '打分阈值',
+    '白天窗口·开始', '白天窗口·结束', '单群每小时上限', '无人接茬判定', '冷却时长',
+    '评估节流', '最低日活条数']) {
+    truthy(text.includes(label), `齿轮缺字段：${label}`)
+  }
+  truthy(text.includes('三层开关'), '齿轮顶部应说明三层开关')
 })
 
 /* ── 汇总 ──────────────────────────────────────────────────── */

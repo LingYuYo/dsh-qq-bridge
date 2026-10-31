@@ -715,5 +715,21 @@ await check('_senseGroups 带出 proactiveEnabled；闸门据此否决', async (
   assert.equal(on.proactiveEnabled, true)
 })
 
+await check('引擎总闸只认插件卡片：features.proactive 说了算', () => {
+  const b = makeBridge()
+  // 卡片关着（老配置/默认）→ engine 必须 false，配置里的 engine:true 不生效。
+  b.live.proactive = { engine: true, enabled: true }
+  assert.equal(b._proactiveConfig().engine, false, '★ 卡片关着时配置里的 engine 不能打开引擎')
+
+  // 卡片打开 → engine true。
+  b.live.features = { proactive: true }
+  assert.equal(b._proactiveConfig().engine, true)
+  assert.equal(b._proactiveConfig().enabled, true, '参数仍来自配置层')
+
+  // 卡片再次关掉 → 立刻停摆。
+  b.live.features = { proactive: false }
+  assert.equal(b._proactiveConfig().engine, false)
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) process.exitCode = 1

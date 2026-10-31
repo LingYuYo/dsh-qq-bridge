@@ -1073,6 +1073,57 @@ window.__ModuleLoader__.load({
       return missing.length === 0 ? rows : [...rows, ...missing]
     }
 
+    /**
+     * 内置插件卡片的本地默认副本（v2.0 第二十九步修复）。
+     *
+     * 为什么前端也要有一份：`plugins` 是**用户配置数组**，老配置里早就存了
+     * `pl-debounce / pl-ratelimit / ...` 这 5 条。Host 的 `DEFAULT_PLUGINS` 只在
+     * 配置**没有这个键**时生效，所以新加的 `pl-proactive` 对老配置永远不出现。
+     * 技能卡早就有 `mergeDefaultSkills` 兜这个坑，插件卡之前漏了。
+     *
+     * 必须与 index.js 的 `DEFAULT_PLUGINS` 逐字一致；`enabled` 以用户已存的为准，
+     * 缺项才用这里的默认值（`pl-proactive` 默认 **关闭**，fail-closed）。
+     */
+    const DEFAULT_PLUGINS_LOCAL = [
+      {
+        id: 'pl-debounce', name: '防抖合并', icon: 'activity', tag: '本地', ver: '1.4.0', enabled: true,
+        desc: '群聊里连续多条短消息先攒一窗口再一次性回复，避免逐条刷屏。',
+      },
+      {
+        id: 'pl-ratelimit', name: '频率控制', icon: 'shield', tag: '本地', ver: '1.1.0', enabled: true,
+        desc: '按会话限流，超出阈值直接静默丢弃，防止被刷屏或触发风控。',
+      },
+      {
+        id: 'pl-compact', name: '上下文压缩', icon: 'memory', tag: '内置', ver: '1.4.3', enabled: true,
+        desc: '长会话自动摘要早期内容，控制 token 开销，同时保住关键约定。',
+      },
+      {
+        id: 'pl-guard', name: '工具门禁', icon: 'shield', tag: '本地', ver: '1.1.0', enabled: true,
+        desc: 'deny-by-default 的工具白名单，把本地执行能力彻底挡在 QQ 会话之外。',
+      },
+      {
+        id: 'pl-persona', name: '人设注入', icon: 'spark', tag: '本地', ver: '1.2.1', enabled: true,
+        desc: '把全局人设或会话级覆盖注入系统提示词，complete 模式下不掺入任何框架自述。',
+      },
+      {
+        id: 'pl-proactive', name: '主动感知', icon: 'activity', tag: '本地', ver: '1.0.0', enabled: false,
+        desc: '常驻 tick 感知群聊活跃度，规则达标才考虑主动说话。还需要单群授权才会真的开口。',
+      },
+      {
+        id: 'pl-archive', name: '日志归档', icon: 'file', tag: '实验', ver: '0.8.2', enabled: false,
+        desc: '把桥接日志与收到的截图按日期归档到工作区，方便事后复盘。',
+      },
+    ]
+
+    /** 合并默认插件项：已有的保留（含用户改过的 enabled），缺的补默认。 */
+    function mergeDefaultPlugins(list) {
+      const rows = Array.isArray(list) ? list.filter((row) => row && typeof row === 'object') : (list ? [] : null)
+      // null = 配置里没有 plugins 键（交给 Host 默认值），这里不动。
+      if (rows === null) return null
+      const missing = DEFAULT_PLUGINS_LOCAL.filter((item) => !rows.some((row) => row && row.id === item.id))
+      return missing.length === 0 ? rows : [...rows, ...missing]
+    }
+
     /** 值相等判断（配置值都是 JSON 可序列化的纯对象/数组）。 */
     function sameJSON(a, b) {
       if (a === b) return true
@@ -1843,17 +1894,18 @@ window.__ModuleLoader__.load({
           h('br'),
           '「退出桥接」= 停止且不自动重启；DSH 退出时会自动停掉它，不留孤儿进程。'),
         // v2.0 第二十八步：主动感知面板。
-        h(PresenceSection, { live, get, write, writable }))
+        h(PresenceSection, { live, get }))
     }
 
-    /** 主动感知：tick 状态 / 上次决策 / 冷却时间（v2.0 第二十八步）。 */
     /**
-     * 主动感知（全局视角，v2.0 第二十九步）。
+     * 主动感知 · **只读监控**（v2.0 第三十步）。
      *
-     * 只回答「引擎跑了没 / 在演练还是真发 / 授权了几个群 / 谁在冷却」。
-     * 单群的决策日志已经搬到「会话管理 → 单群 → 主动感知 Tab」，这里不再重复。
+     * 控制入口只有两处，这里一个开关都不放：
+     *   · 总闸 + 参数 → 「技能与插件 → 主动感知」卡片及其齿轮；
+     *   · 单群授权   → 「会话管理 → 单群 → 主动感知」Tab。
+     * 本面板只回答「引擎跑了没 / 演练还是真发 / 授权了几个群 / 谁在冷却」。
      */
-    function PresenceSection({ live, get, write, writable }) {
+    function PresenceSection({ live, get }) {
       const presence = live && typeof live.presence === 'object' ? live.presence : null
       const engineOn = presence ? presence.engine === true : false
       const realSend = get('proactive.enabled') === true
@@ -1908,17 +1960,11 @@ window.__ModuleLoader__.load({
             h('b', null, `${get('proactive.minSilenceMin') ?? 30}~${get('proactive.maxSilenceMin') ?? 120} 分钟`)),
           h('div', { className: 'qqg-kv' }, h('span', null, '单群每小时上限'),
             h('b', null, `${get('proactive.hourlyLimit') ?? 2} 次`))),
-        h('div', { className: 'qqg-textarea-actions' },
-          h('button', {
-            type: 'button',
-            className: 'qqg-btn' + (realSend ? ' qqg-btn-danger' : ' qqg-btn-primary'),
-            disabled: !writable,
-            onClick: () => write('proactive.enabled', !realSend),
-          }, realSend ? '关闭真实发送（回到演练）' : '打开真实发送')),
+        // 只读监控：本页不再放任何开关（控制入口统一在「技能与插件」卡片与单群 Tab）。
         h('div', { className: 'qqg-hint' },
           engineOn
-            ? '各群的决策记录在「会话管理 → 单群 → 主动感知」Tab 里看，这里只汇总全局状态。'
-            : '把插件卡片打开后，这里开始显示 tick 与授权群状态。')))
+            ? '本页只读。开/关与参数在「技能与插件 → 主动感知」卡片；单群授权在「会话管理 → 单群 → 主动感知」。'
+            : '引擎未启动。去「技能与插件 → 主动感知」把卡片开关打开，本页才会开始显示 tick。')))
     }
 
     /* ══════════ 系统日志 Tab（v2.0 第七步，2026-10-28）══════════ */
@@ -5035,8 +5081,12 @@ window.__ModuleLoader__.load({
      */
     function SessionProactiveTab({ session, live, get }) {
       const presence = live && typeof live.presence === 'object' ? live.presence : null
-      const engineOn = presence ? presence.engine === true : false
-      const dryRunning = presence ? presence.dryRun === true : false
+      // 总闸的权威来源是配置里那张插件卡（点开关立刻反映，不用等桥接轮询）。
+      // presence.engine 只用于显示运行态；两者不一致时以配置为准。
+      const globalCard = (mergeDefaultPlugins(get('plugins')) ?? [])
+        .find((item) => item && item.id === 'pl-proactive')
+      const engineOn = globalCard ? globalCard.enabled === true : false
+      const dryRunning = presence ? presence.dryRun === true : get('proactive.enabled') !== true
       const authorized = session.proactiveEnabled === true
       const mine = presence?.groups?.find((item) => item.key === session.key) ?? null
       const decisions = Array.isArray(mine?.decisions) ? mine.decisions.slice(-10).reverse() : []
@@ -5045,6 +5095,11 @@ window.__ModuleLoader__.load({
       const [note, setNote] = React.useState(null)
 
       const toggle = async () => {
+        // 硬绑定：总闸没开时开关是禁用的，这里再兜一层（防止键盘/无障碍路径绕过）。
+        if (!engineOn) {
+          setNote({ kind: 'err', text: '请先在「技能与插件」中开启主动感知总闸。' })
+          return
+        }
         setBusy(true)
         setNote(null)
         try {
@@ -5072,19 +5127,21 @@ window.__ModuleLoader__.load({
           right: h('span', { className: 'qqg-pill' + (authorized ? ' qqg-pill-accent' : '') },
             authorized ? '已授权' : '未授权'),
         },
-          // 防呆红线：前两层没开时，用醒目的提示压在最上面。
+          // 防呆红线：总闸没开时把开关置灰并给出明确指引（真·双重确认）。
           !engineOn
             ? h('div', { className: 'qqg-status qqg-status-err' },
-              '全局引擎未开启：现在打开本群开关也不会有任何效果。'
-              + '先去「技能与插件 → 主动感知」把插件卡片打开。')
+              '请先在「技能与插件」中开启主动感知总闸。'
+              + '路径：技能与插件 → 插件（Plugin）→「主动感知」卡片右侧开关。')
             : dryRunning
               ? h('div', { className: 'qqg-status' },
                 '演练模式：引擎在跑规则，但不会调模型、不会发消息。'
-                + '要真开口，去「技能与插件 → 主动感知」打开「允许真实发送」。')
+                + '要真开口，在「技能与插件 → 主动感知 → 齿轮」里打开「允许真实发送」。')
               : null,
           h('div', { className: 'qqg-list' },
             h('div', { className: 'qqg-kv' }, h('span', null, '本群开关'),
               h('b', null, authorized ? '已开启' : '未开启')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '全局总闸'),
+              h('b', null, engineOn ? '已开启' : '未开启（本群开关不可用）')),
             h('div', { className: 'qqg-kv' }, h('span', null, '引擎状态'),
               h('b', null, engineOn ? (dryRunning ? '运行中（演练）' : '运行中（真实发送）') : '已停摆')),
             h('div', { className: 'qqg-kv' }, h('span', null, '当前冷却'),
@@ -5094,8 +5151,10 @@ window.__ModuleLoader__.load({
           h('div', { className: 'qqg-textarea-actions' },
             h('button', {
               type: 'button',
-              className: 'qqg-btn' + (authorized ? ' qqg-btn-danger' : ' qqg-btn-primary'),
-              disabled: busy,
+              className: 'qqg-btn' + (authorized && engineOn ? ' qqg-btn-danger' : ' qqg-btn-primary'),
+              // 总闸没开 = 禁用（置灰），这是「双重确认」的硬绑定。
+              disabled: busy || !engineOn,
+              title: engineOn ? '' : '请先在「技能与插件」中开启主动感知总闸',
               onClick: () => { void toggle() },
             }, busy ? '处理中…' : (authorized ? '关闭本群主动感知' : '开启本群主动感知'))),
           note
@@ -5746,19 +5805,11 @@ window.__ModuleLoader__.load({
         : null),
       // 主动感知（v2.0 第二十九步）：卡片开着但真实发送关着时，必须明确说「这是演练」，
       // 否则用户会以为开了却一直没动静。
-      'pl-proactive': (valueOf, get) => {
-        const authorized = (Array.isArray(get('sessions')) ? get('sessions') : [])
-          .filter((row) => row && row.kind === 'group' && row.proactiveEnabled === true)
-        const enabled = valueOf('proactive.enabled') === true
-        if (!enabled) {
-          return '演练模式：引擎在跑规则、写决策日志，但不会调模型也不会发消息。'
-            + `已授权群 ${authorized.length} 个。想让机器人真开口，把「允许真实发送」打开。`
-        }
-        if (authorized.length === 0) {
-          return '真实发送已开，但还没有任何群被授权：去「会话管理 → 单群 → 主动感知」打开「开启本群主动感知」。'
-        }
-        return null
-      },
+      'pl-proactive': (valueOf) => (valueOf('proactive.enabled') === true
+        ? null
+        : '演练模式：引擎在跑规则、写决策日志，但不会调模型也不会发消息。'
+          + '想让机器人真开口，把下面的「允许真实发送」打开；'
+          + '再逐群去「会话管理 → 单群 → 主动感知」打开本群开关。'),
       // 开发者特权：三件事任一没配好，暗号就是「开了但没用」——必须在弹窗顶部说清楚，
       // 否则用户会以为桥接坏了。
       'sk-developer': (valueOf, get) => {
@@ -6358,7 +6409,9 @@ window.__ModuleLoader__.load({
       // 老配置里可能没有 sk-image（P2 新增「发图片」）：这里补默认项，让用户能看到 / 关掉；
       // 任何写回都基于合并后的整数组，写回去就带上它了（契约 3.1）。
       const skills = mergeDefaultSkills(get('skills'))
-      const plugins = Array.isArray(get('plugins')) ? get('plugins') : []
+      // v2.0 第二十九步修复：插件清单同样要补齐默认项，否则老配置里永远看不到
+      // 新加的 pl-proactive（用户已存的条目原样保留，开关状态不会被覆盖）。
+      const plugins = mergeDefaultPlugins(get('plugins')) ?? []
       const extEnabled = Array.isArray(get('externalPlugins.enabled')) ? get('externalPlugins.enabled') : []
       const extDirs = Array.isArray(get('externalPlugins.dirs')) ? get('externalPlugins.dirs') : []
 

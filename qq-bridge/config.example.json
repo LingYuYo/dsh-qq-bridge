@@ -115,8 +115,7 @@
     }
   },
   "proactive": {
-    "_comment": "常驻感知 / 主动行为（v2.0 第二十九步，三层开关）。engine=插件卡片总闸（false=引擎停摆）；enabled=真实发送（false=演练，只写决策日志不调模型）；单群授权在 state/sessions.json 的 proactiveEnabled（默认 false）。",
-    "engine": false,
+    "_comment": "常驻感知 / 主动行为（v2.0 第三十步）。引擎跑不跑**只认插件卡片**「主动感知」（技能与插件页），本段只提供参数。enabled=真实发送开关（false=演练，只写决策日志不调模型）。单群授权在 state/sessions.json 的 proactiveEnabled（默认 false）。",
     "enabled": false,
     "tickMs": 20000,
     "groups": [],

@@ -1380,7 +1380,10 @@ export function readFeatureFlags(config = featureState.source) {
     // 开发者特权（v2.0）：与其它新卡相反 —— 缺项按**关闭**，提权通道必须 fail-closed。
     developer: itemEnabledOr(config, 'sk-developer', false),
     // 主动感知（v2.0 第二十九步）：同样是新能力，缺项按**关闭**（fail-closed）。
-    proactive: itemEnabledOr(config, 'pl-proactive', false),
+    // ⚠️ 必须显式传 kind='plugin'：它在 plugins 清单里，默认 kind 是 skill，
+    // 传漏了就会去 skills 里找一个不存在的 id，`proactive` 永远是 false，
+    // 卡片开了引擎也起不来（v2.0 第三十步修的就是这个）。
+    proactive: itemEnabledOr(config, 'pl-proactive', false, 'plugin'),
     guard: itemEnabledIn(config, 'pl-guard', 'plugin'),
     debounce: itemEnabledIn(config, 'pl-debounce', 'plugin'),
     rateLimit: itemEnabledIn(config, 'pl-ratelimit', 'plugin'),
