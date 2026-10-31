@@ -1748,7 +1748,7 @@ window.__ModuleLoader__.load({
       return h(StatusLive, props)
     }
 
-    function StatusLive({ get, writable }) {
+    function StatusLive({ get, write, writable }) {
       const live = useBridgeStatus(true)
       const [proc, refreshProc] = useBridgeProc(true)
       const [busy, setBusy] = React.useState(null)
@@ -1841,7 +1841,67 @@ window.__ModuleLoader__.load({
         h('div', { className: 'qqg-hint' },
           '「启动桥接」会在后台常驻运行 start.mjs；进程输出与操作日志已移到左侧「系统日志」。',
           h('br'),
-          '「退出桥接」= 停止且不自动重启；DSH 退出时会自动停掉它，不留孤儿进程。'))
+          '「退出桥接」= 停止且不自动重启；DSH 退出时会自动停掉它，不留孤儿进程。'),
+        // v2.0 第二十八步：主动感知面板。
+        h(PresenceSection, { live, get, write, writable }))
+    }
+
+    /** 主动感知：tick 状态 / 上次决策 / 冷却时间（v2.0 第二十八步）。 */
+    function PresenceSection({ live, get, write, writable }) {
+      const presence = live && typeof live.presence === 'object' ? live.presence : null
+      const enabled = get('proactive.enabled') === true
+      const hourText = (() => {
+        const start = Number(get('proactive.dayStartHour'))
+        const end = Number(get('proactive.dayEndHour'))
+        return `${Number.isFinite(start) ? start : 9}-${Number.isFinite(end) ? end : 23} 点`
+      })()
+      const verdictLabel = (verdict) => ({
+        speak: '已发言', silent: '选择沉默', skip: '跳过', 'dry-run': '演练（未发送）', 'send-failed': '发送失败',
+      }[verdict] ?? verdict)
+      const decisions = presence?.decisions ? presence.decisions.slice(-8).reverse() : []
+      const groups = presence?.groups ?? []
+      const cooling = groups.filter((item) => item.status === 'cooling' && item.coolUntil > Date.now())
+
+      return h(Panel, {
+        title: '主动感知',
+        desc: '常驻 tick 先跑规则闸门，只有打分达阈值才问模型；默认关闭时只记 dry-run 决策。',
+        right: h(React.Fragment, null,
+          h('span', { className: 'qqg-pill' + (enabled ? ' qqg-pill-accent' : '') },
+            enabled ? '运行中' : '已关闭（dry-run）'),
+          h('span', { className: 'qqg-pill' }, `tick ${Math.round((presence?.tickMs ?? 20000) / 1000)}s`)),
+      },
+        h('div', { className: 'qqg-list' },
+          h('div', { className: 'qqg-kv' }, h('span', null, '最近 tick'),
+            h('b', null, presence?.lastTickAt > 0 ? sessionTime(presence.lastTickAt) : '（还没跑过）')),
+          h('div', { className: 'qqg-kv' }, h('span', null, '本轮统计'),
+            h('b', null, presence
+              ? `感知 ${presence.stats.sensed} 群 / 候选 ${presence.stats.candidates ?? 0} / 评估 ${presence.stats.evaluated} / 发言 ${presence.stats.spoke}`
+              : '—')),
+          h('div', { className: 'qqg-kv' }, h('span', null, '冷却中'),
+            h('b', null, cooling.length === 0
+              ? '（无）'
+              : cooling.map((item) => `${item.key}（至 ${sessionTime(item.coolUntil)}）`).join('；')),
+          h('div', { className: 'qqg-kv' }, h('span', null, '白天窗口'), h('b', null, hourText)),
+          h('div', { className: 'qqg-kv' }, h('span', null, '安静甜区'),
+            h('b', null, `${get('proactive.minSilenceMin') ?? 30}~${get('proactive.maxSilenceMin') ?? 120} 分钟`)),
+          h('div', { className: 'qqg-kv' }, h('span', null, '单群每小时上限'),
+            h('b', null, `${get('proactive.hourlyLimit') ?? 2} 次`))),
+        h('div', { className: 'qqg-textarea-actions' },
+          h('button', {
+            type: 'button',
+            className: 'qqg-btn' + (enabled ? ' qqg-btn-danger' : ' qqg-btn-primary'),
+            disabled: !writable,
+            onClick: () => write('proactive.enabled', !enabled),
+          }, enabled ? '关闭主动感知' : '开启主动感知')),
+        decisions.length === 0
+          ? h('div', { className: 'qqg-hint' },
+            '还没有决策记录。默认关闭模式下，闸门通过的群会写一条 dry-run 决策，观察几晚再开。')
+          : h('div', { className: 'qqg-list' }, decisions.map((row, index) => h('div', {
+            className: 'qqg-kv', key: `${row.at}-${index}`,
+          },
+          h('span', { className: 'qqg-mono' }, sessionTime(row.at)),
+          h('b', null, `${row.key} · ${verdictLabel(row.verdict)}`),
+          h('span', { className: 'qqg-profile-old' }, row.reason))))))
     }
 
     /* ══════════ 系统日志 Tab（v2.0 第七步，2026-10-28）══════════ */

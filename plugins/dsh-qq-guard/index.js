@@ -1070,6 +1070,27 @@ const Config = Schema.object({
       seconds: Schema.number().description('禁言时长(秒)').default(60).min(5).max(3600).volatile(),
     }).description('指令禁言').default({}),
   }).description('运行节奏').default({}),
+  proactive: Schema.object({
+    enabled: Schema.boolean()
+      .description('主动感知总开关。关闭时只写 dry-run 决策日志，不调模型、不发消息。')
+      .default(false).volatile(),
+    tickMs: Schema.number()
+      .description('感知 tick 间隔(ms)：10~30 秒。')
+      .default(20000).min(10000).max(30000).volatile(),
+    groups: Schema.array(Schema.string())
+      .description('参与主动感知的群（g:123456）。留空 = 所有白名单群。')
+      .default([]).volatile(),
+    dayStartHour: Schema.number().description('白天窗口开始（点）').default(9).min(0).max(23).volatile(),
+    dayEndHour: Schema.number().description('白天窗口结束（点，不含）').default(23).min(1).max(24).volatile(),
+    minSilenceMin: Schema.number().description('安静甜区下限（分钟）').default(30).min(5).max(1440).volatile(),
+    maxSilenceMin: Schema.number().description('安静甜区上限（分钟）').default(120).min(10).max(2880).volatile(),
+    minDailyMessages: Schema.number().description('当天至少多少条才算活群').default(20).min(0).max(1000).volatile(),
+    evalIntervalMin: Schema.number().description('同一群两次评估的最小间隔（分钟）').default(30).min(5).max(1440).volatile(),
+    hourlyLimit: Schema.number().description('单群每小时主动发言上限').default(2).min(1).max(10).volatile(),
+    noReplyMinutes: Schema.number().description('多久没人接茬算被无视（分钟）').default(10).min(1).max(120).volatile(),
+    cooldownHours: Schema.number().description('连续两次被无视后冷却（小时）').default(4).min(1).max(48).volatile(),
+    scoreThreshold: Schema.number().description('打分阈值，达到才会问模型').default(5).min(0).max(20).volatile(),
+  }).description('常驻感知 / 主动行为').default({}),
 }).description('QQ 桥接运行时参数：改完即时生效（桥接轮询本插件的 /dsh-qq-guard/config）。')
 
 /** 路由路径：桥接据此拉配置。 */
@@ -3113,6 +3134,56 @@ function sanitizeBackupRow(value) {
     name,
     at: Number(value.at) || 0,
     bytes: Math.max(0, Number(value.bytes) || 0),
+  }
+}
+
+/**
+ * 收敛桥接上报的主动感知视图（v2.0 第二十八步）。
+ * @param {unknown} value
+ */
+function sanitizePresence(value) {
+  if (!value || typeof value !== 'object') return null
+  const text = (input, max) => (typeof input === 'string' ? input.replace(/\s+/gu, ' ').trim().slice(0, max) : '')
+  const num = (input, max) => {
+    const parsed = Number(input)
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.min(parsed, max) : 0
+  }
+  const groups = Array.isArray(value.groups)
+    ? value.groups.slice(0, 20).map((item) => ({
+      key: text(item?.key, 40),
+      status: item?.status === 'cooling' ? 'cooling' : 'ready',
+      coolUntil: num(item?.coolUntil, 8.64e15),
+      waitingSince: num(item?.waitingSince, 8.64e15),
+      ignoredStreak: Math.min(10, num(item?.ignoredStreak, 10)),
+      speakLastHour: Math.min(20, num(item?.speakLastHour, 20)),
+      lastSpeakAt: num(item?.lastSpeakAt, 8.64e15),
+    })).filter((item) => item.key !== '')
+    : []
+  const decisions = Array.isArray(value.decisions)
+    ? value.decisions.slice(-20).map((item) => ({
+      at: num(item?.at, 8.64e15),
+      key: text(item?.key, 40),
+      verdict: ['speak', 'silent', 'skip', 'dry-run', 'send-failed'].includes(item?.verdict)
+        ? item.verdict
+        : 'skip',
+      reason: text(item?.reason, 200),
+      score: Math.min(50, num(item?.score, 50)),
+      text: text(item?.text, 60),
+    }))
+    : []
+  return {
+    enabled: value.enabled === true,
+    tickMs: num(value.tickMs, 60_000),
+    lastTickAt: num(value.lastTickAt, 8.64e15),
+    stats: {
+      sensed: Math.min(100, num(value?.stats?.sensed, 100)),
+      evaluated: Math.min(100, num(value?.stats?.evaluated, 100)),
+      spoke: Math.min(100, num(value?.stats?.spoke, 100)),
+      skipped: Math.min(100, num(value?.stats?.skipped, 100)),
+      candidates: Math.min(100, num(value?.stats?.candidates, 100)),
+    },
+    groups,
+    decisions,
   }
 }
 
@@ -5650,6 +5721,10 @@ function applySettings(ctx, config) {
               ...(Array.isArray(body?.backups)
                 ? { backups: body.backups.slice(0, 7).map(sanitizeBackupRow).filter(Boolean) }
                 : {}),
+              // v2.0 第二十八步：主动感知视图（tick 状态 / 决策 / 冷却）。
+              ...(body?.presence && typeof body.presence === 'object'
+                ? { presence: sanitizePresence(body.presence) }
+                : {}),
             }
             lastStatusAt = Date.now()
             sendJson(res, 200, { ok: true })
@@ -5683,4 +5758,6 @@ export const DENIED_TOOL_NAMES = Object.freeze([...DENY_TOOLS])
 export const SAFE_TOOL_NAMES = Object.freeze([...SAFE_EXACT])
 /** 会话行白名单收敛（导出仅为测试：漏字段是静默 bug，必须有断言盯着）。 */
 export { sanitizeSessionRow }
+/** 主动感知视图白名单收敛（导出仅为测试）。 */
+export { sanitizePresence }
 export { Config }

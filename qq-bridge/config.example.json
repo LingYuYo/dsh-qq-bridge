@@ -93,6 +93,22 @@
     "rateLimit": { "perMin": 12, "burst": 3, "silent": true },
     "mute": { "enabled": true, "words": ["闭嘴", "安静", "别刷屏"], "seconds": 60 }
   },
+  "proactive": {
+    "_comment": "常驻感知 / 主动行为（v2.0 第二十八步）。默认 enabled=false：只写 dry-run 决策日志，不调模型、不发消息。确认日志正常后再打开。",
+    "enabled": false,
+    "tickMs": 20000,
+    "groups": [],
+    "dayStartHour": 9,
+    "dayEndHour": 23,
+    "minSilenceMin": 30,
+    "maxSilenceMin": 120,
+    "minDailyMessages": 20,
+    "evalIntervalMin": 30,
+    "hourlyLimit": 2,
+    "noReplyMinutes": 10,
+    "cooldownHours": 4,
+    "scoreThreshold": 5
+  },
   "memory": {
     "_comment": "记忆与上下文（2026-10-27 合并了原 contextAware）：pokeMaxTurns 默认 15；messageMaxTurns 默认 0 = 交给 DSH 原生上下文；maxContextTokens 是两者共用的一次注入 token 预算（128K~1M，默认 128000），超了从最老的记录开始截断。设置页改这几项会热覆盖这里。",
     "enabled": true,

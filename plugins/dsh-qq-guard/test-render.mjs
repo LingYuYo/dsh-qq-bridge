@@ -177,7 +177,8 @@ for (const tab of ['status', 'sessions', 'skills', 'settings', 'logs', 'usage'])
   const joined = textSink.join('|')
   const expect = {
     // v2.0 第七步：运行状态精简为概览 / 实时状态 / NapCat；日志独立成 Tab。
-    status: ['今日用量概览', '实时状态', '启动桥接', 'NapCat 进程'],
+    // v2.0 第二十八步：新增「主动感知」面板。
+    status: ['今日用量概览', '实时状态', '启动桥接', 'NapCat 进程', '主动感知', '白天窗口'],
     logs: ['系统日志', '运行日志', '应用日志', '高级：控制台、接入开关与连接排查', '连接自检'],
     // 会话管理已接真实数据：桥接未上报时渲染「等待上报」，不再有假会话。
     sessions: ['会话管理', '等待桥接上报', '运行状态'],

@@ -31,6 +31,7 @@ import { Scheduler, TaskQueue, parseCron } from './scheduler.mjs'
 import {
   TrashStore, createBackup, listBackups, restoreBackup,
 } from './memory-governance.mjs'
+import { PresenceEngine, normalizeProactive } from './presence.mjs'
 import { synthesize, TTS_MAX_CHARS, DEFAULT_PROVIDER as DEFAULT_TTS_PROVIDER } from './tts.mjs'
 import { ExternalHooksClient } from './external-hooks.mjs'
 import { DSH_IMAGE_LIMITS, MAX_TILES, prepareImageParts } from './image-prep.mjs'
@@ -1285,6 +1286,17 @@ export class Bridge {
       logger: this.logger,
     }).load()
     this._memoryMaintenanceTimer = null
+    // 常驻感知 / 主动行为（v2.0 第二十八步）。默认关闭：先跑 dry-run 看决策日志。
+    this.presence = new PresenceEngine({
+      dir: path.dirname(this.statePath),
+      getConfig: () => this._proactiveConfig(),
+      sense: () => this._senseGroups(),
+      decide: (snap, result) => this._decideProactive(snap, result),
+      send: (key, text) => this._sendProactive(key, text),
+      log: (row) => this._logOp(row.verdict === 'speak' ? 'info' : 'info',
+        `主动感知 ${row.key} ${row.verdict}：${row.reason}`),
+      logger: this.logger,
+    }).load()
     this.queues = new SerialQueues()
     this.inflight = new Map() // 会话 key -> 正在处理的 Promise
     // 节奏运行时状态（Phase 4）：全是内存态，不落盘。
@@ -1517,6 +1529,8 @@ export class Bridge {
   _applyLiveToClient() {
     const qq = this.qq
     const live = this.live
+    // 主动感知：tick 间隔或开关变化时重建定时器（启动早期 presence 还没建，静默跳过）。
+    this.presence?.reconfigure?.()
     if (!qq) return
     qq.chunkSize = live.chunkSize
     qq.bubbleMaxChars = live.bubbleMaxChars
@@ -1670,6 +1684,123 @@ export class Bridge {
     const hot = this.live?.rhythm
     if (hot && typeof hot === 'object' && !Array.isArray(hot)) return normalizeRhythm(hot)
     return normalizeRhythm(this.config?.rhythm)
+  }
+
+  /** 现读主动感知配置（live > config > 默认，默认关闭）。 */
+  _proactiveConfig() {
+    return normalizeProactive(this.live?.proactive ?? this.config?.proactive)
+  }
+
+  /**
+   * 感知快照（v2.0 第二十八步）：每个允许的群一条，全是本地状态，无网络请求。
+   *
+   * silence 必须取 `max(lastAt, lastSpeakAt)` —— `lastAt` 只在**入站消息**更新，
+   * 机器人自己说完话不会改它；只用 lastAt 会刚说完又判定「安静 40 分钟」。
+   */
+  async _senseGroups() {
+    const conf = this._proactiveConfig()
+    const allow = this._allow()
+    const targetKeys = conf.groups.length > 0
+      ? conf.groups
+      : allow.groups.map((group) => `g:${group}`)
+    const now = Date.now()
+    const out = []
+    for (const key of targetKeys.slice(0, 20)) {
+      const entry = this.state.sessions?.[key]
+      if (!entry) continue
+      const presence = this.presence?.groupOf(key, now)
+      const lastAt = Number(entry.lastAt) || 0
+      const lastSpeakAt = Number(presence?.lastSpeakAt) || 0
+      const anchor = Math.max(lastAt, lastSpeakAt)
+      const silenceMs = anchor > 0 ? now - anchor : 0
+      // 近 30 分钟的人话条数（含引用，不含指令），用于「话题刚散，接得上」加分。
+      const log = this._chatLog.get(key) ?? []
+      const recentCount = log.filter((item) => now - item.at < 30 * 60 * 1000).length
+      const lastLine = log.length > 0 ? log[log.length - 1] : null
+      const lastIsMine = Boolean(lastLine && lastLine.qq === '' && lastLine.name === '')
+      const lastIsQuestion = Boolean(lastLine
+        && /[？?]$/u.test(String(lastLine.text ?? '').trim())
+        && now - lastLine.at > 5 * 60 * 1000)
+      out.push({
+        key,
+        mutedUntil: Number(entry.mutedUntil) || 0,
+        unread: Number(entry.unread) || 0,
+        silenceMs,
+        todayInbound: Number(presence?.today?.inbound) || 0,
+        recentCount,
+        lastIsMine,
+        lastIsQuestion,
+        // 定时任务 15 分钟内要跑 → 让位，避免同一时刻两条主动消息。
+        taskNearMs: this._taskNearMs(key, now),
+        memoryHit: false,
+        presence,
+      })
+    }
+    return out
+  }
+
+  /** 15 分钟内是否有指向本群的定时任务。 */
+  _taskNearMs(key, now = Date.now()) {
+    if (!this.scheduler) return null
+    const groupId = String(key).replace(/^g:/u, '')
+    for (const task of this.scheduler.list()) {
+      if (!task.enabled || task.nextRunAt <= 0) continue
+      if (task.nextRunAt - now > 15 * 60 * 1000) continue
+      if (task.targets.length === 0 || task.targets.includes(key)
+        || task.targets.some((target) => String(target).replace(/^g:/u, '') === groupId)) {
+        return task.nextRunAt - now
+      }
+    }
+    return null
+  }
+
+  /**
+   * 让模型决定说不说（复用群会话，吃满前缀缓存）。
+   * @returns {Promise<{speak:boolean, text?:string, error?:string}>}
+   */
+  async _decideProactive(snap) {
+    const entry = this.state.sessions?.[snap.key]
+    if (!entry?.sessionId) return { speak: false, error: 'no-session' }
+    const silenceMin = Math.round(snap.silenceMs / 60_000)
+    const recent = (this._chatLog.get(snap.key) ?? []).slice(-6)
+    const lines = recent.map((item) => `${item.name || item.qq}：${item.text}`)
+    const prompt = [
+      `[主动感知] 本群已经安静 ${silenceMin} 分钟，最近几条是：`,
+      lines.join('\n') || '（没有可读的上下文）',
+      '',
+      '现在没人 @ 你。你可以主动说一句，也可以继续沉默。',
+      '要说话就直接输出正文（1-2 句，不要 @ 任何人、不要解释你在做什么）；',
+      '不想说就只输出 <silent>。',
+    ].join('\n')
+    try {
+      const reply = await this.dsh.promptAndWait(entry.sessionId, prompt, {
+        timeoutMs: Number(this.live?.replyTimeoutMs ?? this.config.replyTimeoutMs ?? 20000),
+      })
+      const cleaned = stripMonologueLines(stripSilentMarkers(String(reply ?? ''))).trim()
+      if (cleaned === '' || isSilentReply(cleaned)) return { speak: false }
+      return { speak: true, text: cleaned.slice(0, 300) }
+    } catch (error) {
+      return { speak: false, error: String(error?.message ?? error).slice(0, 120) }
+    }
+  }
+
+  /** 主动消息发送：走 taskQueue（单并发 + 抖动 + 每分钟上限），不 @、不引用。 */
+  async _sendProactive(key, text) {
+    const groupId = String(key).replace(/^g:/u, '')
+    if (!/^\d+$/u.test(groupId)) return false
+    const body = stripMonologueLines(String(text ?? '')).trim()
+    if (body === '') return false
+    try {
+      const result = await this.taskQueue.enqueue(async () => {
+        const sent = await this._send({ kind: 'group', groupId, userId: '', senderName: '' },
+          body, { at: false })
+        return sent
+      })
+      return !(result && result.ok === false)
+    } catch (error) {
+      this.logger.warn?.(`主动消息发送失败：${error?.message ?? error}`)
+      return false
+    }
   }
 
   /**
@@ -2346,12 +2477,22 @@ export class Bridge {
     }
     if (hits.length === 0) return ''
     const lines = ['【跨群特别记忆（来自其他群/全局，仅相关时出现）】']
+    // v2.0 第二十八步：置信度标注闭环——每条带来源分数，低置信度显式打标。
+    // 另起一句系统提示，防止模型把 0.5 的记忆说成板上钉钉的事实。
+    let hasLowConfidence = false
     for (const hit of hits) {
+      const confidence = Math.max(0, Math.min(1, Number(hit.confidence) || 0))
+      const tag = confidence < 0.6 ? `记忆:${confidence.toFixed(1)}·低置信` : `记忆:${confidence.toFixed(1)}`
+      if (confidence < 0.6) hasLowConfidence = true
       if (hit.kind === 'person' && hit.qq !== '') {
-        lines.push(`- 群友 ${hit.title || hit.qq}(${hit.qq})：${hit.text}`)
+        lines.push(`- [${tag}] 群友 ${hit.title || hit.qq}(${hit.qq})：${hit.text}`)
       } else {
-        lines.push(`- ${hit.title || hit.key}：${hit.text}`)
+        lines.push(`- [${tag}] ${hit.title || hit.key}：${hit.text}`)
       }
+    }
+    if (hasLowConfidence) {
+      lines.push('[系统提示：标「低置信」的条目只是模糊印象，引用时必须留余地'
+        + '（「我记得好像是…」），不许说成事实。]')
     }
     return lines.join('\n')
   }
@@ -4224,6 +4365,9 @@ export class Bridge {
       this.logger.info?.(`群友黑名单命中：${key} sender=${maskQq(msg.userId)}，静默丢弃`)
       return
     }
+    // v2.0 第二十八步：接茬感知——有人（含群友）在这个群说话就算「接上了」。
+    // 只动内存 map，不打网络、不写盘（写盘由下一次 tick 合并）。
+    this.presence?.noteInbound(key, false)
     // v2.0 第二十五步：休眠 / 唤醒必须**最先**判定（连群友档案都不更新）。
     // 顺序：先放行「起床」（否则睡着后主人也叫不醒），再丢弃休眠中的一切消息。
     const earlyText = stripLeadingMentions(msg?.text ?? '')
@@ -6534,19 +6678,27 @@ export class Bridge {
    * 否则记为 fact（手动写入，默认全局可见）。
    */
   async _handleRememberCommand(msg, text, key) {
-    const hit = /^\/记住\s+(\S+)\s+([\s\S]+)$/u.exec(String(text ?? '').trim())
+    // v2.0 第二十八步：`/记忆` 是 `/记住` 的别名，走完全相同的写入逻辑。
+    // 真机 Bug：模型收到 `/记忆 …` 后口头说「记下了」，但拦截器只认 `/记住`，没落库。
+    // 三种形态都收：/记住 [标题] [内容]、/记忆 [标题] [内容]、/记忆 [内容]（标题自动取前 12 字）。
+    const hit = /^\/记(?:住|忆)(?:\s+(\S+)\s+([\s\S]+)|\s+([\s\S]+))?$/u.exec(String(text ?? '').trim())
     if (!hit) return false
     if (!this.isOwner(msg)) {
       const sent = await this._send(msg, '⚠️ 权限不足，只有主人 / 开发者能记住跨群信息。')
       if (!(sent && sent.ok === false)) this._noteReplied(key)
       return true
     }
-    const title = hit[1].slice(0, 60)
-    const content = hit[2].trim().slice(0, 500)
-    if (content === '') {
-      await this._send(msg, '内容不能为空：/记住 [标题] [内容]')
+    const rawTitle = String(hit[1] ?? '').trim()
+    const rawContent = String(hit[2] ?? hit[3] ?? '').trim()
+    if (rawContent === '') {
+      await this._send(msg, '用法：/记住 [标题] [内容]，或 /记忆 [内容]\n'
+        + '例：/记住 2677321941 喜欢被叫小鱼｜/记忆 游戏日活 4 点刷新')
       return true
     }
+    // 只给一句时，标题取正文前 12 个字（去标点），保证 key 稳定可读。
+    const autoTitle = rawContent.replace(/[，。！？、；：,.!?;:]/gu, '').slice(0, 12)
+    const title = (rawTitle || autoTitle).slice(0, 60)
+    const content = rawContent.slice(0, 500)
     const isQq = /^\d{5,15}$/u.test(title)
     const saved = this.globalMemory.upsert({
       kind: isQq ? 'person' : 'fact',
@@ -7137,6 +7289,8 @@ export class Bridge {
     this.scheduler.start()
     // 记忆治理：回收站过期清理（每分钟）+ 每日备份（启动即检查当天是否已有）。
     this._startMemoryMaintenance()
+    // 常驻感知：默认 enabled=false 只写 dry-run 决策日志，打开后才真发。
+    this.presence.start()
     // 只做只读探活，确认 DSH 可达；不可达时桥接仍会启动，等 DSH 恢复。
     try {
       await this.dsh.call('agentPresets/list', {})
@@ -7163,6 +7317,7 @@ export class Bridge {
     this.scheduler?.stop?.()
     if (this._memoryMaintenanceTimer) clearInterval(this._memoryMaintenanceTimer)
     this._memoryMaintenanceTimer = null
+    this.presence?.stop?.()
     await this.qq.stop?.()
   }
 }

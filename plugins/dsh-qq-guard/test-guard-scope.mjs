@@ -659,6 +659,49 @@ await check('Config：bridgeEnabled 默认开启；日志配置默认值不变',
   assert.equal(plain.logDir, '')
 })
 
+console.log('\n— 主动感知（v2.0 第二十八步）—')
+await check('Config：proactive 默认关闭，时间窗口 9-23，甜区 30~120', () => {
+  const plain = mod.plainConfig(Config({ role: 'settings' })) ?? {}
+  const proactive = plain.proactive ?? {}
+  assert.equal(proactive.enabled, false, '★ 默认必须关闭（先跑 dry-run）')
+  assert.equal(proactive.tickMs, 20000)
+  assert.equal(proactive.dayStartHour, 9)
+  assert.equal(proactive.dayEndHour, 23)
+  assert.equal(proactive.minSilenceMin, 30)
+  assert.equal(proactive.maxSilenceMin, 120)
+  assert.equal(proactive.hourlyLimit, 2)
+  assert.equal(proactive.cooldownHours, 4)
+})
+
+await check('status：presence 白名单收敛（决策类型/长度/数值都要裁剪）', () => {
+  const { sanitizePresence } = mod
+  assert.equal(sanitizePresence(null), null)
+  assert.equal(sanitizePresence('bad'), null)
+  const view = sanitizePresence({
+    enabled: true,
+    tickMs: 99999,
+    lastTickAt: 1_793_500_000_000,
+    stats: { sensed: 3, evaluated: 1, spoke: 1, skipped: 2, candidates: 1 },
+    groups: [
+      { key: 'g:1', status: 'cooling', coolUntil: 1_793_600_000_000, ignoredStreak: 99, speakLastHour: 99 },
+      { key: '', status: 'ready' },
+    ],
+    decisions: [
+      { at: 1_793_500_000_000, key: 'g:1', verdict: 'speak', reason: 'x'.repeat(500), score: 99, text: 'y'.repeat(200) },
+      { at: 1, key: 'g:2', verdict: 'weird', reason: 'z' },
+    ],
+  })
+  assert.equal(view.enabled, true)
+  assert.equal(view.tickMs, 60_000, 'tickMs 上限钳到 60 秒')
+  assert.equal(view.groups.length, 1, '空 key 的群要丢掉')
+  assert.equal(view.groups[0].ignoredStreak, 10)
+  assert.equal(view.groups[0].speakLastHour, 20)
+  assert.equal(view.decisions[0].reason.length, 200, '理由截断到 200')
+  assert.equal(view.decisions[0].text.length, 60, '正文截断到 60')
+  assert.equal(view.decisions[0].score, 50, '分数钳到 50')
+  assert.equal(view.decisions[1].verdict, 'skip', '未知判定回落 skip')
+})
+
 console.log('\n— v2.0 会话详情字段（只读上报，任务一）—')
 await check('sanitizeSessionRow：recent / context / summary / modelRoute 全部白名单收敛', () => {
   const { sanitizeSessionRow } = mod

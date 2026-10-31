@@ -646,5 +646,46 @@ await check('/黑名单 加/删：仅主人，落盘到 userBlacklist', async ()
   assert.match(sent.at(-1), /权限不足/u)
 })
 
+console.log('\n— /记忆 别名与置信度标注（v2.0 第二十八步）—')
+await check('/记忆 是 /记住 的别名，两种形态都能落库', async () => {
+  const b = makeBridge({ allow: { owners: ['1001'] } })
+  const sent = fakeQq(b)
+  // 形态 1：/记住 [标题] [内容]
+  await b._handleRememberCommand(groupMsg('/记住 2677321941 喜欢被叫小鱼'),
+    '/记住 2677321941 喜欢被叫小鱼', 'g:1')
+  assert.equal(b.globalMemory.list().length, 1)
+
+  // 形态 2：/记忆 只有一句 → 标题自动取前 12 字
+  await b._handleRememberCommand(groupMsg('/记忆 游戏日活4点刷新'), '/记忆 游戏日活4点刷新', 'g:1')
+  const items = b.globalMemory.list()
+  assert.equal(items.length, 2)
+  const auto = items.find((item) => item.key.startsWith('manual:游戏日活'))
+  assert.ok(auto, `没落库：${items.map((i) => i.key).join(',')}`)
+  assert.match(auto.title, /游戏日活/u)
+  assert.equal(auto.text, '游戏日活4点刷新')
+
+  // 形态 3：/记忆 [标题] [内容]
+  await b._handleRememberCommand(groupMsg('/记忆 标题 内容'), '/记忆 标题 内容', 'g:1')
+  assert.equal(b.globalMemory.list().length, 3)
+  assert.match(sent.at(-1), /已记住/u)
+})
+
+await check('置信度标注：注入带来源分数，低置信额外打标', () => {
+  const b = makeBridge()
+  b.globalMemory.upsert({
+    kind: 'person', key: 'qq:1001', qq: '1001', title: '甲', text: '喜欢短句', confidence: 0.9,
+  })
+  const high = b._crossGroupMemorySection('g:1', { text: '在吗', senderQq: '1001' })
+  assert.match(high, /\[记忆:0\.9\]/u, high)
+  assert.ok(!/低置信/u.test(high), '高置信不该打低置信标')
+
+  b.globalMemory.upsert({
+    kind: 'fact', key: 'fact:maybe', title: '可能的事', text: '听说周末爬山', confidence: 0.4,
+  })
+  const low = b._crossGroupMemorySection('g:1', { text: '周末爬山吗', senderQq: '2002' })
+  assert.match(low, /记忆:0\.4·低置信/u, low)
+  assert.match(low, /不许说成事实/u, '★ 低置信必须有系统提示')
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) process.exitCode = 1

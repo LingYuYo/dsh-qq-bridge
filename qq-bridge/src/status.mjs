@@ -62,7 +62,7 @@ export function qqStateFromHealth(health) {
 export function buildBridgeStatus({
   health, counts, dshOk = true, sessions, opLog,
   enabled = true, dshBaseUrl = '', wsUrl = '',
-  globalMemory, tasks, backups,
+  globalMemory, tasks, backups, presence,
 } = {}) {
   const qqState = qqStateFromHealth(health)
   return {
@@ -85,5 +85,7 @@ export function buildBridgeStatus({
     ...(Array.isArray(tasks) ? { tasks: tasks.slice(0, 50) } : {}),
     // 记忆备份列表（v2.0 第二十六步）：最多 7 条，设置页恢复用。
     ...(Array.isArray(backups) ? { backups: backups.slice(0, 7) } : {}),
+    // 主动感知（v2.0 第二十八步）：UI 面板展示 tick 状态 / 决策 / 冷却。
+    ...(presence && typeof presence === 'object' ? { presence } : {}),
   }
 }
