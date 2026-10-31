@@ -2030,8 +2030,18 @@ export class OneBotClient {
     ws.addEventListener('open', () => { if (this._ws === ws) this._onOpen() })
     ws.addEventListener('message', (ev) => { if (this._ws === ws) this._onRaw(ev?.data) })
     ws.addEventListener('error', (ev) => {
-      // close 会紧跟其后，重连逻辑放在 _onClose，这里只记一笔
+      if (this._ws !== ws) return
       this.log.warn(`WebSocket 错误：${ev?.message ?? ev?.error?.message ?? '未知'}`)
+      // 握手失败（如 NapCat 重启瞬间的 non-101 / network error）时，部分运行时
+      // 只发 error 不发 close。若不在这里兜底，this._ws 会一直指向这条死连接，
+      // 下次 _connect() 首行 `if (this._ws) return` 直接短路 → 永久失联，只能重启容器。
+      // 这里主动清理状态并进入退避重连；若 close 随后到达，它的守卫会跳过，不会重复调度。
+      this._ws = null
+      this._health.online = null
+      this._health.onlineSource = null
+      this._health.good = null
+      this._rejectAll('连接已断开')
+      this._scheduleReconnect()
     })
     ws.addEventListener('close', (ev) => { if (this._ws === ws) this._onClose(ev) })
   }
