@@ -541,11 +541,12 @@ function btnAnywhere(tree, text) {
   return findAll(tree, (n) => n.tag === 'button' && textOf(n).trim() === text)[0]
 }
 
-await check('详情头下方有四个分页，默认停在「基础配置」', () => {
+await check('详情头下方有五个分页（群聊），默认停在「基础配置」', () => {
   reset()
   const tree = resetSessions(LIVE_DETAIL)
   const labels = findAll(tree, (n) => n.tag === 'button' && n.props?.role === 'tab').map((n) => textOf(n).trim())
-  eq(labels, ['基础配置', '记忆与摘要', '特权与权限', '调试信息'], '四个分页顺序')
+  // v2.0 第二十九步：群聊多一个「主动感知」Tab（私聊不显示）。
+  eq(labels, ['基础配置', '记忆与摘要', '主动感知', '特权与权限', '调试信息'], '五个分页顺序')
   truthy(levelSelect(tree), '基础配置应包含响应档位')
   // v2.0 第十二步：单群人设改成弹窗编辑（不是内联三框）。
   truthy(btnAnywhere(tree, '编辑单群人设'), '基础配置应包含单群人设编辑入口')
@@ -869,6 +870,43 @@ await check('特权与权限：群友黑名单卡片与已加入的 QQ', () => {
   truthy(text.includes('群友黑名单'), '缺群友黑名单卡片')
   truthy(text.includes('20002'), '缺已加入黑名单的 QQ')
   truthy(text.includes('加入黑名单'), '缺加入按钮')
+})
+
+/* ── 用例：单群主动感知 Tab（v2.0 第二十九步）──────────────── */
+console.log('\n单群主动感知 Tab：')
+
+await check('未授权时显示开关与「全局未开」防呆提示', () => {
+  reset()
+  const live = { sessions: [{ ...LIVE_DETAIL.sessions[0], proactiveEnabled: false }], presence: null }
+  let tree = resetSessions(live)
+  tabBtn(tree, '主动感知').props.onClick()
+  tree = render()
+  const text = textOf(tree)
+  truthy(text.includes('主动感知（本群）'), '缺本群主动感知卡片')
+  truthy(text.includes('开启本群主动感知'), '缺开关按钮')
+  truthy(text.includes('全局引擎未开启'), '★ 引擎没开时必须给防呆提示')
+})
+
+await check('已授权 + 演练中：显示演练提示与本群决策记录', () => {
+  reset()
+  const live = {
+    sessions: [{ ...LIVE_DETAIL.sessions[0], proactiveEnabled: true }],
+    presence: {
+      engine: true, enabled: false, dryRun: true, tickMs: 20000,
+      stats: { sensed: 1, candidates: 1, evaluated: 0, spoke: 0, skipped: 0 },
+      groups: [{
+        key: 'g:123456', status: 'ready', coolUntil: 0, speakLastHour: 0,
+        decisions: [{ at: 1700000000000, verdict: 'dry-run', reason: '安静 45 分钟（分数 7）', score: 7 }],
+      }],
+      decisions: [],
+    },
+  }
+  let tree = resetSessions(live)
+  tabBtn(tree, '主动感知').props.onClick()
+  tree = render()
+  const text = textOf(tree)
+  truthy(text.includes('演练模式'), '★ 演练状态必须提示')
+  truthy(text.includes('安静 45 分钟'), '缺本群决策记录')
 })
 
 /* ── 汇总 ──────────────────────────────────────────────────── */

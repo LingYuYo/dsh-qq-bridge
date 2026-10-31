@@ -2524,10 +2524,17 @@ await check('features：Host 下发的派生值优先；缺字段按默认补', 
     image: true, time: true, memory: true, unread: true,
     // v2.0：开发者特权缺字段按关闭（提权通道 fail-closed），不是「缺项按开启」。
     developer: false,
+    // v2.0 第二十九步：主动感知引擎总闸同理，缺字段按关闭。
+    proactive: false,
   })
   assert.equal(featuresFromManifests({ skills: [{ id: 'sk-vision', enabled: false }] }).vision, false)
   assert.equal(featuresFromManifests({ skills: [] }).vision, false, '清单里没有 = 关闭')
   assert.equal(featuresFromManifests({}).vision, true, '清单缺失 = 默认开启')
+  // v2.0 第二十九步：pl-proactive 在 plugins 清单里，缺项按关闭（不能凭空开）。
+  assert.equal(featuresFromManifests({ plugins: [{ id: 'pl-guard', enabled: true }] }).proactive, false)
+  assert.equal(featuresFromManifests({
+    plugins: [{ id: 'pl-proactive', enabled: true }],
+  }).proactive, true, '明确开启才算开启')
   // P2 兼容（契约 3.1）：老配置的 skills 里没有 sk-image → 按新默认开启；
   // 明确写了 sk-image 且 enabled:false 才算关闭。
   assert.equal(featuresFromManifests({ skills: [{ id: 'sk-voice', enabled: true }] }).image, true,

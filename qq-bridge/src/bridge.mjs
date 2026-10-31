@@ -269,6 +269,9 @@ export const DEFAULT_FEATURES = Object.freeze({
   // 理由：这是提权通道（暗号 + 专属 Prompt），默认必须 fail-closed；
   // 老配置里没有这张卡时绝不能凭空打开。
   developer: false,
+  // 「主动感知」（pl-proactive，v2.0 第二十九步）：**缺项按关闭**。
+  // 理由与开发者特权同类：这是「机器人自己开口」的能力，默认必须 fail-closed。
+  proactive: false,
 })
 
 /** 归一化 features：缺字段按默认值补，非布尔忽略。 */
@@ -287,6 +290,7 @@ export function normalizeFeatures(source) {
     memory: bool(raw.memory, DEFAULT_FEATURES.memory),
     unread: bool(raw.unread, DEFAULT_FEATURES.unread),
     developer: bool(raw.developer, DEFAULT_FEATURES.developer),
+    proactive: bool(raw.proactive, DEFAULT_FEATURES.proactive),
   }
 }
 
@@ -325,6 +329,10 @@ export function featuresFromManifests({ skills, plugins } = {}) {
     developer: !Array.isArray(skills) || !skills.some((item) => item && item.id === 'sk-developer')
       ? DEFAULT_FEATURES.developer
       : pick(skills, 'sk-developer', DEFAULT_FEATURES.developer),
+    // 「主动感知」（pl-proactive）：同样是新能力，老清单里没有这张卡 → **默认关闭**。
+    proactive: !Array.isArray(plugins) || !plugins.some((item) => item && item.id === 'pl-proactive')
+      ? DEFAULT_FEATURES.proactive
+      : pick(plugins, 'pl-proactive', DEFAULT_FEATURES.proactive),
   })
 }
 
@@ -1039,6 +1047,8 @@ export function normalizeSessionEntry(key, raw) {
     slang: normalizeSlangList(value.slang),
     // 单群群友黑名单（v2.0 第二十七步）：命中者在入口直接静默丢弃。
     userBlacklist: normalizeQqList(value.userBlacklist),
+    // 单群主动感知授权（v2.0 第二十九步）：默认 false，老群升级后不会自己开口。
+    proactiveEnabled: value.proactiveEnabled === true,
   }
 }
 
@@ -1686,9 +1696,18 @@ export class Bridge {
     return normalizeRhythm(this.config?.rhythm)
   }
 
-  /** 现读主动感知配置（live > config > 默认，默认关闭）。 */
+  /** 现读主动感知配置（live > config > 默认）。
+   *  v2.0 第二十九步：三层开关——
+   *    · `engine`  = 插件卡片 pl-proactive 总闸（引擎跑不跑）
+   *    · `enabled` = 真实发送（false = 演练）
+   *    · 单群授权 = sessions[key].proactiveEnabled（见 _senseGroups）
+   *  卡片开关同时驱动 features.proactive；这里把它合成 engine，避免两处判断漂移。
+   */
   _proactiveConfig() {
-    return normalizeProactive(this.live?.proactive ?? this.config?.proactive)
+    const base = normalizeProactive(this.live?.proactive ?? this.config?.proactive)
+    // 卡片关掉 = 引擎停摆（features 由 Host 按同一份 skills/plugins 算好推下来）。
+    if (this._features().proactive === false) return { ...base, engine: false }
+    return base
   }
 
   /**
@@ -1723,6 +1742,8 @@ export class Bridge {
         && now - lastLine.at > 5 * 60 * 1000)
       out.push({
         key,
+        // v2.0 第二十九步：单群授权（闸门 groupAllowed 读这个字段）。
+        proactiveEnabled: entry.proactiveEnabled === true,
         mutedUntil: Number(entry.mutedUntil) || 0,
         unread: Number(entry.unread) || 0,
         silenceMs,
@@ -2677,6 +2698,8 @@ export class Bridge {
         mergedSlang: this._mergedSlang(key),
         // v2.0 第二十七步：单群群友黑名单（UI 增删用）。
         userBlacklist: normalizeQqList(entry.userBlacklist),
+        // v2.0 第二十九步：单群主动感知授权（第 5 个 Tab 的开关）。
+        proactiveEnabled: entry.proactiveEnabled === true,
         // v2.0 第二十五步：主人级休眠截止时间（UI 显示 💤 与剩余时间）。
         mutedUntil: Number(entry.mutedUntil) || 0,
         // L2 摘要：手动截断留下的前情提要（UI 用名册美化展示 / 手动编辑）。
@@ -3212,6 +3235,15 @@ export class Bridge {
       this._personaSignatures?.clear?.()
       this._logOp('info', `已恢复备份：${op?.file}（${JSON.stringify(result.restored)}）`)
       return { ok: true, action, key, restored: result.restored }
+    }
+
+    // v2.0 第二十九步：单群主动感知授权（会话详情第 5 个 Tab 的开关）。
+    if (action === 'proactive') {
+      const target = this._entryOf(key)
+      target.proactiveEnabled = op?.enabled === true
+      this._saveState()
+      this._logOp('info', `单群主动感知${target.proactiveEnabled ? '开启' : '关闭'}：${key}`)
+      return { ok: true, action, key, proactiveEnabled: target.proactiveEnabled }
     }
 
     // v2.0 第二十七步：单群群友黑名单（设置页卡片用）。

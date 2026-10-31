@@ -673,17 +673,22 @@ await check('Config：proactive 默认关闭，时间窗口 9-23，甜区 30~120
   assert.equal(proactive.cooldownHours, 4)
 })
 
-await check('status：presence 白名单收敛（决策类型/长度/数值都要裁剪）', () => {
+await check('status：presence 白名单收敛（决策类型/长度/数值都要裁剪、分群决策）', () => {
   const { sanitizePresence } = mod
   assert.equal(sanitizePresence(null), null)
   assert.equal(sanitizePresence('bad'), null)
   const view = sanitizePresence({
-    enabled: true,
+    engine: true,
+    enabled: false,
+    dryRun: true,
     tickMs: 99999,
     lastTickAt: 1_793_500_000_000,
     stats: { sensed: 3, evaluated: 1, spoke: 1, skipped: 2, candidates: 1 },
     groups: [
-      { key: 'g:1', status: 'cooling', coolUntil: 1_793_600_000_000, ignoredStreak: 99, speakLastHour: 99 },
+      {
+        key: 'g:1', status: 'cooling', coolUntil: 1_793_600_000_000, ignoredStreak: 99, speakLastHour: 99,
+        decisions: [{ at: 1, verdict: 'speak', reason: 'x'.repeat(500), score: 99, text: 'y'.repeat(200) }],
+      },
       { key: '', status: 'ready' },
     ],
     decisions: [
@@ -691,11 +696,14 @@ await check('status：presence 白名单收敛（决策类型/长度/数值都�
       { at: 1, key: 'g:2', verdict: 'weird', reason: 'z' },
     ],
   })
-  assert.equal(view.enabled, true)
+  assert.equal(view.engine, true, '引擎总闸要透传')
+  assert.equal(view.dryRun, true, '演练状态要透传（UI 防呆提示用）')
   assert.equal(view.tickMs, 60_000, 'tickMs 上限钳到 60 秒')
   assert.equal(view.groups.length, 1, '空 key 的群要丢掉')
   assert.equal(view.groups[0].ignoredStreak, 10)
   assert.equal(view.groups[0].speakLastHour, 20)
+  assert.equal(view.groups[0].decisions.length, 1, '★ 单群决策要透传')
+  assert.equal(view.groups[0].decisions[0].reason.length, 200, '单群理由也要截断')
   assert.equal(view.decisions[0].reason.length, 200, '理由截断到 200')
   assert.equal(view.decisions[0].text.length, 60, '正文截断到 60')
   assert.equal(view.decisions[0].score, 50, '分数钳到 50')
@@ -824,6 +832,8 @@ await check('readFeatureFlags：把开关聚合成桥接/guard 共用的布尔',
     unread: true,
     // 2026-10-28（v2.0 第二步）：开发者特权，缺项按**关闭**（提权通道 fail-closed）。
     developer: false,
+    // v2.0 第二十九步：主动感知引擎总闸，缺项同样按**关闭**（fail-closed）。
+    proactive: false,
     guard: true, debounce: true, rateLimit: true,
   })
 })

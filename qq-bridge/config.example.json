@@ -20,13 +20,19 @@
     "admins": [],
     "owners": [],
     "developers": [],
-    "deny": { "private": [], "groups": [] },
+    "deny": {
+      "private": [],
+      "groups": []
+    },
     "allowAllWhenEmpty": false
   },
   "developer": {
     "_comment": "v2.0 开发者特权。默认全关（fail-closed）。触发词只认前缀；命中后先剥掉关键词再送 DSH，专属 Prompt 只追加在本轮 Prompt 尾部（不动系统提示词与前缀缓存）。memoryNotes 是只读预览，底层写入后续补。",
     "enabled": false,
-    "keywords": ["/dev", "/admin"],
+    "keywords": [
+      "/dev",
+      "/admin"
+    ],
     "prompt": "",
     "strangerReply": false,
     "debugPayload": false,
@@ -59,7 +65,10 @@
   },
   "trimEndPunctuation": {
     "enabled": true,
-    "keep": ["？", "！"]
+    "keep": [
+      "？",
+      "！"
+    ]
   },
   "groupAtReply": true,
   "groupAtPosition": "last",
@@ -90,11 +99,24 @@
     "activityLevel": 1,
     "debounceWindowMs": 800,
     "batchIntervalMs": 2500,
-    "rateLimit": { "perMin": 12, "burst": 3, "silent": true },
-    "mute": { "enabled": true, "words": ["闭嘴", "安静", "别刷屏"], "seconds": 60 }
+    "rateLimit": {
+      "perMin": 12,
+      "burst": 3,
+      "silent": true
+    },
+    "mute": {
+      "enabled": true,
+      "words": [
+        "闭嘴",
+        "安静",
+        "别刷屏"
+      ],
+      "seconds": 60
+    }
   },
   "proactive": {
-    "_comment": "常驻感知 / 主动行为（v2.0 第二十八步）。默认 enabled=false：只写 dry-run 决策日志，不调模型、不发消息。确认日志正常后再打开。",
+    "_comment": "常驻感知 / 主动行为（v2.0 第二十九步，三层开关）。engine=插件卡片总闸（false=引擎停摆）；enabled=真实发送（false=演练，只写决策日志不调模型）；单群授权在 state/sessions.json 的 proactiveEnabled（默认 false）。",
+    "engine": false,
     "enabled": false,
     "tickMs": 20000,
     "groups": [],

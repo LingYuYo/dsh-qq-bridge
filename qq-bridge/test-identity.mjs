@@ -687,5 +687,33 @@ await check('置信度标注：注入带来源分数，低置信额外打标', (
   assert.match(low, /不许说成事实/u, '★ 低置信必须有系统提示')
 })
 
+console.log('\n— 单群主动感知授权（v2.0 第二十九步）—')
+await check('session-op proactive：写入 proactiveEnabled，默认 false', async () => {
+  const b = makeBridge()
+  const key = 'g:123456'
+  const entry = b._entryOf(key)
+  assert.equal(entry.proactiveEnabled, false, '默认必须 false（老群不迁移）')
+
+  const on = await b.applySessionOp({ op: 'proactive', key, enabled: true })
+  assert.equal(on.ok, true)
+  assert.equal(b.state.sessions[key].proactiveEnabled, true)
+  assert.equal(b.sessionViews().find((row) => row.key === key).proactiveEnabled, true, 'status 要带出字段')
+
+  const off = await b.applySessionOp({ op: 'proactive', key, enabled: false })
+  assert.equal(off.ok, true)
+  assert.equal(b.state.sessions[key].proactiveEnabled, false)
+})
+
+await check('_senseGroups 带出 proactiveEnabled；闸门据此否决', async () => {
+  const b = makeBridge({ allow: { groups: ['123456'] } })
+  b.state.sessions['g:123456'] = normalizeSessionEntry('g:123456', { lastAt: Date.now() - 45 * 60 * 1000 })
+  const off = (await b._senseGroups()).find((snap) => snap.key === 'g:123456')
+  assert.equal(off.proactiveEnabled, false)
+
+  b.state.sessions['g:123456'].proactiveEnabled = true
+  const on = (await b._senseGroups()).find((snap) => snap.key === 'g:123456')
+  assert.equal(on.proactiveEnabled, true)
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) process.exitCode = 1

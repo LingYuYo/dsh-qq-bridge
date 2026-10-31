@@ -23,11 +23,13 @@ const check = async (name, fn) => {
 const MIN = 60_000
 const HOUR = 60 * MIN
 const tmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'qq-presence-'))
-const conf = (extra = {}) => normalizeProactive({ enabled: true, ...extra })
+// 三层开关（v2.0 第二十九步）：engine=引擎总闸，enabled=真实发送，单群授权在 sense 上。
+const conf = (extra = {}) => normalizeProactive({ engine: true, enabled: true, ...extra })
 
 /** 构造一个「全都过闸门」的感知快照。 */
 const goodSense = (now, extra = {}) => ({
   key: 'g:934037176',
+  proactiveEnabled: true,
   silenceMs: 45 * MIN,
   todayInbound: 40,
   unread: 0,
@@ -53,10 +55,22 @@ await check('非法值回落默认；tick 限制在 10~30 秒；默认关闭', (
 
 console.log('\n— 闸门（每条都要能单独否掉）—')
 const gateAt = new Date(2026, 10, 1, 14, 0, 0).getTime()  // 本地 14:00
-await check('关闭状态不是闸门：规则照样跑，交给 dry-run 分支', () => {
+await check('总闸（engine）是闸门：未开直接 skip', () => {
   const result = evaluatePresence(goodSense(gateAt), normalizeProactive({}), gateAt)
-  assert.equal(result.verdict, 'evaluate', '关闭时仍要评估，才能写 dry-run 日志')
-  assert.ok(!/未开启/u.test(result.reason))
+  assert.equal(result.verdict, 'skip')
+  assert.match(result.reason, /总闸未开启/u)
+})
+
+await check('真实发送开关不是闸门：演练模式照样评估，交给 dry-run 分支', () => {
+  const result = evaluatePresence(goodSense(gateAt), normalizeProactive({ engine: true }), gateAt)
+  assert.equal(result.verdict, 'evaluate', '演练模式仍要评估，才能写 dry-run 日志')
+})
+
+await check('单群未授权 → skip，理由优先于「群不活跃」', () => {
+  const result = evaluatePresence(goodSense(gateAt, { proactiveEnabled: false, todayInbound: 3 }),
+    conf(), gateAt)
+  assert.equal(result.verdict, 'skip')
+  assert.match(result.reason, /本群未授权/u)
 })
 
 await check('私聊不参与；休眠不参与', () => {
@@ -175,13 +189,13 @@ await check('跨天重置入站计数', () => {
 })
 
 console.log('\n— 引擎（tick 循环）—')
-await check('dry-run：闸门通过只记决策，不调模型、不发消息', async () => {
+await check('dry-run：引擎开着但真实发送关着 → 只记决策，不调模型、不发消息', async () => {
   const dir = tmpDir()
   const now = gateAt
   let decided = 0, sent = 0
   const engine = new PresenceEngine({
     dir,
-    getConfig: () => normalizeProactive({ enabled: false }),
+    getConfig: () => normalizeProactive({ engine: true, enabled: false }),
     sense: async () => [goodSense(now)],
     decide: async () => { decided += 1; return { speak: true, text: '在吗' } },
     send: async () => { sent += 1; return true },
@@ -190,9 +204,25 @@ await check('dry-run：闸门通过只记决策，不调模型、不发消息', 
   await engine.tick()
   assert.equal(decided, 0, '★ dry-run 不能调模型')
   assert.equal(sent, 0)
-  const last = engine.view().decisions.at(-1)
+  const decisions = engine.view().groups[0]?.decisions ?? []
+  const last = decisions.at(-1)
   assert.equal(last.verdict, 'dry-run')
   assert.match(last.reason, /dry-run/u)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+await check('总闸未开 → 引擎停摆，连 sense 都不调', async () => {
+  const dir = tmpDir()
+  let sensed = 0
+  const engine = new PresenceEngine({
+    dir,
+    getConfig: () => normalizeProactive({}),
+    sense: async () => { sensed += 1; return [goodSense(gateAt)] },
+    now: () => gateAt,
+  }).load()
+  await engine.tick()
+  assert.equal(sensed, 0, '★ 总闸关了不该跑感知')
+  assert.equal(engine.view().groups.length, 0)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
@@ -302,6 +332,41 @@ await check('tick 抛异常不影响后续（不中断定时器）', async () =>
   assert.equal(warnings.length, 1)
   assert.match(warnings[0], /sense boom/u)
   assert.equal(engine._ticking, false, '异常后必须解锁，否则再也不会跑')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+await check('决策分群存：每群 20 条上限，全局视图按时间合并', () => {
+  const dir = tmpDir()
+  const now = gateAt
+  const engine = new PresenceEngine({ dir, getConfig: () => conf(), sense: async () => [], now: () => now }).load()
+  for (let i = 0; i < 25; i += 1) {
+    engine.noteDecision({ key: 'g:1', verdict: 'skip', reason: `第 ${i} 条`, score: i })
+  }
+  engine.noteDecision({ key: 'g:2', verdict: 'speak', reason: '另一个群', score: 7 })
+  const view = engine.view(10)
+  const groupOne = view.groups.find((item) => item.key === 'g:1')
+  assert.equal(groupOne.decisions.length, 20, '★ 每群只留 20 条')
+  assert.equal(groupOne.decisions.at(-1).reason, '第 24 条')
+  assert.equal(view.decisions.length, 10, '全局视图按 limit 截断')
+  assert.ok(view.decisions.every((row) => typeof row.key === 'string'), '全局行要带 key')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+await check('旧版顶层 decisions 迁移到分群', () => {
+  const dir = tmpDir()
+  fs.writeFileSync(path.join(dir, 'presence.json'), JSON.stringify({
+    version: 1,
+    groups: { 'g:1': { status: 'ready' } },
+    decisions: [
+      { at: 1, key: 'g:1', verdict: 'skip', reason: '旧记录 A' },
+      { at: 2, key: 'g:2', verdict: 'speak', reason: '旧记录 B' },
+    ],
+  }))
+  const engine = new PresenceEngine({ dir, getConfig: () => conf(), now: () => gateAt }).load()
+  const view = engine.view()
+  assert.equal(view.groups.find((item) => item.key === 'g:1').decisions.length, 1)
+  assert.equal(view.groups.find((item) => item.key === 'g:2').decisions.length, 1)
+  assert.equal(view.decisions.length, 2)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 

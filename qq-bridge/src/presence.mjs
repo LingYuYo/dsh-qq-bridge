@@ -23,6 +23,9 @@ const MAX_DECISIONS = 200
 
 /** 默认配置（Host 的 Config 会覆盖，这里只做兜底）。 */
 export const DEFAULT_PROACTIVE = {
+  /** 引擎总闸（卡片 pl-proactive）：false = 整个 tick 停摆，连感知都不跑。 */
+  engine: false,
+  /** 真实发送开关：false = 演练模式（只写决策日志，不调模型、不发消息）。 */
   enabled: false,
   tickMs: 20_000,
   groups: [],
@@ -38,6 +41,9 @@ export const DEFAULT_PROACTIVE = {
   scoreThreshold: 5,
 }
 
+/** 每群保留多少条决策（单群 Tab 用）。 */
+export const MAX_GROUP_DECISIONS = 20
+
 const HOUR_MS = 60 * 60 * 1000
 const MIN_MS = 60 * 1000
 
@@ -50,6 +56,11 @@ export function normalizeProactive(raw) {
     return Math.min(max, Math.max(min, Math.floor(parsed)))
   }
   return {
+    // 三层开关（v2.0 第二十九步）：
+    //   engine  = 卡片总闸（引擎跑不跑）
+    //   enabled = 真实发送（false = 演练）
+    //   单群授权在 sessions[key].proactiveEnabled，见闸门 groupAllowed
+    engine: src.engine === true,
     enabled: src.enabled === true,
     // tick 间隔限制在 10~30 秒（太密没必要，太疏感知迟钝）。
     tickMs: num(src.tickMs, DEFAULT_PROACTIVE.tickMs, 10_000, 30_000),
@@ -80,6 +91,8 @@ export function blankGroupState(now = Date.now()) {
     lastEvalAt: 0,
     lastSpeakAt: 0,
     today: { date: localDate(now), inbound: 0 },
+    // v2.0 第二十九步：决策记录改成**分群存**（单群 Tab 直接读自己的 20 条）。
+    decisions: [],
   }
 }
 
@@ -100,6 +113,12 @@ export function localDate(now) {
  */
 export function evaluatePresence(sense, conf, now = Date.now()) {
   const gates = {
+    // v2.0 第二十九步：两层授权排在最前。
+    //   engine       = 卡片总闸（normalize 后 conf.engine）
+    //   groupAllowed = 单群授权（sessions[key].proactiveEnabled）
+    // 授权不是条件：它比「今天够不够活跃」更根本，理由也更好懂。
+    engine: conf.engine === true,
+    groupAllowed: sense?.proactiveEnabled === true,
     groupChat: String(sense?.key ?? '').startsWith('g:'),
     awake: !(Number(sense?.mutedUntil) > now),
     notCooling: true,
@@ -129,9 +148,11 @@ export function evaluatePresence(sense, conf, now = Date.now()) {
   gates.noTaskNear = !(Number(sense?.taskNearMs) > 0)
 
   // 按顺序找第一条否掉的闸门，理由要能直接看懂。
-  // 注意：`enabled` 不是闸门。关闭状态下引擎照样跑规则、写 dry-run 决策日志，
+  // 注意：`enabled`（真实发送）不是闸门。演练模式下引擎照样跑规则、写 dry-run 日志，
   // 只是不调模型、不发送 —— 这就是「先跑几晚看日志」的模式。
   const order = [
+    ['engine', '主动感知总闸未开启'],
+    ['groupAllowed', '本群未授权主动感知'],
     ['groupChat', '只对群聊生效'],
     ['awake', '本群休眠中'],
     ['notCooling', `冷却中（至 ${group.coolUntil > 0 ? new Date(group.coolUntil).toLocaleString('zh-CN') : '—'}）`],
@@ -255,7 +276,6 @@ export class PresenceEngine {
     this.now = typeof now === 'function' ? now : () => Date.now()
     this.logger = logger
     this.groups = new Map()
-    this.decisions = []
     this.lastTickAt = 0
     this.lastTickStats = { sensed: 0, evaluated: 0, spoke: 0, skipped: 0 }
     this._timer = null
@@ -271,15 +291,26 @@ export class PresenceEngine {
       const groups = parsed?.groups && typeof parsed.groups === 'object' ? parsed.groups : {}
       for (const [key, value] of Object.entries(groups)) {
         if (!value || typeof value !== 'object') continue
-        this.groups.set(key, { ...blankGroupState(this.now()), ...value })
+        const state = { ...blankGroupState(this.now()), ...value }
+        // 决策分群存（v2.0 第二十九步）：每群只留最近 20 条。
+        state.decisions = Array.isArray(value.decisions)
+          ? value.decisions.slice(-MAX_GROUP_DECISIONS)
+          : []
+        this.groups.set(key, state)
       }
-      this.decisions = Array.isArray(parsed?.decisions) ? parsed.decisions.slice(-MAX_DECISIONS) : []
+      // 旧版（顶层 decisions 全局数组）迁移成分群：按 key 拆到各自的群，然后丢弃顶层。
+      const legacy = Array.isArray(parsed?.decisions) ? parsed.decisions : []
+      for (const row of legacy.slice(-MAX_DECISIONS)) {
+        if (!row || typeof row !== 'object' || typeof row.key !== 'string') continue
+        const state = this.groupOf(row.key)
+        state.decisions = [...(state.decisions ?? []), row].slice(-MAX_GROUP_DECISIONS)
+        this.groups.set(row.key, state)
+      }
       return this
     } catch (error) {
       this.logger?.warn?.(`主动感知状态文件损坏，已重置：${error?.message ?? error}`)
       try { fs.renameSync(this.file, `${this.file}.bak`) } catch { /* ignore */ }
       this.groups.clear()
-      this.decisions = []
       return this
     }
   }
@@ -289,10 +320,9 @@ export class PresenceEngine {
       fs.mkdirSync(this.dir, { recursive: true })
       const tmp = `${this.file}.tmp`
       fs.writeFileSync(tmp, JSON.stringify({
-        version: 1,
+        version: 2,
         updatedAt: this.now(),
         groups: Object.fromEntries(this.groups),
-        decisions: this.decisions.slice(-MAX_DECISIONS),
       }, null, 2))
       fs.renameSync(tmp, this.file)
       this._dirty = false
@@ -321,13 +351,15 @@ export class PresenceEngine {
     this._dirty = true
   }
 
-  /** 记录一条决策。 */
+  /** 记录一条决策（写进该群自己的 20 条）。 */
   noteDecision({ key, verdict, reason, score = 0, text = '' }) {
-    this.decisions.push({
-      at: this.now(), key, verdict, reason, score,
+    const state = this.groupOf(key)
+    const row = {
+      at: this.now(), verdict, reason, score,
       ...(text === '' ? {} : { text: text.slice(0, 60) }),
-    })
-    if (this.decisions.length > MAX_DECISIONS) this.decisions = this.decisions.slice(-MAX_DECISIONS)
+    }
+    state.decisions = [...(state.decisions ?? []), row].slice(-MAX_GROUP_DECISIONS)
+    this.groups.set(key, state)
     this._dirty = true
     this.log?.({ key, verdict, reason, score, text })
   }
@@ -363,6 +395,11 @@ export class PresenceEngine {
       const conf = this.getConfig()
       this.lastTickAt = now
       const stats = { sensed: 0, evaluated: 0, spoke: 0, skipped: 0 }
+      // 总闸未开 = 引擎停摆：连感知都不跑，也不写日志（避免满屏无意义 skip）。
+      if (conf.engine !== true) {
+        this.lastTickStats = stats
+        return
+      }
       const snaps = await this.sense()
       stats.sensed = Array.isArray(snaps) ? snaps.length : 0
       if (!Array.isArray(snaps) || snaps.length === 0) {
@@ -437,24 +474,43 @@ export class PresenceEngine {
     }
   }
 
-  /** UI 视图。 */
+  /**
+   * UI 视图。
+   *
+   * v2.0 第二十九步：决策改成**分群存**——
+   *   · `groups[i].decisions` 给单群 Tab（每群最近 20 条）；
+   *   · `decisions` 是全局视图的合并摘要（按时间倒序取最近 limit 条）。
+   */
   view(limit = 20) {
+    const conf = this.getConfig()
+    const now = this.now()
+    const groups = [...this.groups.entries()].slice(0, 20).map(([key, state]) => ({
+      key,
+      status: state.status,
+      coolUntil: Number(state.coolUntil) || 0,
+      waitingSince: Number(state.waitingSince) || 0,
+      ignoredStreak: Number(state.ignoredStreak) || 0,
+      speakLastHour: (state.speakStamps ?? []).filter((stamp) => now - stamp < HOUR_MS).length,
+      lastEvalAt: Number(state.lastEvalAt) || 0,
+      lastSpeakAt: Number(state.lastSpeakAt) || 0,
+      decisions: (state.decisions ?? []).slice(-MAX_GROUP_DECISIONS),
+    }))
+    // 全局视图：从各群合并，按时间倒序。
+    const merged = []
+    for (const [key, state] of this.groups) {
+      for (const row of state.decisions ?? []) merged.push({ ...row, key })
+    }
+    merged.sort((left, right) => (Number(right.at) || 0) - (Number(left.at) || 0))
     return {
-      enabled: this.getConfig().enabled === true,
-      tickMs: this.getConfig().tickMs,
+      engine: conf.engine === true,
+      enabled: conf.enabled === true,
+      // 演练 = 引擎开着但真实发送关着。
+      dryRun: conf.engine === true && conf.enabled !== true,
+      tickMs: conf.tickMs,
       lastTickAt: this.lastTickAt,
       stats: { ...this.lastTickStats },
-      groups: [...this.groups.entries()].slice(0, 20).map(([key, state]) => ({
-        key,
-        status: state.status,
-        coolUntil: Number(state.coolUntil) || 0,
-        waitingSince: Number(state.waitingSince) || 0,
-        ignoredStreak: Number(state.ignoredStreak) || 0,
-        speakLastHour: (state.speakStamps ?? []).filter((stamp) => this.now() - stamp < HOUR_MS).length,
-        lastEvalAt: Number(state.lastEvalAt) || 0,
-        lastSpeakAt: Number(state.lastSpeakAt) || 0,
-      })),
-      decisions: this.decisions.slice(-limit),
+      groups,
+      decisions: merged.slice(0, Math.max(1, limit)),
     }
   }
 }

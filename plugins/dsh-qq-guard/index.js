@@ -322,6 +322,9 @@ const DEFAULT_PLUGINS = [
     desc: 'deny-by-default 的工具白名单，把本地执行能力彻底挡在 QQ 会话之外。' },
   { id: 'pl-persona', name: '人设注入', icon: 'spark', tag: '本地', ver: '1.2.1', enabled: true,
     desc: '把全局人设或会话级覆盖注入系统提示词，complete 模式下不掺入任何框架自述。' },
+  // 主动感知（v2.0 第二十九步）：引擎总闸。缺项按**关闭**（与开发者特权同类，fail-closed）。
+  { id: 'pl-proactive', name: '主动感知', icon: 'activity', tag: '本地', ver: '1.0.0', enabled: false,
+    desc: '常驻 tick 感知群聊活跃度，规则达标才考虑主动说话。还需要单群授权才会真的开口。' },
   { id: 'pl-archive', name: '日志归档', icon: 'file', tag: '实验', ver: '0.8.2', enabled: false,
     desc: '把桥接日志与收到的截图按日期归档到工作区，方便事后复盘。' },
 ]
@@ -1071,8 +1074,11 @@ const Config = Schema.object({
     }).description('指令禁言').default({}),
   }).description('运行节奏').default({}),
   proactive: Schema.object({
+    engine: Schema.boolean()
+      .description('引擎总闸（卡片「主动感知」的开关同步到这里）。关闭 = 引擎停摆，连感知都不跑。')
+      .default(false).volatile(),
     enabled: Schema.boolean()
-      .description('主动感知总开关。关闭时只写 dry-run 决策日志，不调模型、不发消息。')
+      .description('真实发送开关。关闭 = 演练模式：只写决策日志，不调模型、不发消息。')
       .default(false).volatile(),
     tickMs: Schema.number()
       .description('感知 tick 间隔(ms)：10~30 秒。')
@@ -1373,6 +1379,8 @@ export function readFeatureFlags(config = featureState.source) {
     unread: itemEnabledOr(config, 'sk-unread', true),
     // 开发者特权（v2.0）：与其它新卡相反 —— 缺项按**关闭**，提权通道必须 fail-closed。
     developer: itemEnabledOr(config, 'sk-developer', false),
+    // 主动感知（v2.0 第二十九步）：同样是新能力，缺项按**关闭**（fail-closed）。
+    proactive: itemEnabledOr(config, 'pl-proactive', false),
     guard: itemEnabledIn(config, 'pl-guard', 'plugin'),
     debounce: itemEnabledIn(config, 'pl-debounce', 'plugin'),
     rateLimit: itemEnabledIn(config, 'pl-ratelimit', 'plugin'),
@@ -1506,6 +1514,7 @@ function enqueueSessionOp(op, key, text = '', extra = {}) {
     ...(typeof extra.file === 'string' && extra.file !== '' ? { file: extra.file } : {}),
     ...(typeof extra.qq === 'string' && extra.qq !== '' ? { qq: extra.qq } : {}),
     ...(typeof extra.mode === 'string' && extra.mode !== '' ? { mode: extra.mode } : {}),
+    ...(extra.enabled === true ? { enabled: true } : {}),
     at: Date.now(), lease: 0,
   })
   while (sessionOpsQueue.size > SESSION_OPS_CAP) {
@@ -3148,6 +3157,17 @@ function sanitizePresence(value) {
     const parsed = Number(input)
     return Number.isFinite(parsed) && parsed >= 0 ? Math.min(parsed, max) : 0
   }
+  // 决策行白名单（单群 Tab 与全局视图共用同一套）。
+  const decisionRow = (item) => ({
+    at: num(item?.at, 8.64e15),
+    key: text(item?.key, 40),
+    verdict: ['speak', 'silent', 'skip', 'dry-run', 'send-failed'].includes(item?.verdict)
+      ? item.verdict
+      : 'skip',
+    reason: text(item?.reason, 200),
+    score: Math.min(50, num(item?.score, 50)),
+    text: text(item?.text, 60),
+  })
   const groups = Array.isArray(value.groups)
     ? value.groups.slice(0, 20).map((item) => ({
       key: text(item?.key, 40),
@@ -3157,22 +3177,18 @@ function sanitizePresence(value) {
       ignoredStreak: Math.min(10, num(item?.ignoredStreak, 10)),
       speakLastHour: Math.min(20, num(item?.speakLastHour, 20)),
       lastSpeakAt: num(item?.lastSpeakAt, 8.64e15),
+      // v2.0 第二十九步：单群决策记录（每群最多 20 条）。
+      decisions: Array.isArray(item?.decisions) ? item.decisions.slice(-20).map(decisionRow) : [],
     })).filter((item) => item.key !== '')
     : []
   const decisions = Array.isArray(value.decisions)
-    ? value.decisions.slice(-20).map((item) => ({
-      at: num(item?.at, 8.64e15),
-      key: text(item?.key, 40),
-      verdict: ['speak', 'silent', 'skip', 'dry-run', 'send-failed'].includes(item?.verdict)
-        ? item.verdict
-        : 'skip',
-      reason: text(item?.reason, 200),
-      score: Math.min(50, num(item?.score, 50)),
-      text: text(item?.text, 60),
-    }))
+    ? value.decisions.slice(-20).map(decisionRow)
     : []
   return {
+    // 三层开关（v2.0 第二十九步）：engine=总闸，enabled=真实发送，dryRun=演练中。
+    engine: value.engine === true,
     enabled: value.enabled === true,
+    dryRun: value.dryRun === true,
     tickMs: num(value.tickMs, 60_000),
     lastTickAt: num(value.lastTickAt, 8.64e15),
     stats: {
@@ -3231,6 +3247,8 @@ function sanitizeSessionRow(row) {
         .filter((qq) => /^\d{5,15}$/u.test(qq)))]
         .slice(0, 50)
       : [],
+    // v2.0 第二十九步：单群主动感知授权（第 5 个 Tab 的开关状态）。
+    proactiveEnabled: row.proactiveEnabled === true,
     // 单人设回填（会话详情里的输入框要显示已保存的值）。多行不能压成单行，
     // 只裁掉首尾空白与长度，换行原样保留。
     persona: textPreservingLines(row.persona, 20000),
@@ -4496,6 +4514,7 @@ function applySettings(ctx, config) {
               ...(typeof op.file === 'string' && op.file !== '' ? { file: op.file } : {}),
               ...(typeof op.qq === 'string' && op.qq !== '' ? { qq: op.qq } : {}),
               ...(typeof op.mode === 'string' && op.mode !== '' ? { mode: op.mode } : {}),
+              ...(op.enabled === true ? { enabled: true } : {}),
             })
           }
           sendJson(res, 200, { ok: true, ops })
@@ -4532,7 +4551,8 @@ function applySettings(ctx, config) {
         // 桥接侧会生成前情提要 → 归档旧会话 → 新建同名会话。
         // 两者都不是 QQ 消息，桥接侧标 origin=console，**不冒充主人**（权限仍只认事件 QQ 号）。
         if (!['clear', 'delete', 'persona', 'activity', 'summarize', 'manual-summarize', 'dynamic', 'briefing',
-          'global-memory', 'task', 'forget', 'undo-forget', 'restore-backup', 'user-blacklist'].includes(op)) {
+          'global-memory', 'task', 'forget', 'undo-forget', 'restore-backup', 'user-blacklist',
+          'proactive'].includes(op)) {
           sendJson(res, 400, { ok: false, reason: 'unknown-op', detail: `未知操作：${op || '(空)'}` })
           return
         }
@@ -4599,6 +4619,8 @@ function applySettings(ctx, config) {
           extra.qq = qq
           extra.mode = body?.mode === 'remove' ? 'remove' : 'add'
         }
+        // v2.0 第二十九步：单群主动感知授权。
+        if (op === 'proactive') extra.enabled = body?.enabled === true
         // v2.0 第二十六步：记忆治理。
         if (op === 'forget') {
           const field = typeof body?.field === 'string' ? body.field.trim().slice(0, 40) : ''

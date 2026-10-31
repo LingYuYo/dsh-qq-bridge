@@ -1847,29 +1847,45 @@ window.__ModuleLoader__.load({
     }
 
     /** 主动感知：tick 状态 / 上次决策 / 冷却时间（v2.0 第二十八步）。 */
+    /**
+     * 主动感知（全局视角，v2.0 第二十九步）。
+     *
+     * 只回答「引擎跑了没 / 在演练还是真发 / 授权了几个群 / 谁在冷却」。
+     * 单群的决策日志已经搬到「会话管理 → 单群 → 主动感知 Tab」，这里不再重复。
+     */
     function PresenceSection({ live, get, write, writable }) {
       const presence = live && typeof live.presence === 'object' ? live.presence : null
-      const enabled = get('proactive.enabled') === true
+      const engineOn = presence ? presence.engine === true : false
+      const realSend = get('proactive.enabled') === true
       const hourText = (() => {
         const start = Number(get('proactive.dayStartHour'))
         const end = Number(get('proactive.dayEndHour'))
         return `${Number.isFinite(start) ? start : 9}-${Number.isFinite(end) ? end : 23} 点`
       })()
-      const verdictLabel = (verdict) => ({
-        speak: '已发言', silent: '选择沉默', skip: '跳过', 'dry-run': '演练（未发送）', 'send-failed': '发送失败',
-      }[verdict] ?? verdict)
-      const decisions = presence?.decisions ? presence.decisions.slice(-8).reverse() : []
       const groups = presence?.groups ?? []
       const cooling = groups.filter((item) => item.status === 'cooling' && item.coolUntil > Date.now())
+      // 授权群从会话列表读（status.sessions[i].proactiveEnabled），与桥接同一份数据。
+      const sessions = Array.isArray(live?.sessions) ? live.sessions : []
+      const authorizedKeys = sessions
+        .filter((row) => row && row.kind === 'group' && row.proactiveEnabled === true)
+        .map((row) => row.key)
+      const totalSpeaks = groups.reduce((sum, item) => sum + (Number(item.speakLastHour) || 0), 0)
 
       return h(Panel, {
         title: '主动感知',
-        desc: '常驻 tick 先跑规则闸门，只有打分达阈值才问模型；默认关闭时只记 dry-run 决策。',
+        desc: '常驻 tick 先跑规则闸门，只有打分达阈值才问模型。三层开关缺一不可，单群授权在会话详情里。',
         right: h(React.Fragment, null,
-          h('span', { className: 'qqg-pill' + (enabled ? ' qqg-pill-accent' : '') },
-            enabled ? '运行中' : '已关闭（dry-run）'),
+          h('span', { className: 'qqg-pill' + (engineOn ? ' qqg-pill-accent' : '') },
+            engineOn ? '引擎运行中' : '引擎已停摆'),
+          h('span', { className: 'qqg-pill' + (engineOn && !realSend ? ' qqg-pill-accent' : '') },
+            realSend ? '真实发送' : '演练模式'),
           h('span', { className: 'qqg-pill' }, `tick ${Math.round((presence?.tickMs ?? 20000) / 1000)}s`)),
       },
+        !engineOn
+          ? h('div', { className: 'qqg-status' },
+            '引擎已停摆：插件卡片「主动感知」没开。去「技能与插件 → 主动感知」打开后，'
+            + '才会开始扫描群聊活跃度。')
+          : null,
         h('div', { className: 'qqg-list' },
           h('div', { className: 'qqg-kv' }, h('span', null, '最近 tick'),
             h('b', null, presence?.lastTickAt > 0 ? sessionTime(presence.lastTickAt) : '（还没跑过）')),
@@ -1877,6 +1893,12 @@ window.__ModuleLoader__.load({
             h('b', null, presence
               ? `感知 ${presence.stats.sensed} 群 / 候选 ${presence.stats.candidates ?? 0} / 评估 ${presence.stats.evaluated} / 发言 ${presence.stats.spoke}`
               : '—')),
+          h('div', { className: 'qqg-kv' }, h('span', null, '已授权群'),
+            h('b', null, authorizedKeys.length === 0
+              ? '（0 个：去会话详情打开单群开关）'
+              : `${authorizedKeys.length} 个（${authorizedKeys.slice(0, 3).join('、')}${authorizedKeys.length > 3 ? '…' : ''}）`)),
+          h('div', { className: 'qqg-kv' }, h('span', null, '本小时合计发言'),
+            h('b', null, `${totalSpeaks} 次`)),
           h('div', { className: 'qqg-kv' }, h('span', null, '冷却中'),
             h('b', null, cooling.length === 0
               ? '（无）'
@@ -1889,19 +1911,14 @@ window.__ModuleLoader__.load({
         h('div', { className: 'qqg-textarea-actions' },
           h('button', {
             type: 'button',
-            className: 'qqg-btn' + (enabled ? ' qqg-btn-danger' : ' qqg-btn-primary'),
+            className: 'qqg-btn' + (realSend ? ' qqg-btn-danger' : ' qqg-btn-primary'),
             disabled: !writable,
-            onClick: () => write('proactive.enabled', !enabled),
-          }, enabled ? '关闭主动感知' : '开启主动感知')),
-        decisions.length === 0
-          ? h('div', { className: 'qqg-hint' },
-            '还没有决策记录。默认关闭模式下，闸门通过的群会写一条 dry-run 决策，观察几晚再开。')
-          : h('div', { className: 'qqg-list' }, decisions.map((row, index) => h('div', {
-            className: 'qqg-kv', key: `${row.at}-${index}`,
-          },
-          h('span', { className: 'qqg-mono' }, sessionTime(row.at)),
-          h('b', null, `${row.key} · ${verdictLabel(row.verdict)}`),
-          h('span', { className: 'qqg-profile-old' }, row.reason))))))
+            onClick: () => write('proactive.enabled', !realSend),
+          }, realSend ? '关闭真实发送（回到演练）' : '打开真实发送')),
+        h('div', { className: 'qqg-hint' },
+          engineOn
+            ? '各群的决策记录在「会话管理 → 单群 → 主动感知」Tab 里看，这里只汇总全局状态。'
+            : '把插件卡片打开后，这里开始显示 tick 与授权群状态。')))
     }
 
     /* ══════════ 系统日志 Tab（v2.0 第七步，2026-10-28）══════════ */
@@ -3783,6 +3800,8 @@ window.__ModuleLoader__.load({
     const SESSION_DETAIL_TABS = [
       { id: 'basic', label: '基础配置' },
       { id: 'memory', label: '记忆与摘要' },
+      // 主动感知（v2.0 第二十九步）：单群授权 + 本群冷却/决策。只对群聊显示。
+      { id: 'proactive', label: '主动感知', groupOnly: true },
       { id: 'privilege', label: '特权与权限' },
       { id: 'debug', label: '调试信息' },
     ]
@@ -4043,16 +4062,21 @@ window.__ModuleLoader__.load({
             // 连带左栏列表 / 其它 Tab 一起重渲染。草稿 state 仍留在 SessionsTab，
             // 切走再切回不会丢（组件用 key=cur.key 重新挂载，只清 Tab 内的临时提示）。
             h('div', { className: 'qqg-dtabs', role: 'tablist', 'aria-label': '会话详情分页' },
-              SESSION_DETAIL_TABS.map((tab) => h('button', {
-                key: tab.id,
-                type: 'button',
-                role: 'tab',
-                'aria-selected': detailTab === tab.id ? 'true' : 'false',
-                className: 'qqg-dtab' + (detailTab === tab.id ? ' qqg-dtab-on' : ''),
-                onClick: () => setDetailTab(tab.id),
-              }, tab.label))),
+              SESSION_DETAIL_TABS
+                // 主动感知只对群聊有意义（私聊没有「群活跃度」）。
+                .filter((tab) => !tab.groupOnly || cur.kind === 'group')
+                .map((tab) => h('button', {
+                  key: tab.id,
+                  type: 'button',
+                  role: 'tab',
+                  'aria-selected': detailTab === tab.id ? 'true' : 'false',
+                  className: 'qqg-dtab' + (detailTab === tab.id ? ' qqg-dtab-on' : ''),
+                  onClick: () => setDetailTab(tab.id),
+                }, tab.label))),
             detailTab === 'memory'
               ? h(SessionMemoryTab, { key: cur.key, session: cur, live })
+              : detailTab === 'proactive' && cur.kind === 'group'
+                ? h(SessionProactiveTab, { key: cur.key, session: cur, live, get })
               : detailTab === 'privilege'
                 ? h(SessionPrivilegeTab, { key: cur.key, session: cur, get, write, writable })
                 : detailTab === 'debug'
@@ -5003,6 +5027,98 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * Tab · 主动感知（v2.0 第二十九步，仅群聊）。
+     *
+     * 三重开关的第三层：本群授权。顶部固定显示前两层（引擎总闸 / 演练模式）的状态，
+     * 防止「开了本群却没反应」——这是用户明确要求的防呆红线。
+     */
+    function SessionProactiveTab({ session, live, get }) {
+      const presence = live && typeof live.presence === 'object' ? live.presence : null
+      const engineOn = presence ? presence.engine === true : false
+      const dryRunning = presence ? presence.dryRun === true : false
+      const authorized = session.proactiveEnabled === true
+      const mine = presence?.groups?.find((item) => item.key === session.key) ?? null
+      const decisions = Array.isArray(mine?.decisions) ? mine.decisions.slice(-10).reverse() : []
+      const cooling = mine && mine.status === 'cooling' && mine.coolUntil > Date.now()
+      const [busy, setBusy] = React.useState(false)
+      const [note, setNote] = React.useState(null)
+
+      const toggle = async () => {
+        setBusy(true)
+        setNote(null)
+        try {
+          const result = await postSessionOp({
+            op: 'proactive', key: session.key, enabled: !authorized,
+          })
+          setNote(result?.ok
+            ? { kind: 'ok', text: authorized ? '已关闭本群主动感知。' : '已开启本群主动感知。' }
+            : { kind: 'err', text: '操作失败：' + (result?.error ?? 'unknown') })
+        } catch (error) {
+          setNote({ kind: 'err', text: '操作失败：' + (error?.message ?? error) })
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const verdictLabel = (verdict) => ({
+        speak: '已发言', silent: '选择沉默', skip: '跳过', 'dry-run': '演练', 'send-failed': '发送失败',
+      }[verdict] ?? verdict)
+
+      return h('div', { className: 'qqg-dstack' },
+        h(Panel, {
+          title: '主动感知（本群）',
+          desc: '三层开关缺一不可：插件卡片 + 允许真实发送 + 本群授权。这里只管第三层。',
+          right: h('span', { className: 'qqg-pill' + (authorized ? ' qqg-pill-accent' : '') },
+            authorized ? '已授权' : '未授权'),
+        },
+          // 防呆红线：前两层没开时，用醒目的提示压在最上面。
+          !engineOn
+            ? h('div', { className: 'qqg-status qqg-status-err' },
+              '全局引擎未开启：现在打开本群开关也不会有任何效果。'
+              + '先去「技能与插件 → 主动感知」把插件卡片打开。')
+            : dryRunning
+              ? h('div', { className: 'qqg-status' },
+                '演练模式：引擎在跑规则，但不会调模型、不会发消息。'
+                + '要真开口，去「技能与插件 → 主动感知」打开「允许真实发送」。')
+              : null,
+          h('div', { className: 'qqg-list' },
+            h('div', { className: 'qqg-kv' }, h('span', null, '本群开关'),
+              h('b', null, authorized ? '已开启' : '未开启')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '引擎状态'),
+              h('b', null, engineOn ? (dryRunning ? '运行中（演练）' : '运行中（真实发送）') : '已停摆')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '当前冷却'),
+              h('b', null, cooling ? `至 ${sessionTime(mine.coolUntil)}` : '（无）')),
+            h('div', { className: 'qqg-kv' }, h('span', null, '本小时发言'),
+              h('b', null, `${mine?.speakLastHour ?? 0} / ${get('proactive.hourlyLimit') ?? 2}`))),
+          h('div', { className: 'qqg-textarea-actions' },
+            h('button', {
+              type: 'button',
+              className: 'qqg-btn' + (authorized ? ' qqg-btn-danger' : ' qqg-btn-primary'),
+              disabled: busy,
+              onClick: () => { void toggle() },
+            }, busy ? '处理中…' : (authorized ? '关闭本群主动感知' : '开启本群主动感知'))),
+          note
+            ? h('div', { className: 'qqg-status' + (note.kind === 'err' ? ' qqg-status-err' : '') },
+              note.text)
+            : null),
+        h(Panel, {
+          title: '本群决策记录',
+          desc: '最近 10 条（每群最多留 20 条），含「跳过」的理由——看得懂为什么没说话。',
+        },
+          decisions.length === 0
+            ? h('div', { className: 'qqg-hint' },
+              authorized
+                ? '还没有记录。引擎每 10~30 秒扫一次，闸门通过才会写一条。'
+                : '本群还没授权，引擎不会评估这个群，也就不会有记录。')
+            : h('div', { className: 'qqg-list' }, decisions.map((row, index) => h('div', {
+              className: 'qqg-kv', key: `${row.at}-${index}`,
+            },
+            h('span', { className: 'qqg-mono' }, sessionTime(row.at)),
+            h('b', null, verdictLabel(row.verdict)),
+            h('span', { className: 'qqg-profile-old' }, row.reason))))))
+    }
+
     /** Tab 3 · 特权与权限：三阶名单 + 白名单/黑名单快捷操作。 */
     function SessionPrivilegeTab({ session, get, write, writable }) {
       const asList = (value) => (Array.isArray(value) ? value.map(String) : [])
@@ -5231,7 +5347,7 @@ window.__ModuleLoader__.load({
     const IMPLEMENTED_IDS = {
       skill: ['sk-voice', 'sk-vision', 'sk-search', 'sk-image', 'sk-poke', 'sk-quote',
         'sk-memory', 'sk-time-aware', 'sk-unread', 'sk-developer'],
-      plugin: ['pl-guard', 'pl-debounce', 'pl-ratelimit'],
+      plugin: ['pl-guard', 'pl-debounce', 'pl-ratelimit', 'pl-proactive'],
     }
 
     /* ── 技能 / 插件弹窗：真实配置字段表 ─────────────────────── */
@@ -5539,9 +5655,71 @@ window.__ModuleLoader__.load({
           hint: '开启后超限直接丢弃，不回复提示。',
         },
       ],
+      // 主动感知（v2.0 第二十九步）：引擎总闸 + 真实发送 + 全部可调参数。
+      // 卡片开关（tile enabled）本身就是引擎总闸，这里的 `proactive.engine` 由它在
+      // Host 侧同步下来；弹窗顶部会显示三层状态，防止「开了单群却没反应」。
+      'pl-proactive': [
+        {
+          path: 'proactive.enabled', type: 'switch', label: '允许真实发送',
+          hint: '关闭 = 演练模式：只写决策日志，不调模型、不发消息。建议先观察几晚再开。',
+        },
+        {
+          path: 'proactive.tickMs', type: 'number', label: '扫描间隔（毫秒）',
+          min: 10000, max: 30000, step: 1000,
+          hint: '每多少毫秒扫一次群聊活跃度。10~30 秒；越短感知越灵敏，也越耗 CPU。',
+        },
+        {
+          path: 'proactive.minSilenceMin', type: 'number', label: '安静阈值·下限（分钟）',
+          min: 5, max: 1440, step: 5,
+          hint: '群安静超过这么久才考虑插嘴（甜区起点）。',
+        },
+        {
+          path: 'proactive.maxSilenceMin', type: 'number', label: '安静阈值·上限（分钟）',
+          min: 10, max: 2880, step: 5,
+          hint: '安静超过这么久就不插嘴了（死群不喊）。',
+        },
+        {
+          path: 'proactive.scoreThreshold', type: 'number', label: '打分阈值',
+          min: 0, max: 20, step: 1,
+          hint: '规则打分达到这个值才问模型。调高 = 更少但更谨慎的主动发言。',
+        },
+        {
+          path: 'proactive.dayStartHour', type: 'number', label: '白天窗口·开始（点）',
+          min: 0, max: 23, step: 1,
+          hint: '这个小时（含）之后才允许主动说话。',
+        },
+        {
+          path: 'proactive.dayEndHour', type: 'number', label: '白天窗口·结束（点）',
+          min: 1, max: 24, step: 1,
+          hint: '这个小时（不含）之后不再主动说话。',
+        },
+        {
+          path: 'proactive.hourlyLimit', type: 'number', label: '单群每小时上限',
+          min: 1, max: 10, step: 1,
+          hint: '安全刹车：单个群每小时最多主动发言几次。',
+        },
+        {
+          path: 'proactive.noReplyMinutes', type: 'number', label: '无人接茬判定（分钟）',
+          min: 1, max: 120, step: 1,
+          hint: '主动发言后多久没人说话算「被无视」。',
+        },
+        {
+          path: 'proactive.cooldownHours', type: 'number', label: '冷却时长（小时）',
+          min: 1, max: 48, step: 1,
+          hint: '连续两次被无视后，这个群停止主动发言多久。',
+        },
+        {
+          path: 'proactive.evalIntervalMin', type: 'number', label: '评估节流（分钟）',
+          min: 5, max: 1440, step: 5,
+          hint: '同一群两次评估的最小间隔，控制 token 成本。',
+        },
+        {
+          path: 'proactive.minDailyMessages', type: 'number', label: '最低日活条数',
+          min: 0, max: 1000, step: 5,
+          hint: '当天消息少于这个数就当死群，不主动说话。',
+        },
+      ],
     }
-
-    /** 未实装条目的「开发中」原因：齿轮可点，但只说明状态，不摆假表单。 */
     const TILE_DEV_REASON = {
       'sk-remind': '定时提醒还没实装，桥接侧没有对应实现。',
       'sk-weather': '天气查询还是实验条目，接口和触发词都没定。',
@@ -5566,6 +5744,21 @@ window.__ModuleLoader__.load({
         ? '未配置 Key：QQ 会话里调 web_search 会直接报错（WEB_PROVIDER_CREDENTIAL_MISSING）；'
           + '填入 DeepSeek Platform 的 Key 并保存后生效。'
         : null),
+      // 主动感知（v2.0 第二十九步）：卡片开着但真实发送关着时，必须明确说「这是演练」，
+      // 否则用户会以为开了却一直没动静。
+      'pl-proactive': (valueOf, get) => {
+        const authorized = (Array.isArray(get('sessions')) ? get('sessions') : [])
+          .filter((row) => row && row.kind === 'group' && row.proactiveEnabled === true)
+        const enabled = valueOf('proactive.enabled') === true
+        if (!enabled) {
+          return '演练模式：引擎在跑规则、写决策日志，但不会调模型也不会发消息。'
+            + `已授权群 ${authorized.length} 个。想让机器人真开口，把「允许真实发送」打开。`
+        }
+        if (authorized.length === 0) {
+          return '真实发送已开，但还没有任何群被授权：去「会话管理 → 单群 → 主动感知」打开「开启本群主动感知」。'
+        }
+        return null
+      },
       // 开发者特权：三件事任一没配好，暗号就是「开了但没用」——必须在弹窗顶部说清楚，
       // 否则用户会以为桥接坏了。
       'sk-developer': (valueOf, get) => {
@@ -5586,6 +5779,19 @@ window.__ModuleLoader__.load({
      * 代理是 DSH 启动期决定的事（只读启动环境变量），插件侧改不了，所以这里只给操作办法。
      */
     const TILE_MODAL_NOTES = {
+      // 主动感知（v2.0 第二十九步）：三层开关的防呆红线，放在弹窗最顶部。
+      'pl-proactive': [
+        {
+          title: '三层开关，缺一个都不会开口',
+          text: '① 这张卡片（引擎总闸）→ ② 「允许真实发送」（关着是演练）→ '
+            + '③ 每个群自己的「开启本群主动感知」（会话管理 → 单群 → 主动感知 Tab）。',
+        },
+        {
+          title: '演练模式说明',
+          text: '「允许真实发送」关着时，引擎照样跑规则、写决策日志，但绝不调模型、不发消息。'
+            + '建议先观察几晚的 dry-run 记录，确认规则符合群习惯再打开。',
+        },
+      ],
       'sk-search': [
         {
           title: 'web_fetch 走代理的现状',
