@@ -1036,6 +1036,8 @@ export function normalizeSessionEntry(key, raw) {
     userProfiles: normalizeUserProfiles(value.userProfiles),
     // 本群黑话词条（v2.0 第十一步）：对象数组，单群同名 term 覆盖全局。
     slang: normalizeSlangList(value.slang),
+    // 单群群友黑名单（v2.0 第二十七步）：命中者在入口直接静默丢弃。
+    userBlacklist: normalizeQqList(value.userBlacklist),
   }
 }
 
@@ -1072,6 +1074,13 @@ export function normalizePersonaOverride(value) {
 }
 
 /** 归一化群友档案：只认数字 QQ，字段全部收敛，防止 state 被写脏。 */
+/** 单群群友黑名单：只保留合法 QQ、去重、最多 50 个（v2.0 第二十七步）。 */
+function normalizeQqList(value) {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value.map((item) => String(item ?? '').trim()).filter((qq) => /^\d{5,15}$/u.test(qq)))]
+    .slice(0, 50)
+}
+
 function normalizeUserProfiles(value) {
   const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
   const out = {}
@@ -1499,6 +1508,8 @@ export class Bridge {
       silent: 0,
       // 群休眠中丢弃的消息数（v2.0 第二十五步）。
       sleeping: 0,
+      // 群友黑名单丢弃的消息数（v2.0 第二十七步）。
+      blacklisted: 0,
     }
   }
 
@@ -2523,6 +2534,8 @@ export class Bridge {
         // v2.0 第十一步：黑话词条（对象数组，单群）与合并视图（UI 标签展示用）。
         slang: normalizeSlangList(entry.slang),
         mergedSlang: this._mergedSlang(key),
+        // v2.0 第二十七步：单群群友黑名单（UI 增删用）。
+        userBlacklist: normalizeQqList(entry.userBlacklist),
         // v2.0 第二十五步：主人级休眠截止时间（UI 显示 💤 与剩余时间）。
         mutedUntil: Number(entry.mutedUntil) || 0,
         // L2 摘要：手动截断留下的前情提要（UI 用名册美化展示 / 手动编辑）。
@@ -3058,6 +3071,25 @@ export class Bridge {
       this._personaSignatures?.clear?.()
       this._logOp('info', `已恢复备份：${op?.file}（${JSON.stringify(result.restored)}）`)
       return { ok: true, action, key, restored: result.restored }
+    }
+
+    // v2.0 第二十七步：单群群友黑名单（设置页卡片用）。
+    if (action === 'user-blacklist') {
+      const qq = String(op?.qq ?? '').trim()
+      if (!/^\d{5,15}$/u.test(qq)) return { ok: false, error: 'bad-qq', action, key }
+      const target = this._entryOf(key)
+      const list = normalizeQqList(target.userBlacklist)
+      if (String(op?.mode ?? 'add') === 'add') {
+        if (!list.includes(qq)) list.push(qq)
+      } else {
+        const index = list.indexOf(qq)
+        if (index < 0) return { ok: false, error: 'not-in-list', action, key }
+        list.splice(index, 1)
+      }
+      target.userBlacklist = list.slice(0, 50)
+      this._saveState()
+      this._logOp('info', `群友黑名单变更（UI）：${key} ${maskQq(qq)}`)
+      return { ok: true, action, key, userBlacklist: target.userBlacklist }
     }
 
     // v2.0 第二十四步：删除跨群记忆 / 定时任务（设置页列表用）。
@@ -4184,6 +4216,14 @@ export class Bridge {
       return
     }
     const key = this.keyOf(msg)
+    // v2.0 第二十七步：单群群友黑名单——极早期静默丢弃。
+    // 主人/开发者例外：否则误加自己就再也解不开。
+    const blacklist = this.state.sessions?.[key]?.userBlacklist
+    if (Array.isArray(blacklist) && blacklist.includes(String(msg.userId)) && !this.isOwner(msg)) {
+      this.stats.blacklisted++
+      this.logger.info?.(`群友黑名单命中：${key} sender=${maskQq(msg.userId)}，静默丢弃`)
+      return
+    }
     // v2.0 第二十五步：休眠 / 唤醒必须**最先**判定（连群友档案都不更新）。
     // 顺序：先放行「起床」（否则睡着后主人也叫不醒），再丢弃休眠中的一切消息。
     const earlyText = stripLeadingMentions(msg?.text ?? '')
@@ -4354,6 +4394,8 @@ export class Bridge {
       // v2.0 第二十六步：记忆治理（遗忘 / 撤销删除）。
       if (await this._handleForgetCommand(msg, commandText, key)) return
       if (await this._handleUndoForgetCommand(msg, commandText, key)) return
+      // v2.0 第二十七步：单群群友黑名单（主人/开发者）。
+      if (await this._handleBlacklistCommand(msg, commandText, key)) return
     }
     // 口述建任务（不带 `/`）：「@小鱼 定时任务：每天9点发早安」。
     // 必须在投递 DSH **之前**拦截：普通群友发的一律拒绝，绝不让模型去解析。
@@ -6341,6 +6383,44 @@ export class Bridge {
       }
     }
     return { ok: verifyOk, kind: 'l3', removed: targets.length, verify: { ok: verifyOk } }
+  }
+
+  /**
+   * `/黑名单 [加|删] <QQ>`（v2.0 第二十七步）：单群群友黑名单，仅主人/开发者。
+   * 不带参数时列出当前名单。
+   */
+  async _handleBlacklistCommand(msg, text, key) {
+    const hit = /^\/黑名单(?:\s+(加|删)\s+(\d{5,15}))?$/u.exec(String(text ?? '').trim())
+    if (!hit) return false
+    if (!this.isOwner(msg)) {
+      const sent = await this._send(msg, '⚠️ 权限不足：只有主人 / 开发者能改群友黑名单。')
+      if (!(sent && sent.ok === false)) this._noteReplied(key)
+      return true
+    }
+    const entry = this._entryOf(key)
+    const current = normalizeQqList(entry.userBlacklist)
+    if (!hit[1]) {
+      await this._send(msg, current.length === 0
+        ? '本群还没有群友黑名单。用法：/黑名单 加 12345'
+        : `本群群友黑名单（${current.length}）：${current.join('、')}`)
+      return true
+    }
+    const qq = hit[2]
+    if (hit[1] === '加') {
+      if (!current.includes(qq)) current.push(qq)
+    } else if (!current.includes(qq)) {
+      await this._send(msg, `这个 QQ 不在黑名单里：${qq}`)
+      return true
+    } else {
+      current.splice(current.indexOf(qq), 1)
+    }
+    entry.userBlacklist = current.slice(0, 50)
+    this._saveState()
+    this._logOp('info', `群友黑名单 ${hit[1]}：${key} ${maskQq(qq)}`)
+    await this._send(msg, hit[1] === '加'
+      ? `已把 ${qq} 加入本群黑名单：他之后的消息会被静默丢弃。`
+      : `已把 ${qq} 移出本群黑名单。`)
+    return true
   }
 
   /** `/遗忘 [范围]`：仅主人 / 开发者。 */

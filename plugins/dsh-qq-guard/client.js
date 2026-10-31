@@ -4957,6 +4957,33 @@ window.__ModuleLoader__.load({
       const inDeny = asList(get(denyPath)).includes(target)
       const roleOf = (list) => list.includes(target)
 
+      // v2.0 第二十七步：单群群友黑名单（增删走 session-op）。
+      const [blInput, setBlInput] = React.useState('')
+      const [blBusy, setBlBusy] = React.useState(false)
+      const [blNote, setBlNote] = React.useState(null)
+      const blacklist = Array.isArray(session.userBlacklist) ? session.userBlacklist : []
+      const changeBlacklist = async (mode, qq) => {
+        if (!/^\d{5,15}$/u.test(qq)) {
+          setBlNote({ kind: 'err', text: 'QQ 号不合法（5~15 位数字）。' })
+          return
+        }
+        setBlBusy(true)
+        setBlNote(null)
+        try {
+          const result = await postSessionOp({ op: 'user-blacklist', key: session.key, mode, qq })
+          if (!result?.ok) {
+            setBlNote({ kind: 'err', text: '操作失败：' + (result?.error ?? 'unknown') })
+            return
+          }
+          setBlNote({ kind: 'ok', text: mode === 'add' ? `已把 ${qq} 加入黑名单。` : `已把 ${qq} 移出黑名单。` })
+          if (mode === 'add') setBlInput('')
+        } catch (error) {
+          setBlNote({ kind: 'err', text: '操作失败：' + (error?.message ?? error) })
+        } finally {
+          setBlBusy(false)
+        }
+      }
+
       /** 名单是**全局**的（不按群区分），所以这里只能整体读写。 */
       const toggleIn = (path, value) => {
         if (!writable || value === '') return
@@ -5017,6 +5044,43 @@ window.__ModuleLoader__.load({
             }, inDeny ? '移出黑名单' : '加入黑名单')),
           h('div', { className: 'qqg-hint' },
             '黑名单优先于白名单；改动保存后，桥接在下一条消息前现读生效，不用重启。')),
+        isGroup
+          ? h(Panel, {
+            title: '群友黑名单',
+            desc: '只影响这个群：名单里的 QQ 发消息会被静默丢弃（不进上下文、不调模型）。主人 / 开发者不受影响。',
+            right: h('span', { className: 'qqg-pill' }, blacklist.length + ' 人'),
+          },
+            h('div', { className: 'qqg-textarea-actions' },
+              h('input', {
+                className: 'qqg-input',
+                value: blInput,
+                placeholder: '输入 QQ 号',
+                disabled: blBusy || !writable,
+                'aria-label': '群友黑名单 QQ',
+                onChange: (event) => setBlInput(event.target.value.replace(/[^\d]/gu, '').slice(0, 15)),
+              }),
+              h('button', {
+                type: 'button', className: 'qqg-btn',
+                disabled: blBusy || !writable || blInput === '',
+                onClick: () => { void changeBlacklist('add', blInput) },
+              }, '加入黑名单')),
+            blacklist.length === 0
+              ? h('div', { className: 'qqg-hint' }, '还没有群友黑名单。也可以发 /黑名单 加 12345。')
+              : h('div', { className: 'qqg-list' }, blacklist.map((qq) => h('div', {
+                className: 'qqg-kv', key: qq,
+              },
+              h('span', null, '黑名单 QQ'),
+              h('b', { className: 'qqg-mono' }, qq),
+              h('button', {
+                type: 'button', className: 'qqg-btn qqg-btn-danger',
+                disabled: blBusy || !writable,
+                onClick: () => { void changeBlacklist('remove', qq) },
+              }, '移出')))),
+            blNote
+              ? h('div', { className: 'qqg-status' + (blNote.kind === 'err' ? ' qqg-status-err' : '') },
+                blNote.text)
+              : null)
+          : null,
         isGroup
           ? h(Panel, {
             title: '身份授予（仅私聊会话）',

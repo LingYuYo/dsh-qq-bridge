@@ -491,6 +491,7 @@ await check('sanitizeSessionRow：core / userProfiles / slang / contextBriefing 
     briefingEdited: true,
     briefingGenerated: '自动原文',
     mutedUntil: 1_793_000_000_000,
+    userBlacklist: ['20002', 'bad', '20003', '20002'],
   })
   assert.equal(row.core.identity, '本群身份')
   assert.equal(row.userProfiles.length, 1, '非法 QQ 的档案要丢掉')
@@ -507,6 +508,7 @@ await check('sanitizeSessionRow：core / userProfiles / slang / contextBriefing 
   assert.equal(row.briefingEdited, true, '人工编辑标记要透传')
   assert.equal(row.briefingGenerated, '自动原文', '原始自动文本要透传（重置用）')
   assert.equal(row.mutedUntil, 1_793_000_000_000, '休眠截止时间要透传（UI 角标用）')
+  assert.deepEqual(row.userBlacklist, ['20002', '20003'], '群友黑名单要白名单化并去重')
   // 空覆盖 → null（继承全局）
   assert.equal(sanitizeSessionRow({ key: 'g:2', personaOverride: {} }).personaOverride, null)
 })
@@ -629,6 +631,8 @@ await check('session-ops：记忆治理（forget / undo-forget / restore-backup�
     return res
   }
   assert.equal((await post({ op: 'forget', key: 'g:1' })).status, 400, 'forget 缺 field 要拒绝')
+  assert.equal((await post({ op: 'user-blacklist', key: 'g:1', qq: 'abc' })).status, 400,
+    'user-blacklist 只收数字 QQ')
   assert.equal((await post({ op: 'restore-backup', key: 'g:1', file: '../../x' })).status, 400,
     'restore-backup 只接受合法备份名')
   assert.equal((await post({
@@ -636,12 +640,14 @@ await check('session-ops：记忆治理（forget / undo-forget / restore-backup�
   })).status, 200)
   await post({ op: 'forget', key: 'g:1', field: 'l2' })
   await post({ op: 'undo-forget', key: 'g:1' })
+  await post({ op: 'user-blacklist', key: 'g:1', mode: 'add', qq: '20002' })
 
   const getRes = { status: 0, body: '', writeHead(s) { this.status = s }, end(b) { this.body = b } }
   route.handler({ method: 'GET', headers: {} }, getRes)
   const ops = JSON.parse(getRes.body).ops
   assert.equal(ops.find((op) => op.op === 'forget').field, 'l2')
   assert.equal(ops.find((op) => op.op === 'restore-backup').file, 'backup-20260101-030000.json.gz')
+  assert.equal(ops.find((op) => op.op === 'user-blacklist').qq, '20002')
 })
 
 console.log('\n— 接入总闸（v2.0 第七步）—')

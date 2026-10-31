@@ -1483,6 +1483,8 @@ function enqueueSessionOp(op, key, text = '', extra = {}) {
     ...(typeof extra.id === 'string' && extra.id !== '' ? { id: extra.id } : {}),
     ...(typeof extra.field === 'string' && extra.field !== '' ? { field: extra.field } : {}),
     ...(typeof extra.file === 'string' && extra.file !== '' ? { file: extra.file } : {}),
+    ...(typeof extra.qq === 'string' && extra.qq !== '' ? { qq: extra.qq } : {}),
+    ...(typeof extra.mode === 'string' && extra.mode !== '' ? { mode: extra.mode } : {}),
     at: Date.now(), lease: 0,
   })
   while (sessionOpsQueue.size > SESSION_OPS_CAP) {
@@ -3151,6 +3153,13 @@ function sanitizeSessionRow(row) {
     lastText: text(row.lastText, 200),
     // v2.0 第二十五步：主人级休眠截止时间（ms）。0 = 未休眠。
     mutedUntil: num(row.mutedUntil, 8.64e15),
+    // v2.0 第二十七步：单群群友黑名单（QQ 数组，最多 50）。
+    userBlacklist: Array.isArray(row.userBlacklist)
+      ? [...new Set(row.userBlacklist
+        .map((item) => (typeof item === 'string' ? item.trim().slice(0, 20) : ''))
+        .filter((qq) => /^\d{5,15}$/u.test(qq)))]
+        .slice(0, 50)
+      : [],
     // 单人设回填（会话详情里的输入框要显示已保存的值）。多行不能压成单行，
     // 只裁掉首尾空白与长度，换行原样保留。
     persona: textPreservingLines(row.persona, 20000),
@@ -4414,6 +4423,8 @@ function applySettings(ctx, config) {
               ...(typeof op.id === 'string' && op.id !== '' ? { id: op.id } : {}),
               ...(typeof op.field === 'string' && op.field !== '' ? { field: op.field } : {}),
               ...(typeof op.file === 'string' && op.file !== '' ? { file: op.file } : {}),
+              ...(typeof op.qq === 'string' && op.qq !== '' ? { qq: op.qq } : {}),
+              ...(typeof op.mode === 'string' && op.mode !== '' ? { mode: op.mode } : {}),
             })
           }
           sendJson(res, 200, { ok: true, ops })
@@ -4450,7 +4461,7 @@ function applySettings(ctx, config) {
         // 桥接侧会生成前情提要 → 归档旧会话 → 新建同名会话。
         // 两者都不是 QQ 消息，桥接侧标 origin=console，**不冒充主人**（权限仍只认事件 QQ 号）。
         if (!['clear', 'delete', 'persona', 'activity', 'summarize', 'manual-summarize', 'dynamic', 'briefing',
-          'global-memory', 'task', 'forget', 'undo-forget', 'restore-backup'].includes(op)) {
+          'global-memory', 'task', 'forget', 'undo-forget', 'restore-backup', 'user-blacklist'].includes(op)) {
           sendJson(res, 400, { ok: false, reason: 'unknown-op', detail: `未知操作：${op || '(空)'}` })
           return
         }
@@ -4506,6 +4517,16 @@ function applySettings(ctx, config) {
             return
           }
           extra.id = id
+        }
+        // v2.0 第二十七步：单群群友黑名单增删。
+        if (op === 'user-blacklist') {
+          const qq = typeof body?.qq === 'string' ? body.qq.trim() : ''
+          if (!/^\d{5,15}$/u.test(qq)) {
+            sendJson(res, 400, { ok: false, reason: 'bad-qq' })
+            return
+          }
+          extra.qq = qq
+          extra.mode = body?.mode === 'remove' ? 'remove' : 'add'
         }
         // v2.0 第二十六步：记忆治理。
         if (op === 'forget') {

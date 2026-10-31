@@ -303,6 +303,28 @@ await check('分片优先在标点处断开', () => {
   assert.ok(parts.every(p => p.length <= 100), '每段不超过上限')
 })
 
+console.log('\n— 智能 @（v2.0 第二十七步）—')
+await check('昵称反查 QQ → CQ at 码 → at 段；查不到原样保留', () => {
+  const client = new OneBotClient({ wsUrl: 'ws://127.0.0.1:1' })
+  client._rememberName('123456', '999', '星语')
+  assert.equal(client.resolveMentions('@星语 在吗', '123456'), '[CQ:at,qq=999] 在吗')
+  assert.equal(client.resolveMentions('@不存在 在吗', '123456'), '@不存在 在吗')
+  assert.equal(client.resolveMentions('@星语 在吗', '999999'), '@星语 在吗', '别的群缓存不能串')
+
+  const segments = client._buildSegments('group', '[CQ:at,qq=999] 在吗')
+  assert.deepEqual(segments, [
+    { type: 'at', data: { qq: '999' } },
+    { type: 'text', data: { text: ' 在吗' } },
+  ])
+})
+
+await check('私聊不生成 at 段（CQ 码按纯文本转义）', () => {
+  const client = new OneBotClient({ wsUrl: 'ws://127.0.0.1:1' })
+  const segments = client._buildSegments('private', '[CQ:at,qq=999] 在吗')
+  assert.equal(typeof segments, 'string')
+  assert.ok(segments.includes('CQ：at'), segments)
+})
+
 console.log('\n— 分气泡（换行 → 多条消息）—')
 await check('无换行 → 单条', () => {
   assert.deepEqual(splitBubbles('就这一句'), ['就这一句'])

@@ -1846,6 +1846,43 @@ export class OneBotClient {
    *   `[CQ:` 转义问题影响，也不用手工拼 `&#91;` 之类的实体）。
    * @returns {string|Array<object>}
    */
+  /**
+   * 把文本里的「@昵称」反查成群成员真实 QQ（v2.0 第二十七步）。
+   *
+   * 模型输出 `@星语` 时 QQ 只当纯文本；这里用入站消息攒下的昵称缓存反查，
+   * 命中就换成标准 CQ at 码，由 `_buildSegments` 转成 at 段。
+   * 查不到（改名 / 没说过话 / 昵称带空格）原样保留，绝不猜。
+   *
+   * @param {string} text
+   * @param {string} groupId
+   * @returns {string}
+   */
+  resolveMentions(text, groupId) {
+    const gid = String(groupId ?? '').trim()
+    const source = String(text ?? '')
+    if (!/^\d+$/u.test(gid) || !source.includes('@')) return source
+    return source.replace(/@([^\s@[\]]{1,24})/gu, (whole, name) => {
+      const qq = this._qqOfName(gid, name)
+      return qq === '' ? whole : `[CQ:at,qq=${qq}]`
+    })
+  }
+
+  /** 按昵称反查 QQ（同群、最近一次记录的优先）。 */
+  _qqOfName(groupId, name) {
+    const gid = String(groupId ?? '')
+    let best = ''
+    let bestAt = 0
+    for (const [key, value] of this._atNames) {
+      if (!key.startsWith(`${gid}:`)) continue
+      if (value.name !== name) continue
+      if (value.at > bestAt) {
+        bestAt = value.at
+        best = key.slice(gid.length + 1)
+      }
+    }
+    return best
+  }
+
   _buildSegments(kind, text, { atUserId, atPosition, replyTo } = {}) {
     const needAt = kind === 'group'
       && atUserId !== undefined && atUserId !== null
@@ -1856,15 +1893,32 @@ export class OneBotClient {
     const replyId = kind === 'group' && replyTo !== undefined && replyTo !== null
       ? String(replyTo).trim()
       : ''
-    if (!needAt && !replyId) return escapeCqText(text)
-    // at 放文本**前面**：QQ 客户端里 @ 会高亮成「@昵称」，正文跟在其后读起来自然。
-    // at 与正文之间必须有一个空格（2026-10-23 修）：OneBot 的 at 段本身不负责空白，
-    // 两个段紧挨着渲染出来就是「@群友你好」，模型和群友都会看错。
-    const body = escapeCqText(String(text ?? '').replace(/^[ \t]+/u, ''))
+    const raw = String(text ?? '').replace(/^[ \t]+/u, '')
+    // 群聊：模型写的「@昵称」已经在 _sendText 里换成 CQ at 码，这里拆成 at 段；
+    // 私聊没有 at 段，整段按纯文本转义（CQ 码会变成普通文字，安全）。
+    const hasCqAt = kind === 'group' && /\[CQ:at,qq=\d+\]/u.test(raw)
+    if (!needAt && !replyId && !hasCqAt) return escapeCqText(raw)
     const segments = []
     if (replyId) segments.push({ type: 'reply', data: { id: replyId } })
     if (needAt) segments.push({ type: 'at', data: { qq: String(atUserId).trim() } })
-    segments.push({ type: 'text', data: { text: needAt ? ' ' + body : body } })
+    let firstText = true
+    const pushText = (value) => {
+      const escaped = escapeCqText(value)
+      if (escaped === '') return
+      segments.push({ type: 'text', data: { text: needAt && firstText ? ' ' + escaped : escaped } })
+      firstText = false
+    }
+    const parts = hasCqAt ? raw.split(/(\[CQ:at,qq=\d+\])/u) : [raw]
+    for (const part of parts) {
+      if (part === '') continue
+      const atMatch = /^\[CQ:at,qq=(\d+)\]$/u.exec(part)
+      if (atMatch) {
+        segments.push({ type: 'at', data: { qq: atMatch[1] } })
+        continue
+      }
+      pushText(part)
+    }
+    if (segments.length === 0) segments.push({ type: 'text', data: { text: '' } })
     return segments
   }
 
@@ -1909,10 +1963,11 @@ export class OneBotClient {
         && String(replyTo).trim() !== ''
         ? String(replyTo).trim()
         : ''
-      const message = this._buildSegments(kind, chunks[i], {
-        ...(withAt ? { atUserId, atPosition } : {}),
-        ...(withReply ? { replyTo: withReply } : {}),
-      })
+      const message = this._buildSegments(kind,
+        kind === 'group' ? this.resolveMentions(chunks[i], targetId) : chunks[i], {
+          ...(withAt ? { atUserId, atPosition } : {}),
+          ...(withReply ? { replyTo: withReply } : {}),
+        })
       const params = kind === 'private'
         ? { user_id: Number(id), message }
         : { group_id: Number(id), message }

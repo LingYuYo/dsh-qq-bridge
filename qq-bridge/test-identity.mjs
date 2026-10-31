@@ -611,5 +611,40 @@ await check('/遗忘 L1：清空本群缓冲 / 保留最近 N 条', async () => 
   assert.deepEqual(b._chatLog.get('g:1').map((item) => item.seq), [3])
 })
 
+console.log('\n— 单群群友黑名单（v2.0 第二十七步）—')
+await check('黑名单入口静默丢弃：不进 L1、不调模型；主人例外', async () => {
+  const b = makeBridge({ allow: { owners: ['1001', '10001'], groups: ['123456'] } })
+  fakeQq(b)
+  b.state.sessions['g:123456'] = normalizeSessionEntry('g:123456', { userBlacklist: ['20002'] })
+  let prompted = 0
+  b._enqueue = async () => { prompted += 1 }
+
+  await b.handleMessage(groupMsg('在吗', { groupId: '123456', userId: '20002' }))
+  assert.equal(prompted, 0, '★ 黑名单不能投递')
+  assert.equal(b.stats.blacklisted, 1)
+  assert.equal(b._chatLog.has('g:123456'), false, '★ 不能进归纳缓冲')
+
+  // 主人即使被误加进黑名单也不受影响，否则再也解不开。
+  b.state.sessions['g:123456'].userBlacklist = ['10001']
+  await b.handleMessage(groupMsg('在吗', { groupId: '123456', userId: '10001' }))
+  assert.equal(b.stats.blacklisted, 1, '主人不该被黑名单拦')
+})
+
+await check('/黑名单 加/删：仅主人，落盘到 userBlacklist', async () => {
+  const b = makeBridge({ allow: { owners: ['1001'] } })
+  const sent = fakeQq(b)
+  await b._handleBlacklistCommand(groupMsg('/黑名单 加 20002'), '/黑名单 加 20002', 'g:1')
+  assert.deepEqual(b.state.sessions['g:1'].userBlacklist, ['20002'])
+
+  await b._handleBlacklistCommand(groupMsg('/黑名单 删 20002'), '/黑名单 删 20002', 'g:1')
+  assert.deepEqual(b.state.sessions['g:1'].userBlacklist, [])
+
+  const denied = await b._handleBlacklistCommand(
+    groupMsg('/黑名单 加 20002', { userId: '20002' }), '/黑名单 加 20002', 'g:1',
+  )
+  assert.equal(denied, true)
+  assert.match(sent.at(-1), /权限不足/u)
+})
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`)
 if (fail > 0) process.exitCode = 1

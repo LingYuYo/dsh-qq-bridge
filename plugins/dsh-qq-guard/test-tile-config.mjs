@@ -854,5 +854,22 @@ await check('记忆治理：清空 L1 / 遗忘 L2 / 撤销 / 恢复备份都能�
   truthy(text.includes('恢复备份'), '缺恢复备份按钮')
 })
 
+/* ── 用例：群友黑名单卡片（v2.0 第二十七步）────────────────── */
+console.log('\n群友黑名单：')
+
+await check('特权与权限：群友黑名单卡片与已加入的 QQ', () => {
+  reset()
+  const live = {
+    sessions: [{ ...LIVE_DETAIL.sessions[0], kind: 'group', userBlacklist: ['20002'] }],
+  }
+  let tree = resetSessions(live)
+  tabBtn(tree, '特权与权限').props.onClick()
+  tree = render()
+  const text = textOf(tree)
+  truthy(text.includes('群友黑名单'), '缺群友黑名单卡片')
+  truthy(text.includes('20002'), '缺已加入黑名单的 QQ')
+  truthy(text.includes('加入黑名单'), '缺加入按钮')
+})
+
 /* ── 汇总 ──────────────────────────────────────────────────── */
 console.log(`\n结果：${pass} 通过 / ${process.exitCode === 1 ? '≥1' : 0} 失败`)
